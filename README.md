@@ -6,7 +6,22 @@ A standalone CLI that compiles SQL into an ffmpeg `-filter_complex` invocation. 
 
 ## Example
 
-A picture-in-picture overlay, with the two clips' audio pairwise mixed under it -- the CTE carries a video column AND an audio column, and the outer SELECT list is the two-stream output:
+Two dual-language episodes, played back to back. Each branch splats `<alias>.audio` -- the whole audio array, not one track -- so `UNION ALL`'s column matching pairs the streams up for you: video with video, English with English, French with French.
+
+```sql
+SELECT a.frame, a.audio FROM input('episode1.mkv') a
+UNION ALL
+SELECT b.frame, b.audio FROM input('episode2.mkv') b
+```
+
+```
+$ sqlmpeg run query.sql -o season.mkv
+ffmpeg -i episode1.mkv -i episode2.mkv -filter_complex '[0:v:0][0:a:0][0:a:1][1:v:0][1:a:0][1:a:1]concat=n=2:v=1:a=2[out0][out1][out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra season.mkv
+```
+
+That is the whole point of the frontend: SQL already demands that `UNION ALL` branches agree on column count, types and order, and that demand IS ffmpeg's concat segment contract -- `concat=n=2:v=1:a=2`, its inputs interleaved segment by segment. Arrays are no exception; two three-track episodes give `a=3` and nobody counts pads by hand. The `language` tags survive the concat because both segments agree on them.
+
+A second example -- a picture-in-picture overlay, with the two clips' audio pairwise mixed under it. The CTE carries a video column AND an audio column, and the outer SELECT list is the two-stream output:
 
 ```sql
 WITH pip AS (

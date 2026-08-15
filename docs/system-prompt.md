@@ -104,6 +104,14 @@ statement is not. `--` and `/* */` comments are allowed.
   branch arrays must also agree on length) -- otherwise `CONCAT_MISMATCH`.
   Branches must also already agree on resolution and frame rate for video
   columns -- `scale(...)` inside a branch if they do not.
+- Columns pair up by position, arrays included: a splatted `<alias>.audio` in
+  every branch concatenates element 1 with element 1, element 2 with element
+  2, and so on, so two dual-language files joined by `UNION ALL` keep both
+  language tracks. That is the way to concatenate multi-track sources -- do
+  not subscript each track into its own column.
+- A concatenated output stream keeps a `language`/`title` tag only when every
+  branch's stream in that column carries the SAME one; where they disagree
+  (or a branch's stream is untagged) the output carries no tag.
 - Plain `UNION` is rejected: deduplication has no streaming meaning.
 - Legal at the top level and as a CTE body.
 
@@ -263,13 +271,21 @@ SELECT fade_out(fade_in(speed(a.frame, 2), 1), 1.5, 8.5)
 FROM input('clip.mp4') a
 ```
 
-The next example broadcasts a bare array (`v.audio`); that only compiles against a real, readable file, since sizing the array needs its actual stream count (see Broadcasting above).
+The next examples use a bare array (`v.audio`, `a.audio`) -- broadcast over, or splatted into the SELECT list. Those only compile against a real, readable file, since sizing the array needs its actual stream count (see Broadcasting above).
 
 Add reverb to every audio track in film.mkv, whatever language each one is in.
 
 ```sql-probed
 SELECT v.video[1], reverb(v.audio, 0.3)
 FROM input('film.mkv') v
+```
+
+Play episode1.mkv then episode2.mkv as one file, keeping every language track of both.
+
+```sql-probed
+SELECT a.frame, a.audio FROM input('episode1.mkv') a
+UNION ALL
+SELECT b.frame, b.audio FROM input('episode2.mkv') b
 ```
 
 ## Repair loop

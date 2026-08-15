@@ -30,6 +30,7 @@ pytestmark = pytest.mark.exec
 _FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 _TESTSRC = _FIXTURES_DIR / "testsrc.mp4"
 _AV2 = _FIXTURES_DIR / "av2.mp4"
+_AV3 = _FIXTURES_DIR / "av3.mp4"
 
 _SRC_WIDTH = 320
 _SRC_HEIGHT = 240
@@ -259,3 +260,35 @@ def test_reverb_broadcast_produces_a_tagged_stream_per_language_track(tmp_path: 
     streams = _ffprobe_streams(out_path)
     assert [s["codec_type"] for s in streams] == ["audio", "audio"]
     assert [s["tags"]["language"] for s in streams] == ["eng", "fra"]
+
+
+# ---------------------------------------------------------------------------
+# UNION ALL splat: concat two dual-language sources, tracks paired by position
+# ---------------------------------------------------------------------------
+
+
+def test_union_splat_concatenates_both_language_tracks(tmp_path: Path) -> None:
+    """The README headline, end to end.
+
+    Both branches splat `<alias>.audio`, so UNION ALL's column matching pairs
+    av2's and av3's tracks elementwise into `concat=n=2:v=1:a=2`. The two files
+    tag their tracks eng/fra alike, so both concat audio pads keep the language
+    they agree on -- and the run is twice as long as either source.
+    """
+    _require_fixture(_AV2)
+    _require_fixture(_AV3)
+    out_path = tmp_path / "season.mp4"
+    query = (
+        f"SELECT a.frame, a.audio FROM input('{_sql_path(_AV2)}') a "
+        f"UNION ALL "
+        f"SELECT b.frame, b.audio FROM input('{_sql_path(_AV3)}') b"
+    )
+
+    _compile_and_run(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["video", "audio", "audio"]
+    assert [s["tags"]["language"] for s in streams[1:]] == ["eng", "fra"]
+    assert _ffprobe_duration(out_path) == pytest.approx(
+        _ffprobe_duration(_AV2) + _ffprobe_duration(_AV3), abs=0.3
+    )

@@ -6,9 +6,11 @@ Uses ffmpeg's ``lavfi`` test-pattern sources (``testsrc2``, ``smptebars``,
 which is gitignored.
 
 The set: ``testsrc.mp4`` / ``smptebars.mp4`` (video only), ``av.mp4`` (video +
-one audio track), and ``av2.mp4`` (video + TWO audio tracks tagged
-``language=eng`` / ``language=fra``), which is what the broadcasting tests
-expand over.
+one audio track), and ``av2.mp4`` / ``av3.mp4`` (video + TWO audio tracks
+tagged ``language=eng`` / ``language=fra``), which is what the broadcasting
+tests expand over. av2 and av3 differ only in their sine frequencies, so a
+``UNION ALL`` of the two concatenates two distinguishable multi-language
+sources whose language tags agree track for track.
 
 Idempotent: a fixture whose output file already exists is skipped, so this
 is safe to run repeatedly, including once per CI job right before the exec
@@ -43,6 +45,7 @@ _SOURCES: dict[str, str] = {
 
 _AV_NAME = "av.mp4"
 _AV2_NAME = "av2.mp4"
+_AV3_NAME = "av3.mp4"
 
 
 def _ffmpeg_available() -> bool:
@@ -101,6 +104,28 @@ def _generate_av2() -> None:
     )
 
 
+def _generate_av3() -> None:
+    """A second two-language fixture (sine 550 eng, 990 fra): av2's concat partner.
+
+    Same shape as av2.mp4 -- same size, rate, duration and language tags, so a
+    ``UNION ALL`` of the two is a legal concat -- but different tones, so the
+    two segments of a concatenated output are told apart by ear.
+    """
+    _run(
+        FIXTURES_DIR / _AV3_NAME,
+        [
+            "-f", "lavfi", "-i", f"testsrc2=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
+            "-f", "lavfi", "-i", f"sine=frequency=550:duration={_DURATION}",
+            "-f", "lavfi", "-i", f"sine=frequency=990:duration={_DURATION}",
+            "-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0",
+            "-metadata:s:a:0", "language=eng",
+            "-metadata:s:a:1", "language=fra",
+            "-pix_fmt", "yuv420p",
+            "-shortest",
+        ],
+    )
+
+
 def main() -> int:
     if not _ffmpeg_available():
         print("error: ffmpeg not found on PATH", file=sys.stderr)
@@ -109,6 +134,7 @@ def main() -> int:
         _generate(name, lavfi)
     _generate_av()
     _generate_av2()
+    _generate_av3()
     return 0
 
 

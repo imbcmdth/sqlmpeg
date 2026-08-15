@@ -18,6 +18,7 @@ the real thing, in an ``exec``-marked test against ``tests/fixtures/av.mp4``
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -27,7 +28,7 @@ import pytest
 from sqlmpeg import compiler
 from sqlmpeg import lower as lower_module
 from sqlmpeg.compiler import compile_sql
-from sqlmpeg.emit import emit
+from sqlmpeg.emit import build_ffmpeg_args, emit
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.ir import Graph
 from sqlmpeg.lower import lower
@@ -39,12 +40,43 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
 
 
-def _readme_sql() -> str:
-    """The first ```sql block in README.md -- the PiP example, verbatim."""
-    text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    blocks = re.findall(r"```sql\n(.*?)```", text, re.DOTALL)
+# README ```sql blocks are dispatched by CONTENT, not by position, so moving
+# an example up or down the page does not silently re-point a test. The
+# headline names files nobody has; it is compiled against the real two-language
+# fixtures instead, which is exactly how its shown command was produced.
+_README_FIXTURE_PATHS = {"episode1.mkv": "av2.mp4", "episode2.mkv": "av3.mp4"}
+
+
+def _readme_text() -> str:
+    return (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+
+def _readme_block(needle: str) -> str:
+    """The one ```sql block of README.md containing `needle`, verbatim."""
+    blocks = re.findall(r"```sql\n(.*?)```", _readme_text(), re.DOTALL)
     assert blocks, "README.md no longer contains a ```sql block"
-    return str(blocks[0])
+    matching = [str(block) for block in blocks if needle in block]
+    assert len(matching) == 1, f"expected exactly one README ```sql block with {needle!r}"
+    return matching[0]
+
+
+def _readme_sql() -> str:
+    """The PiP example: a CTE carrying a video column AND an audio column."""
+    return _readme_block("WITH pip")
+
+
+def _readme_union_sql() -> str:
+    """The headline UNION ALL splat, re-pointed at the real fixtures.
+
+    The example names 'episode1.mkv'/'episode2.mkv' for readability; av2.mp4
+    and av3.mp4 are what those stand in for -- two files with one video and two
+    audio tracks tagged eng/fra apiece -- and splatting an array needs a file
+    that can actually be probed for its stream count.
+    """
+    sql = _readme_block("episode1.mkv")
+    for shown, fixture in _README_FIXTURE_PATHS.items():
+        sql = sql.replace(shown, (FIXTURES_DIR / fixture).as_posix())
+    return sql
 
 
 def _lower(sql: str, probes: dict[str, ProbeResult | None] | None = None) -> Graph:
@@ -122,7 +154,55 @@ def _probe_result(
 
 
 # ---------------------------------------------------------------------------
-# the README example (v0 compat: `frame` sugar still compiles)
+# the README headline: UNION ALL over splatted audio arrays
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.exec
+def test_readme_headline_concatenates_the_two_sources_pairwise(_fixtures: None) -> None:
+    """Both branches splat `<alias>.audio`, so the concat signature is derived,
+    not written: 1 video + 2 audio pads, inputs interleaved segment by segment."""
+    g = compile_sql(_readme_union_sql())
+    assert _filters(g) == ["concat"]
+    concat = g.nodes["n1"]
+    assert concat.args == {"n": 2, "v": 1, "a": 2}
+    assert concat.inputs == [
+        "src:a:v:0", "src:a:a:0", "src:a:a:1",
+        "src:b:v:0", "src:b:a:0", "src:b:a:1",
+    ]
+    assert concat.outputs == ["video", "audio", "audio"]
+    assert _outputs(g) == [
+        ("n1:0", "video", None),
+        ("n1:1", "audio", None),
+        ("n1:2", "audio", None),
+    ]
+
+
+@pytest.mark.exec
+def test_readme_headline_keeps_the_agreed_language_tags(_fixtures: None) -> None:
+    """Both segments tag their tracks eng/fra, so the concat outputs keep them;
+    the video pads' mp4-stamped `und` says nothing and is dropped."""
+    g = compile_sql(_readme_union_sql())
+    assert [o.metadata for o in g.outputs] == [
+        {},
+        {"language": "eng"},
+        {"language": "fra"},
+    ]
+
+
+@pytest.mark.exec
+def test_readme_headline_command_is_the_real_compilation(_fixtures: None) -> None:
+    """The command shown under the headline is what sqlmpeg actually prints for
+    that query, with only the fixture paths written back to the shown names."""
+    args = build_ffmpeg_args(emit(compile_sql(_readme_union_sql())), "season.mkv")
+    shown = shlex.join(args)
+    for name, fixture in _README_FIXTURE_PATHS.items():
+        shown = shown.replace((FIXTURES_DIR / fixture).as_posix(), name)
+    assert shown in _readme_text(), shown
+
+
+# ---------------------------------------------------------------------------
+# the README PiP example (v0 compat: `frame` sugar still compiles)
 # ---------------------------------------------------------------------------
 
 
@@ -547,12 +627,107 @@ def test_broadcast_through_amix_drops_every_elements_provenance() -> None:
     assert [o.metadata for o in g.outputs] == [{}, {}]
 
 
-def test_concat_breaks_provenance() -> None:
+def test_concat_keeps_provenance_every_segment_agrees_on() -> None:
+    """Both segments of the pad say `language=eng`, so the pad still does."""
     g = _lower(
         "SELECT a.audio[1] FROM input('x.mp4') a "
         "UNION ALL SELECT b.audio[1] FROM input('y.mp4') b",
         {
             "a": _probe_result(audio_tags={"language": "eng"}),
+            "b": _probe_result(audio_tags={"language": "eng"}),
+        },
+    )
+    assert g.outputs[0].metadata == {"language": "eng"}
+
+
+def test_concat_drops_provenance_the_segments_disagree_on() -> None:
+    """An English segment concatenated with a French one is neither."""
+    g = _lower(
+        "SELECT a.audio[1] FROM input('x.mp4') a "
+        "UNION ALL SELECT b.audio[1] FROM input('y.mp4') b",
+        {
+            "a": _probe_result(audio_tags={"language": "eng"}),
+            "b": _probe_result(audio_tags={"language": "fra"}),
+        },
+    )
+    assert g.outputs[0].metadata == {}
+
+
+def test_concat_drops_provenance_when_one_segment_has_none() -> None:
+    """Agreement is on what SURVIVES the und-filter: an untagged segment has
+    nothing to say, so the tagged one does not speak for the whole output."""
+    g = _lower(
+        "SELECT a.audio[1] FROM input('x.mp4') a "
+        "UNION ALL SELECT b.audio[1] FROM input('y.mp4') b",
+        {
+            "a": _probe_result(audio_tags={"language": "eng"}),
+            "b": _probe_result(audio_tags={"language": "und"}),
+        },
+    )
+    assert g.outputs[0].metadata == {}
+
+
+def test_concat_of_two_untagged_segments_carries_no_metadata() -> None:
+    """Two `und` streams filter down to {} apiece: they agree on nothing, and
+    an empty agreement is still no metadata."""
+    g = _lower(
+        "SELECT a.audio[1] FROM input('x.mp4') a "
+        "UNION ALL SELECT b.audio[1] FROM input('y.mp4') b",
+        {
+            "a": _probe_result(audio_tags={"language": "und"}),
+            "b": _probe_result(audio_tags={"language": "und"}),
+        },
+    )
+    assert g.outputs[0].metadata == {}
+
+
+def test_concat_drops_provenance_when_a_segment_was_not_probed() -> None:
+    g = _lower(
+        "SELECT a.audio[1] FROM input('x.mp4') a "
+        "UNION ALL SELECT b.audio[1] FROM input('y.mp4') b",
+        {"a": _probe_result(audio_tags={"language": "eng"}), "b": None},
+    )
+    assert g.outputs[0].metadata == {}
+
+
+def test_concat_agrees_per_pad_over_flattened_array_columns() -> None:
+    """Splatted arrays pair elementwise, and each pad agrees (or not) on its
+    own: track 1 matches eng/eng, track 2 is fra against deu."""
+    g = _lower(
+        "SELECT a.audio FROM input('x.mp4') a UNION ALL SELECT b.audio FROM input('y.mp4') b",
+        {
+            "a": _probe_result(
+                audios=2, per_audio_tags=[{"language": "eng"}, {"language": "fra"}]
+            ),
+            "b": _probe_result(
+                audios=2, per_audio_tags=[{"language": "eng"}, {"language": "deu"}]
+            ),
+        },
+    )
+    assert [o.metadata for o in g.outputs] == [{"language": "eng"}, {}]
+
+
+def test_concat_provenance_survives_a_filtered_segment() -> None:
+    """Provenance reaches the concat through each branch's own 1:1 chain."""
+    g = _lower(
+        "SELECT volume(a.audio[1], 0.5) FROM input('x.mp4') a "
+        "UNION ALL SELECT b.audio[1] FROM input('y.mp4') b",
+        {
+            "a": _probe_result(audio_tags={"language": "fra", "title": "VF"}),
+            "b": _probe_result(audio_tags={"language": "fra", "title": "VF"}),
+        },
+    )
+    assert g.outputs[0].metadata == {"language": "fra", "title": "VF"}
+
+
+def test_concat_after_amix_carries_no_metadata() -> None:
+    """A mixed segment has no source at all, so the pad cannot agree with the
+    other one whatever it says."""
+    g = _lower(
+        "SELECT amix(a.audio[1], a.audio[2]) FROM input('x.mp4') a "
+        "UNION ALL SELECT b.audio[1] FROM input('y.mp4') b",
+        {
+            "a": _probe_result(audios=2, audio_tags={"language": "eng"}),
             "b": _probe_result(audio_tags={"language": "eng"}),
         },
     )
@@ -1228,6 +1403,12 @@ def _av2_fixture(_fixtures: None) -> str:
     return (FIXTURES_DIR / "av2.mp4").as_posix()
 
 
+@pytest.fixture(scope="module")
+def _av3_fixture(_fixtures: None) -> str:
+    """av2's concat partner: same shape and tags, different sine frequencies."""
+    return (FIXTURES_DIR / "av3.mp4").as_posix()
+
+
 @pytest.mark.exec
 def test_probed_fixture_rejects_an_out_of_range_subscript(_av_fixture: str) -> None:
     """av.mp4 has exactly one video and one audio stream."""
@@ -1321,3 +1502,45 @@ def test_probed_cte_array_subscript_against_a_real_file(_av2_fixture: str) -> No
     )
     assert err.code is ErrorCode.STREAM_NOT_FOUND
     assert "column 'c.snd' has 2 streams" in err.message
+
+
+# ---------------------------------------------------------------------------
+# UNION ALL over splatted arrays, against the two real 2-track fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.exec
+def test_union_splat_pairs_every_language_track(_av2_fixture: str, _av3_fixture: str) -> None:
+    """The flagship case: two dual-language files, `<alias>.audio` splatted in
+    both branches, and the tracks pair up by position -- eng with eng, fra with
+    fra -- into one concat with 1 video and 2 audio pads."""
+    g = compile_sql(
+        f"SELECT a.frame, a.audio FROM input('{_av2_fixture}') a "
+        f"UNION ALL SELECT b.frame, b.audio FROM input('{_av3_fixture}') b"
+    )
+    assert _filters(g) == ["concat"]
+    assert g.nodes["n1"].args == {"n": 2, "v": 1, "a": 2}
+    assert g.nodes["n1"].inputs == [
+        "src:a:v:0", "src:a:a:0", "src:a:a:1",
+        "src:b:v:0", "src:b:a:0", "src:b:a:1",
+    ]
+    assert len(g.outputs) == 3
+    assert [o.type for o in g.outputs] == ["video", "audio", "audio"]
+    assert [o.metadata for o in g.outputs] == [
+        {},
+        {"language": "eng"},
+        {"language": "fra"},
+    ]
+
+
+@pytest.mark.exec
+def test_union_of_disagreeing_tracks_drops_the_language(
+    _av2_fixture: str, _av3_fixture: str
+) -> None:
+    """av2's first track is eng and av3's second is fra: the concat output is
+    neither, so it carries no language at all."""
+    g = compile_sql(
+        f"SELECT a.audio[1] FROM input('{_av2_fixture}') a "
+        f"UNION ALL SELECT b.audio[2] FROM input('{_av3_fixture}') b"
+    )
+    assert [o.metadata for o in g.outputs] == [{}]
