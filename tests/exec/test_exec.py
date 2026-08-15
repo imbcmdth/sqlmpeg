@@ -29,6 +29,7 @@ pytestmark = pytest.mark.exec
 
 _FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 _TESTSRC = _FIXTURES_DIR / "testsrc.mp4"
+_AV2 = _FIXTURES_DIR / "av2.mp4"
 
 _SRC_WIDTH = 320
 _SRC_HEIGHT = 240
@@ -117,6 +118,28 @@ def _ffprobe_duration(path: Path) -> float:
     return float(data["format"]["duration"])
 
 
+def _ffprobe_streams(path: Path) -> list[dict[str, object]]:
+    args = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=index,codec_type,codec_name",
+        "-show_entries",
+        "stream_tags=language",
+        "-of",
+        "json",
+        str(path),
+    ]
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    streams: list[dict[str, object]] = data["streams"]
+    return streams
+
+
 def _extract_frame(video: Path, t: float, out_png: Path) -> None:
     args = [
         "ffmpeg",
@@ -187,3 +210,52 @@ def test_hflip_matches_pil_flipped_source_by_phash(tmp_path: Path) -> None:
 
     distance = expected_hash - actual_hash
     assert distance <= _PHASH_MAX_DISTANCE
+
+
+# ---------------------------------------------------------------------------
+# multi-stream (v2 / RFC-001): remap-only passthrough and audio broadcasting
+# ---------------------------------------------------------------------------
+
+
+def test_remap_only_stream_copies_the_selected_audio_track(tmp_path: Path) -> None:
+    """`a.video[1], a.audio[2]` on a 2-audio-track file: nothing re-encoded.
+
+    av2.mp4 tags its second audio track `language=fra`; a bare subscript with
+    zero node consumers must stay a passthrough (-map + -c copy), so the
+    output keeps that tag and the exact input codec.
+    """
+    _require_fixture(_AV2)
+    out_path = tmp_path / "remap.mp4"
+    query = f"SELECT a.video[1], a.audio[2] FROM input('{_sql_path(_AV2)}') a"
+
+    graph = compile_sql(query)
+    emitted = emit(graph)
+    assert emitted.filter_complex == ""  # pure passthrough: no filtergraph at all
+
+    args = build_ffmpeg_args(emitted, str(out_path))
+    assert "-c:0" in args and "-c:1" in args  # both outputs are stream-copied
+    args.insert(1, "-y")
+    result = subprocess.run(args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)
+    assert result.returncode == 0, result.stderr
+    assert out_path.exists()
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["video", "audio"]
+    audio = streams[1]
+    assert audio["tags"]["language"] == "fra"
+    source_audio = _ffprobe_streams(_AV2)[2]  # a.audio[2] is the fra track (1-based)
+    assert audio["codec_name"] == source_audio["codec_name"]
+
+
+def test_reverb_broadcast_produces_a_tagged_stream_per_language_track(tmp_path: Path) -> None:
+    """`reverb(a.audio, 0.3)` on a 2-audio-track file expands to two aecho
+    subgraphs, one per track, and each output keeps its source language tag."""
+    _require_fixture(_AV2)
+    out_path = tmp_path / "reverb.mp4"
+    query = f"SELECT reverb(a.audio, 0.3) FROM input('{_sql_path(_AV2)}') a"
+
+    _compile_and_run(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["audio", "audio"]
+    assert [s["tags"]["language"] for s in streams] == ["eng", "fra"]

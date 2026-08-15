@@ -18,7 +18,10 @@
         "y": 50
       },
       "inputs": [
-        "src:b"
+        "src:b:v:0"
+      ],
+      "outputs": [
+        "video"
       ]
     },
     {
@@ -30,6 +33,9 @@
       },
       "inputs": [
         "n1"
+      ],
+      "outputs": [
+        "video"
       ]
     },
     {
@@ -40,10 +46,20 @@
         "y": 20
       },
       "inputs": [
-        "src:a",
+        "src:a:v:0",
         "n2"
+      ],
+      "outputs": [
+        "video"
       ]
     }
   ],
-  "output": "n3"
+  "outputs": [
+    {
+      "ref": "n3",
+      "type": "video",
+      "name": null,
+      "metadata": {}
+    }
+  ]
 }

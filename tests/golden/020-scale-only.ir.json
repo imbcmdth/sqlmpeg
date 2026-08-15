@@ -14,9 +14,19 @@
         "h": "-2"
       },
       "inputs": [
-        "src:a"
+        "src:a:v:0"
+      ],
+      "outputs": [
+        "video"
       ]
     }
   ],
-  "output": "n1"
+  "outputs": [
+    {
+      "ref": "n1",
+      "type": "video",
+      "name": null,
+      "metadata": {}
+    }
+  ]
 }

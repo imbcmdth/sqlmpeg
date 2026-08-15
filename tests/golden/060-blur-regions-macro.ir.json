@@ -7,13 +7,17 @@
   },
   "nodes": [
     {
-      "id": "src_a_split",
+      "id": "src_a_v_0_split",
       "filter": "split",
       "args": {
         "n": 2
       },
       "inputs": [
-        "src:a"
+        "src:a:v:0"
+      ],
+      "outputs": [
+        "video",
+        "video"
       ]
     },
     {
@@ -26,7 +30,10 @@
         "y": 100
       },
       "inputs": [
-        "src_a_split:0"
+        "src_a_v_0_split:0"
+      ],
+      "outputs": [
+        "video"
       ]
     },
     {
@@ -37,6 +44,9 @@
       },
       "inputs": [
         "n1"
+      ],
+      "outputs": [
+        "video"
       ]
     },
     {
@@ -47,10 +57,20 @@
         "y": 100
       },
       "inputs": [
-        "src_a_split:1",
+        "src_a_v_0_split:1",
         "n2"
+      ],
+      "outputs": [
+        "video"
       ]
     }
   ],
-  "output": "n3"
+  "outputs": [
+    {
+      "ref": "n3",
+      "type": "video",
+      "name": null,
+      "metadata": {}
+    }
+  ]
 }

@@ -1,7 +1,7 @@
 {
   "inputs": [
-    "one.mp4",
-    "two.mp4"
+    "intro.mp4",
+    "main.mp4"
   ],
   "sources": {
     "a": 0,
@@ -14,21 +14,30 @@
       "args": {
         "n": 2,
         "v": 1,
-        "a": 0
+        "a": 1
       },
       "inputs": [
         "src:a:v:0",
-        "src:b:v:0"
+        "src:a:a:0",
+        "src:b:v:0",
+        "src:b:a:0"
       ],
       "outputs": [
-        "video"
+        "video",
+        "audio"
       ]
     }
   ],
   "outputs": [
     {
-      "ref": "n1",
+      "ref": "n1:0",
       "type": "video",
+      "name": null,
+      "metadata": {}
+    },
+    {
+      "ref": "n1:1",
+      "type": "audio",
       "name": null,
       "metadata": {}
     }

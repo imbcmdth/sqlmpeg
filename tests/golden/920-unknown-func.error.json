@@ -3,5 +3,5 @@
   "col": 8,
   "code": "UNKNOWN_FUNCTION",
   "message": "unknown function sharpen()",
-  "hint": "known functions: blur, blur_regions, crop, draw_box, fade_in, fade_out, hflip, overlay, scale, speed, text, vflip"
+  "hint": "known functions: afade_in, afade_out, amix, atempo, blur, blur_regions, crop, draw_box, fade_in, fade_out, hflip, overlay, reverb, scale, speed, text, vflip, volume"
 }

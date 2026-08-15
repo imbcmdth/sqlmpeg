@@ -2,6 +2,6 @@
   "line": 1,
   "col": 8,
   "code": "UDF_ARG_TYPE",
-  "message": "blur() expects blur(frame, num), got blur(frame)",
-  "hint": "arguments are frame expressions or literals, in the order shown"
+  "message": "blur() expects blur(video, num), got blur(video)",
+  "hint": "arguments are stream expressions or literals, in the order shown"
 }
