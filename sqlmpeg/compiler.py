@@ -2,10 +2,19 @@
 
 ``compile_sql`` chains the first three passes plus the split pass::
 
-    parse -> resolve -> lower -> insert_splits
+    parse -> resolve -> probe -> lower -> insert_splits
 
 The returned graph is split-complete, i.e. every pad has exactly one consumer,
 which is what :func:`sqlmpeg.emit.emit` expects.
+
+Probing (RFC-001 "Probing policy") happens here, between resolve and lower:
+every distinct input path is probed exactly once and the results are re-keyed
+by ALIAS for :func:`sqlmpeg.lower.lower` (two aliases over one file share a
+single probe). :func:`sqlmpeg.probe.probe` never raises and returns ``None``
+for a URL, a missing file, or a missing/failing ffprobe, so a compile is never
+blocked by an unreadable input — it just loses the extra validation (subscript
+bounds) and the provenance metadata that probing would have added. Passing
+``probe=False`` skips probing entirely, for byte-reproducible offline compiles.
 
 Guardrail #7 lives here: no input, however malformed, may produce anything but
 a compile result or a :class:`~sqlmpeg.errors.SqlmpegError`. Each pass already
@@ -19,19 +28,39 @@ from __future__ import annotations
 from .errors import ErrorCode, SqlmpegError
 from .ir import Graph
 from .lower import lower
-from .parser import parse, resolve
+from .parser import Resolved, parse, resolve
+from .probe import ProbeResult
+from .probe import probe as probe_path
 from .split import insert_splits
 
 __all__ = ["compile_sql"]
 
 
-def compile_sql(text: str) -> Graph:
+def _probe_inputs(res: Resolved) -> dict[str, ProbeResult | None]:
+    """Probe each distinct input path once; return the results keyed by alias."""
+    by_path: dict[str, ProbeResult | None] = {}
+    by_alias: dict[str, ProbeResult | None] = {}
+    for alias, index in res.sources.items():
+        path = res.input_paths[index]
+        if path not in by_path:
+            by_path[path] = probe_path(path)
+        by_alias[alias] = by_path[path]
+    return by_alias
+
+
+def compile_sql(text: str, *, probe: bool = True) -> Graph:
     """Compile SQL `text` into a split-complete IR graph.
+
+    With ``probe=True`` (the default) every input is probed opportunistically;
+    with ``probe=False`` nothing is read from disk and lowering is fully
+    symbolic.
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     try:
-        return insert_splits(lower(resolve(parse(text))))
+        res = resolve(parse(text))
+        probes = _probe_inputs(res) if probe else {}
+        return insert_splits(lower(res, probes))
     except SqlmpegError:
         raise
     except RecursionError as err:
