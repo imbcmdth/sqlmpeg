@@ -101,6 +101,8 @@ FFmpeg filter(s): `fade`
 
 `fade_out(f: frame, dur: num)`
 
-Fade out to black over dur seconds.
+`fade_out(f: frame, dur: num, at: num)`
+
+Fade out to black over dur seconds starting at `at` seconds (without `at` the fade starts at t=0 and every later frame is black; pass at = clip length - dur to fade at the end).
 
 FFmpeg filter(s): `fade`

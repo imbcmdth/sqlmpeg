@@ -602,7 +602,8 @@ class _Resolver:
                     f"duplicate name '{name}'",
                     inner,
                     fallback=table,
-                    hint="reference a CTE once per query; reuse is automatic",
+                    hint="a name can appear only once per FROM clause; to consume "
+                    "it twice, reference <name>.frame twice — reuse is automatic",
                 )
             scope[name] = "cte"
             return

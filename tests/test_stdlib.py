@@ -73,7 +73,7 @@ def test_names_match_spec_name_field() -> None:
         ("text", {5}),
         ("speed", {2}),
         ("fade_in", {2}),
-        ("fade_out", {2}),
+        ("fade_out", {2, 3}),
     ],
 )
 def test_arities(name: str, arities: set[int]) -> None:
@@ -225,6 +225,16 @@ def test_fade_out() -> None:
     _, filt, args, inputs = ctx.nodes[0]
     assert filt == "fade"
     assert args == {"type": "out", "d": 2.0}
+    assert inputs == ["src:a"]
+
+
+def test_fade_out_with_start() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["fade_out"].expand(ctx, ["src:a", 1.5, 8.5])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs = ctx.nodes[0]
+    assert filt == "fade"
+    assert args == {"type": "out", "st": 8.5, "d": 1.5}
     assert inputs == ["src:a"]
 
 

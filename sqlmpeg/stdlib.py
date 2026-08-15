@@ -141,6 +141,8 @@ def _expand_fade_in(ctx: ExpandCtx, args: list[object]) -> FrameRef:
 def _expand_fade_out(ctx: ExpandCtx, args: list[object]) -> FrameRef:
     f = _as_frame(args[0])
     dur = args[1]
+    if len(args) == 3:
+        return ctx.node("fade", {"type": "out", "st": args[2], "d": dur}, [f])
     return ctx.node("fade", {"type": "out", "d": dur}, [f])
 
 
@@ -242,8 +244,15 @@ FUNCTIONS: dict[str, FuncSpec] = {
     ),
     "fade_out": FuncSpec(
         name="fade_out",
-        variants=((_frame("f"), _num("dur")),),
-        doc="Fade out to black over dur seconds.",
+        variants=(
+            (_frame("f"), _num("dur")),
+            (_frame("f"), _num("dur"), _num("at")),
+        ),
+        doc=(
+            "Fade out to black over dur seconds starting at `at` seconds "
+            "(without `at` the fade starts at t=0 and every later frame is black; "
+            "pass at = clip length - dur to fade at the end)."
+        ),
         expand=_expand_fade_out,
     ),
 }

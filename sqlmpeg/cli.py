@@ -16,6 +16,8 @@ Subcommands:
 * ``run QUERY.sql -o OUT [--timeout SECS] [-y]`` -- compile and execute
   ffmpeg as a subprocess (guardrail #6: argv list, no shell, timeout
   enforced, stderr captured and surfaced on failure).
+* ``prompt`` -- print the portable LLM system prompt (plan 012) to stdout;
+  takes no arguments and never touches the filesystem.
 
 ``QUERY.sql`` may be ``-`` to read the query text from stdin in every
 subcommand.
@@ -35,6 +37,7 @@ from .compiler import compile_sql
 from .emit import Emitted, build_ffmpeg_args, emit
 from .errors import SqlmpegError
 from .ir import Graph
+from .prompt import build_system_prompt
 
 __all__ = ["main"]
 
@@ -91,6 +94,8 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument(
         "-y", action="store_true", dest="overwrite", help="pass -y (overwrite) to ffmpeg"
     )
+
+    subparsers.add_parser("prompt", help="print the LLM system prompt for this dialect")
 
     return parser
 
@@ -227,11 +232,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_prompt(args: argparse.Namespace) -> int:
+    print(build_system_prompt())
+    return 0
+
+
 _HANDLERS = {
     "compile": _cmd_compile,
     "explain": _cmd_explain,
     "validate": _cmd_validate,
     "run": _cmd_run,
+    "prompt": _cmd_prompt,
 }
 
 
