@@ -1,4 +1,3 @@
-# Generated files whose tests assert byte-identity with the generator output
-# (which writes LF): never CRLF-smudge these on checkout.
-docs/stdlib.md text eol=lf
-docs/system-prompt.md text eol=lf
+# Docs are written with LF by generators/tests that assert byte-identity or
+# LF-only content: never CRLF-smudge them on checkout.
+docs/** text eol=lf
