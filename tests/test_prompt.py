@@ -49,7 +49,7 @@ def test_every_sql_example_compiles(query: str) -> None:
         graph = compile_sql(query)
     except SqlmpegError as err:  # pragma: no cover - failure path
         pytest.fail(f"prompt example does not compile: {err}\n{query}")
-    assert graph.output
+    assert graph.outputs
 
 
 def test_examples_cover_the_headline_constructs() -> None:

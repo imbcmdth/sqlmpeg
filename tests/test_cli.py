@@ -84,6 +84,29 @@ def test_compile_stdin(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFi
     assert "-filter_complex" in out
 
 
+def test_compile_no_probe(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    query = _write_sql(tmp_path, VALID_QUERY)
+    code = cli.main(["compile", "--no-probe", query])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "-filter_complex" in out
+
+
+def test_compile_no_probe_skips_probing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--no-probe must never touch the filesystem via probe()."""
+    query = _write_sql(tmp_path, VALID_QUERY)
+
+    def _boom(path: str) -> None:
+        raise AssertionError("probe() should not be called with --no-probe")
+
+    monkeypatch.setattr("sqlmpeg.compiler.probe_path", _boom)
+    code = cli.main(["compile", "--no-probe", query])
+    assert code == 0
+    capsys.readouterr()
+
+
 # ---------------------------------------------------------------------------
 # explain
 # ---------------------------------------------------------------------------
@@ -103,6 +126,19 @@ def test_explain_round_trips_graph(tmp_path: Path, capsys: pytest.CaptureFixture
     assert graph.to_dict() == data
 
 
+def test_explain_no_probe(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    query = _write_sql(tmp_path, VALID_QUERY)
+    code = cli.main(["explain", "--no-probe", query])
+    out = capsys.readouterr().out
+    assert code == 0
+
+    import json
+
+    data = json.loads(out)
+    graph = Graph.from_dict(data)
+    assert graph.input_paths == ["x.mp4"]
+
+
 def test_explain_bad_query(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     query = _write_sql(tmp_path, BAD_QUERY)
     code = cli.main(["explain", query])
@@ -120,6 +156,17 @@ def test_explain_bad_query(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
 def test_validate_success_is_silent(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     query = _write_sql(tmp_path, VALID_QUERY)
     code = cli.main(["validate", query])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_validate_no_probe_success_is_silent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    query = _write_sql(tmp_path, VALID_QUERY)
+    code = cli.main(["validate", "--no-probe", query])
     captured = capsys.readouterr()
     assert code == 0
     assert captured.out == ""

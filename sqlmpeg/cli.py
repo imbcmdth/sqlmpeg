@@ -6,18 +6,27 @@ plan 008.
 
 Subcommands:
 
-* ``compile QUERY.sql [--graph-only] [-o OUT]`` -- print the full ffmpeg
-  command (POSIX-quoted via ``shlex.join``, even on Windows -- it is
-  documentation output, not something meant to be pasted into cmd.exe), or
-  just the ``-filter_complex`` string with ``--graph-only``.
-* ``explain QUERY.sql`` -- dump the IR graph as JSON.
-* ``validate QUERY.sql [--json]`` -- exit 0 silent on success; on error,
-  exit 1 with either a one-line human message or ``err.to_dict()`` JSON.
+* ``compile QUERY.sql [--graph-only] [-o OUT] [--no-probe]`` -- print the
+  full ffmpeg command (POSIX-quoted via ``shlex.join``, even on Windows --
+  it is documentation output, not something meant to be pasted into
+  cmd.exe), or just the ``-filter_complex`` string with ``--graph-only``.
+* ``explain QUERY.sql [--no-probe]`` -- dump the IR graph as JSON.
+* ``validate QUERY.sql [--json] [--no-probe]`` -- exit 0 silent on success;
+  on error, exit 1 with either a one-line human message or
+  ``err.to_dict()`` JSON.
 * ``run QUERY.sql -o OUT [--timeout SECS] [-y]`` -- compile and execute
   ffmpeg as a subprocess (guardrail #6: argv list, no shell, timeout
-  enforced, stderr captured and surfaced on failure).
+  enforced, stderr captured and surfaced on failure). ``run`` always
+  probes -- the files must exist to execute, so there is no ``--no-probe``
+  escape hatch here.
 * ``prompt`` -- print the portable LLM system prompt (plan 012) to stdout;
   takes no arguments and never touches the filesystem.
+
+``--no-probe`` (compile/explain/validate only) skips ffprobe entirely for a
+byte-reproducible, fully offline compile (RFC-001 "Probing policy"): no
+``STREAM_NOT_FOUND``/``BROADCAST_MISMATCH`` validation, ``SELECT *`` and bare
+array splats fail with ``INPUT_NOT_FOUND``, and provenance metadata is never
+attached.
 
 ``QUERY.sql`` may be ``-`` to read the query text from stdin in every
 subcommand.
@@ -75,14 +84,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "--graph-only", action="store_true", help="print only the filter_complex string"
     )
     compile_p.add_argument("-o", "--output", default=_DEFAULT_OUT, help="output path placeholder")
+    compile_p.add_argument(
+        "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
+    )
 
     explain_p = subparsers.add_parser("explain", help="dump the compiled IR graph as JSON")
     explain_p.add_argument("query", help="path to a .sql file, or - for stdin")
+    explain_p.add_argument(
+        "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
+    )
 
     validate_p = subparsers.add_parser("validate", help="check that a query compiles")
     validate_p.add_argument("query", help="path to a .sql file, or - for stdin")
     validate_p.add_argument(
         "--json", action="store_true", dest="as_json", help="emit the error as JSON"
+    )
+    validate_p.add_argument(
+        "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
     )
 
     run_p = subparsers.add_parser("run", help="compile and execute ffmpeg")
@@ -139,7 +157,7 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        graph = compile_sql(text)
+        graph = compile_sql(text, probe=not args.no_probe)
         emitted = emit(graph)
     except SqlmpegError as err:
         _print_error(err)
@@ -160,7 +178,7 @@ def _cmd_explain(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        graph = compile_sql(text)
+        graph = compile_sql(text, probe=not args.no_probe)
     except SqlmpegError as err:
         _print_error(err)
         return 1
@@ -175,7 +193,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        compile_sql(text)
+        compile_sql(text, probe=not args.no_probe)
     except SqlmpegError as err:
         if args.as_json:
             print(json.dumps(err.to_dict()))

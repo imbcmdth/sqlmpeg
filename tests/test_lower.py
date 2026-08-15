@@ -127,6 +127,7 @@ def _probe_result(
 
 
 def test_readme_example_lowers_to_expected_nodes() -> None:
+    """The flagship PiP example: a CTE carrying video AND audio columns."""
     g = compile_sql(_readme_sql())
     assert g.to_dict() == {
         "inputs": ["game.mp4", "game.mp4"],
@@ -154,25 +155,50 @@ def test_readme_example_lowers_to_expected_nodes() -> None:
                 "inputs": ["src:a:v:0", "n2"],
                 "outputs": ["video"],
             },
+            {
+                "id": "n4",
+                "filter": "volume",
+                "args": {"volume": 0.65},
+                "inputs": ["src:a:a:0"],
+                "outputs": ["audio"],
+            },
+            {
+                "id": "n5",
+                "filter": "volume",
+                "args": {"volume": 0.35},
+                "inputs": ["src:b:a:0"],
+                "outputs": ["audio"],
+            },
+            {
+                "id": "n6",
+                "filter": "amix",
+                "args": {"inputs": 2},
+                "inputs": ["n4", "n5"],
+                "outputs": ["audio"],
+            },
         ],
-        "outputs": [{"ref": "n3", "type": "video", "name": None, "metadata": {}}],
+        "outputs": [
+            {"ref": "n3", "type": "video", "name": None, "metadata": {}},
+            {"ref": "n6", "type": "audio", "name": None, "metadata": {}},
+        ],
     }
 
 
-def test_readme_example_has_exactly_one_video_output() -> None:
-    """`frame` sugar does NOT re-add v0's implicit audio stream."""
+def test_readme_example_selects_its_two_streams_explicitly() -> None:
+    """The SELECT list is the output list: one video column, one mixed audio
+    column, and nothing implicit."""
     g = compile_sql(_readme_sql())
-    assert len(g.outputs) == 1
-    assert g.outputs[0].type == "video"
+    assert [o.type for o in g.outputs] == ["video", "audio"]
 
 
 def test_readme_example_emits_a_filtergraph() -> None:
     e = emit(compile_sql(_readme_sql()))
     assert "crop=" in e.filter_complex
     assert "overlay=" in e.filter_complex
+    assert "amix=" in e.filter_complex
     assert e.inputs == ["game.mp4", "game.mp4"]
-    assert [m.target for m in e.maps] == ["[out0]"]
-    assert [m.copy for m in e.maps] == [False]
+    assert [m.target for m in e.maps] == ["[out0]", "[out1]"]
+    assert [m.copy for m in e.maps] == [False, False]
 
 
 def test_readme_example_scale_factor_is_not_a_decimal() -> None:

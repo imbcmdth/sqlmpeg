@@ -2,25 +2,59 @@
 
 A standalone CLI that compiles SQL into an ffmpeg `-filter_complex` invocation. Write a `SELECT` statement; get a runnable ffmpeg command. FFmpeg is the executor — this tool never touches pixels.
 
-**Status: Work in progress (v0.1.0)**
+**Status: Work in progress (v0.2.0)**
 
 ## Example
 
+A picture-in-picture overlay, with the two clips' audio pairwise mixed under it -- the CTE carries a video column AND an audio column, and the outer SELECT list is the two-stream output:
+
 ```sql
 WITH pip AS (
-  SELECT scale(crop(b.frame, 1200, 50, 600, 200), 0.5) AS frame
+  SELECT scale(crop(b.frame, 1200, 50, 600, 200), 0.5) AS frame,
+         b.audio[1] AS sound
   FROM input('game.mp4') b
 )
-SELECT overlay(a.frame, pip.frame, 20, 20)
+SELECT overlay(a.frame, pip.frame, 20, 20),
+       amix(volume(a.audio[1], 0.65), volume(pip.sound, 0.35))
 FROM input('game.mp4') a, pip
 ```
 
 ```
 $ sqlmpeg run query.sql -o out.mp4
-ffmpeg -i game.mp4 -i game.mp4 -filter_complex \
-  "[1:v]crop=600:200:1200:50,scale=iw*0.5:-2[pip]; \
-   [0:v][pip]overlay=20:20[out]" -map "[out]" out.mp4
+ffmpeg -i game.mp4 -i game.mp4 -filter_complex '[0:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];[1:v:0][n2]overlay=x=20:y=20[out0];[1:a:0]volume=volume=0.65[n4];[0:a:0]volume=volume=0.35[n5];[n4][n5]amix=inputs=2[out1]' -map '[out0]' -map '[out1]' out.mp4
 ```
+
+## Streams
+
+Every input exposes two array-typed pseudo-columns, `<alias>.video` and `<alias>.audio` (1-based indexing, Postgres array semantics; `<alias>.frame` is sugar for `<alias>.video[1]`). **The SELECT list is the output stream list** — one expression is one output stream, and column order is `-map` order. There is no implicit audio track: select it explicitly, or it is not in the output.
+
+A bare subscript that no function ever touches is passed straight through as a stream copy (`-c:<n> copy`, nothing re-encoded); a subscript wrapped in a function is filtered and gets an `[out0]`, `[out1]`, ... label.
+
+Remap only — first video stream, second audio stream, both copied:
+
+```sql
+SELECT a.video[1], a.audio[2]
+FROM input('foo.mp4') a
+```
+
+```
+$ sqlmpeg compile --no-probe query.sql
+ffmpeg -i foo.mp4 -map 0:v:0 -c:0 copy -map 0:a:1 -c:1 copy out.mp4
+```
+
+A bare `<alias>.audio` (no subscript) is every audio stream of that input, in file order; handed to a function it broadcasts — one subgraph per stream, and each output keeps its source stream's `language` tag automatically. Adding reverb to every language track in a file:
+
+```sql
+SELECT v.video[1], reverb(v.audio, 0.3)
+FROM input('film.mkv') v
+```
+
+```
+$ sqlmpeg compile query.sql
+ffmpeg -i film.mkv -filter_complex '[0:a:0]aecho=in_gain=0.8:out_gain=0.9:delays=60:decays=0.3[out1];[0:a:1]aecho=in_gain=0.8:out_gain=0.9:delays=60:decays=0.3[out2]' -map 0:v:0 -c:0 copy -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra out.mp4
+```
+
+(That example needs a real, readable file to know how many audio streams to broadcast over — `sqlmpeg compile` opportunistically probes any local file that exists and falls back to a fully symbolic, offline compile otherwise; `--no-probe` forces the offline path even when the file is present, for byte-reproducible output.)
 
 ## Use with an AI
 
@@ -44,10 +78,6 @@ the loop converges in a round or two. Then `sqlmpeg run query.sql -o out.mp4`.
 
 The prompt is generated from the function table, so it never drifts from the
 compiler. A rendered copy lives in [docs/system-prompt.md](docs/system-prompt.md).
-
-## Audio handling
-
-**Audio: v0 copies audio from the first input (`-c:a copy`); SQL is video-only.** This is a deliberate constraint, not a limitation. Full audio filter support requires a matching SQL dialect and stdlib — that is a v1 expansion. For now, the tool handles video transforms and carries audio unchanged.
 
 ---
 

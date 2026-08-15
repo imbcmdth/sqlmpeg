@@ -24,13 +24,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlmpeg.ir import FrameRef
+from sqlmpeg.ir import FrameRef, StreamType
 from sqlmpeg.stdlib import FUNCTIONS, FuncSpec, Param
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _OUTPUT_PATH = _REPO_ROOT / "docs" / "stdlib.md"
 
-_DUMMY_ARGS: dict[str, object] = {"frame": "f", "num": 1, "str": "x"}
+_DUMMY_ARGS: dict[str, object] = {"video": "f", "audio": "f", "num": 1, "str": "x"}
 
 _HEADER = """\
 # sqlmpeg stdlib
@@ -52,7 +52,11 @@ class _FilterCollector:
         self._counter = 0
 
     def node(
-        self, filter: str, args: dict[str, object], inputs: list[FrameRef]
+        self,
+        filter: str,
+        args: dict[str, object],
+        inputs: list[FrameRef],
+        outputs: list[StreamType],
     ) -> FrameRef:
         self.filters.append(filter)
         node_id = f"n{self._counter}"

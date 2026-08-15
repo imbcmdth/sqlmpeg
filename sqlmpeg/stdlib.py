@@ -296,7 +296,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
     "speed": FuncSpec(
         name="speed",
         variants=((_video("f"), _num("factor")),),
-        doc="Change playback speed by factor (video-only in v0).",
+        doc="Change a video stream's playback speed by factor (use atempo for audio).",
         expand=_expand_speed,
         returns="video",
     ),
