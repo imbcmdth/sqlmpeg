@@ -25,7 +25,8 @@ What lowering does, in order:
   spliced lazily, the first time a stream of that alias is consumed, and
   memoized per stream, so every consumer of the same stream shares one
   ``trim``+``setpts`` (video) / ``atrim``+``asetpts`` (audio) pair.
-* Each projection lowers bottom-up to one :class:`~sqlmpeg.ir.Output`. A
+* Each projection lowers bottom-up to one :class:`~sqlmpeg.ir.Output` per
+  stream it carries (an array column splats into consecutive Outputs). A
   stdlib call type-checks its arguments against
   ``stdlib.FUNCTIONS[name].variants`` (kinds are ``video``/``audio``/``num``/
   ``str``) and then delegates node creation to the spec's ``expand``
@@ -37,16 +38,29 @@ What lowering does, in order:
   — and its output pads are ``["video"]*v + ["audio"]*a``, mapped back to the
   branch's own column order.
 
+Broadcasting (plan 020) makes a bare ``a.video`` / ``a.audio`` the WHOLE array
+of that input's streams, in probe order. Splatted into a SELECT list it becomes
+one Output per element; handed to a function it expands the call elementwise
+(a fresh subgraph per element); stored in a CTE column it keeps its length, so
+``<cte>.<name>`` splats or broadcasts again and ``<cte>.<name>[k]`` picks one
+element (1-based, bounds-checked statically — no probe needed at that point).
+Arrays are purely a lowering concept: the spread happens here, so the IR, the
+split pass and emit only ever see scalar streams.
+
 Probing (``probes``, keyed by alias) only ever ADDS validation: an explicit
 subscript lowers to the same ref whether or not the input could be probed, but
-a probed input bounds-checks it (``STREAM_NOT_FOUND``). An output whose ref is
-a raw source stream of a probed input also carries that stream's language/title
-tags into ``Output.metadata`` (an ffmpeg-stamped ``language=und`` carries no
-information and is dropped). Provenance through filter chains is plan 020's.
+a probed input bounds-checks it (``STREAM_NOT_FOUND``). Enumerating an array is
+the one thing that cannot be done symbolically — a bare array over an input
+that could not be probed is ``INPUT_NOT_FOUND``. Two arrays in one call zip and
+must agree on length (``BROADCAST_MISMATCH``); scalar arguments repeat.
 
-Not yet supported here (plan 020, broadcasting): bare ``a.video`` / ``a.audio``
-arrays — splatted into a SELECT list, passed to a function, or produced by a
-CTE column — and subscripting a computed (CTE) column.
+Provenance: a stream derived 1:1 from one probed source stream — a passthrough,
+or a chain of single-stream-input calls, WHERE trims included — carries that
+stream's language/title tags into ``Output.metadata`` (an ffmpeg-stamped
+``language=und`` carries no information and is dropped), so a broadcast
+``reverb(a.audio, 0.3)`` keeps every track's language tag. Anything that mixes
+two streams (``amix``, ``overlay``) or concatenates them breaks the chain and
+its outputs carry no metadata.
 
 Node ids are ``n1, n2, ...`` in creation order across the whole graph, minted
 by :class:`_NodeFactory`, the :class:`sqlmpeg.stdlib.ExpandCtx` implementation.
@@ -79,10 +93,10 @@ from dataclasses import dataclass, field
 from sqlglot import exp
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import FrameRef, Graph, Node, Output, StreamType, is_src, src_parts
+from sqlmpeg.ir import FrameRef, Graph, Node, Output, StreamType
 from sqlmpeg.parser import Resolved, _pos, subscript_index, union_branches
 from sqlmpeg.parser import _ident_name as _fold
-from sqlmpeg.probe import ProbeResult
+from sqlmpeg.probe import ProbeResult, StreamMeta
 from sqlmpeg.stdlib import FUNCTIONS, ExpandCtx, Param, signatures
 
 __all__ = ["lower"]
@@ -108,9 +122,9 @@ _TIME_HINT = "<alias>.t is only usable as WHERE <alias>.t BETWEEN <start> AND <e
 _ARG_HINT = "arguments are stream expressions or literals, in the order shown"
 _STREAM_HINT = "a SELECT column must be a stream, e.g. a.video[1] or scale(a.frame, 0.5)"
 _SUBSCRIPT_HINT = "stream subscripts are 1-based: a.video[1] is the first video stream"
-_BROADCAST_HINT = (
-    "broadcasting over a whole stream array is coming (plan 020); "
-    "for now subscript a single stream, e.g. a.audio[1]"
+_ZIP_HINT = (
+    "broadcast arrays zip elementwise, one output per element; "
+    "subscript one of them to pair a single stream with the other, e.g. a.audio[1]"
 )
 
 
@@ -264,18 +278,58 @@ def _string(node: exp.Expr) -> str:
 
 @dataclass(frozen=True)
 class _Stream:
-    """One typed stream value: an IR ref plus the pad type it carries."""
+    """One typed stream: an IR ref, the pad type it carries, and its origin.
+
+    `source` is the probed :class:`~sqlmpeg.probe.StreamMeta` this stream comes
+    from 1:1 — directly (a passthrough subscript) or through a chain of
+    single-stream-input filters, the WHERE trim included. It is None as soon as
+    the input was not probed or the value mixes streams (``amix``, ``overlay``,
+    ``concat``). :func:`_provenance` turns it into ``Output.metadata``.
+    """
 
     ref: FrameRef
     type: StreamType
+    source: StreamMeta | None = None
+
+
+@dataclass(frozen=True)
+class _Value:
+    """What every expression lowers to: one stream, or a whole array of them.
+
+    `is_array` is deliberately not ``len(streams) != 1``: a one-element array
+    is still an array — it splats, broadcasts and subscripts — and on a
+    single-track file that is the ONLY thing separating ``a.audio`` from
+    ``a.audio[1]``.
+    """
+
+    type: StreamType  # element type; every element of an array agrees on it
+    streams: tuple[_Stream, ...]
+    is_array: bool
+
+    def at(self, index: int) -> _Stream:
+        """Element `index` of an array; the one stream of a scalar (it repeats)."""
+        return self.streams[index] if self.is_array else self.streams[0]
+
+
+def _scalar(stream: _Stream) -> _Value:
+    return _Value(type=stream.type, streams=(stream,), is_array=False)
+
+
+def _array(stream_type: StreamType, streams: Iterable[_Stream]) -> _Value:
+    return _Value(type=stream_type, streams=tuple(streams), is_array=True)
 
 
 @dataclass(frozen=True)
 class _Column:
-    """One SELECT column of a branch (or of a CTE body): its name and stream."""
+    """One SELECT column of a branch (or of a CTE body): its name and value.
+
+    An array column carries every one of its streams here, so a CTE records an
+    array column's LENGTH statically and a later ``<cte>.<name>[k]`` is
+    bounds-checked without re-probing anything.
+    """
 
     name: str | None
-    stream: _Stream
+    value: _Value
 
 
 @dataclass(frozen=True)
@@ -360,14 +414,20 @@ class _Lowerer:
                 self._lower_query(union_branches(body), body)
             )
         columns = self._lower_query(self.res.branches, self.res.select)
+        # The SELECT list IS the output stream list, and an array column is
+        # several streams, so it splats into consecutive Outputs. Every element
+        # of an aliased array column keeps that alias VERBATIM (no ordinal
+        # suffix): the alias names the column, not the stream, and ffmpeg
+        # metadata naming is plan 022's business.
         self.graph.outputs = [
             Output(
-                ref=column.stream.ref,
-                type=column.stream.type,
+                ref=stream.ref,
+                type=stream.type,
                 name=column.name,
-                metadata=self._provenance(column.stream.ref),
+                metadata=_provenance(stream),
             )
             for column in columns
+            for stream in column.value.streams
         ]
         return self.graph
 
@@ -380,24 +440,38 @@ class _Lowerer:
             raise _error(ErrorCode.UNSUPPORTED_SQL, "query has no SELECT", anchor)
         lowered = [self._lower_branch(branch) for branch in branches]
         if len(lowered) == 1:
+            # A single branch keeps its arrays: a CTE body's array column stays
+            # an array for `<cte>.<name>` to splat, broadcast over, or subscript.
             return lowered[0]
-        self._check_concat_signature(branches, lowered)
-        return self._concat(lowered)
+        # concat maps one input pad per column, so arrays are flattened to
+        # one column per element BEFORE it sees them.
+        flattened = [_flatten(columns) for columns in lowered]
+        self._check_concat_signature(branches, lowered, flattened)
+        return self._concat(flattened)
 
     def _check_concat_signature(
-        self, branches: list[exp.Select], lowered: list[list[_Column]]
+        self,
+        branches: list[exp.Select],
+        lowered: list[list[_Column]],
+        flattened: list[list[_Column]],
     ) -> None:
-        """Every UNION ALL branch must agree on column count, types and order."""
-        expected = [column.stream.type for column in lowered[0]]
-        for index in range(1, len(lowered)):
-            got = [column.stream.type for column in lowered[index]]
+        """Every UNION ALL branch must agree on column count, types and order.
+
+        On the FLATTENED signature: an array column contributes one concat
+        column per element, so branches must agree on element counts too. The
+        message renders each column as written (``audio[2]`` for an array), so
+        a pure length mismatch reads as one.
+        """
+        expected = [column.value.type for column in flattened[0]]
+        for index in range(1, len(flattened)):
+            got = [column.value.type for column in flattened[index]]
             if got == expected:
                 continue
             raise _error(
                 ErrorCode.CONCAT_MISMATCH,
                 "UNION ALL branches must select the same stream types in the same "
-                f"order: branch 1 selects ({', '.join(expected) or 'nothing'}), "
-                f"branch {index + 1} selects ({', '.join(got) or 'nothing'})",
+                f"order: branch 1 selects ({_signature(lowered[0])}), "
+                f"branch {index + 1} selects ({_signature(lowered[index])})",
                 branches[index],
                 hint="ffmpeg concat needs identical segments; reorder or add columns",
             )
@@ -412,14 +486,14 @@ class _Lowerer:
         differently, so the pads are mapped back onto it here.
         """
         first = lowered[0]
-        video_positions = [i for i, column in enumerate(first) if column.stream.type == "video"]
-        audio_positions = [i for i, column in enumerate(first) if column.stream.type == "audio"]
+        video_positions = [i for i, column in enumerate(first) if column.value.type == "video"]
+        audio_positions = [i for i, column in enumerate(first) if column.value.type == "audio"]
         video_count, audio_count = len(video_positions), len(audio_positions)
 
         inputs: list[FrameRef] = []
         for columns in lowered:
-            inputs += [columns[i].stream.ref for i in video_positions]
-            inputs += [columns[i].stream.ref for i in audio_positions]
+            inputs += [columns[i].value.streams[0].ref for i in video_positions]
+            inputs += [columns[i].value.streams[0].ref for i in audio_positions]
 
         video_pads: list[StreamType] = ["video"] * video_count
         audio_pads: list[StreamType] = ["audio"] * audio_count
@@ -437,12 +511,16 @@ class _Lowerer:
             pad_of[position] = video_count + pad
 
         total = video_count + audio_count
+        # concat mixes segments, so nothing downstream of it is derived 1:1 from
+        # a single source stream: provenance stops here (`source` stays None).
         return [
             _Column(
                 name=column.name,
-                stream=_Stream(
-                    ref=node_id if total == 1 else f"{node_id}:{pad_of[position]}",
-                    type=column.stream.type,
+                value=_scalar(
+                    _Stream(
+                        ref=node_id if total == 1 else f"{node_id}:{pad_of[position]}",
+                        type=column.value.type,
+                    )
                 ),
             )
             for position, column in enumerate(first)
@@ -462,7 +540,7 @@ class _Lowerer:
         return [
             _Column(
                 name=_projection_name(projection),
-                stream=self._lower_expr(projection, env, select),
+                value=self._lower_expr(projection, env, select),
             )
             for projection in projections
         ]
@@ -598,14 +676,28 @@ class _Lowerer:
                 _number(high, ErrorCode.UNSUPPORTED_SQL),
             )
 
-    def _access(self, env: _Env, alias: str, stream: _Stream) -> _Stream:
-        """Apply `alias`'s WHERE trim to `stream`, once per distinct stream."""
+    def _access(self, env: _Env, alias: str, value: _Value) -> _Value:
+        """Apply `alias`'s WHERE trim to every stream of `value`.
+
+        Elementwise over an array, and memoized per stream, so each element of
+        a broadcast array gets exactly one trim, shared by all its consumers.
+        """
         window = env.trims.get(alias)
         if window is None:
-            return stream
+            return value
+        return _Value(
+            type=value.type,
+            streams=tuple(self._trim(env, window, stream) for stream in value.streams),
+            is_array=value.is_array,
+        )
+
+    def _trim(
+        self, env: _Env, window: tuple[int | float, int | float], stream: _Stream
+    ) -> _Stream:
+        """The trimmed counterpart of one stream; a trim is spliced once per stream."""
         cached = env.trimmed.get(stream.ref)
         if cached is not None:
-            return _Stream(ref=cached, type=stream.type)
+            return _Stream(ref=cached, type=stream.type, source=stream.source)
         start, end = window
         if stream.type == "video":
             trimmed = self.ctx.node(
@@ -622,15 +714,16 @@ class _Lowerer:
                 "asetpts", {"expr": "PTS-STARTPTS"}, [trimmed], ["audio"]
             )
         env.trimmed[stream.ref] = rebased
-        return _Stream(ref=rebased, type=stream.type)
+        # A trim is 1:1, so it threads provenance through unchanged.
+        return _Stream(ref=rebased, type=stream.type, source=stream.source)
 
     # -- expressions ------------------------------------------------------
 
-    def _lower_expr(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Stream:
+    def _lower_expr(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Value:
         node = _unwrap(node)
         if isinstance(node, exp.Bracket | exp.Column):
-            alias, stream = self._base_stream(node, env, select)
-            return self._access(env, alias, stream)
+            alias, value = self._base_stream(node, env, select)
+            return self._access(env, alias, value)
         if isinstance(node, exp.Cast):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -655,11 +748,15 @@ class _Lowerer:
 
     def _base_stream(
         self, node: exp.Expr, env: _Env, select: exp.Select
-    ) -> tuple[str, _Stream]:
-        """Resolve a column / subscript to ``(alias, untrimmed stream)``.
+    ) -> tuple[str, _Value]:
+        """Resolve a column / subscript to ``(alias, untrimmed value)``.
 
-        Pure: creates no nodes, so the type checker (:meth:`_classify`) can
-        call it on an argument before deciding whether to lower it.
+        The value is an ARRAY for a bare ``a.video`` / ``a.audio`` (or a bare
+        reference to an array-typed CTE column) and a scalar for anything
+        subscripted. Pure: creates no nodes, so the type checker
+        (:meth:`_classify`) can call it on an argument before deciding whether
+        to lower it — which is also why enumerating an unprobeable input fails
+        here, before the graph has grown.
         """
         if isinstance(node, exp.Bracket):
             inner = node.this
@@ -698,7 +795,7 @@ class _Lowerer:
         anchor: exp.Expr,
         env: _Env,
         select: exp.Select,
-    ) -> tuple[str, _Stream]:
+    ) -> tuple[str, _Value]:
         table_node = column.args.get("table")
         if table_node is None:
             raise _error(
@@ -720,17 +817,17 @@ class _Lowerer:
                 hint=self._known_hint(),
             )
         if isinstance(binding, _InputBinding):
-            return alias, self._input_stream(alias, name, index, anchor, select)
-        return alias, self._cte_stream(binding, name, index, anchor, select)
+            return alias, self._input_value(alias, name, index, anchor, select)
+        return alias, self._cte_value(binding, name, index, anchor, select)
 
-    def _input_stream(
+    def _input_value(
         self,
         alias: str,
         name: str,
         index: int | None,
         anchor: exp.Expr,
         select: exp.Select,
-    ) -> _Stream:
+    ) -> _Value:
         if name == _TIME_COLUMN:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -762,29 +859,79 @@ class _Lowerer:
                     f"{alias}.audio and {alias}.t",
                 )
             if index is None:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"'{alias}.{name}' is the whole array of {array_type} streams, "
-                    "which is not supported yet",
-                    anchor,
-                    fallback=select,
-                    hint=_BROADCAST_HINT,
-                )
+                return self._enumerate(alias, array_type, anchor, select)
             stream_type = array_type
             zero_based = index - 1
 
         self._check_bounds(alias, stream_type, zero_based, anchor, select)
-        marker = _TYPE_MARKERS[stream_type]
-        return _Stream(ref=f"src:{alias}:{marker}:{zero_based}", type=stream_type)
+        return _scalar(self._source_stream(alias, stream_type, zero_based))
 
-    def _cte_stream(
+    def _source_stream(self, alias: str, stream_type: StreamType, index: int) -> _Stream:
+        """One raw input stream, tagged with its probed metadata when there is any."""
+        marker = _TYPE_MARKERS[stream_type]
+        return _Stream(
+            ref=f"src:{alias}:{marker}:{index}",
+            type=stream_type,
+            source=self._stream_meta(alias, stream_type, index),
+        )
+
+    def _stream_meta(
+        self, alias: str, stream_type: StreamType, index: int
+    ) -> StreamMeta | None:
+        result = self.probes.get(alias)
+        if result is None:
+            return None
+        streams = result.by_type(stream_type)
+        if not 0 <= index < len(streams):
+            return None
+        return streams[index]
+
+    def _enumerate(
+        self, alias: str, stream_type: StreamType, anchor: exp.Expr, select: exp.Select
+    ) -> _Value:
+        """The whole array of `alias`'s `stream_type` streams, in file order.
+
+        The one thing lowering cannot do symbolically: an array's LENGTH is a
+        property of the file, so an input that could not be probed fails here
+        (RFC-001, "Probing policy" — "cannot enumerate the streams of a file I
+        cannot read" is a natural error, not a policy error).
+        """
+        result = self.probes.get(alias)
+        if result is None:
+            path = self.res.input_paths[self.graph.sources[alias]]
+            raise _error(
+                ErrorCode.INPUT_NOT_FOUND,
+                f"cannot enumerate the streams of '{path}': file not found or unreadable",
+                anchor,
+                fallback=select,
+                hint=f"'{alias}.{stream_type}' is the whole stream array, and only a "
+                f"readable input can size it; subscript one stream, "
+                f"e.g. {alias}.{stream_type}[1]",
+            )
+        count = len(result.by_type(stream_type))
+        if count == 0:
+            path = self.res.input_paths[self.graph.sources[alias]]
+            raise _error(
+                ErrorCode.STREAM_NOT_FOUND,
+                f"'{alias}.{stream_type}' is empty: '{path}' has no "
+                f"{stream_type} streams",
+                anchor,
+                fallback=select,
+                hint="an empty stream array would select nothing; drop the column",
+            )
+        return _array(
+            stream_type,
+            (self._source_stream(alias, stream_type, k) for k in range(count)),
+        )
+
+    def _cte_value(
         self,
         binding: _CteBinding,
         name: str,
         index: int | None,
         anchor: exp.Expr,
         select: exp.Select,
-    ) -> _Stream:
+    ) -> _Value:
         column = self._cte_column(binding, name)
         if column is None:
             raise _error(
@@ -794,33 +941,45 @@ class _Lowerer:
                 fallback=select,
                 hint=self._cte_columns_hint(binding),
             )
-        if index is not None:
+        value = column.value
+        if index is None:
+            return value
+        if not value.is_array:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"'{binding.name}.{name}' is a single stream and cannot be subscripted",
                 anchor,
                 fallback=select,
-                hint=_BROADCAST_HINT,
+                hint=f"drop the subscript: '{binding.name}.{name}' already names one stream",
             )
-        return column.stream
+        # The length was recorded when the CTE body lowered, so this bound is
+        # STATIC: no probe is consulted here, whatever produced the array.
+        if not 1 <= index <= len(value.streams):
+            have = f"{len(value.streams)} stream" + ("" if len(value.streams) == 1 else "s")
+            raise _error(
+                ErrorCode.STREAM_NOT_FOUND,
+                f"'{binding.name}.{name}[{index}]' does not exist: "
+                f"column '{binding.name}.{name}' has {have}",
+                anchor,
+                fallback=select,
+                hint=_SUBSCRIPT_HINT,
+            )
+        return _scalar(value.streams[index - 1])
 
     def _cte_column(self, binding: _CteBinding, name: str) -> _Column | None:
         for column in binding.columns:
             if column.name == name:
                 return column
         # v0 compat: a CTE that selects exactly one video column is reachable
-        # as `<cte>.frame` whatever (if anything) its AS named it.
-        if (
-            name == _FRAME_COLUMN
-            and len(binding.columns) == 1
-            and binding.columns[0].stream.type == "video"
-        ):
+        # as `<cte>.frame` whatever (if anything) its AS named it. `frame` is
+        # singular sugar, so an array column does not answer to it.
+        if name == _FRAME_COLUMN and _is_single_video_column(binding):
             return binding.columns[0]
         return None
 
     def _cte_columns_hint(self, binding: _CteBinding) -> str:
         names = {column.name for column in binding.columns if column.name is not None}
-        if len(binding.columns) == 1 and binding.columns[0].stream.type == "video":
+        if _is_single_video_column(binding):
             names.add(_FRAME_COLUMN)
         if not names:
             return (
@@ -863,7 +1022,7 @@ class _Lowerer:
         parts: tuple[str, list[exp.Expr]],
         env: _Env,
         select: exp.Select,
-    ) -> _Stream:
+    ) -> _Value:
         raw_name, arg_nodes = parts
         name = raw_name.lower()
         spec = FUNCTIONS.get(name)
@@ -888,15 +1047,74 @@ class _Lowerer:
                 hint=_ARG_HINT,
             )
 
-        values: list[object] = []
-        for param, arg in zip(variant, arg_nodes):
+        # Every argument is lowered exactly ONCE — a stream argument used by
+        # several elements is one subgraph fanned out by the split pass, not a
+        # copy per element — and only then does the CALL broadcast over the
+        # arrays among them.
+        streams: dict[int, _Value] = {}
+        literals: dict[int, object] = {}
+        for position, (param, arg) in enumerate(zip(variant, arg_nodes)):
             if param.kind in ("video", "audio"):
-                values.append(self._lower_expr(arg, env, select).ref)
+                streams[position] = self._lower_expr(arg, env, select)
             elif param.kind == "num":
-                values.append(_number(arg))
+                literals[position] = _number(arg)
             else:
-                values.append(_string(arg))
-        return _Stream(ref=spec.expand(self.ctx, values), type=spec.returns)
+                literals[position] = _string(arg)
+
+        length = self._zip_length(name, node, arg_nodes, streams, select)
+        origin = _sole_stream_position(variant)
+        expanded: list[_Stream] = []
+        for element in range(1 if length is None else length):
+            values: list[object] = [
+                streams[position].at(element).ref
+                if position in streams
+                else literals[position]
+                for position in range(len(variant))
+            ]
+            # A single-stream-input function is 1:1, so its result inherits the
+            # provenance of its one input; anything taking two streams (amix,
+            # overlay) mixes sources and carries none.
+            source = None if origin is None else streams[origin].at(element).source
+            expanded.append(
+                _Stream(ref=spec.expand(self.ctx, values), type=spec.returns, source=source)
+            )
+        if length is None:
+            return _scalar(expanded[0])
+        return _array(spec.returns, expanded)
+
+    def _zip_length(
+        self,
+        name: str,
+        node: exp.Expr,
+        arg_nodes: list[exp.Expr],
+        streams: dict[int, _Value],
+        select: exp.Select,
+    ) -> int | None:
+        """The element count this call expands to, or None if nothing is an array.
+
+        Arrays zip (no cross products): they must all have the same length, and
+        scalar arguments repeat into every element.
+        """
+        first: tuple[int, int] | None = None  # (argument position, length)
+        for position, value in sorted(streams.items()):
+            if not value.is_array:
+                continue
+            length = len(value.streams)
+            if first is None:
+                first = (position, length)
+                continue
+            if length == first[1]:
+                continue
+            raise _error(
+                ErrorCode.BROADCAST_MISMATCH,
+                f"{name}() cannot broadcast over arrays of different lengths: "
+                f"{_sql_text(arg_nodes[first[0]])} has {_stream_count(first[1])}, "
+                f"{_sql_text(arg_nodes[position])} has {_stream_count(length)}",
+                node,
+                fallback=select,
+                hint=_ZIP_HINT,
+            )
+        return None if first is None else first[1]
 
     def _classify(self, node: exp.Expr, env: _Env, select: exp.Select) -> str:
         """Kind label for one call argument, matched against ``Param.kind``.
@@ -934,37 +1152,83 @@ class _Lowerer:
             return spec.returns
         return _EXPR_KIND
 
-    # -- provenance --------------------------------------------------------
 
-    def _provenance(self, ref: FrameRef) -> dict[str, str]:
-        """Language/title tags of a passthrough output's source stream.
+# ---------------------------------------------------------------------------
+# provenance & small value helpers
+# ---------------------------------------------------------------------------
 
-        Only a DIRECT source ref qualifies in this plan: threading 1:1
-        provenance through a filter chain is plan 020's job. ``language=und``
-        is what an mp4 muxer stamps on an untagged stream, so it is dropped.
-        """
-        if not is_src(ref):
-            return {}
-        try:
-            alias, stream_type, index = src_parts(ref)
-        except ValueError:  # pragma: no cover - refs are built above
-            return {}
-        result = self.probes.get(alias)
-        if result is None:
-            return {}
-        streams = result.by_type(stream_type)
-        if not 0 <= index < len(streams):
-            return {}
-        source = streams[index]
-        metadata: dict[str, str] = {}
-        for key in _PROVENANCE_KEYS:
-            value = source.metadata.get(key)
-            if value is None:
-                continue
-            if key == "language" and value == _UNDEFINED_LANGUAGE:
-                continue
-            metadata[key] = value
-        return metadata
+
+def _provenance(stream: _Stream) -> dict[str, str]:
+    """Language/title tags of the source stream an output is derived 1:1 from.
+
+    `_Stream.source` is what threads them: it survives a passthrough, the WHERE
+    trim and any chain of single-stream-input calls, and is dropped by anything
+    that mixes streams. ``language=und`` is what an mp4 muxer stamps on an
+    untagged stream, so it carries no information and is not copied.
+    """
+    source = stream.source
+    if source is None:
+        return {}
+    metadata: dict[str, str] = {}
+    for key in _PROVENANCE_KEYS:
+        value = source.metadata.get(key)
+        if value is None:
+            continue
+        if key == "language" and value == _UNDEFINED_LANGUAGE:
+            continue
+        metadata[key] = value
+    return metadata
+
+
+def _flatten(columns: list[_Column]) -> list[_Column]:
+    """One column per stream: arrays are gone, every column is a scalar.
+
+    An aliased array column hands its alias to each of its elements, exactly as
+    the SELECT-list splat does.
+    """
+    return [
+        _Column(name=column.name, value=_scalar(stream))
+        for column in columns
+        for stream in column.value.streams
+    ]
+
+
+def _signature(columns: list[_Column]) -> str:
+    """Branch column types for a CONCAT_MISMATCH message, arrays as ``audio[2]``."""
+    parts = [
+        f"{column.value.type}[{len(column.value.streams)}]"
+        if column.value.is_array
+        else column.value.type
+        for column in columns
+    ]
+    return ", ".join(parts) or "nothing"
+
+
+def _is_single_video_column(binding: _CteBinding) -> bool:
+    """True if `binding` exposes exactly one column and it is a single video stream."""
+    if len(binding.columns) != 1:
+        return False
+    value = binding.columns[0].value
+    return value.type == "video" and not value.is_array
+
+
+def _sole_stream_position(variant: tuple[Param, ...]) -> int | None:
+    """The index of the ONE stream parameter of `variant`, or None if it has 2+."""
+    positions = [i for i, param in enumerate(variant) if param.kind in ("video", "audio")]
+    return positions[0] if len(positions) == 1 else None
+
+
+def _sql_text(node: exp.Expr) -> str:
+    """The argument as the user wrote it, for a BROADCAST_MISMATCH message.
+
+    ``dialect="postgres"`` matters: it re-adds the ``INDEX_OFFSET`` sqlglot
+    subtracted at parse time, so ``a.audio[2]`` renders as ``a.audio[2]``.
+    """
+    return str(node.sql(dialect="postgres"))
+
+
+def _stream_count(count: int) -> str:
+    return f"{count} stream" + ("" if count == 1 else "s")
 
 
 def _match_variant(

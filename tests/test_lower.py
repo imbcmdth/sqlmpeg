@@ -1,4 +1,4 @@
-"""Tests for the lower pass and the compiler pipeline (plans 005, 019).
+"""Tests for the lower pass and the compiler pipeline (plans 005, 019, 020).
 
 These go through the real parser: lowering is only ever handed a ``Resolved``
 that ``resolve`` accepted, so hand-built inputs would test a shape that cannot
@@ -8,9 +8,11 @@ synthetic :class:`~sqlmpeg.probe.ProbeResult`.
 
 Paths in these queries deliberately do not exist, so ``compile_sql``'s
 opportunistic probing degrades to symbolic lowering without shelling out
-(RFC-001 "Probing policy"); probe-dependent behavior is exercised either with
-a hand-built ``ProbeResult`` or, for the real thing, in an ``exec``-marked
-test against ``tests/fixtures/av.mp4``.
+(RFC-001 "Probing policy"); probe-dependent behavior — which is ALL of
+broadcasting, since an array's length comes from the file — is exercised
+either with a hand-built ``ProbeResult`` through ``lower`` directly, or, for
+the real thing, in an ``exec``-marked test against ``tests/fixtures/av.mp4``
+(1 audio track) and ``tests/fixtures/av2.mp4`` (2 language-tagged tracks).
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from sqlmpeg.ir import Graph
 from sqlmpeg.lower import lower
 from sqlmpeg.parser import parse, resolve
 from sqlmpeg.probe import ProbeResult, StreamMeta
+from sqlmpeg.split import insert_splits
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
@@ -51,7 +54,17 @@ def _lower(sql: str, probes: dict[str, ProbeResult | None] | None = None) -> Gra
 def _reject(sql: str) -> SqlmpegError:
     with pytest.raises(SqlmpegError) as excinfo:
         compile_sql(sql)
-    err = excinfo.value
+    return _anchored(excinfo.value)
+
+
+def _reject_lower(sql: str, probes: dict[str, ProbeResult | None]) -> SqlmpegError:
+    """Like ``_reject``, for rejections that only a probed input can produce."""
+    with pytest.raises(SqlmpegError) as excinfo:
+        _lower(sql, probes)
+    return _anchored(excinfo.value)
+
+
+def _anchored(err: SqlmpegError) -> SqlmpegError:
     assert err.line is not None, "every rejection must be line-anchored"
     assert err.col is not None
     return err
@@ -71,8 +84,16 @@ def _probe_result(
     *,
     video_tags: dict[str, str] | None = None,
     audio_tags: dict[str, str] | None = None,
+    per_audio_tags: list[dict[str, str]] | None = None,
 ) -> ProbeResult:
-    """A synthetic ProbeResult -- no ffprobe, no fixture, no disk."""
+    """A synthetic ProbeResult -- no ffprobe, no fixture, no disk.
+
+    ``audio_tags`` tags every audio stream the same; ``per_audio_tags`` tags
+    them one by one (and fixes ``audios``), which is what the broadcasting
+    provenance tests need.
+    """
+    if per_audio_tags is not None:
+        audios = len(per_audio_tags)
     streams = [
         StreamMeta(
             type="video",
@@ -89,7 +110,7 @@ def _probe_result(
         StreamMeta(
             type="audio",
             index=i,
-            metadata=dict(audio_tags or {}),
+            metadata=dict(per_audio_tags[i] if per_audio_tags is not None else audio_tags or {}),
             width=None,
             height=None,
             fps=None,
@@ -260,23 +281,256 @@ def test_frame_cannot_be_subscripted() -> None:
 
 
 # ---------------------------------------------------------------------------
-# bare arrays: rejected until broadcasting (plan 020)
+# broadcasting: bare arrays splat (plan 020)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "sql",
-    [
-        "SELECT a.audio FROM input('x.mp4') a",
-        "SELECT a.video FROM input('x.mp4') a",
-        "SELECT volume(a.audio, 0.5) FROM input('x.mp4') a",
-        "WITH c AS (SELECT a.audio FROM input('x.mp4') a) SELECT c.audio FROM c",
-    ],
-)
-def test_bare_stream_array_says_broadcasting_is_coming(sql: str) -> None:
-    err = _reject(sql)
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert err.hint is not None and "broadcasting" in err.hint
+def test_bare_audio_array_splats_into_one_output_per_stream() -> None:
+    g = _lower("SELECT a.audio FROM input('x.mp4') a", {"a": _probe_result(audios=3)})
+    assert g.nodes == {}
+    assert _outputs(g) == [
+        ("src:a:a:0", "audio", None),
+        ("src:a:a:1", "audio", None),
+        ("src:a:a:2", "audio", None),
+    ]
+
+
+def test_bare_video_array_splats_in_file_order() -> None:
+    g = _lower(
+        "SELECT a.video FROM input('x.mp4') a", {"a": _probe_result(videos=2, audios=1)}
+    )
+    assert _outputs(g) == [("src:a:v:0", "video", None), ("src:a:v:1", "video", None)]
+
+
+def test_a_splat_keeps_its_place_in_the_select_list() -> None:
+    g = _lower(
+        "SELECT a.audio, a.video[1] FROM input('x.mp4') a",
+        {"a": _probe_result(videos=1, audios=2)},
+    )
+    assert [o.type for o in g.outputs] == ["audio", "audio", "video"]
+
+
+def test_as_alias_is_repeated_verbatim_on_every_splatted_element() -> None:
+    """The alias names the COLUMN, so elements are NOT suffixed with an ordinal."""
+    g = _lower(
+        "SELECT a.audio AS Track FROM input('x.mp4') a", {"a": _probe_result(audios=2)}
+    )
+    assert [o.name for o in g.outputs] == ["track", "track"]
+
+
+def test_an_unaliased_splat_names_nothing() -> None:
+    g = _lower("SELECT a.audio FROM input('x.mp4') a", {"a": _probe_result(audios=2)})
+    assert [o.name for o in g.outputs] == [None, None]
+
+
+def test_a_one_stream_array_still_splats() -> None:
+    g = _lower("SELECT a.audio FROM input('x.mp4') a", {"a": _probe_result(audios=1)})
+    assert _outputs(g) == [("src:a:a:0", "audio", None)]
+
+
+def test_unprobeable_bare_array_cannot_be_enumerated() -> None:
+    """No probe -> no length -> INPUT_NOT_FOUND, the natural error (RFC-001)."""
+    err = _reject("SELECT a.audio FROM input('nope.mp4') a")
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+    assert "cannot enumerate the streams of 'nope.mp4'" in err.message
+    assert err.line == 1 and err.col is not None
+
+
+def test_unprobeable_bare_array_as_an_argument_is_the_same_error() -> None:
+    err = _reject("SELECT volume(a.audio, 0.5) FROM input('nope.mp4') a")
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+    assert err.hint is not None and "a.audio[1]" in err.hint
+
+
+def test_no_probe_flag_also_loses_the_ability_to_enumerate() -> None:
+    with pytest.raises(SqlmpegError) as excinfo:
+        compile_sql("SELECT a.audio FROM input('x.mp4') a", probe=False)
+    assert excinfo.value.code is ErrorCode.INPUT_NOT_FOUND
+
+
+# ---------------------------------------------------------------------------
+# broadcasting: calls expand elementwise
+# ---------------------------------------------------------------------------
+
+
+def test_scalar_broadcast_makes_one_node_per_element() -> None:
+    g = _lower(
+        "SELECT volume(a.audio, 0.5) FROM input('x.mp4') a", {"a": _probe_result(audios=2)}
+    )
+    assert _filters(g) == ["volume", "volume"]
+    assert g.nodes["n1"].inputs == ["src:a:a:0"]
+    assert g.nodes["n2"].inputs == ["src:a:a:1"]
+    assert g.nodes["n1"].args == g.nodes["n2"].args == {"volume": 0.5}
+    assert _outputs(g) == [("n1", "audio", None), ("n2", "audio", None)]
+
+
+def test_nested_broadcasts_compose() -> None:
+    """`volume(reverb(a.audio, 0.3), 0.5)` : the inner array flows outward."""
+    g = _lower(
+        "SELECT volume(reverb(a.audio, 0.3), 0.5) FROM input('x.mp4') a",
+        {"a": _probe_result(audios=2)},
+    )
+    assert _filters(g) == ["aecho", "aecho", "volume", "volume"]
+    assert g.nodes["n3"].inputs == ["n1"]
+    assert g.nodes["n4"].inputs == ["n2"]
+
+
+def test_two_arrays_zip_elementwise() -> None:
+    g = _lower(
+        "SELECT amix(a.audio, b.audio) FROM input('x.mp4') a, input('y.mp4') b",
+        {"a": _probe_result(audios=2), "b": _probe_result(audios=2)},
+    )
+    assert _filters(g) == ["amix", "amix"]
+    assert g.nodes["n1"].inputs == ["src:a:a:0", "src:b:a:0"]
+    assert g.nodes["n2"].inputs == ["src:a:a:1", "src:b:a:1"]
+
+
+def test_a_scalar_argument_repeats_into_every_element() -> None:
+    g = _lower(
+        "SELECT amix(a.audio, b.audio[1]) FROM input('x.mp4') a, input('y.mp4') b",
+        {"a": _probe_result(audios=2), "b": _probe_result(audios=1)},
+    )
+    assert g.nodes["n1"].inputs == ["src:a:a:0", "src:b:a:0"]
+    assert g.nodes["n2"].inputs == ["src:a:a:1", "src:b:a:0"]
+
+
+def test_a_repeated_scalar_is_fanned_out_by_the_split_pass() -> None:
+    """Broadcasting reuses one ref N times; asplit is what makes that legal."""
+    g = insert_splits(
+        _lower(
+            "SELECT amix(a.audio, b.audio[1]) FROM input('x.mp4') a, input('y.mp4') b",
+            {"a": _probe_result(audios=2), "b": _probe_result(audios=1)},
+        )
+    )
+    assert _filters(g) == ["asplit", "amix", "amix"]
+    assert g.nodes["src_b_a_0_split"].args == {"n": 2}
+    assert g.nodes["n1"].inputs == ["src:a:a:0", "src_b_a_0_split:0"]
+    assert g.nodes["n2"].inputs == ["src:a:a:1", "src_b_a_0_split:1"]
+
+
+def test_zip_length_mismatch_is_a_broadcast_mismatch() -> None:
+    err = _reject_lower(
+        "SELECT amix(a.audio, b.audio) FROM input('x.mp4') a, input('y.mp4') b",
+        {"a": _probe_result(audios=3), "b": _probe_result(audios=2)},
+    )
+    assert err.code is ErrorCode.BROADCAST_MISMATCH
+    assert "a.audio has 3 streams" in err.message
+    assert "b.audio has 2 streams" in err.message
+
+
+def test_broadcast_over_a_video_array() -> None:
+    g = _lower(
+        "SELECT hflip(a.video) FROM input('x.mp4') a", {"a": _probe_result(videos=2)}
+    )
+    assert _filters(g) == ["hflip", "hflip"]
+
+
+def test_an_array_argument_still_type_checks_by_element() -> None:
+    err = _reject_lower(
+        "SELECT hflip(a.audio) FROM input('x.mp4') a", {"a": _probe_result(audios=2)}
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "got hflip(audio)" in err.message
+
+
+def test_broadcast_composes_with_the_where_trim() -> None:
+    """One trim per element, shared by every consumer of that element."""
+    g = _lower(
+        "SELECT volume(a.audio, 0.5), reverb(a.audio, 0.3) FROM input('x.mp4') a "
+        "WHERE a.t BETWEEN 1 AND 2",
+        {"a": _probe_result(audios=2)},
+    )
+    assert _filters(g) == [
+        "atrim",
+        "asetpts",
+        "atrim",
+        "asetpts",
+        "volume",
+        "volume",
+        "aecho",
+        "aecho",
+    ]
+    assert g.nodes["n1"].inputs == ["src:a:a:0"]
+    assert g.nodes["n3"].inputs == ["src:a:a:1"]
+    # both calls consume the SAME two trimmed streams, one per element
+    assert [g.nodes[n].inputs for n in ("n5", "n6", "n7", "n8")] == [
+        ["n2"],
+        ["n4"],
+        ["n2"],
+        ["n4"],
+    ]
+
+
+# ---------------------------------------------------------------------------
+# broadcasting: provenance
+# ---------------------------------------------------------------------------
+
+
+def test_broadcast_outputs_carry_their_own_source_metadata() -> None:
+    g = _lower(
+        "SELECT reverb(a.audio, 0.3) FROM input('x.mp4') a",
+        {
+            "a": _probe_result(
+                audios=2, per_audio_tags=[{"language": "eng"}, {"language": "fra"}]
+            )
+        },
+    )
+    assert [o.metadata for o in g.outputs] == [{"language": "eng"}, {"language": "fra"}]
+
+
+def test_provenance_survives_a_chain_of_single_stream_calls() -> None:
+    g = _lower(
+        "SELECT volume(reverb(a.audio[1], 0.3), 0.5) FROM input('x.mp4') a",
+        {"a": _probe_result(audio_tags={"language": "fra", "title": "VF"})},
+    )
+    assert g.outputs[0].metadata == {"language": "fra", "title": "VF"}
+
+
+def test_provenance_survives_the_where_trim() -> None:
+    g = _lower(
+        "SELECT a.audio[1] FROM input('x.mp4') a WHERE a.t BETWEEN 0 AND 1",
+        {"a": _probe_result(audio_tags={"language": "fra"})},
+    )
+    assert g.outputs[0].metadata == {"language": "fra"}
+
+
+def test_amix_breaks_provenance() -> None:
+    """Two stream inputs = no single source; the mix is nobody's language."""
+    g = _lower(
+        "SELECT amix(a.audio[1], a.audio[2]) FROM input('x.mp4') a",
+        {
+            "a": _probe_result(
+                audios=2, per_audio_tags=[{"language": "eng"}, {"language": "fra"}]
+            )
+        },
+    )
+    assert _filters(g) == ["amix"]
+    assert g.outputs[0].metadata == {}
+
+
+def test_broadcast_through_amix_drops_every_elements_provenance() -> None:
+    g = _lower(
+        "SELECT amix(a.audio, b.audio) FROM input('x.mp4') a, input('y.mp4') b",
+        {
+            "a": _probe_result(
+                audios=2, per_audio_tags=[{"language": "eng"}, {"language": "fra"}]
+            ),
+            "b": _probe_result(audios=2, audio_tags={"language": "deu"}),
+        },
+    )
+    assert [o.metadata for o in g.outputs] == [{}, {}]
+
+
+def test_concat_breaks_provenance() -> None:
+    g = _lower(
+        "SELECT a.audio[1] FROM input('x.mp4') a "
+        "UNION ALL SELECT b.audio[1] FROM input('y.mp4') b",
+        {
+            "a": _probe_result(audio_tags={"language": "eng"}),
+            "b": _probe_result(audio_tags={"language": "eng"}),
+        },
+    )
+    assert g.outputs[0].metadata == {}
 
 
 # ---------------------------------------------------------------------------
@@ -405,13 +659,88 @@ def test_unknown_cte_column_lists_the_known_names() -> None:
     assert err.hint is not None and "pic" in err.hint and "snd" in err.hint
 
 
-def test_cte_column_cannot_be_subscripted_yet() -> None:
+def test_a_scalar_cte_column_cannot_be_subscripted() -> None:
     err = _reject(
         "WITH c AS (SELECT a.audio[1] AS snd FROM input('x.mp4') a) "
         "SELECT c.snd[1] FROM c"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert err.hint is not None and "broadcasting" in err.hint
+    assert "'c.snd' is a single stream" in err.message
+
+
+# ---------------------------------------------------------------------------
+# CTE array columns: splat, broadcast again, subscript (plan 020)
+# ---------------------------------------------------------------------------
+
+
+def test_cte_array_column_splats_in_the_outer_select() -> None:
+    g = _lower(
+        "WITH c AS (SELECT reverb(a.audio, 0.3) AS snd FROM input('x.mp4') a) "
+        "SELECT c.snd FROM c",
+        {"a": _probe_result(audios=2)},
+    )
+    assert _filters(g) == ["aecho", "aecho"]
+    # the CTE's own AS name stays inside the CTE; the outer SELECT names the
+    # output columns (here: not at all).
+    assert _outputs(g) == [("n1", "audio", None), ("n2", "audio", None)]
+
+
+def test_cte_array_column_broadcasts_again() -> None:
+    g = _lower(
+        "WITH c AS (SELECT a.audio AS snd FROM input('x.mp4') a) "
+        "SELECT volume(c.snd, 0.5) FROM c",
+        {"a": _probe_result(audios=2)},
+    )
+    assert _filters(g) == ["volume", "volume"]
+    assert g.nodes["n1"].inputs == ["src:a:a:0"]
+    assert g.nodes["n2"].inputs == ["src:a:a:1"]
+
+
+def test_cte_array_column_is_subscriptable_one_based() -> None:
+    g = _lower(
+        "WITH c AS (SELECT reverb(a.audio, 0.3) AS snd FROM input('x.mp4') a) "
+        "SELECT c.snd[2] FROM c",
+        {"a": _probe_result(audios=2)},
+    )
+    # both elements are still built (the CTE lowered as a whole); only the
+    # subscripted one reaches the output list.
+    assert _filters(g) == ["aecho", "aecho"]
+    assert _outputs(g) == [("n2", "audio", None)]
+
+
+def test_cte_array_subscript_bounds_are_static() -> None:
+    """The length was recorded when the CTE lowered: no probe is consulted here."""
+    err = _reject_lower(
+        "WITH c AS (SELECT a.audio AS snd FROM input('x.mp4') a) "
+        "SELECT c.snd[3] FROM c",
+        {"a": _probe_result(audios=2)},
+    )
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "'c.snd[3]' does not exist" in err.message
+    assert "column 'c.snd' has 2 streams" in err.message
+
+
+def test_cte_array_column_provenance_reaches_the_outer_output() -> None:
+    g = _lower(
+        "WITH c AS (SELECT reverb(a.audio, 0.3) AS snd FROM input('x.mp4') a) "
+        "SELECT c.snd FROM c",
+        {
+            "a": _probe_result(
+                audios=2, per_audio_tags=[{"language": "eng"}, {"language": "fra"}]
+            )
+        },
+    )
+    assert [o.metadata for o in g.outputs] == [{"language": "eng"}, {"language": "fra"}]
+
+
+def test_a_single_array_video_cte_column_is_not_frame_sugar() -> None:
+    """`<cte>.frame` is singular sugar; an array column does not answer to it."""
+    err = _reject_lower(
+        "WITH c AS (SELECT a.video FROM input('x.mp4') a) SELECT hflip(c.frame) FROM c",
+        {"a": _probe_result(videos=2)},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "c.frame" in err.message
 
 
 def test_where_trims_a_cte_column_by_its_type() -> None:
@@ -505,6 +834,31 @@ def test_union_all_column_count_mismatch_is_a_concat_mismatch() -> None:
     )
     assert err.code is ErrorCode.CONCAT_MISMATCH
     assert err.line == 2
+
+
+def test_union_all_flattens_array_columns_into_concat_columns() -> None:
+    g = _lower(
+        "SELECT a.audio FROM input('x.mp4') a UNION ALL SELECT b.audio FROM input('y.mp4') b",
+        {"a": _probe_result(audios=2), "b": _probe_result(audios=2)},
+    )
+    concat = g.nodes["n1"]
+    assert concat.args == {"n": 2, "v": 0, "a": 2}
+    assert concat.inputs == ["src:a:a:0", "src:a:a:1", "src:b:a:0", "src:b:a:1"]
+    assert concat.outputs == ["audio", "audio"]
+    assert _outputs(g) == [("n1:0", "audio", None), ("n1:1", "audio", None)]
+
+
+def test_union_all_element_count_mismatch_is_a_concat_mismatch() -> None:
+    """Same types, different array lengths: the flattened signatures differ."""
+    err = _reject_lower(
+        "SELECT a.audio FROM input('x.mp4') a\n"
+        "UNION ALL SELECT b.audio FROM input('y.mp4') b",
+        {"a": _probe_result(audios=2), "b": _probe_result(audios=1)},
+    )
+    assert err.code is ErrorCode.CONCAT_MISMATCH
+    assert err.line == 2
+    assert "branch 1 selects (audio[2])" in err.message
+    assert "branch 2 selects (audio[1])" in err.message
 
 
 def test_union_all_column_order_mismatch_is_a_concat_mismatch() -> None:
@@ -712,13 +1066,13 @@ def test_undefined_language_tag_is_not_copied() -> None:
     assert g.outputs[0].metadata == {"title": "Main"}
 
 
-def test_filtered_output_carries_no_metadata_in_this_plan() -> None:
-    """1:1 provenance through a filter chain arrives with plan 020."""
+def test_filtered_output_threads_its_sources_provenance() -> None:
+    """Plan 020: a 1:1 filter chain keeps the tags raw ffmpeg would have lost."""
     g = _lower(
         "SELECT volume(a.audio[1], 0.5) FROM input('x.mp4') a",
         {"a": _probe_result(audio_tags={"language": "fra"})},
     )
-    assert g.outputs[0].metadata == {}
+    assert g.outputs[0].metadata == {"language": "fra"}
 
 
 def test_unprobed_passthrough_has_no_metadata() -> None:
@@ -829,12 +1183,23 @@ def test_pipeline_output_survives_a_round_trip_through_dicts() -> None:
 
 
 @pytest.fixture(scope="module")
-def _av_fixture() -> str:
+def _fixtures() -> None:
     subprocess.run(
         [sys.executable, str(REPO_ROOT / "scripts" / "gen_fixtures.py")],
         check=True,
     )
+
+
+@pytest.fixture(scope="module")
+def _av_fixture(_fixtures: None) -> str:
+    """testsrc2 + one sine track."""
     return (FIXTURES_DIR / "av.mp4").as_posix()
+
+
+@pytest.fixture(scope="module")
+def _av2_fixture(_fixtures: None) -> str:
+    """testsrc2 + TWO sine tracks, tagged language=eng and language=fra."""
+    return (FIXTURES_DIR / "av2.mp4").as_posix()
 
 
 @pytest.mark.exec
@@ -858,3 +1223,75 @@ def test_probed_fixture_accepts_its_real_streams(_av_fixture: str) -> None:
 def test_no_probe_flag_skips_the_bounds_check_on_a_real_file(_av_fixture: str) -> None:
     g = compile_sql(f"SELECT a.audio[3] FROM input('{_av_fixture}') a", probe=False)
     assert _outputs(g) == [("src:a:a:2", "audio", None)]
+
+
+@pytest.mark.exec
+def test_empty_stream_array_is_a_typed_error(_fixtures: None) -> None:
+    """testsrc.mp4 is video-only: splatting its audio must not silently
+    produce a zero-output graph (a command with no -map)."""
+    path = (FIXTURES_DIR / "testsrc.mp4").as_posix()
+    err = _reject(f"SELECT a.audio FROM input('{path}') a")
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "no audio streams" in err.message
+
+
+# ---------------------------------------------------------------------------
+# broadcasting against the real 2-audio-track fixture
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.exec
+def test_reverb_over_every_language_track(_av2_fixture: str) -> None:
+    """The headline case: one aecho per language track, each output still tagged."""
+    g = compile_sql(f"SELECT reverb(a.audio, 0.3) AS dubbed FROM input('{_av2_fixture}') a")
+    assert _filters(g) == ["aecho", "aecho"]
+    assert g.nodes["n1"].inputs == ["src:a:a:0"]
+    assert g.nodes["n2"].inputs == ["src:a:a:1"]
+    assert [(o.ref, o.name) for o in g.outputs] == [("n1", "dubbed"), ("n2", "dubbed")]
+    assert [o.metadata for o in g.outputs] == [{"language": "eng"}, {"language": "fra"}]
+
+
+@pytest.mark.exec
+def test_probed_scalar_broadcast_makes_one_node_per_real_stream(_av2_fixture: str) -> None:
+    g = compile_sql(f"SELECT volume(a.audio, 0.5) FROM input('{_av2_fixture}') a")
+    assert _filters(g) == ["volume", "volume"]
+    assert len(g.outputs) == 2
+
+
+@pytest.mark.exec
+def test_probed_splat_passes_every_track_through(_av2_fixture: str) -> None:
+    g = compile_sql(f"SELECT a.video, a.audio FROM input('{_av2_fixture}') a")
+    assert g.nodes == {}
+    assert _outputs(g) == [
+        ("src:a:v:0", "video", None),
+        ("src:a:a:0", "audio", None),
+        ("src:a:a:1", "audio", None),
+    ]
+    # the video track's mp4-stamped language=und says nothing and is dropped
+    assert [o.metadata for o in g.outputs] == [
+        {},
+        {"language": "eng"},
+        {"language": "fra"},
+    ]
+
+
+@pytest.mark.exec
+def test_zip_mismatch_across_two_real_files(_av_fixture: str, _av2_fixture: str) -> None:
+    """av2.mp4 has 2 audio tracks, av.mp4 has 1: nothing to zip."""
+    err = _reject(
+        f"SELECT amix(a.audio, b.audio) "
+        f"FROM input('{_av2_fixture}') a, input('{_av_fixture}') b"
+    )
+    assert err.code is ErrorCode.BROADCAST_MISMATCH
+    assert "a.audio has 2 streams" in err.message
+    assert "b.audio has 1 stream" in err.message
+
+
+@pytest.mark.exec
+def test_probed_cte_array_subscript_against_a_real_file(_av2_fixture: str) -> None:
+    err = _reject(
+        f"WITH c AS (SELECT a.audio AS snd FROM input('{_av2_fixture}') a) "
+        f"SELECT c.snd[3] FROM c"
+    )
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "column 'c.snd' has 2 streams" in err.message
