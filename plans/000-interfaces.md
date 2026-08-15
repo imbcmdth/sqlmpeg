@@ -102,18 +102,25 @@ Simple filters: `expand` is one `ctx.node(...)` call. Macros (`blur_regions`): s
 ## parser.py (plan 004)
 
 ```python
+QueryExpr = exp.Select | exp.Union   # a plain SELECT or a UNION ALL of them
+
 def parse(text: str) -> sqlglot.exp.Expression   # read="postgres"; raises SqlmpegError(PARSE_ERROR)
 
 @dataclass
 class Resolved:
-    select: sqlglot.exp.Select            # top-level select, CTEs still attached
-    input_paths: list[str]                # first-appearance order, deduped by path
-    sources: dict[str, int]               # alias -> input index
-    ctes: dict[str, sqlglot.exp.Select]   # CTE name -> its select
+    select: QueryExpr                     # top-level query, CTEs still attached
+    input_paths: list[str]                # -i order; index = ffmpeg input index; MAY REPEAT PATHS
+    sources: dict[str, int]               # alias -> input index (dedup key is the ALIAS, not path)
+    ctes: dict[str, QueryExpr]            # CTE name -> body, definition order (body may be UNION ALL)
+    branches: list[exp.Select]            # select flattened into UNION ALL branches (len 1 if plain)
 
 def resolve(tree) -> Resolved   # raises UNKNOWN_ALIAS / SINGLE_OUTPUT_ONLY /
                                 # NO_STREAMING_EQUIVALENT / UNSUPPORTED_SQL
+def union_branches(query: exp.Expr) -> list[exp.Select]  # also usable on CTE bodies
 ```
+
+Input index order is traversal order: CTEs in definition order first, then top-level
+branches. Aliases are Postgres-folded (unquoted → lowercase). AS SHIPPED in parser.py.
 
 ## lower.py + compiler.py (plan 005)
 
