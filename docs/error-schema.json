@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sqlmpeg.dev/schemas/error.json",
+  "title": "sqlmpeg error object",
+  "description": "The JSON object printed by `sqlmpeg validate --json` on rejection, and returned by SqlmpegError.to_dict(). See docs/errors.md for the meaning of each `code` value.",
+  "type": "object",
+  "properties": {
+    "line": {
+      "description": "1-based line number the error is anchored to, or null if no position is available.",
+      "type": ["integer", "null"]
+    },
+    "col": {
+      "description": "1-based column number the error is anchored to, or null if no position is available.",
+      "type": ["integer", "null"]
+    },
+    "code": {
+      "description": "The ErrorCode enum value (sqlmpeg/errors.py).",
+      "type": "string",
+      "enum": [
+        "PARSE_ERROR",
+        "UNKNOWN_FUNCTION",
+        "UNKNOWN_ALIAS",
+        "UDF_ARG_TYPE",
+        "SINGLE_OUTPUT_ONLY",
+        "NO_STREAMING_EQUIVALENT",
+        "CONCAT_MISMATCH",
+        "UNSUPPORTED_SQL",
+        "INTERNAL"
+      ]
+    },
+    "message": {
+      "description": "Human-readable description of the rejection.",
+      "type": "string"
+    },
+    "hint": {
+      "description": "Optional suggestion for how to fix the query, or null.",
+      "type": ["string", "null"]
+    }
+  },
+  "required": ["line", "col", "code", "message", "hint"],
+  "additionalProperties": false
+}
