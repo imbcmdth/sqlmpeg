@@ -15,10 +15,17 @@ class ErrorCode(str, Enum):
     UNKNOWN_FUNCTION = "UNKNOWN_FUNCTION"
     UNKNOWN_ALIAS = "UNKNOWN_ALIAS"
     UDF_ARG_TYPE = "UDF_ARG_TYPE"
-    SINGLE_OUTPUT_ONLY = "SINGLE_OUTPUT_ONLY"
+    SINGLE_OUTPUT_ONLY = "SINGLE_OUTPUT_ONLY"  # retired in v2: multi-column SELECT
+    # is legal now (RFC-001); kept in the enum for the docs' sake, not raised
+    # by any v2 code path.
     NO_STREAMING_EQUIVALENT = "NO_STREAMING_EQUIVALENT"
     CONCAT_MISMATCH = "CONCAT_MISMATCH"  # reserved for v1 probing
     UNSUPPORTED_SQL = "UNSUPPORTED_SQL"  # catch-all for constructs outside dialect
+    STREAM_NOT_FOUND = "STREAM_NOT_FOUND"  # probed subscript out of range
+    INPUT_NOT_FOUND = "INPUT_NOT_FOUND"  # */splat/broadcast needs a readable
+    # input and there is none
+    BROADCAST_MISMATCH = "BROADCAST_MISMATCH"  # zip length mismatch across
+    # broadcast-expanded array arguments
     INTERNAL = "INTERNAL"  # bug backstop; fuzz asserts this never fires
 
 
