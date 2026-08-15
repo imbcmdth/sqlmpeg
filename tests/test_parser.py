@@ -4,7 +4,7 @@ import pytest
 from sqlglot import exp
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.parser import Resolved, parse, resolve, union_branches
+from sqlmpeg.parser import Resolved, parse, resolve, subscript_index, union_branches
 
 README_SQL = """WITH pip AS (
   SELECT scale(crop(b.frame, 1200, 50, 600, 200), 0.5) AS frame
@@ -26,6 +26,14 @@ def _reject(sql: str) -> SqlmpegError:
     assert err.line is not None, "every rejection must be line-anchored"
     assert err.col is not None
     return err
+
+
+def _projection(sql: str, index: int = 0) -> exp.Expr:
+    """The nth top-level projection of a query that resolves cleanly."""
+    select = _resolve(sql).branches[0]
+    projection = select.expressions[index]
+    assert isinstance(projection, exp.Expr)
+    return projection
 
 
 # ---------------------------------------------------------------------------
@@ -222,20 +230,48 @@ def test_union_without_all_suggests_union_all() -> None:
 
 
 # ---------------------------------------------------------------------------
-# resolve — SINGLE_OUTPUT_ONLY / SELECT *
+# resolve — multiple projections (RFC-001: SELECT list = output stream list)
 # ---------------------------------------------------------------------------
 
 
-def test_two_output_columns() -> None:
-    err = _reject("SELECT a.frame, a.t FROM input('x') a")
-    assert err.code is ErrorCode.SINGLE_OUTPUT_ONLY
+def test_two_output_columns_are_legal() -> None:
+    res = _resolve("SELECT a.video[1], a.audio[1] FROM input('x') a")
+    assert len(res.branches[0].expressions) == 2
+    assert res.sources == {"a": 0}
 
 
-def test_two_output_columns_in_cte() -> None:
-    err = _reject(
-        "WITH c AS (SELECT a.frame, a.t FROM input('x') a) SELECT c.frame FROM c"
+def test_two_output_columns_in_cte_are_legal() -> None:
+    res = _resolve(
+        "WITH c AS (SELECT a.video[1] AS v, a.audio[1] AS aud FROM input('x') a) "
+        "SELECT c.v, c.aud FROM c"
     )
-    assert err.code is ErrorCode.SINGLE_OUTPUT_ONLY
+    assert list(res.ctes) == ["c"]
+    assert len(res.branches[0].expressions) == 2
+
+
+def test_many_output_columns_are_legal() -> None:
+    res = _resolve(
+        "SELECT a.video[1], a.audio[1], a.audio[2], hflip(a.frame) FROM input('x') a"
+    )
+    assert len(res.branches[0].expressions) == 4
+
+
+def test_multiple_projections_in_every_union_branch() -> None:
+    sql = (
+        "SELECT a.video[1], a.audio[1] FROM input('x') a "
+        "UNION ALL SELECT b.video[1], b.audio[1] FROM input('y') b"
+    )
+    res = _resolve(sql)
+    assert len(res.branches) == 2
+    assert all(len(branch.expressions) == 2 for branch in res.branches)
+
+
+def test_select_with_no_output_column_is_rejected() -> None:
+    # sqlglot parses "SELECT FROM t" into a Select with an empty projection
+    # list, so the no-projection guard is the one arity check that survives v2.
+    err = _reject("SELECT FROM input('x') a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "no output column" in err.message
 
 
 @pytest.mark.parametrize("sql", ["SELECT * FROM input('x') a", "SELECT a.* FROM input('x') a"])
@@ -243,6 +279,167 @@ def test_select_star(sql: str) -> None:
     err = _reject(sql)
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert err.hint is not None and "frame expression" in err.hint
+
+
+# ---------------------------------------------------------------------------
+# resolve — stream columns and subscripts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a.frame FROM input('x') a",
+        "SELECT a.video FROM input('x') a",
+        "SELECT a.audio FROM input('x') a",
+        "SELECT a.video[1] FROM input('x') a",
+        "SELECT a.video[3] FROM input('x') a",
+        "SELECT a.audio[2] FROM input('x') a",
+        "SELECT a.video [ 1 ] FROM input('x') a",
+        "SELECT a.video\n  [1] FROM input('x') a",
+        "SELECT a.video[10] FROM input('x') a",
+        "SELECT scale(a.video[1], 0.5) FROM input('x') a",
+        "SELECT scale(a.video, 0.5) FROM input('x') a",
+        "SELECT A.VIDEO[1] FROM input('x') A",
+        "SELECT a.video[1] AS v FROM input('x') a",
+    ],
+)
+def test_stream_columns_are_accepted(sql: str) -> None:
+    assert _resolve(sql).sources == {"a": 0}
+
+
+def test_cte_columns_may_have_any_name_and_be_subscripted() -> None:
+    # A CTE's columns are named by AS, so the parser must not apply the input
+    # pseudo-column whitelist to them — lower validates the name.
+    res = _resolve(
+        "WITH c AS (SELECT a.audio AS tracks FROM input('x') a) "
+        "SELECT c.tracks[2], c.tracks FROM c"
+    )
+    assert list(res.ctes) == ["c"]
+    assert res.sources == {"a": 0}
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a.bogus FROM input('x') a",
+        "SELECT a.subtitle[1] FROM input('x') a",
+        "SELECT hflip(a.frames) FROM input('x') a",
+        'SELECT a."Video" FROM input(\'x\') a',
+    ],
+)
+def test_unknown_input_column_is_rejected(sql: str) -> None:
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.hint is not None and "video" in err.hint
+
+
+def test_unknown_input_column_is_line_anchored() -> None:
+    err = _reject("SELECT\n  a.bogus\nFROM input('x') a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.line == 2
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a.video[0] FROM input('x') a",
+        "SELECT a.video[-1] FROM input('x') a",
+        "SELECT a.video[-10] FROM input('x') a",
+        "SELECT a.video[1.5] FROM input('x') a",
+        "SELECT a.video['x'] FROM input('x') a",
+        "SELECT a.video[x] FROM input('x') a",
+        "SELECT a.video[a.t] FROM input('x') a",
+        "SELECT a.video[null] FROM input('x') a",
+        "SELECT a.video[true] FROM input('x') a",
+        "SELECT a.video[1:2] FROM input('x') a",
+        "SELECT a.video[1, 2] FROM input('x') a",
+        "SELECT a.video[cast(1 AS INT)] FROM input('x') a",
+        "SELECT scale(a.video[0], 0.5) FROM input('x') a",
+    ],
+)
+def test_bad_subscript_is_rejected(sql: str) -> None:
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.hint is not None and "stream subscripts are 1-based" in err.hint
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a.video[1][2] FROM input('x') a",
+        "SELECT a.video[1][1][1] FROM input('x') a",
+    ],
+)
+def test_chained_subscript_is_rejected(sql: str) -> None:
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "chained" in err.message
+
+
+def test_subscripting_a_function_result_is_rejected() -> None:
+    err = _reject("SELECT scale(a.video[1], 0.5)[1] FROM input('x') a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "stream columns" in err.message
+
+
+def test_bad_subscript_is_line_anchored() -> None:
+    err = _reject("SELECT\n  a.video[0]\nFROM input('x') a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.line == 2
+
+
+def test_subscript_on_unknown_alias_is_unknown_alias() -> None:
+    assert _reject("SELECT z.video[1] FROM input('x') a").code is ErrorCode.UNKNOWN_ALIAS
+
+
+# ---------------------------------------------------------------------------
+# subscript_index — sqlglot rebases subscripts at parse time (INDEX_OFFSET)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sql_index", "ast_literal"),
+    [(1, "0"), (2, "1"), (3, "2"), (10, "9")],
+)
+def test_sqlglot_rebases_the_subscript_at_parse_time(sql_index: int, ast_literal: str) -> None:
+    # Guards the assumption subscript_index is built on: read="postgres" has
+    # INDEX_OFFSET = 1, so the parser stores <written index> - 1 and the
+    # generator adds it back. If sqlglot ever stops doing this, this test fails
+    # loudly instead of every subscript silently compiling off by one.
+    bracket = _projection(f"SELECT a.video[{sql_index}] FROM input('x') a")
+    assert isinstance(bracket, exp.Bracket)
+    literal = bracket.expressions[0]
+    assert isinstance(literal, exp.Literal)
+    assert literal.this == ast_literal
+    assert bracket.sql(dialect="postgres") == f"a.video[{sql_index}]"
+
+
+@pytest.mark.parametrize("sql_index", [1, 2, 7, 128])
+def test_subscript_index_undoes_the_rebase(sql_index: int) -> None:
+    bracket = _projection(f"SELECT a.audio[{sql_index}] FROM input('x') a")
+    assert isinstance(bracket, exp.Bracket)
+    assert subscript_index(bracket) == sql_index
+
+
+def test_subscript_index_of_a_bare_column_is_not_applicable() -> None:
+    # Bare a.video is a Column, never a Bracket: callers check the node type.
+    assert isinstance(_projection("SELECT a.video FROM input('x') a"), exp.Column)
+
+
+def test_subscript_index_rejects_non_literals() -> None:
+    bracket = parse("SELECT a.video[x] FROM input('x') a").expressions[0]
+    assert isinstance(bracket, exp.Bracket)
+    assert subscript_index(bracket) is None
+
+
+def test_constant_folded_subscript_is_accepted_as_its_value() -> None:
+    # KNOWN sqlglot behaviour: it simplifies the rebased index, so a.audio[1+1]
+    # is indistinguishable from a.audio[2] by the time the parser sees it.
+    # Documented rather than worked around — the result is still a valid stream.
+    bracket = _projection("SELECT a.audio[1 + 1] FROM input('x') a")
+    assert isinstance(bracket, exp.Bracket)
+    assert subscript_index(bracket) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +605,12 @@ def test_cte_body_must_be_a_select() -> None:
         "/* block */",
         "SELECT a.frame FROM input('x') a UNION ALL",
         "\x00\x01",
+        "SELECT a.video[ FROM input('x') a",
+        "SELECT a.video[] FROM input('x') a",
+        "SELECT a.video[[1]] FROM input('x') a",
+        "SELECT a.video[1 FROM input('x') a",
+        "SELECT a.video[" + "1," * 200 + "1] FROM input('x') a",
+        "SELECT " + "a.video[1], " * 200 + "a.audio[1] FROM input('x') a",
         "SELECT " + "f(" * 60 + "a.frame" + ")" * 60 + " FROM input('x') a",
     ],
 )

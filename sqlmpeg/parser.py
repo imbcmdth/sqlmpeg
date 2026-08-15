@@ -18,6 +18,16 @@ Notes for downstream passes (lower):
   for CTE bodies) to get the flat list of branch selects.
 * Identifier names are normalized the Postgres way: unquoted identifiers are
   lowercased, quoted ones are kept verbatim. ``sources`` keys are normalized.
+* The SELECT list may hold MORE THAN ONE projection (RFC-001: one column = one
+  output stream). ``SINGLE_OUTPUT_ONLY`` is retired; the parser only rejects an
+  empty projection list.
+* Stream subscripts (``a.video[1]``) arrive as ``exp.Bracket`` wrapping the
+  ``exp.Column``. **sqlglot rebases the index at parse time**: under
+  ``read="postgres"`` (``INDEX_OFFSET = 1``) it rewrites the single subscript
+  expression to ``expr - 1`` whenever it annotates it as an integer type, so
+  ``a.video[1]`` holds ``Literal(0)`` and ``a.video[0]`` holds ``Neg(Literal(1))``.
+  Never read ``Bracket.expressions[0]`` directly — use :func:`subscript_index`,
+  which undoes the rebase and hands back the 1-based number the user wrote.
 """
 
 from __future__ import annotations
@@ -31,7 +41,7 @@ from sqlglot.errors import ParseError, SqlglotError
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 
-__all__ = ["Resolved", "parse", "resolve", "union_branches"]
+__all__ = ["Resolved", "parse", "resolve", "subscript_index", "union_branches"]
 
 # A top-level (or CTE-level) query: a plain SELECT, or a UNION ALL of them.
 QueryExpr = exp.Select | exp.Union
@@ -59,12 +69,27 @@ _STREAMING_CLAUSES: dict[str, str] = {
 _SELECT_ALLOWED = frozenset({"with_", "expressions", "from_", "joins", "where"})
 _UNION_ALLOWED = frozenset({"with_", "this", "expression", "distinct"})
 _SUBQUERY_ALLOWED = frozenset({"this"})
+_BRACKET_ALLOWED = frozenset({"this", "expressions"})
+
+# The only column names an INPUT alias exposes. A CTE alias exposes whatever its
+# body named with AS, so the whitelist does not apply there (lower checks those).
+_INPUT_COLUMNS = frozenset({"frame", "video", "audio", "t"})
+
+# sqlglot's Postgres dialect INDEX_OFFSET. Parsing rebases a subscript by
+# -INDEX_OFFSET and generating adds it back; see the module docstring.
+_INDEX_OFFSET = 1
+
+_DIGITS_RE = re.compile(r"[0-9]+\Z")
 
 _WHERE_HINT = (
     "the only supported WHERE form is <alias>.t BETWEEN <start> AND <end>, "
     "optionally joined with AND"
 )
 _ALIAS_HINT = "add an alias, e.g. FROM input('clip.mp4') a"
+_SUBSCRIPT_HINT = (
+    "stream subscripts are 1-based integer literals: a.video[1] is the first "
+    "video stream"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +155,37 @@ def _ident_name(node: exp.Expr | None) -> str:
     if isinstance(node, exp.Identifier):
         return node.name if node.args.get("quoted") else node.name.lower()
     return str(node.name).lower()
+
+
+# ---------------------------------------------------------------------------
+# subscripts
+# ---------------------------------------------------------------------------
+
+
+def subscript_index(bracket: exp.Bracket) -> int | None:
+    """The 1-based stream index the user wrote, or None if it is not a literal.
+
+    sqlglot parses ``a.video[1]`` under ``read="postgres"`` into
+    ``Bracket(this=Column, expressions=[Literal(0)])`` — it subtracts the
+    dialect's ``INDEX_OFFSET`` from any subscript it annotates as an integer,
+    and its generator adds it back. This undoes that rebase, so a query written
+    ``a.video[2]`` returns ``2``.
+
+    Returns None for everything the parser rejects anyway: a missing or multiple
+    subscript, a non-integer literal (string, float, NULL, boolean), a
+    non-literal expression, and 0 or negative indices — sqlglot represents those
+    as ``exp.Neg`` after the rebase, never as a bare literal.
+    """
+    expressions = bracket.expressions
+    if len(expressions) != 1:
+        return None
+    index = expressions[0]
+    if not isinstance(index, exp.Literal) or index.is_string:
+        return None
+    text = str(index.this)
+    if not _DIGITS_RE.match(text):
+        return None
+    return int(text) + _INDEX_OFFSET
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +452,7 @@ class _Resolver:
                     ErrorCode.UNSUPPORTED_SQL,
                     "CTE column lists are not supported",
                     alias,
-                    hint="a CTE produces exactly one frame column",
+                    hint="name the CTE's columns with AS inside its SELECT",
                 )
             name = _ident_name(alias.this)
             self._reserve(name, alias.this)
@@ -439,28 +495,23 @@ class _Resolver:
     def _validate_select(self, select: exp.Select, visible: set[str]) -> None:
         _check_query_args(select, _SELECT_ALLOWED, "SELECT")
 
+        # RFC-001: the SELECT list IS the output stream list, so any number of
+        # projections is legal. Only an empty list is not.
         projections = select.expressions
-        if len(projections) > 1:
-            raise _error(
-                ErrorCode.SINGLE_OUTPUT_ONLY,
-                f"SELECT must produce exactly one frame column, got {len(projections)}",
-                projections[1],
-                fallback=select,
-                hint="split the extra columns into separate queries",
-            )
         if not projections:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL, "SELECT has no output column", fallback=select
             )
-        projection = projections[0]
-        self._check_expression(projection, select)
+        for projection in projections:
+            self._check_expression(projection, select)
 
         where = select.args.get("where")
         if isinstance(where, exp.Where):
             self._check_expression(where, select)
 
         scope = self._collect_scope(select, visible)
-        self._check_columns(projection, scope, select)
+        for projection in projections:
+            self._check_columns(projection, scope, select)
         if isinstance(where, exp.Where):
             self._check_where(where, scope, select)
 
@@ -507,6 +558,37 @@ class _Resolver:
                     fallback=select,
                     hint="select a single frame expression",
                 )
+            if isinstance(sub, exp.Bracket):
+                self._check_subscript(sub, select)
+
+    def _check_subscript(self, bracket: exp.Bracket, select: exp.Select) -> None:
+        """A subscript selects exactly one stream: ``<alias>.<column>[<int>]``."""
+        _check_query_args(bracket, _BRACKET_ALLOWED, "subscript")
+        inner = bracket.this
+        if isinstance(inner, exp.Bracket):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "chained stream subscripts are not supported",
+                bracket,
+                fallback=select,
+                hint="one subscript selects one stream, e.g. a.video[1]",
+            )
+        if not isinstance(inner, exp.Column):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "only stream columns can be subscripted",
+                bracket,
+                fallback=select,
+                hint="subscript a stream column, e.g. a.video[1]",
+            )
+        if subscript_index(bracket) is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "stream subscript must be a positive integer literal",
+                bracket,
+                fallback=select,
+                hint=_SUBSCRIPT_HINT,
+            )
 
     # -- FROM / aliases ---------------------------------------------------
 
@@ -688,13 +770,24 @@ class _Resolver:
                     hint="qualify the column with its alias, e.g. a.frame",
                 )
             name = _ident_name(table_node)
-            if name not in scope:
+            kind = scope.get(name)
+            if kind is None:
                 raise _error(
                     ErrorCode.UNKNOWN_ALIAS,
                     f"unknown alias '{name}'",
                     table_node,
                     fallback=select,
                     hint=self._known_hint(scope),
+                )
+            # An input exposes a fixed set of pseudo-columns. A CTE exposes
+            # whatever its body named with AS, so only lower can check those.
+            if kind == "input" and _ident_name(sub.this) not in _INPUT_COLUMNS:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"unknown column '{name}.{sub.name}'",
+                    sub,
+                    fallback=select,
+                    hint=f"an input exposes {', '.join(sorted(_INPUT_COLUMNS))}",
                 )
 
     def _check_where(
