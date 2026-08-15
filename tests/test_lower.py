@@ -41,10 +41,14 @@ FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
 
 
 # README ```sql blocks are dispatched by CONTENT, not by position, so moving
-# an example up or down the page does not silently re-point a test. The
-# headline names files nobody has; it is compiled against the real two-language
-# fixtures instead, which is exactly how its shown command was produced.
-_README_FIXTURE_PATHS = {"episode1.mkv": "av2.mp4", "episode2.mkv": "av3.mp4"}
+# an example up or down the page does not silently re-point a test. Both
+# examples name files nobody has; each is compiled against the real
+# two-language fixtures instead, which is exactly how its shown command was
+# produced. Two separate mappings (not one shared dict) because both examples
+# reuse the same two fixtures under different shown names -- a single
+# fixture->name mapping could not tell them apart in the reverse direction.
+_UNION_README_PATHS = {"episode1.mkv": "av2.mp4", "episode2.mkv": "av3.mp4"}
+_FLAGSHIP_README_PATHS = {"film.mkv": "av2.mp4", "commentary.mkv": "av3.mp4"}
 
 
 def _readme_text() -> str:
@@ -60,11 +64,6 @@ def _readme_block(needle: str) -> str:
     return matching[0]
 
 
-def _readme_sql() -> str:
-    """The PiP example: a CTE carrying a video column AND an audio column."""
-    return _readme_block("WITH pip")
-
-
 def _readme_union_sql() -> str:
     """The headline UNION ALL splat, re-pointed at the real fixtures.
 
@@ -74,7 +73,7 @@ def _readme_union_sql() -> str:
     that can actually be probed for its stream count.
     """
     sql = _readme_block("episode1.mkv")
-    for shown, fixture in _README_FIXTURE_PATHS.items():
+    for shown, fixture in _UNION_README_PATHS.items():
         sql = sql.replace(shown, (FIXTURES_DIR / fixture).as_posix())
     return sql
 
@@ -196,92 +195,91 @@ def test_readme_headline_command_is_the_real_compilation(_fixtures: None) -> Non
     that query, with only the fixture paths written back to the shown names."""
     args = build_ffmpeg_args(emit(compile_sql(_readme_union_sql())), "season.mkv")
     shown = shlex.join(args)
-    for name, fixture in _README_FIXTURE_PATHS.items():
+    for name, fixture in _UNION_README_PATHS.items():
         shown = shown.replace((FIXTURES_DIR / fixture).as_posix(), name)
     assert shown in _readme_text(), shown
 
 
 # ---------------------------------------------------------------------------
-# the README PiP example (v0 compat: `frame` sugar still compiles)
+# the README flagship: PiP composite + broadcast-zip mix (plan 024)
 # ---------------------------------------------------------------------------
 
 
-def test_readme_example_lowers_to_expected_nodes() -> None:
-    """The flagship PiP example: a CTE carrying video AND audio columns."""
-    g = compile_sql(_readme_sql())
-    assert g.to_dict() == {
-        "inputs": ["game.mp4", "game.mp4"],
-        # CTEs are traversed first, so the CTE's alias `b` takes input 0.
-        "sources": {"b": 0, "a": 1},
-        "nodes": [
-            {
-                "id": "n1",
-                "filter": "crop",
-                "args": {"w": 600, "h": 200, "x": 1200, "y": 50},
-                "inputs": ["src:b:v:0"],
-                "outputs": ["video"],
-            },
-            {
-                "id": "n2",
-                "filter": "scale",
-                "args": {"w": "iw*0.5", "h": "-2"},
-                "inputs": ["n1"],
-                "outputs": ["video"],
-            },
-            {
-                "id": "n3",
-                "filter": "overlay",
-                "args": {"x": 20, "y": 20},
-                "inputs": ["src:a:v:0", "n2"],
-                "outputs": ["video"],
-            },
-            {
-                "id": "n4",
-                "filter": "volume",
-                "args": {"volume": 0.65},
-                "inputs": ["src:a:a:0"],
-                "outputs": ["audio"],
-            },
-            {
-                "id": "n5",
-                "filter": "volume",
-                "args": {"volume": 0.35},
-                "inputs": ["src:b:a:0"],
-                "outputs": ["audio"],
-            },
-            {
-                "id": "n6",
-                "filter": "amix",
-                "args": {"inputs": 2},
-                "inputs": ["n4", "n5"],
-                "outputs": ["audio"],
-            },
-        ],
-        "outputs": [
-            {"ref": "n3", "type": "video", "name": None, "metadata": {}},
-            {"ref": "n6", "type": "audio", "name": None, "metadata": {}},
-        ],
-    }
+def _readme_flagship_sql() -> str:
+    """The headline: a CTE carrying a video column AND a whole audio array,
+    re-pointed at the real fixtures (film=av2, commentary=av3).
+
+    `c.audio` (in the CTE) and `f.audio` (in the outer `volume()` calls) are
+    both bare arrays -- broadcasting them needs a real, readable file to know
+    how many streams there are, same reason the union-splat example below
+    needs one.
+    """
+    sql = _readme_block("commentary")
+    for shown, fixture in _FLAGSHIP_README_PATHS.items():
+        sql = sql.replace(shown, (FIXTURES_DIR / fixture).as_posix())
+    return sql
 
 
-def test_readme_example_selects_its_two_streams_explicitly() -> None:
-    """The SELECT list is the output list: one video column, one mixed audio
-    column, and nothing implicit."""
-    g = compile_sql(_readme_sql())
-    assert [o.type for o in g.outputs] == ["video", "audio"]
+@pytest.mark.exec
+def test_readme_flagship_lowers_to_expected_nodes(_fixtures: None) -> None:
+    """scale->overlay composites the video; volume broadcasts over each
+    2-track audio array (4 nodes) and amix zips the pairs (2 nodes)."""
+    g = compile_sql(_readme_flagship_sql())
+    assert _filters(g) == [
+        "scale", "overlay", "volume", "volume", "volume", "volume", "amix", "amix",
+    ]
+    # CTEs are traversed first, so the CTE's alias `c` takes input 0.
+    assert g.sources == {"c": 0, "f": 1}
+    assert g.nodes["n2"].inputs == ["src:f:v:0", "n1"]  # overlay(f.frame, pip.frame, ...)
+    # amix zips f.audio[k]*0.65 with c.audio[k]*0.35, one pair per language
+    assert g.nodes["n7"].inputs == ["n3", "n5"]
+    assert g.nodes["n8"].inputs == ["n4", "n6"]
 
 
-def test_readme_example_emits_a_filtergraph() -> None:
-    e = emit(compile_sql(_readme_sql()))
-    assert "crop=" in e.filter_complex
+@pytest.mark.exec
+def test_readme_flagship_selects_its_three_streams(_fixtures: None) -> None:
+    """The SELECT list is the output list: one composited video column, and
+    the zipped mix broadcasts into one audio column per language."""
+    g = compile_sql(_readme_flagship_sql())
+    assert [o.type for o in g.outputs] == ["video", "audio", "audio"]
+
+
+@pytest.mark.exec
+def test_readme_flagship_amix_pairs_keep_the_agreed_language(_fixtures: None) -> None:
+    """Deliverable 1: a multi-stream call threads provenance when every zipped
+    input agrees. Both fixtures tag audio[1]=eng, audio[2]=fra, so each mixed
+    pair keeps its language; the composited video has no tag on either side
+    (probed, untagged video streams) for `overlay` to agree on."""
+    g = compile_sql(_readme_flagship_sql())
+    assert [o.metadata for o in g.outputs] == [
+        {},
+        {"language": "eng"},
+        {"language": "fra"},
+    ]
+
+
+@pytest.mark.exec
+def test_readme_flagship_emits_a_filtergraph(_fixtures: None) -> None:
+    e = emit(compile_sql(_readme_flagship_sql()))
+    assert "scale=" in e.filter_complex
     assert "overlay=" in e.filter_complex
     assert "amix=" in e.filter_complex
-    assert e.inputs == ["game.mp4", "game.mp4"]
-    assert [m.target for m in e.maps] == ["[out0]", "[out1]"]
-    assert [m.copy for m in e.maps] == [False, False]
+    assert [m.target for m in e.maps] == ["[out0]", "[out1]", "[out2]"]
+    assert [m.copy for m in e.maps] == [False, False, False]
 
 
-def test_readme_example_scale_factor_is_not_a_decimal() -> None:
+@pytest.mark.exec
+def test_readme_flagship_command_is_the_real_compilation(_fixtures: None) -> None:
+    """The command shown under the headline is what sqlmpeg actually prints for
+    that query, with only the fixture paths written back to the shown names."""
+    args = build_ffmpeg_args(emit(compile_sql(_readme_flagship_sql())), "pip.mkv")
+    shown = shlex.join(args)
+    for name, fixture in _FLAGSHIP_README_PATHS.items():
+        shown = shown.replace((FIXTURES_DIR / fixture).as_posix(), name)
+    assert shown in _readme_text(), shown
+
+
+def test_readme_flagship_scale_factor_is_not_a_decimal() -> None:
     """``Literal.to_py()`` yields Decimal for 0.5; the IR must carry float."""
     g = _lower("SELECT scale(a.frame, 0.5, 0.25) FROM input('x.mp4') a")
     args = g.nodes["n1"].args
@@ -600,8 +598,25 @@ def test_provenance_survives_the_where_trim() -> None:
     assert g.outputs[0].metadata == {"language": "fra"}
 
 
-def test_amix_breaks_provenance() -> None:
-    """Two stream inputs = no single source; the mix is nobody's language."""
+def test_amix_keeps_provenance_both_inputs_agree_on() -> None:
+    """Plan 024: a multi-stream call is a join like concat -- it threads the
+    tag when every stream feeding it agrees, so mixing two English tracks
+    yields an English track."""
+    g = _lower(
+        "SELECT amix(a.audio[1], a.audio[2]) FROM input('x.mp4') a",
+        {
+            "a": _probe_result(
+                audios=2, per_audio_tags=[{"language": "eng"}, {"language": "eng"}]
+            )
+        },
+    )
+    assert _filters(g) == ["amix"]
+    assert g.outputs[0].metadata == {"language": "eng"}
+
+
+def test_amix_drops_provenance_its_two_inputs_disagree_on() -> None:
+    """f.audio[1]=eng mixed with f.audio[2]=fra: two stream inputs that say
+    different things have nothing in common to thread."""
     g = _lower(
         "SELECT amix(a.audio[1], a.audio[2]) FROM input('x.mp4') a",
         {
@@ -612,6 +627,23 @@ def test_amix_breaks_provenance() -> None:
     )
     assert _filters(g) == ["amix"]
     assert g.outputs[0].metadata == {}
+
+
+def test_broadcast_through_amix_keeps_each_pairs_agreed_language() -> None:
+    """The flagship shape: two 2-track sources tagged eng/fra alike, zipped by
+    amix -- each pair keeps the language both sides of it agree on."""
+    g = _lower(
+        "SELECT amix(a.audio, b.audio) FROM input('x.mp4') a, input('y.mp4') b",
+        {
+            "a": _probe_result(
+                audios=2, per_audio_tags=[{"language": "eng"}, {"language": "fra"}]
+            ),
+            "b": _probe_result(
+                audios=2, per_audio_tags=[{"language": "eng"}, {"language": "fra"}]
+            ),
+        },
+    )
+    assert [o.metadata for o in g.outputs] == [{"language": "eng"}, {"language": "fra"}]
 
 
 def test_broadcast_through_amix_drops_every_elements_provenance() -> None:
@@ -721,17 +753,37 @@ def test_concat_provenance_survives_a_filtered_segment() -> None:
 
 
 def test_concat_after_amix_carries_no_metadata() -> None:
-    """A mixed segment has no source at all, so the pad cannot agree with the
-    other one whatever it says."""
+    """`a`'s two mixed tracks disagree (eng vs fra), so the amix segment has
+    no source at all and the pad cannot agree with the other one whatever it
+    says."""
     g = _lower(
         "SELECT amix(a.audio[1], a.audio[2]) FROM input('x.mp4') a "
         "UNION ALL SELECT b.audio[1] FROM input('y.mp4') b",
         {
-            "a": _probe_result(audios=2, audio_tags={"language": "eng"}),
+            "a": _probe_result(
+                audios=2, per_audio_tags=[{"language": "eng"}, {"language": "fra"}]
+            ),
             "b": _probe_result(audio_tags={"language": "eng"}),
         },
     )
     assert g.outputs[0].metadata == {}
+
+
+def test_concat_after_agreeing_amix_keeps_the_shared_language() -> None:
+    """Plan 024: `a`'s two mixed tracks agree (eng and eng), so the amix
+    segment threads that language into the concat pad, and the other segment
+    agrees too -- the tag survives two joins deep."""
+    g = _lower(
+        "SELECT amix(a.audio[1], a.audio[2]) FROM input('x.mp4') a "
+        "UNION ALL SELECT b.audio[1] FROM input('y.mp4') b",
+        {
+            "a": _probe_result(
+                audios=2, per_audio_tags=[{"language": "eng"}, {"language": "eng"}]
+            ),
+            "b": _probe_result(audio_tags={"language": "eng"}),
+        },
+    )
+    assert g.outputs[0].metadata == {"language": "eng"}
 
 
 # ---------------------------------------------------------------------------
@@ -1208,6 +1260,41 @@ def test_overlay_arity_error_is_still_typed() -> None:
     assert "overlay(video, video, num, num)" in err.message
 
 
+def test_overlay_keeps_the_agreed_video_tag() -> None:
+    """Plan 024: overlay is a multi-stream join exactly like amix -- when both
+    probed video streams it composites agree on a tag, the composite keeps
+    it. (Use the same file under two aliases, same as the README headline.)"""
+    g = _lower(
+        "SELECT overlay(a.frame, b.frame, 0, 0) FROM input('x.mp4') a, input('y.mp4') b",
+        {
+            "a": _probe_result(video_tags={"language": "eng"}),
+            "b": _probe_result(video_tags={"language": "eng"}),
+        },
+    )
+    assert g.outputs[0].metadata == {"language": "eng"}
+
+
+def test_overlay_drops_provenance_its_two_inputs_disagree_on() -> None:
+    g = _lower(
+        "SELECT overlay(a.frame, b.frame, 0, 0) FROM input('x.mp4') a, input('y.mp4') b",
+        {
+            "a": _probe_result(video_tags={"language": "eng"}),
+            "b": _probe_result(video_tags={"language": "fra"}),
+        },
+    )
+    assert g.outputs[0].metadata == {}
+
+
+def test_overlay_drops_provenance_when_one_side_is_unprobed() -> None:
+    """One input could not be probed at all, so it has no source to agree
+    with the other -- same rule an unprobed concat segment follows."""
+    g = _lower(
+        "SELECT overlay(a.frame, b.frame, 0, 0) FROM input('x.mp4') a, input('y.mp4') b",
+        {"a": _probe_result(video_tags={"language": "eng"}), "b": None},
+    )
+    assert g.outputs[0].metadata == {}
+
+
 def test_a_colliding_builtin_is_an_unknown_function() -> None:
     err = _reject("SELECT trim(a.frame) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
@@ -1373,8 +1460,9 @@ def test_lower_wraps_unexpected_exceptions_as_internal(
     assert excinfo.value.code is ErrorCode.INTERNAL
 
 
-def test_pipeline_output_survives_a_round_trip_through_dicts() -> None:
-    g = compile_sql(_readme_sql())
+@pytest.mark.exec
+def test_pipeline_output_survives_a_round_trip_through_dicts(_fixtures: None) -> None:
+    g = compile_sql(_readme_flagship_sql())
     assert Graph.from_dict(g.to_dict()).to_dict() == g.to_dict()
 
 

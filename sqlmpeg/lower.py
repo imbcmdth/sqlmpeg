@@ -58,11 +58,12 @@ Provenance: a stream derived 1:1 from one probed source stream — a passthrough
 or a chain of single-stream-input calls, WHERE trims included — carries that
 stream's language/title tags into ``Output.metadata`` (an ffmpeg-stamped
 ``language=und`` carries no information and is dropped), so a broadcast
-``reverb(a.audio, 0.3)`` keeps every track's language tag. Anything that mixes
-two streams (``amix``, ``overlay``) breaks the chain and its outputs carry no
-metadata. A ``concat`` pad is the one join that can survive: it keeps the tags
-when EVERY segment feeding that pad carries the same non-empty ones, so
-concatenating two multi-language sources keeps each output track's language.
+``reverb(a.audio, 0.3)`` keeps every track's language tag. A call over two or
+more streams (``amix``, ``overlay``) and a ``concat`` pad (fed by one stream
+per UNION ALL segment) are the other kind of join: each threads the tag only
+when EVERY stream feeding it carries the same non-empty one, so mixing two
+English tracks keeps ``language=eng``, but mixing English with French, or with
+an untagged stream, keeps neither. Same rule, one function: ``_agreed_source``.
 
 Node ids are ``n1, n2, ...`` in creation order across the whole graph, minted
 by :class:`_NodeFactory`, the :class:`sqlmpeg.stdlib.ExpandCtx` implementation.
@@ -284,11 +285,12 @@ class _Stream:
 
     `source` is the probed :class:`~sqlmpeg.probe.StreamMeta` this stream comes
     from 1:1 — directly (a passthrough subscript) or through a chain of
-    single-stream-input filters, the WHERE trim included. It is None as soon as
-    the input was not probed or the value mixes streams (``amix``,
-    ``overlay``). A ``concat`` pad keeps it only when every segment feeding
-    that pad agrees on what it says (:func:`_agreed_source`).
-    :func:`_provenance` turns it into ``Output.metadata``.
+    single-stream-input filters, the WHERE trim included — and is threaded
+    unconditionally. A call over two or more streams (``amix``, ``overlay``)
+    and a ``concat`` pad are the other kind of join: each keeps `source` only
+    when every stream feeding it agrees on what it says (:func:`_agreed_source`);
+    otherwise it is None, same as an unprobed input. :func:`_provenance` turns
+    it into ``Output.metadata``.
     """
 
     ref: FrameRef
@@ -1069,7 +1071,7 @@ class _Lowerer:
                 literals[position] = _string(arg)
 
         length = self._zip_length(name, node, arg_nodes, streams, select)
-        origin = _sole_stream_position(variant)
+        positions = _stream_positions(variant)
         expanded: list[_Stream] = []
         for element in range(1 if length is None else length):
             values: list[object] = [
@@ -1078,10 +1080,17 @@ class _Lowerer:
                 else literals[position]
                 for position in range(len(variant))
             ]
-            # A single-stream-input function is 1:1, so its result inherits the
-            # provenance of its one input; anything taking two streams (amix,
-            # overlay) mixes sources and carries none.
-            source = None if origin is None else streams[origin].at(element).source
+            # A single-stream-input function is 1:1, so its result inherits
+            # that one input's provenance unconditionally. A call over two or
+            # more streams (amix, overlay) is a join like concat's: it threads
+            # provenance only when every input stream agrees (_agreed_source)
+            # -- mixing two English tracks yields an English track.
+            if len(positions) == 1:
+                source = streams[positions[0]].at(element).source
+            elif len(positions) >= 2:
+                source = _agreed_source([streams[p].at(element) for p in positions])
+            else:
+                source = None
             expanded.append(
                 _Stream(ref=spec.expand(self.ctx, values), type=spec.returns, source=source)
             )
@@ -1169,10 +1178,11 @@ def _provenance(stream: _Stream) -> dict[str, str]:
     """Language/title tags of the source stream an output is derived 1:1 from.
 
     `_Stream.source` is what threads them: it survives a passthrough, the WHERE
-    trim, any chain of single-stream-input calls and a concat whose segments
-    agree (:func:`_agreed_source`), and is dropped by anything that mixes
-    streams. ``language=und`` is what an mp4 muxer stamps on an untagged
-    stream, so it carries no information and is not copied.
+    trim, and any chain of single-stream-input calls unconditionally; a call
+    over two or more streams (``amix``, ``overlay``) and a concat pad thread it
+    only when every stream feeding them agrees (:func:`_agreed_source`).
+    ``language=und`` is what an mp4 muxer stamps on an untagged stream, so it
+    carries no information and is not copied.
     """
     source = stream.source
     if source is None:
@@ -1189,16 +1199,18 @@ def _provenance(stream: _Stream) -> dict[str, str]:
 
 
 def _agreed_source(segments: list[_Stream]) -> StreamMeta | None:
-    """The provenance one concat pad inherits from the segments feeding it.
+    """The provenance an N:1 join inherits from the streams feeding it.
 
-    `segments` is that pad's input stream, one per UNION ALL branch, in branch
-    order. Concatenation is 1:N, so the result is only still "that stream" when
-    every segment says the SAME thing about it: the comparison is on the
-    FILTERED provenance dicts, not on the raw ``StreamMeta``, so two segments
-    that differ in sample rate or index but agree on ``language=fra`` do agree,
-    and two "und"-tagged segments both filter down to ``{}`` — nothing to say,
-    so nothing survives. Any disagreement, or an empty dict, gives None, which
-    is what every concat used to return.
+    Used by both kinds of join that take more than one input stream: a concat
+    pad (`segments` is one stream per UNION ALL branch, in branch order) and a
+    multi-stream call like ``amix``/``overlay`` (`segments` is its stream
+    arguments, in argument order, one element already picked out of each). The
+    result is only still "that stream" when every segment says the SAME thing
+    about it: the comparison is on the FILTERED provenance dicts, not on the
+    raw ``StreamMeta``, so two segments that differ in sample rate or index but
+    agree on ``language=fra`` do agree, and two "und"-tagged segments both
+    filter down to ``{}`` — nothing to say, so nothing survives. Any
+    disagreement, or an empty dict, gives None.
 
     The first segment's ``StreamMeta`` is what gets threaded: it and the others
     render identically, and it keeps ``_Stream.source`` a real probed stream.
@@ -1243,10 +1255,9 @@ def _is_single_video_column(binding: _CteBinding) -> bool:
     return value.type == "video" and not value.is_array
 
 
-def _sole_stream_position(variant: tuple[Param, ...]) -> int | None:
-    """The index of the ONE stream parameter of `variant`, or None if it has 2+."""
-    positions = [i for i, param in enumerate(variant) if param.kind in ("video", "audio")]
-    return positions[0] if len(positions) == 1 else None
+def _stream_positions(variant: tuple[Param, ...]) -> list[int]:
+    """Every parameter position of `variant` whose kind is a stream type, in order."""
+    return [i for i, param in enumerate(variant) if param.kind in ("video", "audio")]
 
 
 def _sql_text(node: exp.Expr) -> str:

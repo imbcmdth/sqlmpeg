@@ -292,3 +292,42 @@ def test_union_splat_concatenates_both_language_tracks(tmp_path: Path) -> None:
     assert _ffprobe_duration(out_path) == pytest.approx(
         _ffprobe_duration(_AV2) + _ffprobe_duration(_AV3), abs=0.3
     )
+
+
+# ---------------------------------------------------------------------------
+# PiP composite + broadcast-zip mix: the plan 024 flagship, end to end
+# ---------------------------------------------------------------------------
+
+
+def test_pip_mix_flagship_composites_video_and_keeps_both_language_tags(
+    tmp_path: Path,
+) -> None:
+    """The README headline, end to end.
+
+    `pip` scales commentary down and `overlay`s it onto the film; `volume`
+    broadcasts over each file's 2-track audio array and `amix` zips the pairs,
+    English with English and French with French. The composited video output
+    stays the base film's size (the PiP shrinks, not the frame it lands on);
+    both mixed audio outputs keep the language both zipped sides agree on.
+    """
+    _require_fixture(_AV2)
+    _require_fixture(_AV3)
+    out_path = tmp_path / "pip.mp4"
+    query = (
+        "WITH pip AS ("
+        f"  SELECT scale(c.frame, 0.25) AS frame, c.audio AS sound "
+        f"  FROM input('{_sql_path(_AV3)}') c"
+        ") "
+        "SELECT overlay(f.frame, pip.frame, 20, 20), "
+        "       amix(volume(f.audio, 0.65), volume(pip.sound, 0.35)) "
+        f"FROM input('{_sql_path(_AV2)}') f, pip"
+    )
+
+    _compile_and_run(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["video", "audio", "audio"]
+    assert [s.get("tags", {}).get("language") for s in streams[1:]] == ["eng", "fra"]
+
+    video = _ffprobe_video_stream(out_path)
+    assert (video["width"], video["height"]) == (_SRC_WIDTH, _SRC_HEIGHT)

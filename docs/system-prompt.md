@@ -68,6 +68,9 @@ statement is not. `--` and `/* */` comments are allowed.
   subscripted single stream) always broadcasts and never triggers that check.
 - Every broadcast-expanded output stream automatically keeps its source
   stream's `language`/`title` tag in the compiled command.
+- A call over two or more streams (`amix`, `overlay`) is a mix, not a
+  passthrough: a zipped mix keeps a tag only when every zipped input agrees
+  on it, e.g. `amix` over two English tracks keeps `language=eng`.
 - `<cte>.<name>` for an array-valued CTE column behaves exactly like an
   input's `<alias>.video` / `<alias>.audio`: splat it, broadcast a function
   over it, or subscript one element with `<cte>.<name>[k]`.
@@ -286,6 +289,18 @@ Play episode1.mkv then episode2.mkv as one file, keeping every language track of
 SELECT a.frame, a.audio FROM input('episode1.mkv') a
 UNION ALL
 SELECT b.frame, b.audio FROM input('episode2.mkv') b
+```
+
+Put a quarter-size picture-in-picture copy of commentary.mkv in the corner of film.mkv, and mix every language track of both under it, the film at 65% and the commentary at 35%.
+
+```sql-probed
+WITH pip AS (
+  SELECT scale(c.frame, 0.25) AS frame, c.audio AS sound
+  FROM input('commentary.mkv') c
+)
+SELECT overlay(f.frame, pip.frame, 20, 20),
+       amix(volume(f.audio, 0.65), volume(pip.sound, 0.35))
+FROM input('film.mkv') f, pip
 ```
 
 ## Repair loop

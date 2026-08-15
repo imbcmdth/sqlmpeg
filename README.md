@@ -6,7 +6,26 @@ A standalone CLI that compiles SQL into an ffmpeg `-filter_complex` invocation. 
 
 ## Example
 
-Two dual-language episodes, played back to back. Each branch splats `<alias>.audio` -- the whole audio array, not one track -- so `UNION ALL`'s column matching pairs the streams up for you: video with video, English with English, French with French.
+A picture-in-picture composite: `commentary.mkv` shrinks into the corner of `film.mkv`, and every language track of both gets mixed under it. The CTE carries a video column AND a whole audio array; `volume` broadcasts over that array, one node per language track; `amix` zips the two arrays elementwise -- English with English, French with French -- so one query composites the video and mixes every language:
+
+```sql
+WITH pip AS (
+  SELECT scale(c.frame, 0.25) AS frame, c.audio AS sound
+  FROM input('commentary.mkv') c
+)
+SELECT overlay(f.frame, pip.frame, 20, 20),
+       amix(volume(f.audio, 0.65), volume(pip.sound, 0.35))
+FROM input('film.mkv') f, pip
+```
+
+```
+$ sqlmpeg run query.sql -o pip.mkv
+ffmpeg -i commentary.mkv -i film.mkv -filter_complex '[0:v:0]scale=w=iw*0.25:h=-2[n1];[1:v:0][n1]overlay=x=20:y=20[out0];[1:a:0]volume=volume=0.65[n3];[1:a:1]volume=volume=0.65[n4];[0:a:0]volume=volume=0.35[n5];[0:a:1]volume=volume=0.35[n6];[n3][n5]amix=inputs=2[out1];[n4][n6]amix=inputs=2[out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra pip.mkv
+```
+
+Both `amix` pairs mix one language with itself across the two sources, so each keeps that language's tag; the composited video carries none -- `overlay` mixes two streams too, and here neither side has a tag to agree on.
+
+A second example -- two dual-language episodes, played back to back. Each branch splats `<alias>.audio` -- the whole audio array, not one track -- so `UNION ALL`'s column matching pairs the streams up for you: video with video, English with English, French with French.
 
 ```sql
 SELECT a.frame, a.audio FROM input('episode1.mkv') a
@@ -20,24 +39,6 @@ ffmpeg -i episode1.mkv -i episode2.mkv -filter_complex '[0:v:0][0:a:0][0:a:1][1:
 ```
 
 That is the whole point of the frontend: SQL already demands that `UNION ALL` branches agree on column count, types and order, and that demand IS ffmpeg's concat segment contract -- `concat=n=2:v=1:a=2`, its inputs interleaved segment by segment. Arrays are no exception; two three-track episodes give `a=3` and nobody counts pads by hand. The `language` tags survive the concat because both segments agree on them.
-
-A second example -- a picture-in-picture overlay, with the two clips' audio pairwise mixed under it. The CTE carries a video column AND an audio column, and the outer SELECT list is the two-stream output:
-
-```sql
-WITH pip AS (
-  SELECT scale(crop(b.frame, 1200, 50, 600, 200), 0.5) AS frame,
-         b.audio[1] AS sound
-  FROM input('game.mp4') b
-)
-SELECT overlay(a.frame, pip.frame, 20, 20),
-       amix(volume(a.audio[1], 0.65), volume(pip.sound, 0.35))
-FROM input('game.mp4') a, pip
-```
-
-```
-$ sqlmpeg run query.sql -o out.mp4
-ffmpeg -i game.mp4 -i game.mp4 -filter_complex '[0:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];[1:v:0][n2]overlay=x=20:y=20[out0];[1:a:0]volume=volume=0.65[n4];[0:a:0]volume=volume=0.35[n5];[n4][n5]amix=inputs=2[out1]' -map '[out0]' -map '[out1]' out.mp4
-```
 
 ## Streams
 
