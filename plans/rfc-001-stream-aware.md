@@ -62,16 +62,30 @@ by construction. `UDF_ARG_TYPE` messages already carry the shape
    (Breaking vs v0 behavior; acceptable pre-release, loud README note. `frame`
    sugar does NOT re-add implicit audio.)
 
-## Probing policy
+## Probing policy (revised 2026-08-15: probe by default, degrade gracefully)
 
-- Explicit subscripts compile symbolically (no ffprobe, compile stays offline,
-  file need not exist) — ffmpeg errors at runtime if absent. Matches v0's
-  "trusts declared usage".
-- `SELECT *` and bare-array splats need the real stream list → require probing:
-  automatic in `run`, opt-in via `compile --probe` / `validate --probe`.
-- New error codes: `PROBE_REQUIRED` (splat/* without probe), `STREAM_NOT_FOUND`
-  (probed and missing). Probing also activates `CONCAT_MISMATCH` (fps/res/
-  sample-rate checks) and enables warning on subscripts past the probed count.
+Probing is not a mode and there is no PROBE_REQUIRED error. Every compile
+probes opportunistically and falls back to symbolic lowering when it cannot:
+
+- **Probe when possible:** local file exists AND ffprobe is on PATH. Results
+  cached per (path, mtime, size). Probing only ADDS validation — subscript
+  bounds (`STREAM_NOT_FOUND`, line-anchored), real `CONCAT_MISMATCH`
+  (fps/resolution/sample-rate) — and RESOLVES `SELECT *` / bare-array splats.
+  It never changes the lowering of explicit subscripts (`a.audio[2]` is
+  `0:a:1` either way), so golden IR stays deterministic.
+- **Fall back silently when not:** file missing, input is a URL (never fetch
+  the network inside compile), or no ffprobe. Explicit-subscript queries
+  compile to the same command; ffmpeg validates at runtime. This keeps
+  compile-offline, the golden suite (nonexistent fixture paths), and the fuzz
+  corpus (garbage paths, thousands of compiles) all working.
+- `SELECT *` / splats on an unprobeable input fail with plain
+  `INPUT_NOT_FOUND` — "cannot enumerate streams of a file I cannot read" is a
+  natural error, not a policy error.
+- `run` probes by construction (files must exist to execute), so the LLM
+  validate-loop sees `STREAM_NOT_FOUND` at line/col instead of an ffmpeg
+  runtime failure.
+- Guardrail #1 update: compile never REQUIRES ffprobe, but uses it when
+  available. `--no-probe` escape hatch for byte-reproducible offline compiles.
 
 ## Examples
 
