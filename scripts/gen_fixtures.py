@@ -36,6 +36,8 @@ _SOURCES: dict[str, str] = {
     "smptebars.mp4": f"smptebars=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
 }
 
+_AV_NAME = "av.mp4"
+
 
 def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
@@ -65,12 +67,43 @@ def _generate(name: str, lavfi: str) -> None:
         raise SystemExit(f"ffmpeg failed generating {out_path}")
 
 
+def _generate_av() -> None:
+    """testsrc2 video + sine audio -- the only fixture with an audio stream."""
+    out_path = FIXTURES_DIR / _AV_NAME
+    if out_path.exists():
+        print(f"skip (already exists): {out_path}")
+        return
+    FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
+    args = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc2=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
+        "-f",
+        "lavfi",
+        "-i",
+        f"sine=frequency=440:duration={_DURATION}",
+        "-pix_fmt",
+        "yuv420p",
+        "-shortest",
+        str(out_path),
+    ]
+    print(f"generating: {out_path}")
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(result.stderr, file=sys.stderr)
+        raise SystemExit(f"ffmpeg failed generating {out_path}")
+
+
 def main() -> int:
     if not _ffmpeg_available():
         print("error: ffmpeg not found on PATH", file=sys.stderr)
         return 1
     for name, lavfi in _SOURCES.items():
         _generate(name, lavfi)
+    _generate_av()
     return 0
 
 
