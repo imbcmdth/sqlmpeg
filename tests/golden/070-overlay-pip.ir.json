@@ -1,0 +1,36 @@
+{
+  "inputs": [
+    "main.mp4",
+    "logo.mp4"
+  ],
+  "sources": {
+    "a": 0,
+    "b": 1
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "filter": "scale",
+      "args": {
+        "w": "iw*0.3",
+        "h": "-2"
+      },
+      "inputs": [
+        "src:b"
+      ]
+    },
+    {
+      "id": "n2",
+      "filter": "overlay",
+      "args": {
+        "x": 50,
+        "y": 50
+      },
+      "inputs": [
+        "src:a",
+        "n1"
+      ]
+    }
+  ],
+  "output": "n2"
+}

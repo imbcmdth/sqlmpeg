@@ -1,0 +1,7 @@
+{
+  "line": 1,
+  "col": 17,
+  "code": "SINGLE_OUTPUT_ONLY",
+  "message": "SELECT must produce exactly one frame column, got 2",
+  "hint": "split the extra columns into separate queries"
+}

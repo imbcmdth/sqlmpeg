@@ -1,0 +1,35 @@
+{
+  "inputs": [
+    "clip.mp4"
+  ],
+  "sources": {
+    "a": 0
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "filter": "crop",
+      "args": {
+        "w": 300,
+        "h": 400,
+        "x": 10,
+        "y": 20
+      },
+      "inputs": [
+        "src:a"
+      ]
+    },
+    {
+      "id": "n2",
+      "filter": "scale",
+      "args": {
+        "w": 640,
+        "h": 480
+      },
+      "inputs": [
+        "n1"
+      ]
+    }
+  ],
+  "output": "n2"
+}

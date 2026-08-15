@@ -1,0 +1,43 @@
+{
+  "inputs": [
+    "clip.mp4"
+  ],
+  "sources": {
+    "a": 0
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "filter": "trim",
+      "args": {
+        "start": 1,
+        "end": 5
+      },
+      "inputs": [
+        "src:a"
+      ]
+    },
+    {
+      "id": "n2",
+      "filter": "setpts",
+      "args": {
+        "expr": "PTS-STARTPTS"
+      },
+      "inputs": [
+        "n1"
+      ]
+    },
+    {
+      "id": "n3",
+      "filter": "scale",
+      "args": {
+        "w": "iw*2",
+        "h": "-2"
+      },
+      "inputs": [
+        "n2"
+      ]
+    }
+  ],
+  "output": "n3"
+}

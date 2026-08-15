@@ -1,0 +1,26 @@
+{
+  "inputs": [
+    "one.mp4",
+    "two.mp4"
+  ],
+  "sources": {
+    "a": 0,
+    "b": 1
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "filter": "concat",
+      "args": {
+        "n": 2,
+        "v": 1,
+        "a": 0
+      },
+      "inputs": [
+        "src:a",
+        "src:b"
+      ]
+    }
+  ],
+  "output": "n1"
+}
