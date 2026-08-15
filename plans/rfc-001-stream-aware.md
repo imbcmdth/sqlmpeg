@@ -23,9 +23,9 @@ output stream; column order = output stream order = `-map` order.
   1-based per Postgres array semantics; docs map to ffmpeg's 0-based `0:v:0`.
 - `a.frame` remains as sugar for `a.video[1]` (v0 compat; every v0 query still
   compiles).
-- Bare `a.video` / `a.audio` (whole array) is legal ONLY splatted directly in a
-  SELECT list, meaning "all streams of that type, in order". Arrays never appear
-  as function arguments (contains the type-system blast radius).
+- Bare `a.video` / `a.audio` is the whole array. Legal splatted in a SELECT
+  list ("all streams of that type, in order") AND as a function argument, where
+  it broadcasts (see Broadcasting below).
 - `SELECT *` = all streams of the input(s) in file order (requires probing, see
   below).
 - Rejected: `#0_0`-style stream refs and `SELECT * EXCEPT (...)` — neither
@@ -39,6 +39,36 @@ output stream; column order = output stream order = `-map` order.
 `amix(a, b)`, `atempo(a, factor)`, `afade_in/afade_out`, `acopy`-free passthrough
 by construction. `UDF_ARG_TYPE` messages already carry the shape
 (`amix() expects (audio, audio), got (audio, video)`).
+
+## Broadcasting (added 2026-08-15)
+
+Passing an array where a function expects a scalar stream maps the call over
+every element — a spread that happens AT LOWER TIME, so the IR, split pass, and
+emit never see arrays; each element gets its own scalar subgraph. The feature
+is entirely frontend: type checker + lowering walk.
+
+- Elementwise: `reverb(a.audio, 0.3)` : `audio[]` — one aecho subgraph per
+  source audio stream. `num`/`str` args apply unchanged to every element.
+  Nesting composes: `volume(reverb(a.audio, 0.3), 0.5)` : `audio[]`.
+- Multiple arrays zip elementwise; length mismatch is a typed, line-anchored
+  `BROADCAST_MISMATCH` ("a.audio has 3 streams, b.audio has 2"). No cross
+  products. Scalar + array mixes broadcast the scalar.
+- Requires a probeable input (need N to expand): joins `SELECT *` in the
+  needs-readable-input tier of the probing matrix; on the symbolic fallback
+  path it fails with the same natural `INPUT_NOT_FOUND`.
+- CTE columns carry types, arrays included: `WITH dubbed AS (SELECT
+  reverb(a.audio, 0.3) AS aud ...)` gives `dubbed.aud : audio[]` — splat it,
+  broadcast over it again, or subscript it (`dubbed.aud[2]`). Subscripting is
+  one rule: positional selection on ANY array-typed column, physical or
+  computed. (This resolves the multi-column-CTE open question: CTE columns are
+  named by their AS aliases; subscripts work wherever the type is an array.)
+- Provenance metadata: broadcast-expanded outputs know their source stream, so
+  emit adds `-metadata:s:<out> language=...` (etc.) automatically from the
+  probe — filtered streams keep their language tags, which raw ffmpeg drops.
+  Headline use case: `reverb(a.audio, 0.3)` processes every language track and
+  each output stays tagged.
+- UNION ALL branches with array columns must agree on element count (probed);
+  mismatch is `CONCAT_MISMATCH`.
 
 ## Semantics that fall out
 
@@ -113,15 +143,17 @@ FROM input('talk.mp4') v, input('music.mp3') m
 
 ## Open questions
 
-- Column aliases (`AS eng_audio`) → `-metadata:s:<n> title=`? Nice, deferrable.
-- CTEs with multi-column bodies: a CTE becomes a named record of streams;
-  `pip.video[1]` vs single-column CTEs keeping bare `pip.frame`. Needs a rule
-  for referencing CTE columns (probably: CTE column names come from the SELECT
-  aliases, referenced as `cte.name`; subscripts only on inputs).
+- Column aliases (`AS eng_audio`) → `-metadata:s:<n> title=`? Nice, deferrable
+  (broadcast provenance metadata covers the important case, language tags).
 - Functions returning multiple streams (none in scope; UNION ALL covers concat;
   keep stdlib single-return).
 - Subtitle/data streams: passthrough-only in v1 (`s.subtitle[1]` selectable,
   no filters).
+- Array-length arithmetic beyond zip (e.g. filtering an array down by language
+  predicate: `a.audio WHERE lang IN ('eng','fra')`)? v2 at the earliest.
+
+(Resolved: multi-column CTE referencing — see Broadcasting; CTE columns are
+AS-named and typed, subscripting works on any array-typed column.)
 
 ## Staging
 
