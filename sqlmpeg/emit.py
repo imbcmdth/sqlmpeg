@@ -4,11 +4,32 @@ This is pass 4 of the compiler (see "Architecture" in sqlmpeg-project.md).
 It assumes the graph has already been through the split pass, so every pad
 has exactly one consumer.
 
-FrameRef grammar consumed here (authoritative source: ``split.py``)::
+FrameRef grammar consumed here (authoritative source: ``ir.py``)::
 
-    "<node-id>"      -> output pad 0 of that node
-    "<node-id>:<k>"  -> output pad k of that node (only split nodes have k>0)
-    "src:<alias>"    -> a raw input stream; rendered as "[<index>:v]"
+    "<node-id>"          -> output pad 0 of that node
+    "<node-id>:<p>"      -> output pad p of that node
+    "src:<alias>:v:<k>"  -> the k-th (0-based) video stream of the input bound
+                            to <alias>; rendered as "[<index>:v:<k>]"
+    "src:<alias>:a:<k>"  -> same for audio; rendered as "[<index>:a:<k>]"
+
+Outputs and passthrough
+-----------------------
+``Graph.outputs`` is the output stream list: one ``Output`` per top-level
+SELECT column, in ``-map`` order. Each one becomes an :class:`OutputMap`:
+
+* **passthrough** -- ``Output.ref`` is a source ref with zero node consumers.
+  The stream never enters the filtergraph: the map target is the bare ffmpeg
+  stream spec (``"0:a:1"``) and ``copy`` is True, so ``build_ffmpeg_args``
+  adds ``-c:<i> copy``. (v0 hung a ``null`` filter on such refs; that hack is
+  gone.)
+* **filtered** -- ``Output.ref`` names a node pad. That pad's label is
+  ``out<i>``, where ``i`` is the output's index in ``Graph.outputs``, and the
+  map target is ``"[out<i>]"``. v0's single ``[out]`` label is gone: labels
+  are always indexed, even for a one-column SELECT.
+
+A graph whose outputs are all passthrough has NO nodes and therefore an empty
+``filter_complex``; ``build_ffmpeg_args`` omits ``-filter_complex`` entirely
+in that case.
 
 Pad label scheme
 ----------------
@@ -16,14 +37,17 @@ Every node output pad gets exactly one label, derived from the node id
 (sanitized: any character outside ``[A-Za-z0-9_]`` becomes ``_``):
 
 * single-output node  -> ``[<id>]``            e.g. ``[n2]``
-* multi-output node   -> ``[<id><k>]``         e.g. a ``split=2`` node whose
-  id is ``n1_split`` produces ``[n1_split0][n1_split1]``, so a full chain
-  reads ``[n1]split=2[n1_split0][n1_split1]``
-* the pad named by ``Graph.output`` -> ``[out]``, whichever node/pad it is
+* multi-output node   -> ``[<id><p>]``         e.g. a ``split`` node whose
+  id is ``n1_split`` and whose ``outputs`` list has two entries produces
+  ``[n1_split0][n1_split1]``, so a full chain reads
+  ``[n1]split=2[n1_split0][n1_split1]``
+* a pad named by ``Graph.outputs[i]`` -> ``[out<i>]``, whichever node/pad it is
 
-``out`` is reserved up front, and any label collision is broken by appending
-``_`` until the label is unique. Labels of pads that are consumed inside a
-merged comma-chain are never rendered (that is what chain merging means).
+The out-pad count of a node is ``len(node.outputs)`` -- no filter is special
+cased. ``out0..out<n-1>`` are reserved up front, and any label collision is
+broken by appending ``_`` until the label is unique. Labels of pads that are
+consumed inside a merged comma-chain are never rendered (that is what chain
+merging means).
 
 Chain merging
 -------------
@@ -33,20 +57,21 @@ output pad and has no other inputs; such runs are joined with ``,`` and only
 the head's input labels and the tail's output labels are rendered. Chains are
 joined with ``;`` (no whitespace). The README example therefore emits::
 
-    [1:v]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];[0:v][n2]overlay=x=20:y=20[out]
+    [1:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];[0:v:0][n2]overlay=x=20:y=20[out0]
 
 Argument rendering
 ------------------
 ``args`` renders in dict insertion order as ``filter=k1=v1:k2=v2``. Special
 cases: a filter with no args renders bare (``hflip``, no ``=``); the key
 ``"expr"`` renders value-only (``setpts=PTS-STARTPTS``); every arg of a
-``split`` node renders value-only (``split=2``). ``concat`` needs nothing
-special: ``{"n": 2, "v": 1, "a": 0}`` -> ``concat=n=2:v=1:a=0``.
+``split``/``asplit`` node renders value-only (``split=2``). ``concat`` needs
+nothing special: ``{"n": 2, "v": 1, "a": 0}`` -> ``concat=n=2:v=1:a=0``.
 
 Escaping
 --------
-All values go through :func:`_escape_value` -- the single place where ffmpeg
-filtergraph escaping happens (drawtext ``text=`` included).
+All filter values go through :func:`_escape_value` -- the single place where
+ffmpeg filtergraph escaping happens (drawtext ``text=`` included). Metadata
+values do NOT: they are passed as argv words, not parsed as a filtergraph.
 """
 
 from __future__ import annotations
@@ -55,14 +80,15 @@ import re
 from dataclasses import dataclass
 
 from .errors import ErrorCode, SqlmpegError
-from .ir import FrameRef, Graph, Node, is_src, src_alias
+from .ir import FrameRef, Graph, Node, Output, StreamType, is_src, src_parts
 
-OUTPUT_LABEL = "out"
-"""Label given to the pad named by ``Graph.output`` (without brackets)."""
+OUTPUT_LABEL_PREFIX = "out"
+"""Filtered outputs are labelled ``out0``, ``out1``, ... (without brackets)."""
 
-_PASSTHROUGH_FILTER = "null"
-_SPLIT_FILTER = "split"
+_SPLIT_FILTERS = frozenset({"split", "asplit"})
 _VALUE_ONLY_KEYS = frozenset({"expr"})
+
+_TYPE_MARKERS: dict[StreamType, str] = {"video": "v", "audio": "a"}
 
 # Level 1 (filter-option) escaping: these characters would otherwise separate
 # options / quote inside a single filter's argument list.
@@ -82,68 +108,71 @@ _LABEL_UNSAFE = re.compile(r"[^A-Za-z0-9_]")
 
 
 @dataclass
+class OutputMap:
+    """One ``-map`` argument: a filtered pad label or a raw stream spec."""
+
+    target: str  # "[out0]" (filtered) or "0:a:1" (passthrough)
+    type: StreamType
+    copy: bool  # passthrough -> True -> -c:<i> copy
+    metadata: dict[str, str]
+
+
+@dataclass
 class Emitted:
     inputs: list[str]  # file paths in -i order
-    filter_complex: str
-    output_label: str  # label WITHOUT brackets, e.g. "out"
+    filter_complex: str  # "" when every output is a passthrough
+    maps: list[OutputMap]  # one per Graph.outputs entry, same order
 
 
 def emit(g: Graph) -> Emitted:
-    """Render `g` as an ffmpeg filtergraph.
+    """Render `g` as an ffmpeg filtergraph plus its output map list.
 
     Raises ``SqlmpegError(INTERNAL)`` if the graph is malformed: a cycle or
-    non-topological node ordering, a dangling FrameRef, or a pad with more
-    than one consumer (which means the split pass did not run).
+    non-topological node ordering, a dangling FrameRef, no outputs, or a pad
+    with more than one consumer (which means the split pass did not run --
+    an ``Output`` counts as a consumer, so a pad feeding both a node and an
+    output, or two outputs naming the same pad, is a split-pass bug).
     """
     _verify_topological(g)
 
     nodes = list(g.nodes.values())
-    output_ref = g.output
-    if is_src(output_ref):
-        # Pass-through query: ffmpeg still needs a filter to hang [out] on.
-        passthrough = Node(
-            id=_fresh_id("passthrough", g.nodes),
-            filter=_PASSTHROUGH_FILTER,
-            args={},
-            inputs=[output_ref],
-        )
-        nodes.append(passthrough)
-        output_ref = passthrough.id
-
     pads = {node.id: _out_pad_count(node) for node in nodes}
-    _check_fanout(nodes, output_ref)
-    labels = _assign_labels(nodes, pads, output_ref)
+    _check_fanout(nodes, g.outputs)
+    labels = _assign_labels(nodes, pads, g.outputs)
 
     chains = _build_chains(nodes, pads)
     filter_complex = ";".join(_render_chain(chain, g, pads, labels) for chain in chains)
 
+    maps = [_output_map(g, output, labels) for output in g.outputs]
+
     return Emitted(
         inputs=list(g.input_paths),
         filter_complex=filter_complex,
-        output_label=OUTPUT_LABEL,
+        maps=maps,
     )
 
 
 def build_ffmpeg_args(e: Emitted, out_path: str) -> list[str]:
     """Full ffmpeg argv for `e`, writing to `out_path`.
 
-    Audio is copied from the first input (spec: v0 SQL is video-only); the
-    ``?`` in ``0:a?`` makes the mapping tolerate a silent input.
+    The SELECT list is authoritative: exactly one ``-map`` per
+    :class:`OutputMap`, in order, with ``-c:<i> copy`` for passthrough streams
+    and ``-metadata:s:<i> k=v`` (keys sorted) for provenance metadata. v0's
+    implicit ``-map 0:a? -c:a copy`` tail is gone. ``-filter_complex`` is
+    omitted when the graph is pure passthrough.
     """
     args = ["ffmpeg"]
     for path in e.inputs:
         args += ["-i", path]
-    args += [
-        "-filter_complex",
-        e.filter_complex,
-        "-map",
-        f"[{e.output_label}]",
-        "-map",
-        "0:a?",
-        "-c:a",
-        "copy",
-        out_path,
-    ]
+    if e.filter_complex:
+        args += ["-filter_complex", e.filter_complex]
+    for index, mapping in enumerate(e.maps):
+        args += ["-map", mapping.target]
+        if mapping.copy:
+            args += [f"-c:{index}", "copy"]
+        for key in sorted(mapping.metadata):
+            args += [f"-metadata:s:{index}", f"{key}={mapping.metadata[key]}"]
+    args.append(out_path)
     return args
 
 
@@ -202,11 +231,22 @@ def _parse_node_ref(ref: FrameRef) -> tuple[str, int]:
     return node_id, pad
 
 
+def _parse_src_ref(ref: FrameRef) -> tuple[str, StreamType, int]:
+    try:
+        alias, stream_type, index = src_parts(ref)
+    except ValueError as exc:
+        raise _internal(f"malformed source ref {ref!r}: {exc}") from None
+    if index < 0:
+        raise _internal(f"malformed source ref {ref!r}: negative stream index")
+    return alias, stream_type, index
+
+
 def _slot(ref: FrameRef) -> str:
     """Canonical key for the pad a FrameRef points at.
 
     ``"n1"`` and ``"n1:0"`` are the same pad, so both map to ``"n1:0"``;
-    source refs keep their ``"src:<alias>"`` form.
+    source refs are already canonical and keep their ``"src:<alias>:v:<k>"``
+    form.
     """
     if is_src(ref):
         return ref
@@ -215,12 +255,18 @@ def _slot(ref: FrameRef) -> str:
 
 
 def _out_pad_count(node: Node) -> int:
-    if node.filter != _SPLIT_FILTER:
-        return 1
-    n = node.args.get("n")
-    if not isinstance(n, int) or isinstance(n, bool) or n < 2:
-        raise _internal(f"split node {node.id!r} needs an integer arg n >= 2, got {n!r}")
-    return n
+    count = len(node.outputs)
+    if count < 1:
+        raise _internal(f"node {node.id!r} declares no output pads")
+    return count
+
+
+def _src_spec(g: Graph, ref: FrameRef) -> str:
+    """Render a source ref as an ffmpeg stream spec, e.g. ``0:a:1``."""
+    alias, stream_type, index = _parse_src_ref(ref)
+    if alias not in g.sources:
+        raise _internal(f"source ref {ref!r} names unknown source alias {alias!r}")
+    return f"{g.sources[alias]}:{_TYPE_MARKERS[stream_type]}:{index}"
 
 
 def _verify_topological(g: Graph) -> None:
@@ -232,19 +278,24 @@ def _verify_topological(g: Graph) -> None:
         for ref in node.inputs:
             _check_ref(g, ref, defined, f"node {node.id!r}")
         defined.add(node_id)
-    if not g.output:
-        raise _internal("graph has no output ref")
-    _check_ref(g, g.output, defined, "graph output")
+    if not g.outputs:
+        raise _internal("graph has no outputs")
+    for index, output in enumerate(g.outputs):
+        if not output.ref:
+            raise _internal(f"graph output {index} has an empty ref")
+        _check_ref(g, output.ref, defined, f"graph output {index}")
 
 
 def _check_ref(g: Graph, ref: FrameRef, defined: set[str], where: str) -> None:
     if is_src(ref):
-        alias = src_alias(ref)
+        alias, _stream_type, _index = _parse_src_ref(ref)
         if alias not in g.sources:
             raise _internal(f"{where} references unknown source alias {alias!r}")
-        index = g.sources[alias]
-        if not 0 <= index < len(g.input_paths):
-            raise _internal(f"source alias {alias!r} maps to out-of-range input index {index}")
+        input_index = g.sources[alias]
+        if not 0 <= input_index < len(g.input_paths):
+            raise _internal(
+                f"source alias {alias!r} maps to out-of-range input index {input_index}"
+            )
         return
     node_id, pad = _parse_node_ref(ref)
     if node_id not in g.nodes:
@@ -258,8 +309,8 @@ def _check_ref(g: Graph, ref: FrameRef, defined: set[str], where: str) -> None:
         raise _internal(f"{where} references pad {pad} of {node_id!r}, which has fewer outputs")
 
 
-def _check_fanout(nodes: list[Node], output_ref: FrameRef) -> None:
-    counts = _count_consumers(nodes, output_ref)
+def _check_fanout(nodes: list[Node], outputs: list[Output]) -> None:
+    counts = _count_consumers(nodes, outputs)
     for slot, count in counts.items():
         if count > 1:
             raise _internal(
@@ -268,24 +319,17 @@ def _check_fanout(nodes: list[Node], output_ref: FrameRef) -> None:
             )
 
 
-def _count_consumers(nodes: list[Node], output_ref: FrameRef) -> dict[str, int]:
+def _count_consumers(nodes: list[Node], outputs: list[Output]) -> dict[str, int]:
+    """Count consumers per pad. A ``Graph.outputs`` entry is a consumer too."""
     counts: dict[str, int] = {}
     for node in nodes:
         for ref in node.inputs:
             slot = _slot(ref)
             counts[slot] = counts.get(slot, 0) + 1
-    out_slot = _slot(output_ref)
-    counts[out_slot] = counts.get(out_slot, 0) + 1
+    for output in outputs:
+        slot = _slot(output.ref)
+        counts[slot] = counts.get(slot, 0) + 1
     return counts
-
-
-def _fresh_id(base: str, taken: dict[str, Node]) -> str:
-    candidate = base
-    suffix = 0
-    while candidate in taken:
-        suffix += 1
-        candidate = f"{base}{suffix}"
-    return candidate
 
 
 def _sanitize_label(node_id: str) -> str:
@@ -293,16 +337,27 @@ def _sanitize_label(node_id: str) -> str:
     return label or "pad"
 
 
-def _assign_labels(nodes: list[Node], pads: dict[str, int], output_ref: FrameRef) -> dict[str, str]:
-    out_slot = _slot(output_ref)
-    used: set[str] = {OUTPUT_LABEL}
+def _assign_labels(
+    nodes: list[Node], pads: dict[str, int], outputs: list[Output]
+) -> dict[str, str]:
+    """Map every node pad slot to its rendered label (without brackets)."""
+    output_labels: dict[str, str] = {}
+    for index, output in enumerate(outputs):
+        if is_src(output.ref):
+            continue  # passthrough: never enters the filtergraph
+        output_labels[_slot(output.ref)] = f"{OUTPUT_LABEL_PREFIX}{index}"
+
+    # Reserve every out<i> up front, passthrough indices included, so a node
+    # id that happens to be "out1" can never steal an output label.
+    used = {f"{OUTPUT_LABEL_PREFIX}{index}" for index in range(len(outputs))}
     labels: dict[str, str] = {}
     for node in nodes:
         count = pads[node.id]
         for pad in range(count):
             slot = f"{node.id}:{pad}"
-            if slot == out_slot:
-                labels[slot] = OUTPUT_LABEL
+            output_label = output_labels.get(slot)
+            if output_label is not None:
+                labels[slot] = output_label
                 continue
             base = _sanitize_label(node.id)
             if count > 1:
@@ -312,6 +367,28 @@ def _assign_labels(nodes: list[Node], pads: dict[str, int], output_ref: FrameRef
             used.add(base)
             labels[slot] = base
     return labels
+
+
+def _output_map(g: Graph, output: Output, labels: dict[str, str]) -> OutputMap:
+    if is_src(output.ref):
+        # Passthrough: zero node consumers is guaranteed by _check_fanout,
+        # which counts this Output itself as the pad's single consumer.
+        return OutputMap(
+            target=_src_spec(g, output.ref),
+            type=output.type,
+            copy=True,
+            metadata=dict(output.metadata),
+        )
+    slot = _slot(output.ref)
+    label = labels.get(slot)
+    if label is None:
+        raise _internal(f"no pad label was assigned for {slot!r}")
+    return OutputMap(
+        target=f"[{label}]",
+        type=output.type,
+        copy=False,
+        metadata=dict(output.metadata),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +413,7 @@ def _extends(prev: Node, node: Node, pads: dict[str, int]) -> bool:
     exactly one input, and that input must be `prev`'s only output pad. Pads
     are consume-once (checked in :func:`_check_fanout`), so `node` being a
     consumer of that pad already makes it the sole consumer, and rules out the
-    pad also being the graph output.
+    pad also being named by a ``Graph.outputs`` entry.
     """
     if pads[prev.id] != 1:
         return False
@@ -363,7 +440,7 @@ def _render_chain(
 
 def _input_label(g: Graph, ref: FrameRef, labels: dict[str, str]) -> str:
     if is_src(ref):
-        return f"{g.sources[src_alias(ref)]}:v"
+        return _src_spec(g, ref)
     slot = _slot(ref)
     label = labels.get(slot)
     if label is None:
@@ -374,7 +451,7 @@ def _input_label(g: Graph, ref: FrameRef, labels: dict[str, str]) -> str:
 def _render_filter(node: Node) -> str:
     if not node.args:
         return node.filter
-    value_only_filter = node.filter == _SPLIT_FILTER
+    value_only_filter = node.filter in _SPLIT_FILTERS
     parts: list[str] = []
     for key, value in node.args.items():
         rendered = _escape_value(_render_scalar(node, key, value))

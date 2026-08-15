@@ -1,21 +1,56 @@
-"""Tests for the emit pass (plan 007).
+"""Tests for the emit pass (plans 007 + 018).
 
-Graphs are hand-built with ir.Node/ir.Graph -- emit must not depend on the
-parser/lower/split modules.
+Graphs are hand-built with ir.Node/ir.Graph/ir.Output -- emit must not depend
+on the parser/lower/split modules.
+
+The ``@pytest.mark.exec`` test at the bottom runs real ffmpeg against the
+generated fixtures (``python scripts/gen_fixtures.py``); it is excluded from
+the default run by ``addopts = -m "not exec"``.
 """
 
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
 import pytest
 
-from sqlmpeg.emit import Emitted, _escape_value, build_ffmpeg_args, emit
+from sqlmpeg.emit import Emitted, OutputMap, _escape_value, build_ffmpeg_args, emit
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import Graph, Node
+from sqlmpeg.ir import Graph, Node, Output, StreamType
+
+
+def _node(
+    node_id: str,
+    filter_name: str,
+    args: dict[str, object],
+    inputs: list[str],
+    outputs: list[StreamType] | None = None,
+) -> Node:
+    return Node(
+        id=node_id,
+        filter=filter_name,
+        args=dict(args),
+        inputs=list(inputs),
+        outputs=list(outputs) if outputs is not None else ["video"],
+    )
+
+
+def _out(
+    ref: str,
+    type: StreamType = "video",
+    *,
+    name: str | None = None,
+    metadata: dict[str, str] | None = None,
+) -> Output:
+    return Output(ref=ref, type=type, name=name, metadata=dict(metadata or {}))
 
 
 def _graph(
     nodes: list[Node],
-    output: str,
+    outputs: list[Output],
     *,
     input_paths: list[str] | None = None,
     sources: dict[str, int] | None = None,
@@ -24,7 +59,7 @@ def _graph(
         input_paths=list(input_paths or ["a.mp4"]),
         sources=dict(sources or {"a": 0}),
         nodes={n.id: n for n in nodes},
-        output=output,
+        outputs=list(outputs),
     )
 
 
@@ -34,11 +69,14 @@ def _graph(
 
 
 def test_single_node_graph() -> None:
-    g = _graph([Node("n1", "crop", {"w": 600, "h": 200, "x": 1200, "y": 50}, ["src:a"])], "n1")
+    g = _graph(
+        [_node("n1", "crop", {"w": 600, "h": 200, "x": 1200, "y": 50}, ["src:a:v:0"])],
+        [_out("n1")],
+    )
     e = emit(g)
-    assert e.filter_complex == "[0:v]crop=w=600:h=200:x=1200:y=50[out]"
-    assert e.output_label == "out"
+    assert e.filter_complex == "[0:v:0]crop=w=600:h=200:x=1200:y=50[out0]"
     assert e.inputs == ["a.mp4"]
+    assert e.maps == [OutputMap(target="[out0]", type="video", copy=False, metadata={})]
     assert isinstance(e, Emitted)
 
 
@@ -46,18 +84,18 @@ def test_readme_example_shape() -> None:
     """WITH pip AS (scale(crop(b.frame,...), 0.5)) SELECT overlay(a.frame, pip.frame, 20, 20)."""
     g = _graph(
         [
-            Node("n1", "crop", {"w": 600, "h": 200, "x": 1200, "y": 50}, ["src:b"]),
-            Node("n2", "scale", {"w": "iw*0.5", "h": "-2"}, ["n1"]),
-            Node("n3", "overlay", {"x": 20, "y": 20}, ["src:a", "n2"]),
+            _node("n1", "crop", {"w": 600, "h": 200, "x": 1200, "y": 50}, ["src:b:v:0"]),
+            _node("n2", "scale", {"w": "iw*0.5", "h": "-2"}, ["n1"]),
+            _node("n3", "overlay", {"x": 20, "y": 20}, ["src:a:v:0", "n2"]),
         ],
-        "n3",
+        [_out("n3")],
         input_paths=["game.mp4", "game.mp4"],
         sources={"a": 0, "b": 1},
     )
     e = emit(g)
     assert e.filter_complex == (
-        "[1:v]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];"
-        "[0:v][n2]overlay=x=20:y=20[out]"
+        "[1:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];"
+        "[0:v:0][n2]overlay=x=20:y=20[out0]"
     )
     # one comma-chain (crop,scale) and one semicolon between the two chains
     assert e.filter_complex.count(";") == 1
@@ -67,138 +105,296 @@ def test_readme_example_shape() -> None:
 def test_long_linear_run_merges_into_one_chain() -> None:
     g = _graph(
         [
-            Node("n1", "trim", {"start": 1, "end": 5}, ["src:a"]),
-            Node("n2", "setpts", {"expr": "PTS-STARTPTS"}, ["n1"]),
-            Node("n3", "hflip", {}, ["n2"]),
-            Node("n4", "gblur", {"sigma": 2.5}, ["n3"]),
+            _node("n1", "trim", {"start": 1, "end": 5}, ["src:a:v:0"]),
+            _node("n2", "setpts", {"expr": "PTS-STARTPTS"}, ["n1"]),
+            _node("n3", "hflip", {}, ["n2"]),
+            _node("n4", "gblur", {"sigma": 2.5}, ["n3"]),
         ],
-        "n4",
+        [_out("n4")],
     )
     e = emit(g)
     assert e.filter_complex == (
-        "[0:v]trim=start=1:end=5,setpts=PTS-STARTPTS,hflip,gblur=sigma=2.5[out]"
+        "[0:v:0]trim=start=1:end=5,setpts=PTS-STARTPTS,hflip,gblur=sigma=2.5[out0]"
     )
     assert ";" not in e.filter_complex
 
 
+def test_audio_source_ref_renders_typed_index() -> None:
+    g = _graph(
+        [_node("n1", "volume", {"volume": 0.5}, ["src:a:a:1"], ["audio"])],
+        [_out("n1", "audio")],
+    )
+    e = emit(g)
+    assert e.filter_complex == "[0:a:1]volume=volume=0.5[out0]"
+    assert e.maps == [OutputMap(target="[out0]", type="audio", copy=False, metadata={})]
+
+
 def test_diamond_post_split_labels_and_semicolons() -> None:
-    """src:a split in two, one branch blurred, both recombined by overlay."""
+    """src:a:v:0 split in two, one branch blurred, both recombined by overlay."""
     g = _graph(
         [
-            Node("src_a_split", "split", {"n": 2}, ["src:a"]),
-            Node("n1", "gblur", {"sigma": 5}, ["src_a_split:1"]),
-            Node("n2", "overlay", {"x": 0, "y": 0}, ["src_a_split:0", "n1"]),
+            _node("src_a_split", "split", {"n": 2}, ["src:a:v:0"], ["video", "video"]),
+            _node("n1", "gblur", {"sigma": 5}, ["src_a_split:1"]),
+            _node("n2", "overlay", {"x": 0, "y": 0}, ["src_a_split:0", "n1"]),
         ],
-        "n2",
+        [_out("n2")],
     )
     e = emit(g)
     assert e.filter_complex == (
-        "[0:v]split=2[src_a_split0][src_a_split1];"
+        "[0:v:0]split=2[src_a_split0][src_a_split1];"
         "[src_a_split1]gblur=sigma=5[n1];"
-        "[src_a_split0][n1]overlay=x=0:y=0[out]"
+        "[src_a_split0][n1]overlay=x=0:y=0[out0]"
     )
 
 
-def test_split_node_gets_one_label_per_output_pad() -> None:
+def test_split_node_gets_one_label_per_declared_output_pad() -> None:
     """A split whose producer is not adjacent renders [n1]split=2[n1_split0][n1_split1]."""
     g = _graph(
         [
-            Node("n1", "hflip", {}, ["src:a"]),
-            Node("n2", "vflip", {}, ["src:b"]),
-            Node("n1_split", "split", {"n": 2}, ["n1"]),
-            Node("n3", "overlay", {"x": 0, "y": 0}, ["n1_split:0", "n2"]),
-            Node("n4", "overlay", {"x": 10, "y": 10}, ["n1_split:1", "n3"]),
+            _node("n1", "hflip", {}, ["src:a:v:0"]),
+            _node("n2", "vflip", {}, ["src:b:v:0"]),
+            _node("n1_split", "split", {"n": 2}, ["n1"], ["video", "video"]),
+            _node("n3", "overlay", {"x": 0, "y": 0}, ["n1_split:0", "n2"]),
+            _node("n4", "overlay", {"x": 10, "y": 10}, ["n1_split:1", "n3"]),
         ],
-        "n4",
+        [_out("n4")],
         input_paths=["a.mp4", "b.mp4"],
         sources={"a": 0, "b": 1},
     )
     e = emit(g)
-    assert "[n1]split=2[n1_split0][n1_split1];" in e.filter_complex
     assert e.filter_complex == (
-        "[0:v]hflip[n1];"
-        "[1:v]vflip[n2];"
+        "[0:v:0]hflip[n1];"
+        "[1:v:0]vflip[n2];"
         "[n1]split=2[n1_split0][n1_split1];"
         "[n1_split0][n2]overlay=x=0:y=0[n3];"
-        "[n1_split1][n3]overlay=x=10:y=10[out]"
+        "[n1_split1][n3]overlay=x=10:y=10[out0]"
     )
 
 
-def test_split_output_pads_consumed_in_order() -> None:
-    """A 3-way split: pad k is labelled <id><k> and consumed by the right node."""
+def test_pad_count_comes_from_outputs_not_from_split_args() -> None:
+    """``n`` is only an argument now; ``outputs`` decides how many pads render."""
     g = _graph(
         [
-            Node("s", "split", {"n": 3}, ["src:a"]),
-            Node("n1", "hflip", {}, ["s:0"]),
-            Node("n2", "vflip", {}, ["s:1"]),
-            Node("n3", "gblur", {"sigma": 1}, ["s:2"]),
-            Node("n4", "overlay", {"x": 0, "y": 0}, ["n1", "n2"]),
-            Node("n5", "overlay", {"x": 0, "y": 0}, ["n4", "n3"]),
+            _node("s", "split", {"n": 3}, ["src:a:v:0"], ["video", "video", "video"]),
+            _node("n1", "hflip", {}, ["s:0"]),
+            _node("n2", "vflip", {}, ["s:1"]),
+            _node("n3", "gblur", {"sigma": 1}, ["s:2"]),
+            _node("n4", "overlay", {"x": 0, "y": 0}, ["n1", "n2"]),
+            _node("n5", "overlay", {"x": 0, "y": 0}, ["n4", "n3"]),
         ],
-        "n5",
+        [_out("n5")],
     )
     e = emit(g)
-    assert e.filter_complex.startswith("[0:v]split=3[s0][s1][s2];")
+    assert e.filter_complex.startswith("[0:v:0]split=3[s0][s1][s2];")
     assert "[s0]hflip[n1];" in e.filter_complex
     assert "[s1]vflip[n2];" in e.filter_complex
     assert "[s2]gblur=sigma=1[n3];" in e.filter_complex
-    assert e.filter_complex.endswith("[n4][n3]overlay=x=0:y=0[out]")
+    assert e.filter_complex.endswith("[n4][n3]overlay=x=0:y=0[out0]")
+
+
+def test_asplit_renders_value_only_args_and_audio_pads() -> None:
+    g = _graph(
+        [
+            _node("s", "asplit", {"n": 2}, ["src:a:a:0"], ["audio", "audio"]),
+            _node("n1", "volume", {"volume": 2}, ["s:0"], ["audio"]),
+            _node("n2", "amix", {"inputs": 2}, ["s:1", "n1"], ["audio"]),
+        ],
+        [_out("n2", "audio")],
+    )
+    e = emit(g)
+    assert e.filter_complex == (
+        "[0:a:0]asplit=2[s0][s1];"
+        "[s0]volume=volume=2[n1];"
+        "[s1][n1]amix=inputs=2[out0]"
+    )
 
 
 def test_split_as_chain_tail_merges_with_its_producer() -> None:
     g = _graph(
         [
-            Node("n1", "hflip", {}, ["src:a"]),
-            Node("n1_split", "split", {"n": 2}, ["n1"]),
-            Node("n2", "gblur", {"sigma": 3}, ["n1_split:0"]),
-            Node("n3", "overlay", {"x": 0, "y": 0}, ["n1_split:1", "n2"]),
+            _node("n1", "hflip", {}, ["src:a:v:0"]),
+            _node("n1_split", "split", {"n": 2}, ["n1"], ["video", "video"]),
+            _node("n2", "gblur", {"sigma": 3}, ["n1_split:0"]),
+            _node("n3", "overlay", {"x": 0, "y": 0}, ["n1_split:1", "n2"]),
         ],
-        "n3",
+        [_out("n3")],
     )
     e = emit(g)
     assert e.filter_complex == (
-        "[0:v]hflip,split=2[n1_split0][n1_split1];"
+        "[0:v:0]hflip,split=2[n1_split0][n1_split1];"
         "[n1_split0]gblur=sigma=3[n2];"
-        "[n1_split1][n2]overlay=x=0:y=0[out]"
+        "[n1_split1][n2]overlay=x=0:y=0[out0]"
     )
 
 
-def test_passthrough_graph_emits_null_filter() -> None:
-    g = _graph([], "src:a")
+# ---------------------------------------------------------------------------
+# multi-output maps, passthrough, metadata
+# ---------------------------------------------------------------------------
+
+
+def test_pure_passthrough_graph_has_empty_filter_complex() -> None:
+    """SELECT a.video[1], a.audio[2] -- a remap, nothing re-encoded."""
+    g = _graph([], [_out("src:a:v:0"), _out("src:a:a:1", "audio")])
     e = emit(g)
-    assert e.filter_complex == "[0:v]null[out]"
-    assert e.output_label == "out"
+    assert e.filter_complex == ""
+    assert e.maps == [
+        OutputMap(target="0:v:0", type="video", copy=True, metadata={}),
+        OutputMap(target="0:a:1", type="audio", copy=True, metadata={}),
+    ]
 
 
-def test_output_label_wins_over_generated_label() -> None:
-    """A node id of 'out' does not steal the reserved output label."""
+def test_passthrough_from_second_input_uses_its_index() -> None:
     g = _graph(
-        [
-            Node("out", "hflip", {}, ["src:a"]),
-            Node("n2", "vflip", {}, ["out"]),
-        ],
-        "n2",
+        [],
+        [_out("src:b:a:2", "audio")],
+        input_paths=["a.mp4", "b.mp4"],
+        sources={"a": 0, "b": 1},
+    )
+    assert emit(g).maps == [OutputMap(target="1:a:2", type="audio", copy=True, metadata={})]
+
+
+def test_mixed_filtered_and_passthrough() -> None:
+    """SELECT hflip(a.video[1]), a.audio[1] -- audio never enters the graph."""
+    g = _graph(
+        [_node("n1", "hflip", {}, ["src:a:v:0"])],
+        [_out("n1"), _out("src:a:a:0", "audio", name="orig")],
     )
     e = emit(g)
-    # the 'out' node is merged into the chain, so its label is elided entirely
-    assert e.filter_complex == "[0:v]hflip,vflip[out]"
+    assert e.filter_complex == "[0:v:0]hflip[out0]"
+    assert e.maps == [
+        OutputMap(target="[out0]", type="video", copy=False, metadata={}),
+        OutputMap(target="0:a:0", type="audio", copy=True, metadata={}),
+    ]
 
 
-def test_label_collision_is_broken() -> None:
+def test_passthrough_first_still_labels_filtered_output_by_its_index() -> None:
+    """Labels track the output index, not the count of filtered outputs."""
+    g = _graph(
+        [_node("n1", "volume", {"volume": 0.5}, ["src:a:a:0"], ["audio"])],
+        [_out("src:a:v:0"), _out("n1", "audio")],
+    )
+    e = emit(g)
+    assert e.filter_complex == "[0:a:0]volume=volume=0.5[out1]"
+    assert e.maps == [
+        OutputMap(target="0:v:0", type="video", copy=True, metadata={}),
+        OutputMap(target="[out1]", type="audio", copy=False, metadata={}),
+    ]
+
+
+def test_two_filtered_outputs_are_labelled_in_graph_output_order() -> None:
     g = _graph(
         [
-            Node("out", "hflip", {}, ["src:a"]),
-            Node("n2", "vflip", {}, ["src:b"]),
-            Node("n3", "overlay", {"x": 0, "y": 0}, ["out", "n2"]),
+            _node("n1", "hflip", {}, ["src:a:v:0"]),
+            _node("n2", "volume", {"volume": 2}, ["src:a:a:0"], ["audio"]),
         ],
-        "n3",
+        [_out("n2", "audio"), _out("n1")],  # deliberately not node order
+    )
+    e = emit(g)
+    assert e.filter_complex == "[0:v:0]hflip[out1];[0:a:0]volume=volume=2[out0]"
+    assert [m.target for m in e.maps] == ["[out0]", "[out1]"]
+    assert [m.type for m in e.maps] == ["audio", "video"]
+
+
+def test_concat_node_with_video_and_audio_pads() -> None:
+    """UNION ALL of (video, audio) branches: concat n=2:v=1:a=1 -> two pads."""
+    g = _graph(
+        [
+            _node(
+                "n1",
+                "concat",
+                {"n": 2, "v": 1, "a": 1},
+                ["src:a:v:0", "src:a:a:0", "src:b:v:0", "src:b:a:0"],
+                ["video", "audio"],
+            )
+        ],
+        [_out("n1"), _out("n1:1", "audio")],
         input_paths=["a.mp4", "b.mp4"],
         sources={"a": 0, "b": 1},
     )
     e = emit(g)
     assert e.filter_complex == (
-        "[0:v]hflip[out_];[1:v]vflip[n2];[out_][n2]overlay=x=0:y=0[out]"
+        "[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[out0][out1]"
     )
+    assert e.maps == [
+        OutputMap(target="[out0]", type="video", copy=False, metadata={}),
+        OutputMap(target="[out1]", type="audio", copy=False, metadata={}),
+    ]
+
+
+def test_metadata_is_carried_onto_the_map() -> None:
+    g = _graph(
+        [_node("n1", "aecho", {"expr": "0.8:0.9:60:0.3"}, ["src:a:a:1"], ["audio"])],
+        [_out("n1", "audio", name="fra", metadata={"language": "fra", "title": "VF"})],
+    )
+    e = emit(g)
+    assert e.maps[0].metadata == {"language": "fra", "title": "VF"}
+    assert e.maps[0].copy is False
+
+
+def test_map_metadata_is_a_copy_not_the_output_dict() -> None:
+    output = _out("src:a:a:0", "audio", metadata={"language": "eng"})
+    g = _graph([], [output])
+    e = emit(g)
+    e.maps[0].metadata["language"] = "mangled"
+    assert output.metadata == {"language": "eng"}
+
+
+def test_output_label_wins_over_generated_label() -> None:
+    """A node id of 'out0' does not steal the reserved output label."""
+    g = _graph(
+        [
+            _node("out0", "hflip", {}, ["src:a:v:0"]),
+            _node("n2", "vflip", {}, ["out0"]),
+        ],
+        [_out("n2")],
+    )
+    e = emit(g)
+    # the 'out0' node is merged into the chain, so its label is elided entirely
+    assert e.filter_complex == "[0:v:0]hflip,vflip[out0]"
+
+
+def test_label_collision_is_broken() -> None:
+    g = _graph(
+        [
+            _node("out0", "hflip", {}, ["src:a:v:0"]),
+            _node("n2", "vflip", {}, ["src:b:v:0"]),
+            _node("n3", "overlay", {"x": 0, "y": 0}, ["out0", "n2"]),
+        ],
+        [_out("n3")],
+        input_paths=["a.mp4", "b.mp4"],
+        sources={"a": 0, "b": 1},
+    )
+    e = emit(g)
+    assert e.filter_complex == (
+        "[0:v:0]hflip[out0_];[1:v:0]vflip[n2];[out0_][n2]overlay=x=0:y=0[out0]"
+    )
+
+
+def test_unused_output_index_is_still_reserved() -> None:
+    """out0 belongs to the passthrough column even though it is never rendered."""
+    g = _graph(
+        [_node("out0", "hflip", {}, ["src:a:v:0"]), _node("n2", "vflip", {}, ["src:b:v:0"])],
+        [_out("src:a:a:0", "audio"), _out("out0"), _out("n2")],
+        input_paths=["a.mp4", "b.mp4"],
+        sources={"a": 0, "b": 1},
+    )
+    e = emit(g)
+    assert e.filter_complex == "[0:v:0]hflip[out1];[1:v:0]vflip[out2]"
+    assert [m.target for m in e.maps] == ["0:a:0", "[out1]", "[out2]"]
+
+
+def test_labels_are_sanitized() -> None:
+    g = _graph(
+        [
+            _node("a.b-c", "hflip", {}, ["src:a:v:0"]),
+            _node("n2", "vflip", {}, ["src:b:v:0"]),
+            _node("n3", "overlay", {"x": 0, "y": 0}, ["a.b-c", "n2"]),
+        ],
+        [_out("n3")],
+        input_paths=["a.mp4", "b.mp4"],
+        sources={"a": 0, "b": 1},
+    )
+    assert "[a_b_c]" in emit(g).filter_complex
 
 
 # ---------------------------------------------------------------------------
@@ -207,42 +403,44 @@ def test_label_collision_is_broken() -> None:
 
 
 def test_bare_filter_renders_without_equals() -> None:
-    g = _graph([Node("n1", "hflip", {}, ["src:a"])], "n1")
-    assert emit(g).filter_complex == "[0:v]hflip[out]"
+    g = _graph([_node("n1", "hflip", {}, ["src:a:v:0"])], [_out("n1")])
+    assert emit(g).filter_complex == "[0:v:0]hflip[out0]"
 
 
 def test_expr_key_renders_value_only() -> None:
-    g = _graph([Node("n1", "setpts", {"expr": "PTS/2"}, ["src:a"])], "n1")
-    assert emit(g).filter_complex == "[0:v]setpts=PTS/2[out]"
+    g = _graph([_node("n1", "setpts", {"expr": "PTS/2"}, ["src:a:v:0"])], [_out("n1")])
+    assert emit(g).filter_complex == "[0:v:0]setpts=PTS/2[out0]"
 
 
 def test_concat_renders_named_args() -> None:
     g = _graph(
-        [Node("n1", "concat", {"n": 2, "v": 1, "a": 0}, ["src:a", "src:b"])],
-        "n1",
+        [_node("n1", "concat", {"n": 2, "v": 1, "a": 0}, ["src:a:v:0", "src:b:v:0"])],
+        [_out("n1")],
         input_paths=["a.mp4", "b.mp4"],
         sources={"a": 0, "b": 1},
     )
-    assert emit(g).filter_complex == "[0:v][1:v]concat=n=2:v=1:a=0[out]"
+    assert emit(g).filter_complex == "[0:v:0][1:v:0]concat=n=2:v=1:a=0[out0]"
 
 
 def test_args_render_in_insertion_order_not_sorted() -> None:
-    g = _graph([Node("n1", "crop", {"w": 1, "h": 2, "x": 3, "y": 4}, ["src:a"])], "n1")
-    assert emit(g).filter_complex == "[0:v]crop=w=1:h=2:x=3:y=4[out]"
-    g2 = _graph([Node("n1", "crop", {"y": 4, "x": 3, "h": 2, "w": 1}, ["src:a"])], "n1")
-    assert emit(g2).filter_complex == "[0:v]crop=y=4:x=3:h=2:w=1[out]"
+    g = _graph([_node("n1", "crop", {"w": 1, "h": 2, "x": 3, "y": 4}, ["src:a:v:0"])], [_out("n1")])
+    assert emit(g).filter_complex == "[0:v:0]crop=w=1:h=2:x=3:y=4[out0]"
+    g2 = _graph(
+        [_node("n1", "crop", {"y": 4, "x": 3, "h": 2, "w": 1}, ["src:a:v:0"])], [_out("n1")]
+    )
+    assert emit(g2).filter_complex == "[0:v:0]crop=y=4:x=3:h=2:w=1[out0]"
 
 
 def test_scalar_types_render() -> None:
     g = _graph(
-        [Node("n1", "f", {"i": 3, "f": 0.5, "s": "auto", "b": True, "z": False}, ["src:a"])],
-        "n1",
+        [_node("n1", "f", {"i": 3, "f": 0.5, "s": "auto", "b": True, "z": False}, ["src:a:v:0"])],
+        [_out("n1")],
     )
-    assert emit(g).filter_complex == "[0:v]f=i=3:f=0.5:s=auto:b=1:z=0[out]"
+    assert emit(g).filter_complex == "[0:v:0]f=i=3:f=0.5:s=auto:b=1:z=0[out0]"
 
 
 def test_unrenderable_arg_type_is_internal() -> None:
-    g = _graph([Node("n1", "f", {"k": [1, 2]}, ["src:a"])], "n1")
+    g = _graph([_node("n1", "f", {"k": [1, 2]}, ["src:a:v:0"])], [_out("n1")])
     with pytest.raises(SqlmpegError) as excinfo:
         emit(g)
     assert excinfo.value.code is ErrorCode.INTERNAL
@@ -250,11 +448,11 @@ def test_unrenderable_arg_type_is_internal() -> None:
 
 def test_drawtext_value_goes_through_the_escaper() -> None:
     g = _graph(
-        [Node("n1", "drawtext", {"text": "12:30, take 'one'", "x": 10}, ["src:a"])],
-        "n1",
+        [_node("n1", "drawtext", {"text": "12:30, take 'one'", "x": 10}, ["src:a:v:0"])],
+        [_out("n1")],
     )
     assert emit(g).filter_complex == (
-        r"[0:v]drawtext=text=12\\:30\,\ take\ \\\'one\\\':x=10[out]"
+        r"[0:v:0]drawtext=text=12\\:30\,\ take\ \\\'one\\\':x=10[out0]"
     )
 
 
@@ -337,8 +535,8 @@ def _assert_internal(g: Graph) -> SqlmpegError:
 
 def test_cycle_is_internal_error() -> None:
     g = _graph(
-        [Node("n1", "hflip", {}, ["n2"]), Node("n2", "vflip", {}, ["n1"])],
-        "n2",
+        [_node("n1", "hflip", {}, ["n2"]), _node("n2", "vflip", {}, ["n1"])],
+        [_out("n2")],
     )
     err = _assert_internal(g)
     assert "topological" in err.message
@@ -346,58 +544,107 @@ def test_cycle_is_internal_error() -> None:
 
 def test_forward_reference_is_internal_error() -> None:
     g = _graph(
-        [Node("n1", "vflip", {}, ["n2"]), Node("n2", "hflip", {}, ["src:a"])],
-        "n1",
+        [_node("n1", "vflip", {}, ["n2"]), _node("n2", "hflip", {}, ["src:a:v:0"])],
+        [_out("n1")],
     )
     _assert_internal(g)
 
 
 def test_unknown_node_ref_is_internal_error() -> None:
-    g = _graph([Node("n1", "hflip", {}, ["nope"])], "n1")
+    g = _graph([_node("n1", "hflip", {}, ["nope"])], [_out("n1")])
     err = _assert_internal(g)
     assert "unknown node" in err.message
 
 
 def test_unknown_source_alias_is_internal_error() -> None:
-    g = _graph([Node("n1", "hflip", {}, ["src:zz"])], "n1")
+    g = _graph([_node("n1", "hflip", {}, ["src:zz:v:0"])], [_out("n1")])
     err = _assert_internal(g)
     assert "unknown source alias" in err.message
+
+
+def test_malformed_source_ref_is_internal_error() -> None:
+    g = _graph([_node("n1", "hflip", {}, ["src:a:x:0"])], [_out("n1")])
+    err = _assert_internal(g)
+    assert "malformed source ref" in err.message
+
+
+def test_untyped_v1_source_ref_is_internal_error() -> None:
+    """v0/v1's untyped ``src:a`` is retired and must not silently render."""
+    _assert_internal(_graph([_node("n1", "hflip", {}, ["src:a"])], [_out("n1")]))
 
 
 def test_pad_index_past_output_count_is_internal_error() -> None:
     g = _graph(
         [
-            Node("s", "split", {"n": 2}, ["src:a"]),
-            Node("n1", "hflip", {}, ["s:0"]),
-            Node("n2", "vflip", {}, ["s:5"]),
-            Node("n3", "overlay", {"x": 0, "y": 0}, ["n1", "n2"]),
+            _node("s", "split", {"n": 2}, ["src:a:v:0"], ["video", "video"]),
+            _node("n1", "hflip", {}, ["s:0"]),
+            _node("n2", "vflip", {}, ["s:5"]),
+            _node("n3", "overlay", {"x": 0, "y": 0}, ["n1", "n2"]),
         ],
-        "n3",
+        [_out("n3")],
     )
     _assert_internal(g)
+
+
+def test_node_without_output_pads_is_internal_error() -> None:
+    _assert_internal(_graph([_node("n1", "hflip", {}, ["src:a:v:0"], [])], [_out("n1")]))
 
 
 def test_unsplit_fanout_is_internal_error() -> None:
     """emit refuses to render a pad consumed twice -- ffmpeg pads are consume-once."""
     g = _graph(
         [
-            Node("n1", "hflip", {}, ["src:a"]),
-            Node("n2", "gblur", {"sigma": 1}, ["n1"]),
-            Node("n3", "overlay", {"x": 0, "y": 0}, ["n1", "n2"]),
+            _node("n1", "hflip", {}, ["src:a:v:0"]),
+            _node("n2", "gblur", {"sigma": 1}, ["n1"]),
+            _node("n3", "overlay", {"x": 0, "y": 0}, ["n1", "n2"]),
         ],
-        "n3",
+        [_out("n3")],
     )
     err = _assert_internal(g)
     assert "consume-once" in err.message
 
 
-def test_bad_split_arity_is_internal_error() -> None:
-    g = _graph([Node("s", "split", {"n": 1}, ["src:a"]), Node("n1", "hflip", {}, ["s:0"])], "n1")
-    _assert_internal(g)
+def test_pad_feeding_both_a_node_and_an_output_is_internal_error() -> None:
+    """An Output counts as a consumer, so this needs a split too."""
+    g = _graph(
+        [
+            _node("n1", "hflip", {}, ["src:a:v:0"]),
+            _node("n2", "gblur", {"sigma": 1}, ["n1"]),
+        ],
+        [_out("n1"), _out("n2")],
+    )
+    err = _assert_internal(g)
+    assert "consume-once" in err.message
+
+
+def test_src_pad_used_by_a_node_and_an_output_is_internal_error() -> None:
+    g = _graph(
+        [_node("n1", "hflip", {}, ["src:a:v:0"])],
+        [_out("n1"), _out("src:a:v:0")],
+    )
+    err = _assert_internal(g)
+    assert "consume-once" in err.message
+
+
+def test_two_outputs_naming_the_same_src_pad_is_internal_error() -> None:
+    g = _graph([], [_out("src:a:a:0", "audio"), _out("src:a:a:0", "audio")])
+    err = _assert_internal(g)
+    assert "consume-once" in err.message
+
+
+def test_two_outputs_naming_the_same_node_pad_is_internal_error() -> None:
+    g = _graph([_node("n1", "hflip", {}, ["src:a:v:0"])], [_out("n1"), _out("n1:0")])
+    err = _assert_internal(g)
+    assert "consume-once" in err.message
 
 
 def test_empty_output_ref_is_internal_error() -> None:
-    _assert_internal(_graph([Node("n1", "hflip", {}, ["src:a"])], ""))
+    _assert_internal(_graph([_node("n1", "hflip", {}, ["src:a:v:0"])], [_out("")]))
+
+
+def test_no_outputs_is_internal_error() -> None:
+    err = _assert_internal(_graph([_node("n1", "hflip", {}, ["src:a:v:0"])], []))
+    assert "no outputs" in err.message
 
 
 # ---------------------------------------------------------------------------
@@ -408,11 +655,11 @@ def test_empty_output_ref_is_internal_error() -> None:
 def test_build_ffmpeg_args_exact_list() -> None:
     g = _graph(
         [
-            Node("n1", "crop", {"w": 600, "h": 200, "x": 1200, "y": 50}, ["src:b"]),
-            Node("n2", "scale", {"w": "iw*0.5", "h": "-2"}, ["n1"]),
-            Node("n3", "overlay", {"x": 20, "y": 20}, ["src:a", "n2"]),
+            _node("n1", "crop", {"w": 600, "h": 200, "x": 1200, "y": 50}, ["src:b:v:0"]),
+            _node("n2", "scale", {"w": "iw*0.5", "h": "-2"}, ["n1"]),
+            _node("n3", "overlay", {"x": 20, "y": 20}, ["src:a:v:0", "n2"]),
         ],
-        "n3",
+        [_out("n3")],
         input_paths=["game.mp4", "game.mp4"],
         sources={"a": 0, "b": 1},
     )
@@ -424,31 +671,202 @@ def test_build_ffmpeg_args_exact_list() -> None:
         "-i",
         "game.mp4",
         "-filter_complex",
-        "[1:v]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];"
-        "[0:v][n2]overlay=x=20:y=20[out]",
+        "[1:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];"
+        "[0:v:0][n2]overlay=x=20:y=20[out0]",
         "-map",
-        "[out]",
-        "-map",
-        "0:a?",
-        "-c:a",
-        "copy",
+        "[out0]",
         "out.mp4",
     ]
 
 
 def test_build_ffmpeg_args_single_input() -> None:
-    e = Emitted(inputs=["a.mp4"], filter_complex="[0:v]hflip[out]", output_label="out")
+    e = Emitted(
+        inputs=["a.mp4"],
+        filter_complex="[0:v:0]hflip[out0]",
+        maps=[OutputMap(target="[out0]", type="video", copy=False, metadata={})],
+    )
     assert build_ffmpeg_args(e, "/tmp/o.mkv") == [
         "ffmpeg",
         "-i",
         "a.mp4",
         "-filter_complex",
-        "[0:v]hflip[out]",
+        "[0:v:0]hflip[out0]",
         "-map",
-        "[out]",
-        "-map",
-        "0:a?",
-        "-c:a",
-        "copy",
+        "[out0]",
         "/tmp/o.mkv",
     ]
+
+
+def test_build_ffmpeg_args_omits_filter_complex_when_empty() -> None:
+    """SELECT a.video[1], a.audio[2] -- a pure remap, no filtergraph at all."""
+    g = _graph([], [_out("src:a:v:0"), _out("src:a:a:1", "audio")])
+    assert build_ffmpeg_args(emit(g), "out.mp4") == [
+        "ffmpeg",
+        "-i",
+        "a.mp4",
+        "-map",
+        "0:v:0",
+        "-c:0",
+        "copy",
+        "-map",
+        "0:a:1",
+        "-c:1",
+        "copy",
+        "out.mp4",
+    ]
+
+
+def test_build_ffmpeg_args_mixed_with_metadata() -> None:
+    g = _graph(
+        [_node("n1", "hflip", {}, ["src:a:v:0"])],
+        [
+            _out("n1", metadata={"title": "flipped"}),
+            _out("src:a:a:0", "audio", metadata={"language": "eng"}),
+        ],
+    )
+    assert build_ffmpeg_args(emit(g), "out.mp4") == [
+        "ffmpeg",
+        "-i",
+        "a.mp4",
+        "-filter_complex",
+        "[0:v:0]hflip[out0]",
+        "-map",
+        "[out0]",
+        "-metadata:s:0",
+        "title=flipped",
+        "-map",
+        "0:a:0",
+        "-c:1",
+        "copy",
+        "-metadata:s:1",
+        "language=eng",
+        "out.mp4",
+    ]
+
+
+def test_build_ffmpeg_args_sorts_metadata_keys() -> None:
+    e = Emitted(
+        inputs=["a.mp4"],
+        filter_complex="",
+        maps=[
+            OutputMap(
+                target="0:a:0",
+                type="audio",
+                copy=True,
+                metadata={"title": "Commentary", "language": "fra", "artist": "x"},
+            )
+        ],
+    )
+    args = build_ffmpeg_args(e, "out.mp4")
+    assert args[args.index("-map") :] == [
+        "-map",
+        "0:a:0",
+        "-c:0",
+        "copy",
+        "-metadata:s:0",
+        "artist=x",
+        "-metadata:s:0",
+        "language=fra",
+        "-metadata:s:0",
+        "title=Commentary",
+        "out.mp4",
+    ]
+
+
+def test_build_ffmpeg_args_metadata_values_are_passed_raw() -> None:
+    """Metadata goes through argv, not the filtergraph parser -- no escaping."""
+    e = Emitted(
+        inputs=["a.mp4"],
+        filter_complex="",
+        maps=[
+            OutputMap(
+                target="0:a:0",
+                type="audio",
+                copy=True,
+                metadata={"title": "12:30, take 'one'"},
+            )
+        ],
+    )
+    assert "title=12:30, take 'one'" in build_ffmpeg_args(e, "out.mp4")
+
+
+# ---------------------------------------------------------------------------
+# real ffmpeg sanity check (exec-marked)
+# ---------------------------------------------------------------------------
+
+_FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+_AV = _FIXTURES_DIR / "av.mp4"
+_SUBPROCESS_TIMEOUT = 60.0
+
+
+def _require_ffmpeg_and_fixture() -> None:
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg/ffprobe not found on PATH")
+    if not _AV.exists():
+        pytest.skip(f"fixture missing: {_AV} (run scripts/gen_fixtures.py first)")
+
+
+def _run_ffmpeg(args: list[str]) -> None:
+    args = list(args)
+    args.insert(1, "-y")
+    result = subprocess.run(args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)
+    assert result.returncode == 0, f"{args}\n{result.stderr}"
+
+
+def _probe_codec_types(path: Path) -> list[str]:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    return [str(stream["codec_type"]) for stream in data["streams"]]
+
+
+@pytest.mark.exec
+def test_multi_map_command_runs_under_real_ffmpeg(tmp_path: Path) -> None:
+    """hflip(a.video[1]) + volume(a.audio[1], 0.5) -> a real two-stream file."""
+    _require_ffmpeg_and_fixture()
+    g = _graph(
+        [
+            _node("n1", "hflip", {}, ["src:a:v:0"]),
+            _node("n2", "volume", {"volume": 0.5}, ["src:a:a:0"], ["audio"]),
+        ],
+        [_out("n1"), _out("n2", "audio", metadata={"language": "eng"})],
+        input_paths=[str(_AV)],
+    )
+    e = emit(g)
+    assert e.filter_complex == "[0:v:0]hflip[out0];[0:a:0]volume=volume=0.5[out1]"
+
+    out_path = tmp_path / "multimap.mp4"
+    _run_ffmpeg(build_ffmpeg_args(e, str(out_path)))
+
+    assert out_path.exists()
+    assert _probe_codec_types(out_path) == ["video", "audio"]
+
+
+@pytest.mark.exec
+def test_passthrough_map_runs_under_real_ffmpeg(tmp_path: Path) -> None:
+    """hflip(a.video[1]) + a.audio[1] -- the audio stream is copied, not filtered."""
+    _require_ffmpeg_and_fixture()
+    g = _graph(
+        [_node("n1", "hflip", {}, ["src:a:v:0"])],
+        [_out("n1"), _out("src:a:a:0", "audio", metadata={"language": "eng"})],
+        input_paths=[str(_AV)],
+    )
+    e = emit(g)
+    out_path = tmp_path / "passthrough.mp4"
+    _run_ffmpeg(build_ffmpeg_args(e, str(out_path)))
+
+    assert _probe_codec_types(out_path) == ["video", "audio"]
