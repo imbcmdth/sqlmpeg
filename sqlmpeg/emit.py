@@ -261,6 +261,17 @@ def _out_pad_count(node: Node) -> int:
     return count
 
 
+def _pad_type(g: Graph, ref: FrameRef) -> StreamType:
+    """Stream type of the pad `ref` points at (src marker or node.outputs[pad])."""
+    if is_src(ref):
+        return _parse_src_ref(ref)[1]
+    node_id, pad = _parse_node_ref(ref)
+    node = g.nodes.get(node_id)
+    if node is None:
+        raise _internal(f"ref {ref!r} names unknown node {node_id!r}")
+    return node.outputs[pad]
+
+
 def _src_spec(g: Graph, ref: FrameRef) -> str:
     """Render a source ref as an ffmpeg stream spec, e.g. ``0:a:1``."""
     alias, stream_type, index = _parse_src_ref(ref)
@@ -370,6 +381,12 @@ def _assign_labels(
 
 
 def _output_map(g: Graph, output: Output, labels: dict[str, str]) -> OutputMap:
+    produced = _pad_type(g, output.ref)
+    if produced != output.type:
+        raise _internal(
+            f"output {output.ref!r} is declared {output.type} but the producing "
+            f"pad is {produced} (lower/split bug)"
+        )
     if is_src(output.ref):
         # Passthrough: zero node consumers is guaranteed by _check_fanout,
         # which counts this Output itself as the pad's single consumer.
