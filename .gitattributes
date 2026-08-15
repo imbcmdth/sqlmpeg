@@ -1,0 +1,4 @@
+# Generated files whose tests assert byte-identity with the generator output
+# (which writes LF): never CRLF-smudge these on checkout.
+docs/stdlib.md text eol=lf
+docs/system-prompt.md text eol=lf
