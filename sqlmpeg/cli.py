@@ -6,33 +6,45 @@ plan 008.
 
 Subcommands:
 
-* ``compile QUERY.sql [--graph-only] [-o OUT] [--no-probe]`` -- print the
-  full ffmpeg command (POSIX-quoted via ``shlex.join``, even on Windows --
-  it is documentation output, not something meant to be pasted into
-  cmd.exe), or just the ``-filter_complex`` string with ``--graph-only``.
-  Output path resolution (RFC-002, plan 027): ``-o`` if given, else the
-  query's ``COPY ... TO`` sink path if it has one, else the ``out.mp4``
-  placeholder (today's default).
-* ``explain QUERY.sql [--no-probe]`` -- dump the IR graph as JSON (the sink,
-  if any, is part of that JSON already).
-* ``validate QUERY.sql [--json] [--no-probe]`` -- exit 0 silent on success;
-  on error, exit 1 with either a one-line human message or
+* ``compile QUERY.sql [--graph-only] [-o OUT] [--no-probe] [--portable]`` --
+  print the full ffmpeg command (POSIX-quoted via ``shlex.join``, even on
+  Windows -- it is documentation output, not something meant to be pasted
+  into cmd.exe), or just the ``-filter_complex`` string with
+  ``--graph-only``. Output path resolution (RFC-002, plan 027): ``-o`` if
+  given, else the query's ``COPY ... TO`` sink path if it has one, else the
+  ``out.mp4`` placeholder (today's default).
+* ``explain QUERY.sql [--no-probe] [--portable]`` -- dump the IR graph as
+  JSON (the sink, if any, is part of that JSON already).
+* ``validate QUERY.sql [--json] [--no-probe] [--portable]`` -- exit 0 silent
+  on success; on error, exit 1 with either a one-line human message or
   ``err.to_dict()`` JSON.
 * ``run QUERY.sql [-o OUT] [--timeout SECS] [-y]`` -- compile and execute
   ffmpeg as a subprocess (guardrail #6: argv list, no shell, timeout
   enforced, stderr captured and surfaced on failure). ``run`` always
   probes -- the files must exist to execute, so there is no ``--no-probe``
-  escape hatch here. Output path: ``-o`` if given, else the query's sink
-  path, else a usage error (exit 2) -- unlike ``compile``, ``run`` never
-  falls back to a placeholder path.
-* ``prompt`` -- print the portable LLM system prompt (plan 012) to stdout;
-  takes no arguments and never touches the filesystem.
+  escape hatch here; it has no ``--portable`` either, since it needs an
+  installed ffmpeg to execute against regardless. Output path: ``-o`` if
+  given, else the query's sink path, else a usage error (exit 2) -- unlike
+  ``compile``, ``run`` never falls back to a placeholder path.
+* ``prompt [--dynamic]`` -- print the portable LLM system prompt (plan 012)
+  to stdout; takes no other arguments and never touches the filesystem.
+  ``--dynamic`` (plan 032, RFC-003) appends an "Installed filters" section
+  built from this machine's ``ffmpeg -filters``/``-help`` output -- the one
+  part of the printed prompt that is machine-dependent; without the flag,
+  the output is identical to the portable, tier-1-only base prompt.
 
 ``--no-probe`` (compile/explain/validate only) skips ffprobe entirely for a
 byte-reproducible, fully offline compile (RFC-001 "Probing policy"): no
 ``STREAM_NOT_FOUND``/``BROADCAST_MISMATCH`` validation, ``SELECT *`` and bare
 array splats fail with ``INPUT_NOT_FOUND``, and provenance metadata is never
 attached.
+
+``--portable`` (compile/explain/validate only; RFC-003) compiles against the
+stdlib alone -- no ffmpeg filter registry is even constructed, so a query
+naming a dynamic (tier-2) filter or passing a named option is rejected
+(``UNKNOWN_FUNCTION`` / ``UNSUPPORTED_SQL``) exactly as it would be on a
+machine with no ffmpeg installed at all. Use it to confirm a query will
+compile on someone else's machine.
 
 ``QUERY.sql`` may be ``-`` to read the query text from stdin in every
 subcommand.
@@ -48,6 +60,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import registry as registry_module
 from .compiler import compile_sql
 from .emit import Emitted, build_ffmpeg_args, emit
 from .errors import SqlmpegError
@@ -98,11 +111,21 @@ def _build_parser() -> argparse.ArgumentParser:
     compile_p.add_argument(
         "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
     )
+    compile_p.add_argument(
+        "--portable",
+        action="store_true",
+        help="reject filters and named options that depend on the installed ffmpeg",
+    )
 
     explain_p = subparsers.add_parser("explain", help="dump the compiled IR graph as JSON")
     explain_p.add_argument("query", help="path to a .sql file, or - for stdin")
     explain_p.add_argument(
         "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
+    )
+    explain_p.add_argument(
+        "--portable",
+        action="store_true",
+        help="reject filters and named options that depend on the installed ffmpeg",
     )
 
     validate_p = subparsers.add_parser("validate", help="check that a query compiles")
@@ -112,6 +135,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     validate_p.add_argument(
         "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
+    )
+    validate_p.add_argument(
+        "--portable",
+        action="store_true",
+        help="reject filters and named options that depend on the installed ffmpeg",
     )
 
     run_p = subparsers.add_parser("run", help="compile and execute ffmpeg")
@@ -129,7 +157,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "-y", action="store_true", dest="overwrite", help="pass -y (overwrite) to ffmpeg"
     )
 
-    subparsers.add_parser("prompt", help="print the LLM system prompt for this dialect")
+    prompt_p = subparsers.add_parser("prompt", help="print the LLM system prompt for this dialect")
+    prompt_p.add_argument(
+        "--dynamic",
+        action="store_true",
+        help="append this machine's installed ffmpeg filter list (machine-dependent)",
+    )
 
     return parser
 
@@ -182,7 +215,7 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        graph = compile_sql(text, probe=not args.no_probe)
+        graph = compile_sql(text, probe=not args.no_probe, portable=args.portable)
         emitted = emit(graph)
     except SqlmpegError as err:
         _print_error(err)
@@ -204,7 +237,7 @@ def _cmd_explain(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        graph = compile_sql(text, probe=not args.no_probe)
+        graph = compile_sql(text, probe=not args.no_probe, portable=args.portable)
     except SqlmpegError as err:
         _print_error(err)
         return 1
@@ -219,7 +252,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        compile_sql(text, probe=not args.no_probe)
+        compile_sql(text, probe=not args.no_probe, portable=args.portable)
     except SqlmpegError as err:
         if args.as_json:
             print(json.dumps(err.to_dict()))
@@ -285,7 +318,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_prompt(args: argparse.Namespace) -> int:
-    print(build_system_prompt())
+    dynamic = registry_module.load() if args.dynamic else None
+    print(build_system_prompt(dynamic=dynamic))
     return 0
 
 

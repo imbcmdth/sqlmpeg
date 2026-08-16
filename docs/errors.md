@@ -51,37 +51,37 @@ SELECT a.video[1] FROM input('x.mp4' a
 
 ## UNKNOWN_FUNCTION
 
-**Meaning:** A call in the query names a function that is not in the
+**Meaning:** A call in the query names a function that is neither in the
 stdlib table (`sqlmpeg.stdlib.FUNCTIONS`, rendered in full in
-[docs/stdlib.md](stdlib.md)). This is checked both for the outer call in a
-projection/WHERE expression and for nested calls used as an argument to
-another call.
+[docs/stdlib.md](stdlib.md)) nor a filter the installed ffmpeg reports
+(`sqlmpeg/registry.py`, RFC-003 -- see [docs/dynamic-filters.md](dynamic-filters.md)).
+This is checked both for the outer call in a projection/WHERE expression and
+for nested calls used as an argument to another call.
 
-**Fires when:** the query calls a name that isn't one of the stdlib
-functions (video or audio).
+**Fires when:** the query calls a name that resolves in neither tier.
 
 **Example query:**
 
 ```sql
-SELECT sharpen(a.video[1])
+SELECT gblu(a.video[1])
 FROM input('x.mp4') a
 ```
 
-**Error JSON:**
+**Error JSON** (against ffmpeg 7.1; the near match crosses BOTH tiers --
+`gblu` is closer to the dynamic filter `gblur` than to any stdlib name):
 
 ```json
-{"line": 1, "col": 8, "code": "UNKNOWN_FUNCTION", "message": "unknown function sharpen()", "hint": "known functions: afade_in, afade_out, amix, atempo, blur, blur_regions, crop, draw_box, fade_in, fade_out, hflip, overlay, reverb, scale, speed, text, vflip, volume"}
+{"line": 1, "col": 8, "code": "UNKNOWN_FUNCTION", "message": "unknown function gblu()", "hint": "did you mean gblur()?"}
 ```
 
-The hint is a "did you mean" match when the name is close to a known one, and
-otherwise a plain alphabetical listing of the stdlib.
-
-Since RFC-003 the lookup spans BOTH tiers: the stdlib first, then every filter
-the installed ffmpeg reports (`sqlmpeg/registry.py`), so this code means "no
-stdlib function and no filter of this ffmpeg" and the did-you-mean can suggest
-a filter name (`gblu` -> `gblur`). Where there is no ffmpeg to ask -- or
-`--portable` was passed -- the listing hint says so, because the same query
-might well compile elsewhere.
+The hint is a "did you mean" match against the stdlib and, when available,
+every name the installed ffmpeg reports. Without a near match it falls back
+to a plain alphabetical listing of the stdlib alone (the dynamic list runs to
+~460 entries -- too long to be a useful inline hint), suffixed with why the
+short list might not be the whole story on another machine: `"(dynamic
+ffmpeg filters need ffmpeg on PATH)"` when there is no ffmpeg to ask, or
+`"(dynamic ffmpeg filters are disabled by --portable)"` when `--portable` was
+passed.
 
 ## UNKNOWN_ALIAS
 

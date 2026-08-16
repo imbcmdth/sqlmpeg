@@ -113,7 +113,9 @@ def test_compile_uses_sink_path_when_no_dash_o(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     query = _write_sql(tmp_path, VALID_QUERY)
-    monkeypatch.setattr(cli, "compile_sql", lambda text, probe=True: _sinked_graph("sink.mkv"))
+    monkeypatch.setattr(
+        cli, "compile_sql", lambda text, probe=True, portable=False: _sinked_graph("sink.mkv")
+    )
     code = cli.main(["compile", query])
     out = capsys.readouterr().out
     assert code == 0
@@ -125,7 +127,9 @@ def test_compile_dash_o_overrides_sink_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     query = _write_sql(tmp_path, VALID_QUERY)
-    monkeypatch.setattr(cli, "compile_sql", lambda text, probe=True: _sinked_graph("sink.mkv"))
+    monkeypatch.setattr(
+        cli, "compile_sql", lambda text, probe=True, portable=False: _sinked_graph("sink.mkv")
+    )
     code = cli.main(["compile", query, "-o", "override.mp4"])
     out = capsys.readouterr().out
     assert code == 0
@@ -146,6 +150,70 @@ def test_compile_no_probe_skips_probing(
     code = cli.main(["compile", "--no-probe", query])
     assert code == 0
     capsys.readouterr()
+
+
+# ---------------------------------------------------------------------------
+# --portable (compile/explain/validate only, RFC-003 / plan 032)
+# ---------------------------------------------------------------------------
+
+# A tier-2-only call: no stdlib entry named `unsharp` exists, so this is
+# UNKNOWN_FUNCTION under --portable regardless of whether ffmpeg happens to
+# be installed on the machine running the test -- --portable never even
+# constructs the registry.
+DYNAMIC_QUERY = "SELECT unsharp(a.frame, luma_amount => 1.5) FROM input('x.mp4') a"
+
+
+def test_compile_portable_rejects_a_dynamic_filter(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    query = _write_sql(tmp_path, DYNAMIC_QUERY)
+    code = cli.main(["compile", "--portable", query])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "UNKNOWN_FUNCTION" in captured.err
+
+
+def test_compile_portable_still_accepts_the_stdlib(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    query = _write_sql(tmp_path, VALID_QUERY)
+    code = cli.main(["compile", "--portable", query])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "-filter_complex" in out
+
+
+def test_explain_portable_rejects_a_dynamic_filter(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    query = _write_sql(tmp_path, DYNAMIC_QUERY)
+    code = cli.main(["explain", "--portable", query])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "UNKNOWN_FUNCTION" in captured.err
+
+
+def test_validate_portable_rejects_a_dynamic_filter(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    query = _write_sql(tmp_path, DYNAMIC_QUERY)
+    code = cli.main(["validate", "--json", "--portable", query])
+    captured = capsys.readouterr()
+    assert code == 1
+
+    import json
+
+    data = json.loads(captured.out)
+    assert data["code"] == "UNKNOWN_FUNCTION"
+
+
+def test_run_has_no_portable_flag(tmp_path: Path) -> None:
+    """--portable is compile/explain/validate only -- run always needs ffmpeg
+    to execute against, so there is no offline escape hatch for it."""
+    query = _write_sql(tmp_path, VALID_QUERY)
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["run", query, "--portable"])
+    assert exc_info.value.code == 2
 
 
 # ---------------------------------------------------------------------------

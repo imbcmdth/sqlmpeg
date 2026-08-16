@@ -158,3 +158,69 @@ def test_cli_prompt_takes_no_query_argument() -> None:
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["prompt", "query.sql"])
     assert exc_info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# --dynamic (plan 032, RFC-003): appends the installed ffmpeg's filter list
+# ---------------------------------------------------------------------------
+
+
+def test_dynamic_prompt_with_no_registry_equals_the_base_prompt() -> None:
+    """The no-arg / dynamic=None path must stay byte-identical: this is what
+    keeps docs/system-prompt.md's freshness test passing unchanged."""
+    assert build_system_prompt(dynamic=None) == PROMPT
+    assert build_system_prompt() == PROMPT
+
+
+def test_dynamic_prompt_when_registry_unavailable_appends_one_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ffmpeg on PATH (or a registry that failed to load) still exits
+    cleanly: the base prompt plus one explanatory note, never an error and
+    never the "Installed filters" section itself."""
+    from sqlmpeg.registry import Registry
+
+    empty = Registry()
+    monkeypatch.setattr(empty, "available", lambda: False)
+    text = build_system_prompt(dynamic=empty)
+    assert text.startswith(PROMPT + "\n\n")
+    assert "## Installed filters" not in text
+    assert "ffmpeg" in text[len(PROMPT) :].lower()
+
+
+@pytest.mark.exec
+def test_dynamic_prompt_contains_gblur_and_its_signature() -> None:
+    from sqlmpeg.registry import load
+
+    text = build_system_prompt(dynamic=load())
+    assert "## Installed filters" in text
+    assert "gblur(video) -> video" in text
+
+
+def test_cli_prompt_without_dynamic_never_touches_the_registry(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _boom() -> None:
+        raise AssertionError("registry should not be loaded without --dynamic")
+
+    monkeypatch.setattr(cli.registry_module, "load", _boom)
+    code = cli.main(["prompt"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out == PROMPT + "\n"
+
+
+def test_cli_prompt_dynamic_flag_is_wired(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """CLI wiring only, kept offline by monkeypatching the registry."""
+    from sqlmpeg.registry import Registry
+
+    empty = Registry()
+    monkeypatch.setattr(empty, "available", lambda: False)
+    monkeypatch.setattr(cli.registry_module, "load", lambda: empty)
+    code = cli.main(["prompt", "--dynamic"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out.startswith(PROMPT + "\n\n")
+    assert captured.out != PROMPT + "\n"

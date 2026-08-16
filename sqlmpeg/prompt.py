@@ -1,10 +1,10 @@
-"""The portable LLM system prompt for sqlmpeg (plan 012).
+"""The portable LLM system prompt for sqlmpeg (plan 012; plan 032 for ``--dynamic``).
 
 ``build_system_prompt()`` returns the text a user hands to whatever model they
 like as a system prompt, so that "describe the edit in English, get a runnable
 ffmpeg command" works without sqlmpeg ever calling an API itself.
 
-Two properties this module must keep:
+Two properties the no-arg path (``dynamic=None``) must keep:
 
 * **Deterministic and pure.** No I/O, no clock, no environment. The same string
   every call, on every machine -- ``scripts/gen_prompt.py`` commits it to
@@ -13,6 +13,13 @@ Two properties this module must keep:
   :data:`sqlmpeg.stdlib.FUNCTIONS` (guardrail #4) and the repair guidance is
   keyed by :class:`sqlmpeg.errors.ErrorCode`, so a new function or code cannot
   silently go undocumented. Nothing about the stdlib is hardcoded here.
+
+``build_system_prompt(dynamic=registry.load())`` (``sqlmpeg prompt --dynamic``)
+appends one more, deliberately impure section: what THIS machine's installed
+ffmpeg additionally supports (RFC-003 tier 2), name + pad signature + doc, no
+options (the repair loop's ``UNKNOWN_FILTER_OPTION``/``FILTER_OPTION_TYPE``
+cover those). It is strictly additive -- every section above it is identical
+to the base prompt, which is what keeps the freshness test passing unchanged.
 
 Marker convention (relied on by ``tests/test_prompt.py``): every fenced
 ```sql block in the prompt is one complete query that ``compile_sql`` accepts
@@ -30,6 +37,7 @@ on consoles whose encoding is not UTF-8.
 from __future__ import annotations
 
 from sqlmpeg.errors import ErrorCode
+from sqlmpeg.registry import Registry
 from sqlmpeg.sink import SINK_OPTIONS
 from sqlmpeg.stdlib import FUNCTIONS, Param
 
@@ -604,13 +612,70 @@ def _repair_section() -> str:
 
 
 # ---------------------------------------------------------------------------
+# dynamic filter list (plan 032, opt-in via `sqlmpeg prompt --dynamic`)
+# ---------------------------------------------------------------------------
+#
+# NOT part of the base prompt: this section is appended only when a caller
+# passes a Registry to build_system_prompt, so the no-arg path (what
+# docs/system-prompt.md pins) is untouched. It lists every filter this
+# machine's installed ffmpeg reports -- name, pad signature, one-line doc --
+# with no per-filter option dump (the RFC's call: ~460 filters' worth of
+# option tables would be enormous; validate --json's UNKNOWN_FILTER_OPTION /
+# FILTER_OPTION_TYPE cover that long tail instead).
+
+_DYNAMIC_UNAVAILABLE_NOTE = (
+    "No installed ffmpeg was found on PATH (or its filter list could not be "
+    "read), so there is no per-machine filter list to append here; \"Beyond "
+    "the stdlib\" above still describes the mechanism, it simply has nothing "
+    "to compile against on this machine."
+)
+
+
+def _dynamic_filter_line(name: str, registry: Registry) -> str:
+    f = registry.get(name)
+    assert f is not None  # name came from registry.names() itself
+    signature = ", ".join(f.inputs)
+    return f"- `{name}({signature}) -> {f.output}` -- {f.doc}"
+
+
+def _dynamic_section(registry: Registry) -> str:
+    if not registry.available():
+        return _DYNAMIC_UNAVAILABLE_NOTE
+    names = sorted(registry.names())
+    lines = [
+        f"## Installed filters ({len(names)})",
+        "",
+        "Every filter this machine's installed ffmpeg reports, beyond the "
+        "curated stdlib above -- name, pad signature, one-line description, "
+        "sorted alphabetically. This list is machine-dependent, exactly like "
+        "the rest of \"Beyond the stdlib\": it is only what THIS ffmpeg "
+        "reported when this prompt was generated. Options are never dumped "
+        "here -- pass them by name (`<name> => <value>`) as usual and let "
+        "`sqlmpeg validate --json` report the real option set on a mistake "
+        "(`UNKNOWN_FILTER_OPTION` / `FILTER_OPTION_TYPE`); the repair loop "
+        "above covers the rest.",
+        "",
+    ]
+    lines.extend(_dynamic_filter_line(name, registry) for name in names)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------------------
 
 
-def build_system_prompt() -> str:
-    """The sqlmpeg system prompt: deterministic, pure, ASCII, no trailing newline."""
-    sections = (
+def build_system_prompt(dynamic: Registry | None = None) -> str:
+    """The sqlmpeg system prompt: deterministic, pure, ASCII, no trailing newline.
+
+    With `dynamic=None` (the default) this is exactly the portable, tier-1
+    prompt -- pure and machine-independent, byte-identical to
+    `docs/system-prompt.md`. Passing a `Registry` (`sqlmpeg prompt --dynamic`)
+    appends an "Installed filters" section listing what THIS machine's ffmpeg
+    additionally supports; that section is the only impure, machine-dependent
+    part of the output, and it never changes anything above it.
+    """
+    sections: tuple[str, ...] = (
         _ROLE,
         _DIALECT,
         _output_section(),
@@ -619,4 +684,6 @@ def build_system_prompt() -> str:
         _examples(),
         _repair_section(),
     )
+    if dynamic is not None:
+        sections = sections + (_dynamic_section(dynamic),)
     return "\n\n".join(sections)

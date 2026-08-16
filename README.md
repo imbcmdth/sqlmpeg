@@ -2,7 +2,7 @@
 
 A standalone CLI that compiles SQL into an ffmpeg `-filter_complex` invocation. Write a `SELECT` statement; get a runnable ffmpeg command. FFmpeg is the executor — this tool never touches pixels.
 
-**Status: Work in progress (v0.3.0)**
+**Status: Work in progress (v0.4.0)**
 
 ## Example
 
@@ -64,6 +64,22 @@ ffmpeg -i episode1.mkv -i episode2.mkv -filter_complex '[0:v:0][0:a:0][0:a:1][1:
 ```
 
 That is the whole point of the frontend: SQL already demands that `UNION ALL` branches agree on column count, types and order, and that demand IS ffmpeg's concat segment contract -- `concat=n=2:v=1:a=2`, its inputs interleaved segment by segment. Arrays are no exception; two three-track episodes give `a=3` and nobody counts pads by hand. The `language` tags survive the concat because both segments agree on them.
+
+## Any ffmpeg filter
+
+The examples above only reach for the curated stdlib -- a few dozen functions with a hand-picked, portable argument order that compiles on any machine, ffmpeg installed or not. Underneath, ffmpeg itself ships several hundred filters, and sqlmpeg exposes every one of them too: call it by its own ffmpeg name, its stream inputs positional and every option passed by name.
+
+```sql
+SELECT unsharp(a.frame, luma_msize_x => 7, luma_amount => 1.5), a.audio[1]
+FROM input('clip.mp4') a
+```
+
+```
+$ sqlmpeg compile query.sql
+ffmpeg -i clip.mp4 -filter_complex '[0:v:0]unsharp=luma_msize_x=7:luma_amount=1.5[out0]' -map '[out0]' -map 0:a:0 -c:1 copy out.mp4
+```
+
+This is deliberately machine-dependent: it compiles only where the installed ffmpeg reports an `unsharp` filter, unlike the stdlib above, which compiles everywhere. Named options work on stdlib calls too, reaching through to the underlying filter's full option set -- `blur(a.frame, 5, planes => 1)` sets `gblur`'s `planes`, an option no stdlib table lists. Pass `--portable` to `compile` / `explain` / `validate` to check that a query compiles without relying on any of this -- stdlib only, exactly what a machine with no ffmpeg installed would see. See [docs/dynamic-filters.md](docs/dynamic-filters.md) for the full picture, including its one documented rough edge.
 
 ## Streams
 

@@ -351,6 +351,45 @@ def test_readme_encoding_command_is_the_real_compilation(_fixtures: None) -> Non
     assert shown in _readme_text(), shown
 
 
+# ---------------------------------------------------------------------------
+# the README "Any ffmpeg filter" example (plan 032, RFC-003)
+# ---------------------------------------------------------------------------
+
+_DYNAMIC_README_PATHS = {"clip.mp4": "av.mp4"}
+
+
+def _readme_dynamic_sql() -> str:
+    """The tier-2 example in the "Any ffmpeg filter" section, re-pointed at
+    the real fixture -- `unsharp` is not in any stdlib table, so compiling it
+    needs the installed ffmpeg to introspect, same as any other tier-2 call."""
+    sql = _readme_block("unsharp")
+    for shown, fixture in _DYNAMIC_README_PATHS.items():
+        sql = sql.replace(shown, (FIXTURES_DIR / fixture).as_posix())
+    return sql
+
+
+@pytest.mark.exec
+def test_readme_dynamic_filter_example_compiles(_fixtures: None) -> None:
+    """Name, pad signature and options all come from the installed ffmpeg;
+    the two named options render in the order they were written."""
+    g = compile_sql(_readme_dynamic_sql())
+    assert _filters(g) == ["unsharp"]
+    assert g.nodes["n1"].args == {"luma_msize_x": 7, "luma_amount": 1.5}
+    assert _outputs(g) == [("n1", "video", None), ("src:a:a:0", "audio", None)]
+
+
+@pytest.mark.exec
+def test_readme_dynamic_filter_command_is_the_real_compilation(_fixtures: None) -> None:
+    """The command shown under "Any ffmpeg filter" is what sqlmpeg actually
+    prints for that query, with only the fixture path written back to the
+    shown name."""
+    args = build_ffmpeg_args(emit(compile_sql(_readme_dynamic_sql())), "out.mp4")
+    shown = shlex.join(args)
+    for name, fixture in _DYNAMIC_README_PATHS.items():
+        shown = shown.replace((FIXTURES_DIR / fixture).as_posix(), name)
+    assert shown in _readme_text(), shown
+
+
 def test_readme_flagship_scale_factor_is_not_a_decimal() -> None:
     """``Literal.to_py()`` yields Decimal for 0.5; the IR must carry float."""
     g = _lower("SELECT scale(a.frame, 0.5, 0.25) FROM input('x.mp4') a")
