@@ -119,6 +119,8 @@ def _parse_streams(data: object) -> ProbeResult | None:
         streams: list[StreamMeta] = []
         video_idx = 0
         audio_idx = 0
+        subtitle_idx = 0
+        data_idx = 0
         for raw in raw_streams:
             if not isinstance(raw, dict):
                 return None
@@ -152,7 +154,35 @@ def _parse_streams(data: object) -> ProbeResult | None:
                     )
                 )
                 audio_idx += 1
-            # other codec_type values (subtitle, data, ...) are ignored.
+            elif codec_type == "subtitle":
+                metadata = _tags(raw)
+                streams.append(
+                    StreamMeta(
+                        type="subtitle",
+                        index=subtitle_idx,
+                        metadata=metadata,
+                        width=None,
+                        height=None,
+                        fps=None,
+                        sample_rate=None,
+                    )
+                )
+                subtitle_idx += 1
+            elif codec_type == "data":
+                metadata = _tags(raw)
+                streams.append(
+                    StreamMeta(
+                        type="data",
+                        index=data_idx,
+                        metadata=metadata,
+                        width=None,
+                        height=None,
+                        fps=None,
+                        sample_rate=None,
+                    )
+                )
+                data_idx += 1
+            # other codec_type values (attachment, ...) are ignored.
 
         return ProbeResult(streams=streams)
     except (KeyError, TypeError, ValueError):

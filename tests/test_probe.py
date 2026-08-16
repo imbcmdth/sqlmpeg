@@ -161,7 +161,7 @@ def test_streams_not_a_list_returns_none(
 # --- field mapping (monkeypatched, offline) ---------------------------------
 
 
-def test_maps_fields_and_ignores_other_codec_types(
+def test_maps_fields_including_subtitle_streams(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     f = tmp_path / "x.mp4"
@@ -171,10 +171,13 @@ def test_maps_fields_and_ignores_other_codec_types(
 
     result = probe(str(f))
     assert result is not None
-    assert len(result.streams) == 2  # subtitle stream is ignored
+    # RFC-004: subtitle streams are mapped, not ignored, so all three streams
+    # in FAKE_JSON (video, subtitle, audio) show up.
+    assert len(result.streams) == 3
 
     video = result.by_type("video")
     audio = result.by_type("audio")
+    subtitle = result.by_type("subtitle")
     assert video == [
         StreamMeta(
             type="video",
@@ -197,6 +200,66 @@ def test_maps_fields_and_ignores_other_codec_types(
             sample_rate=44100,
         )
     ]
+    assert subtitle == [
+        StreamMeta(
+            type="subtitle",
+            index=0,
+            metadata={},
+            width=None,
+            height=None,
+            fps=None,
+            sample_rate=None,
+        )
+    ]
+
+
+def test_maps_data_streams(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    data_json = json.dumps(
+        {
+            "streams": [
+                {"codec_type": "video"},
+                {"codec_type": "data", "tags": {"language": "eng"}},
+                {"codec_type": "data"},
+            ]
+        }
+    )
+    _fake_run(monkeypatch, stdout=data_json)
+
+    result = probe(str(f))
+    assert result is not None
+    assert len(result.streams) == 3
+    data = result.by_type("data")
+    assert [s.index for s in data] == [0, 1]
+    assert data[0].metadata == {"language": "eng"}
+    assert data[0].width is None
+    assert data[0].height is None
+    assert data[0].fps is None
+    assert data[0].sample_rate is None
+
+
+def test_attachment_codec_type_is_still_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    attachment_json = json.dumps(
+        {
+            "streams": [
+                {"codec_type": "video"},
+                {"codec_type": "attachment"},
+            ]
+        }
+    )
+    _fake_run(monkeypatch, stdout=attachment_json)
+
+    result = probe(str(f))
+    assert result is not None
+    assert len(result.streams) == 1
+    assert result.streams[0].type == "video"
 
 
 def test_per_type_index_counted_in_file_order(
@@ -296,6 +359,28 @@ def _fixtures() -> Path:
         check=True,
     )
     return FIXTURES_DIR
+
+
+@pytest.mark.exec
+def test_probe_avs_fixture_has_subtitle_stream_with_language_tag(_fixtures: Path) -> None:
+    """avs.mkv (RFC-004, plan 033): av.mp4 + subs.en.vtt muxed with -c:s srt."""
+    result = probe(str(_fixtures / "avs.mkv"))
+    assert result is not None
+    assert len(result.streams) == 3
+
+    video = result.by_type("video")
+    audio = result.by_type("audio")
+    subtitle = result.by_type("subtitle")
+    assert len(video) == 1
+    assert len(audio) == 1
+    assert len(subtitle) == 1
+
+    assert subtitle[0].index == 0
+    assert subtitle[0].metadata == {"language": "eng"}
+    assert subtitle[0].width is None
+    assert subtitle[0].height is None
+    assert subtitle[0].fps is None
+    assert subtitle[0].sample_rate is None
 
 
 @pytest.mark.exec

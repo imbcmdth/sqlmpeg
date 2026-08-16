@@ -22,7 +22,7 @@ from typing import Literal
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 
-OptionScope = Literal["video", "audio", "container"]
+OptionScope = Literal["video", "audio", "subtitle", "container"]
 OptionType = Literal["str", "int", "bool"]
 
 
@@ -101,6 +101,14 @@ SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         type="int",
         doc="Output audio sample rate in Hz, e.g. 48000.",
         flag="-ar",
+        per_stream=True,
+    ),
+    "subtitle_codec": SinkOptionSpec(
+        name="subtitle_codec",
+        scope="subtitle",
+        type="str",
+        doc="Subtitle codec name, e.g. 'mov_text', 'webvtt', 'srt'.",
+        flag="-c",
         per_stream=True,
     ),
     "format": SinkOptionSpec(

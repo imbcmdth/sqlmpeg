@@ -236,3 +236,98 @@ def test_graph_from_dict_tolerates_missing_sink_key() -> None:
     assert "sink" not in d
     g2 = Graph.from_dict(d)
     assert g2.sink is None
+
+
+# ---------------------------------------------------------------------------
+# subtitle / data stream types + src refs (RFC-004, plan 033)
+# ---------------------------------------------------------------------------
+
+
+def test_src_parts_subtitle() -> None:
+    assert src_parts("src:a:s:0") == ("a", "subtitle", 0)
+
+
+def test_src_parts_data() -> None:
+    assert src_parts("src:a:d:3") == ("a", "data", 3)
+
+
+def test_output_round_trip_subtitle() -> None:
+    o = Output(
+        ref="src:s:s:0",
+        type="subtitle",
+        name=None,
+        metadata={"language": "eng"},
+    )
+    d = o.to_dict()
+    o2 = Output.from_dict(d)
+    assert o2 == o
+    assert d["type"] == "subtitle"
+
+
+def test_output_round_trip_data() -> None:
+    o = Output(ref="src:a:d:0", type="data", name=None, metadata={})
+    d = o.to_dict()
+    o2 = Output.from_dict(d)
+    assert o2 == o
+    assert d["type"] == "data"
+
+
+def test_output_from_dict_rejects_invalid_stream_type() -> None:
+    with pytest.raises(ValueError):
+        Output.from_dict(
+            {"ref": "src:a:x:0", "type": "bogus", "name": None, "metadata": {}}
+        )
+
+
+def test_node_outputs_reject_subtitle_data_type_strings_are_still_parseable() -> None:
+    # Node.outputs is typed StreamType too -- subtitle/data parse, even though
+    # by RFC-004's passthrough-only rule no node ever legitimately declares
+    # them (that constraint is enforced by later passes, not by ir.py).
+    n = Node(
+        id="n0",
+        filter="noop",
+        args={},
+        inputs=["src:a:s:0"],
+        outputs=["subtitle"],
+    )
+    d = n.to_dict()
+    n2 = Node.from_dict(d)
+    assert n2.outputs == ["subtitle"]
+
+
+# ---------------------------------------------------------------------------
+# Graph.input_trims (RFC-004 input-seek amendment, plan 033)
+# ---------------------------------------------------------------------------
+
+
+def test_graph_input_trims_defaults_empty() -> None:
+    g = _build_graph()
+    assert g.input_trims == {}
+    assert "input_trims" not in g.to_dict()
+
+
+def test_graph_input_trims_round_trip() -> None:
+    g = _build_graph()
+    g.input_trims = {"a": (5.0, 60.0)}
+    d1 = g.to_dict()
+    assert d1["input_trims"] == {"a": [5.0, 60.0]}
+    g2 = Graph.from_dict(d1)
+    assert g2.input_trims == {"a": (5.0, 60.0)}
+    d2 = g2.to_dict()
+    assert d1 == d2
+
+
+def test_graph_input_trims_multiple_aliases_round_trip() -> None:
+    g = _build_graph()
+    g.input_trims = {"a": (0.0, 10.0), "b": (2.5, 30.25)}
+    d = g.to_dict()
+    g2 = Graph.from_dict(d)
+    assert g2.input_trims == {"a": (0.0, 10.0), "b": (2.5, 30.25)}
+
+
+def test_graph_from_dict_tolerates_missing_input_trims_key() -> None:
+    g = _build_graph()
+    d = g.to_dict()
+    assert "input_trims" not in d
+    g2 = Graph.from_dict(d)
+    assert g2.input_trims == {}

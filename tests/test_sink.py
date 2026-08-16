@@ -12,7 +12,7 @@ import pytest
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.sink import SINK_OPTIONS, SinkOptionSpec, validate_option
 
-# name -> (scope, type) per RFC-002's v1 table.
+# name -> (scope, type) per RFC-002's v1 table, plus RFC-004's subtitle_codec.
 _EXPECTED: dict[str, tuple[str, str]] = {
     "video_codec": ("video", "str"),
     "audio_codec": ("audio", "str"),
@@ -24,11 +24,12 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "sample_rate": ("audio", "int"),
     "format": ("container", "str"),
     "faststart": ("container", "bool"),
+    "subtitle_codec": ("subtitle", "str"),
 }
 
 
-def test_table_has_exactly_ten_entries() -> None:
-    assert len(SINK_OPTIONS) == 10
+def test_table_has_exactly_eleven_entries() -> None:
+    assert len(SINK_OPTIONS) == 11
     assert set(SINK_OPTIONS) == set(_EXPECTED)
 
 
@@ -72,7 +73,16 @@ def test_per_stream_options_use_colon_index_flags() -> None:
         "video_bitrate",
         "audio_bitrate",
         "sample_rate",
+        "subtitle_codec",
     }
+
+
+def test_subtitle_codec_scope_and_flag() -> None:
+    spec = SINK_OPTIONS["subtitle_codec"]
+    assert spec.scope == "subtitle"
+    assert spec.flag == "-c"
+    assert spec.per_stream is True
+    assert "mov_text" in spec.doc or "webvtt" in spec.doc or "srt" in spec.doc
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +96,10 @@ def test_validate_option_happy_str() -> None:
 
 def test_validate_option_happy_int() -> None:
     assert validate_option("crf", 20) == 20
+
+
+def test_validate_option_happy_subtitle_codec() -> None:
+    assert validate_option("subtitle_codec", "mov_text") == "mov_text"
 
 
 def test_validate_option_happy_bool_true() -> None:

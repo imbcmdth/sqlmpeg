@@ -46,6 +46,20 @@ _SOURCES: dict[str, str] = {
 _AV_NAME = "av.mp4"
 _AV2_NAME = "av2.mp4"
 _AV3_NAME = "av3.mp4"
+_SUBS_NAME = "subs.en.vtt"
+_AVS_NAME = "avs.mkv"
+
+_SUBS_VTT = """WEBVTT
+
+00:00:00.000 --> 00:00:00.600
+Cue one.
+
+00:00:00.700 --> 00:00:01.300
+Cue two.
+
+00:00:01.400 --> 00:00:02.000
+Cue three.
+"""
 
 
 def _ffmpeg_available() -> bool:
@@ -126,6 +140,42 @@ def _generate_av3() -> None:
     )
 
 
+def _generate_subs_vtt() -> Path:
+    """A tiny, valid WEBVTT file (3 cues over ~2s) -- plain text, no ffmpeg needed."""
+    out_path = FIXTURES_DIR / _SUBS_NAME
+    if out_path.exists():
+        print(f"skip (already exists): {out_path}")
+        return out_path
+    FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"generating: {out_path}")
+    out_path.write_text(_SUBS_VTT, encoding="utf-8")
+    return out_path
+
+
+def _generate_avs(subs_path: Path) -> None:
+    """av.mp4's video+audio muxed with subs.en.vtt's caption track into an mkv.
+
+    RFC-004's caption story: webvtt -> srt inside an mkv container, with a
+    language tag on the subtitle stream so the fixture also exercises
+    provenance-tag passthrough. `-c copy` covers video/audio; `-c:s srt`
+    overrides the subtitle stream specifically (ffmpeg logs a benign
+    "multiple -c options" notice for this because `-c copy` also nominally
+    covers the subtitle stream before being overridden -- exit code is 0 and
+    the resulting subtitle codec is srt, verified by an exec test).
+    """
+    _run(
+        FIXTURES_DIR / _AVS_NAME,
+        [
+            "-i", str(FIXTURES_DIR / _AV_NAME),
+            "-i", str(subs_path),
+            "-map", "0:v:0", "-map", "0:a:0", "-map", "1:s:0",
+            "-c", "copy",
+            "-c:s", "srt",
+            "-metadata:s:s:0", "language=eng",
+        ],
+    )
+
+
 def main() -> int:
     if not _ffmpeg_available():
         print("error: ffmpeg not found on PATH", file=sys.stderr)
@@ -135,6 +185,8 @@ def main() -> int:
     _generate_av()
     _generate_av2()
     _generate_av3()
+    subs_path = _generate_subs_vtt()
+    _generate_avs(subs_path)
     return 0
 
 

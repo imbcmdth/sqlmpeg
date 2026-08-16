@@ -6,7 +6,7 @@ sqlmpeg-project.md.
 
 FrameRef grammar (v2, RFC-001 "stream-aware" — authoritative statement; split.py's
 module docstring held the v1 grammar and will be brought in line with this one by
-plan 017)
+plan 017; RFC-004 widened the marker set to include `s`/`d` — see below)
 ------------------------------------------------------------------------------
 A `FrameRef` is a plain `str` and is always exactly one of the following forms:
 
@@ -15,6 +15,9 @@ A `FrameRef` is a plain `str` and is always exactly one of the following forms:
                               in `Graph.sources`. Renders as ffmpeg
                               `<idx>:v:<k>` where `idx = sources[alias]`.
     "src:<alias>:a:<k>"   -> same, for the k-th audio stream (0-based).
+    "src:<alias>:s:<k>"   -> same, for the k-th subtitle stream (0-based).
+    "src:<alias>:d:<k>"   -> same, for the k-th data stream (0-based; e.g.
+                              tmcd timecode, GoPro gpmd).
     "<node-id>"           -> a Node's output pad 0 (implicit; valid for any
                               node with a single consumer, or before the
                               split pass has run).
@@ -37,6 +40,14 @@ new `src_parts()` parse the typed form.
 A node id must never itself look like a source ref (i.e. must not start with
 `"src:"`); this invariant is relied on by `is_src()` and is unchanged from
 v1.
+
+Subtitle / data refs are PASSTHROUGH-ONLY (RFC-004): ffmpeg filtergraphs
+carry only video/audio, so a `"src:<alias>:s:<k>"` or `"src:<alias>:d:<k>"`
+ref may only ever appear as a `Graph.outputs` entry (a bare `-map`), never as
+a `Node.inputs` entry and never produced by a `Node.outputs` entry. This
+module does not enforce that constraint -- it is a property of well-formed
+IR that later passes (parser/lower in wave 2, split/emit exemptions in wave
+3) are responsible for upholding and checking.
 """
 
 from __future__ import annotations
@@ -44,7 +55,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-StreamType = Literal["video", "audio"]
+StreamType = Literal["video", "audio", "subtitle", "data"]
 
 FrameRef = str  # a Node.id, "<node-id>:<pad>", or "src:<alias>:v|a:<k>"
 
@@ -81,6 +92,10 @@ def _parse_type_marker(marker: str) -> StreamType:
         return "video"
     if marker == "a":
         return "audio"
+    if marker == "s":
+        return "subtitle"
+    if marker == "d":
+        return "data"
     raise ValueError(f"invalid source ref type marker {marker!r}")
 
 
@@ -89,6 +104,10 @@ def _parse_stream_type(value: object) -> StreamType:
         return "video"
     if value == "audio":
         return "audio"
+    if value == "subtitle":
+        return "subtitle"
+    if value == "data":
+        return "data"
     raise ValueError(f"invalid stream type: {value!r}")
 
 
@@ -198,6 +217,12 @@ class Graph:
     nodes: dict[str, Node] = field(default_factory=dict)  # insertion-ordered
     outputs: list[Output] = field(default_factory=list)  # order = -map order
     sink: Sink | None = None  # COPY ... TO ... WITH (...); None for bare SELECT
+    # RFC-004 input-seek amendment: alias -> (start, end) seconds. Emit (wave
+    # 3) renders "-ss <start> -to <end>" immediately before that alias's -i,
+    # trimming every stream type of that input coherently. Empty by default;
+    # to_dict emits the "input_trims" key only when non-empty (same
+    # golden-compat pattern as "sink" above).
+    input_trims: dict[str, tuple[float, float]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         d: dict[str, object] = {
@@ -206,10 +231,15 @@ class Graph:
             "nodes": [node.to_dict() for node in self.nodes.values()],
             "outputs": [output.to_dict() for output in self.outputs],
         }
-        # "sink" is emitted ONLY when present, so every existing golden
-        # .ir.json (no sink) stays byte-identical -- this change is additive.
+        # "sink" and "input_trims" are emitted ONLY when present/non-empty,
+        # so every existing golden .ir.json stays byte-identical -- these
+        # changes are additive.
         if self.sink is not None:
             d["sink"] = self.sink.to_dict()
+        if self.input_trims:
+            d["input_trims"] = {
+                alias: [start, end] for alias, (start, end) in self.input_trims.items()
+            }
         return d
 
     @classmethod
@@ -240,10 +270,20 @@ class Graph:
             assert isinstance(raw_sink, dict)
             sink = Sink.from_dict(raw_sink)
 
+        raw_input_trims = d.get("input_trims")
+        input_trims: dict[str, tuple[float, float]] = {}
+        if raw_input_trims is not None:
+            assert isinstance(raw_input_trims, dict)
+            for alias, bounds in raw_input_trims.items():
+                assert isinstance(bounds, list)
+                start, end = bounds
+                input_trims[str(alias)] = (float(start), float(end))
+
         return cls(
             input_paths=[str(p) for p in raw_inputs],
             sources={str(k): int(v) for k, v in raw_sources.items()},
             nodes=nodes,
             outputs=outputs,
             sink=sink,
+            input_trims=input_trims,
         )

@@ -213,6 +213,7 @@ stream copy.
 - `video_bitrate` (str, video) -- Target video bitrate, e.g. '4M'.
 - `audio_bitrate` (str, audio) -- Target audio bitrate, e.g. '192k'.
 - `sample_rate` (int, audio) -- Output audio sample rate in Hz, e.g. 48000.
+- `subtitle_codec` (str, subtitle) -- Subtitle codec name, e.g. 'mov_text', 'webvtt', 'srt'.
 - `format` (str, container) -- Container format, e.g. 'mp4' (else inferred from the path extension).
 - `faststart` (bool, container) -- Move the MP4 moov atom to the front of the file for progressive playback.
 
