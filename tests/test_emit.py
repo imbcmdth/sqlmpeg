@@ -55,6 +55,7 @@ def _graph(
     input_paths: list[str] | None = None,
     sources: dict[str, int] | None = None,
     sink: Sink | None = None,
+    input_trims: dict[str, tuple[float, float]] | None = None,
 ) -> Graph:
     return Graph(
         input_paths=list(input_paths or ["a.mp4"]),
@@ -62,6 +63,7 @@ def _graph(
         nodes={n.id: n for n in nodes},
         outputs=list(outputs),
         sink=sink,
+        input_trims=dict(input_trims or {}),
     )
 
 
@@ -1136,6 +1138,106 @@ def test_sink_video_codec_does_not_suppress_a_subtitle_copy() -> None:
         "libx264",
         "out.mkv",
     ]
+
+
+# ---------------------------------------------------------------------------
+# RFC-004 input seek (plan 035): -ss/-to in front of the owning -i
+# ---------------------------------------------------------------------------
+
+
+def test_emitted_input_trims_default_to_all_none() -> None:
+    """Always parallel to `inputs`, so a consumer can index it directly."""
+    g = _graph([], [_out("src:a:v:0")], input_paths=["a.mp4", "b.mp4"], sources={"a": 0, "b": 1})
+    assert emit(g).input_trims == [None, None]
+
+
+def test_alias_keyed_windows_resolve_to_input_positions() -> None:
+    """`Graph.input_trims` is alias-keyed; `Emitted.input_trims` is -i-ordered."""
+    g = _graph(
+        [],
+        [_out("src:b:v:0")],
+        input_paths=["a.mp4", "b.mp4", "c.mp4"],
+        sources={"a": 0, "b": 1, "c": 2},
+        input_trims={"c": (7, 8), "a": (1, 2)},
+    )
+    assert emit(g).input_trims == [(1, 2), None, (7, 8)]
+
+
+def test_build_ffmpeg_args_puts_ss_and_to_before_the_owning_input() -> None:
+    g = _graph(
+        [],
+        [_out("src:a:v:0"), _out("src:b:a:0", "audio")],
+        input_paths=["a.mp4", "b.mp4"],
+        sources={"a": 0, "b": 1},
+        input_trims={"b": (2, 4)},
+    )
+    assert build_ffmpeg_args(emit(g), "out.mp4") == [
+        "ffmpeg",
+        "-i",
+        "a.mp4",
+        "-ss",
+        "2",
+        "-to",
+        "4",
+        "-i",
+        "b.mp4",
+        "-map",
+        "0:v:0",
+        "-c:0",
+        "copy",
+        "-map",
+        "1:a:0",
+        "-c:1",
+        "copy",
+        "out.mp4",
+    ]
+
+
+def test_seek_times_render_by_the_scalar_rules() -> None:
+    """Same rendering a filter argument gets: 12.5 -> "12.5", 5 -> "5"."""
+    g = _graph([], [_out("src:a:v:0")], input_trims={"a": (12.5, 60)})
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args[:6] == ["ffmpeg", "-ss", "12.5", "-to", "60", "-i"]
+
+
+def test_a_seeked_input_still_stream_copies() -> None:
+    """The new capability: a window no longer forces a filter node, so the
+    output stays a passthrough (`-c:<i> copy`) with no filtergraph at all."""
+    g = _graph([], [_out("src:a:v:0")], input_trims={"a": (5, 60)})
+    e = emit(g)
+    assert e.filter_complex == ""
+    assert e.maps[0].copy is True
+    assert "-filter_complex" not in build_ffmpeg_args(e, "out.mp4")
+
+
+def test_a_hand_built_emitted_needs_no_input_trims() -> None:
+    """The empty default means "no input is seeked", so an Emitted built
+    without windows renders exactly as it did before plan 035."""
+    e = Emitted(
+        inputs=["a.mp4"],
+        filter_complex="",
+        maps=[OutputMap(target="0:v:0", type="video", copy=True, metadata={})],
+    )
+    assert build_ffmpeg_args(e, "out.mp4")[:3] == ["ffmpeg", "-i", "a.mp4"]
+
+
+def test_input_trim_on_an_unknown_alias_is_internal_error() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_trims={"nope": (1, 2)})
+    err = _assert_internal(g)
+    assert "unknown source alias" in err.message
+
+
+def test_two_aliases_disagreeing_on_one_inputs_window_is_internal_error() -> None:
+    """Aliases each own an -i, so this cannot come from lowering -- but a
+    hand-built graph that says otherwise must not silently drop a window."""
+    g = _graph(
+        [],
+        [_out("src:a:v:0")],
+        sources={"a": 0, "b": 0},
+        input_trims={"a": (1, 2), "b": (3, 4)},
+    )
+    err = _assert_internal(g)
+    assert "two different trim windows" in err.message
 
 
 # ---------------------------------------------------------------------------

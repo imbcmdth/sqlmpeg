@@ -350,3 +350,35 @@ def test_idempotent_on_duplicate_subtitle_refs() -> None:
     once = insert_splits(g)
     twice = insert_splits(once)
     assert once.to_dict() == twice.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# RFC-004 input seek: input_trims are not part of the pad shape (plan 035)
+# ---------------------------------------------------------------------------
+
+
+def test_input_trims_survive_the_split_pass() -> None:
+    """This pass rewrites pads; a window belongs to an `-i`, so it passes
+    through verbatim (the same rule `sink` follows)."""
+    g = _no_fanout_graph()
+    g.input_trims = {"a": (1.5, 4.0), "b": (0, 2)}
+    out = insert_splits(g)
+    assert out.input_trims == {"a": (1.5, 4.0), "b": (0, 2)}
+    assert out.nodes.keys() == g.nodes.keys()  # nothing else changed either
+
+
+def test_input_trims_are_copied_not_shared() -> None:
+    """Purity: mutating the result must not reach back into the input graph."""
+    g = _no_fanout_graph()
+    g.input_trims = {"b": (0.0, 2.0)}
+    out = insert_splits(g)
+    out.input_trims["b"] = (9.0, 9.0)
+    assert g.input_trims == {"b": (0.0, 2.0)}
+
+
+def test_input_trims_survive_a_graph_that_does_split() -> None:
+    g = _node_fanout_graph()
+    g.input_trims = {"a": (0, 3)}
+    out = insert_splits(g)
+    assert out.nodes["n0_split"].outputs == ["video", "video"]
+    assert out.input_trims == {"a": (0, 3)}

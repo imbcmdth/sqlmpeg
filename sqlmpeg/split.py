@@ -50,7 +50,9 @@ here cannot leave a real filtergraph pad over-consumed.
 
 `insert_splits` is a pure function: it builds and returns a new Graph and
 never mutates its input. It is idempotent -- every ref in the output graph
-has exactly one consumer, so running it again is a no-op.
+has exactly one consumer, so running it again is a no-op. Everything that is
+not part of the graph's pad SHAPE -- `Graph.sink`, `Graph.input_trims` -- is
+copied to the new Graph verbatim.
 """
 
 from __future__ import annotations
@@ -145,7 +147,10 @@ def insert_splits(g: Graph) -> Graph:
         sources=dict(g.sources),
         nodes=new_nodes,
         outputs=new_outputs,
-        # This pass rewrites the graph's SHAPE; the sink is a property of the
-        # whole job and passes through untouched (it is already validated).
+        # This pass rewrites the graph's SHAPE; the sink and the input trims are
+        # properties of the whole job -- of the output file and of the `-i`
+        # entries respectively, neither of which is a filtergraph pad -- so both
+        # pass through untouched (they are already validated).
         sink=g.sink,
+        input_trims=dict(g.input_trims),
     )

@@ -8,40 +8,13 @@
   "nodes": [
     {
       "id": "n1",
-      "filter": "trim",
-      "args": {
-        "start": 1,
-        "end": 5
-      },
-      "inputs": [
-        "src:a:v:0"
-      ],
-      "outputs": [
-        "video"
-      ]
-    },
-    {
-      "id": "n2",
-      "filter": "setpts",
-      "args": {
-        "expr": "PTS-STARTPTS"
-      },
-      "inputs": [
-        "n1"
-      ],
-      "outputs": [
-        "video"
-      ]
-    },
-    {
-      "id": "n3",
       "filter": "scale",
       "args": {
         "w": "iw*2",
         "h": "-2"
       },
       "inputs": [
-        "n2"
+        "src:a:v:0"
       ],
       "outputs": [
         "video"
@@ -50,10 +23,16 @@
   ],
   "outputs": [
     {
-      "ref": "n3",
+      "ref": "n1",
       "type": "video",
       "name": null,
       "metadata": {}
     }
-  ]
+  ],
+  "input_trims": {
+    "a": [
+      1,
+      5
+    ]
+  }
 }

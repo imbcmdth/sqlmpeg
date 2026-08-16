@@ -20,9 +20,11 @@ filter input. Three rejections enforce that, all keyed off ``_PASSTHROUGH_ONLY``
 
 * as a function argument, in EITHER tier -> ``UDF_ARG_TYPE``
   (:meth:`_Lowerer._reject_passthrough_args`);
-* under a WHERE time range that is actually consumed in that branch ->
-  ``UNSUPPORTED_SQL`` (:meth:`_Lowerer._access`; plan 035's input-level seek
-  lifts this for input aliases, never for CTEs);
+* under a **CTE's** WHERE time range that is actually consumed in that branch ->
+  ``UNSUPPORTED_SQL`` (:meth:`_Lowerer._access`). An INPUT alias's WHERE is not
+  a filtergraph trim at all any more (see the WHERE bullet below), so it carries
+  captions perfectly well; a CTE's window IS a filtergraph trim, so for it the
+  rejection is permanent;
 * as a UNION ALL branch column -> ``UNSUPPORTED_SQL``
   (:meth:`_Lowerer._check_concat_columns`; ``concat`` has ``v``/``a`` pads only).
 
@@ -53,10 +55,26 @@ What lowering does, in order:
   recorded columns.
 * ``<alias>.frame`` is sugar for ``<alias>.video[1]`` (v0 compat). A single
   unnamed video column of a CTE is likewise reachable as ``<cte>.frame``.
-* ``WHERE a.t BETWEEN x AND y`` records a per-alias time range. The trim is
-  spliced lazily, the first time a stream of that alias is consumed, and
-  memoized per stream, so every consumer of the same stream shares one
-  ``trim``+``setpts`` (video) / ``atrim``+``asetpts`` (audio) pair.
+* ``WHERE <alias>.t BETWEEN x AND y`` records a per-alias time range, and where
+  that window lands depends on what the alias is (RFC-004's input-seek
+  amendment):
+
+  - an INPUT alias owns its own ``-i`` slot and has at most one window in the
+    whole query, so the window is recorded as ``Graph.input_trims[alias]`` and
+    emit renders it as ``-ss <x> -to <y>`` in front of that ``-i``. NO filter
+    node is spliced: the stream refs come out of lowering untouched, so a
+    trimmed column that nothing else filters stays a PASSTHROUGH and is
+    stream-copied. The seek applies to the WHOLE input — every stream of that
+    alias, including subtitle/data streams and streams the SELECT list never
+    mentions (harmless: an unselected stream is never ``-map``ped) — which is
+    exactly what makes a trimmed caption track possible. Accuracy: decoded
+    (filtered/re-encoded) streams are frame-accurate; stream-copied ones snap
+    back to the preceding keyframe and may start up to a GOP early.
+  - a CTE alias names a filtergraph pad, not an input, so its window still
+    lowers to a filter trim: spliced lazily, the first time a stream of that
+    CTE is consumed, and memoized per stream, so every consumer of the same
+    stream shares one ``trim``+``setpts`` (video) / ``atrim``+``asetpts``
+    (audio) pair. Being a filtergraph trim, it cannot carry captions.
 * Each projection lowers bottom-up to one :class:`~sqlmpeg.ir.Output` per
   stream it carries (an array column splats into consecutive Outputs). A
   stdlib call type-checks its arguments against
@@ -253,8 +271,9 @@ _PASSTHROUGH_HINT = (
     "drop them from the call and select them as their own column"
 )
 _CAPTION_TRIM_HINT = (
-    "select the subtitle/data columns without a WHERE time range, or keep the "
-    "WHERE and select only video/audio columns of that alias"
+    "put the WHERE on the INPUT alias instead (an input's time range becomes a "
+    "seek, which trims every stream type), or select the subtitle/data columns "
+    "of the CTE without a WHERE time range"
 )
 
 # Longest option/constant list a hint or message renders before it stops
@@ -590,9 +609,12 @@ class _Env:
     """Everything one SELECT branch resolves names against."""
 
     bindings: dict[str, _Binding] = field(default_factory=dict)
+    # CTE name -> its WHERE window. CTE-ONLY: an INPUT alias's window is a
+    # property of its `-i`, not of this branch, so `_collect_trims` records it
+    # in `Graph.input_trims` instead and no filter trim is ever spliced for it.
     trims: dict[str, tuple[int | float, int | float]] = field(default_factory=dict)
-    # base stream ref -> its trimmed ref, so one trim is shared by every
-    # consumer of that stream inside this branch.
+    # base stream ref -> its trimmed ref, so one filter trim is shared by every
+    # consumer of that stream inside this branch (CTE-only, as above).
     trimmed: dict[FrameRef, FrameRef] = field(default_factory=dict)
 
 
@@ -858,8 +880,11 @@ class _Lowerer:
         input (probe order, all four stream types interleaved as the container
         has them), COLUMN order for a CTE, with array columns splatting.
 
-        The WHERE trim of each alias still applies (`_access`), which is also
-        where a trimmed caption is rejected.
+        The WHERE window of each alias still applies: for an input alias it is
+        already on the ``-i`` (so ``SELECT *`` under a WHERE seeks every stream
+        of the file, captions included), for a CTE it is the filter trim
+        `_access` splices — which is also where a trimmed CTE caption column is
+        rejected.
         """
         if qualifier:
             binding = env.bindings.get(qualifier)
@@ -1020,7 +1045,18 @@ class _Lowerer:
     # -- WHERE ------------------------------------------------------------
 
     def _collect_trims(self, select: exp.Select, env: _Env) -> None:
-        """Record each aliased time range; the trim itself is spliced lazily."""
+        """Record each aliased time range, on the input or on the branch.
+
+        The binding decides where the window goes (RFC-004's input-seek
+        amendment). An INPUT alias owns its own ``-i`` and is globally unique,
+        so at most one window can ever apply to it: it is recorded on the GRAPH
+        (``Graph.input_trims``) and becomes ``-ss``/``-to``, seeking every
+        stream of that input coherently — captions and unselected streams
+        included. A CTE name is a filtergraph pad, so its window is recorded on
+        the BRANCH (``_Env.trims``) and the ``trim``/``atrim`` pair is spliced
+        lazily by :meth:`_access`, the first time a stream of that CTE is
+        consumed.
+        """
         where = select.args.get("where")
         if not isinstance(where, exp.Where):
             return
@@ -1073,10 +1109,14 @@ class _Lowerer:
                     fallback=where,
                     hint=_TIME_HINT,
                 )
-            env.trims[alias] = (
+            window = (
                 _number(low, ErrorCode.UNSUPPORTED_SQL),
                 _number(high, ErrorCode.UNSUPPORTED_SQL),
             )
+            if isinstance(env.bindings[alias], _InputBinding):
+                self.graph.input_trims[alias] = window
+            else:
+                env.trims[alias] = window
 
     def _access(
         self,
@@ -1086,20 +1126,24 @@ class _Lowerer:
         anchor: exp.Expr,
         select: exp.Select,
     ) -> _Value:
-        """Apply `alias`'s WHERE trim to every stream of `value`.
+        """Apply `alias`'s FILTER trim to every stream of `value`.
 
-        Elementwise over an array, and memoized per stream, so each element of
-        a broadcast array gets exactly one trim, shared by all its consumers.
+        ``_Env.trims`` is CTE-only (see :meth:`_collect_trims`), so this is a
+        no-op for every input alias: an input's window is already on its ``-i``
+        as ``-ss``/``-to``, and the stream refs pass through untouched — which
+        is what lets a trimmed column stay a passthrough and be stream-copied.
+
+        For a CTE window the trim is spliced elementwise over an array and
+        memoized per stream, so each element of a broadcast array gets exactly
+        one trim, shared by all its consumers.
 
         This is also where a trimmed caption is rejected (RFC-004): the WHERE
-        window is collected before any projection lowers, so "is this alias's
+        window is collected before any projection lowers, so "is this CTE's
         subtitle/data actually CONSUMED under a trim" is only knowable here, at
-        the point the trim would be applied. Today's trim is a filtergraph
+        the point the trim would be applied. A CTE's trim is a filtergraph
         ``trim``/``atrim`` pair, which cannot carry subtitle or data streams at
-        all. Plan 035 lifts this for INPUT aliases by lowering the window to
-        ``-ss``/``-to`` on the alias's ``-i`` (which trims every stream type
-        coherently); for a CTE alias — a filtergraph pad, not an input — the
-        rejection is permanent.
+        all, so for a CTE the rejection is permanent (RFC-004); on an input
+        alias it does not arise, because there is no filter node to feed.
         """
         window = env.trims.get(alias)
         if window is None:
@@ -1107,8 +1151,8 @@ class _Lowerer:
         if value.type in _PASSTHROUGH_ONLY:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"captions cannot be trimmed yet: 'WHERE {alias}.t' would have to "
-                f"trim a {value.type} stream, which no filtergraph can carry",
+                f"a CTE's captions cannot be trimmed: 'WHERE {alias}.t' would have "
+                f"to trim a {value.type} stream, which no filtergraph can carry",
                 anchor,
                 fallback=select,
                 hint=_CAPTION_TRIM_HINT,

@@ -686,31 +686,24 @@ def test_an_array_argument_still_type_checks_by_element() -> None:
     assert "got hflip(audio)" in err.message
 
 
-def test_broadcast_composes_with_the_where_trim() -> None:
-    """One trim per element, shared by every consumer of that element."""
+def test_broadcast_composes_with_the_input_seek() -> None:
+    """One window on the -i covers every element of the broadcast array.
+
+    RFC-004's input seek: no atrim/asetpts pair per element any more -- the
+    calls consume the raw stream refs and the whole input is seeked once.
+    """
     g = _lower(
         "SELECT volume(a.audio, 0.5), reverb(a.audio, 0.3) FROM input('x.mp4') a "
         "WHERE a.t BETWEEN 1 AND 2",
         {"a": _probe_result(audios=2)},
     )
-    assert _filters(g) == [
-        "atrim",
-        "asetpts",
-        "atrim",
-        "asetpts",
-        "volume",
-        "volume",
-        "aecho",
-        "aecho",
-    ]
-    assert g.nodes["n1"].inputs == ["src:a:a:0"]
-    assert g.nodes["n3"].inputs == ["src:a:a:1"]
-    # both calls consume the SAME two trimmed streams, one per element
-    assert [g.nodes[n].inputs for n in ("n5", "n6", "n7", "n8")] == [
-        ["n2"],
-        ["n4"],
-        ["n2"],
-        ["n4"],
+    assert _filters(g) == ["volume", "volume", "aecho", "aecho"]
+    assert g.input_trims == {"a": (1, 2)}
+    assert [g.nodes[n].inputs for n in ("n1", "n2", "n3", "n4")] == [
+        ["src:a:a:0"],
+        ["src:a:a:1"],
+        ["src:a:a:0"],
+        ["src:a:a:1"],
     ]
 
 
@@ -936,94 +929,167 @@ def test_concat_after_agreeing_amix_keeps_the_shared_language() -> None:
 
 
 # ---------------------------------------------------------------------------
-# WHERE -> typed trim
+# WHERE on an INPUT alias -> input-level seek (RFC-004 amendment, plan 035)
+#
+# An input alias owns its own -i, so its window becomes Graph.input_trims and
+# emit renders -ss/-to in front of that -i. No filter node is spliced and the
+# stream refs come out of lowering UNCHANGED -- which is what makes a trimmed
+# passthrough (stream copy) possible. The filter trim survives for CTE names
+# only; those tests live in the CTE section below.
 # ---------------------------------------------------------------------------
 
 
-def test_where_between_prepends_trim_and_setpts_on_video() -> None:
+def test_where_between_seeks_the_input_and_leaves_the_video_ref_alone() -> None:
     g = _lower("SELECT hflip(a.frame) FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2.5")
     assert g.to_dict()["nodes"] == [
         {
             "id": "n1",
-            "filter": "trim",
-            "args": {"start": 1, "end": 2.5},
+            "filter": "hflip",
+            "args": {},
             "inputs": ["src:a:v:0"],
             "outputs": ["video"],
         },
-        {
-            "id": "n2",
-            "filter": "setpts",
-            "args": {"expr": "PTS-STARTPTS"},
-            "inputs": ["n1"],
-            "outputs": ["video"],
-        },
-        {"id": "n3", "filter": "hflip", "args": {}, "inputs": ["n2"], "outputs": ["video"]},
     ]
-    assert _outputs(g) == [("n3", "video", None)]
+    assert g.input_trims == {"a": (1, 2.5)}
+    assert g.to_dict()["input_trims"] == {"a": [1, 2.5]}
+    assert _outputs(g) == [("n1", "video", None)]
 
 
-def test_where_between_uses_atrim_and_asetpts_on_audio() -> None:
+def test_where_between_seeks_the_input_for_audio_too() -> None:
+    """No atrim/asetpts pair: one seek covers every stream type of the input."""
     g = _lower("SELECT a.audio[1] FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2")
-    assert g.to_dict()["nodes"] == [
-        {
-            "id": "n1",
-            "filter": "atrim",
-            "args": {"start": 1, "end": 2},
-            "inputs": ["src:a:a:0"],
-            "outputs": ["audio"],
-        },
-        {
-            "id": "n2",
-            "filter": "asetpts",
-            "args": {"expr": "PTS-STARTPTS"},
-            "inputs": ["n1"],
-            "outputs": ["audio"],
-        },
+    assert g.to_dict()["nodes"] == []
+    assert g.input_trims == {"a": (1, 2)}
+    assert _outputs(g) == [("src:a:a:0", "audio", None)]
+
+
+def test_a_trimmed_column_that_nothing_filters_stays_a_passthrough() -> None:
+    """The new capability: a WHERE no longer forces a re-encode.
+
+    The ref is still a source ref, so emit maps it bare and stream-copies it,
+    with the window carried as input options on the -i.
+    """
+    g = compile_sql(
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 5 AND 60",
+        probe=False,
+    )
+    assert g.nodes == {}
+    assert _outputs(g) == [("src:a:v:0", "video", None)]
+    emitted = emit(g)
+    assert emitted.filter_complex == ""
+    assert build_ffmpeg_args(emitted, "out.mp4") == [
+        "ffmpeg",
+        "-ss",
+        "5",
+        "-to",
+        "60",
+        "-i",
+        "x.mp4",
+        "-map",
+        "0:v:0",
+        "-c:0",
+        "copy",
+        "out.mp4",
     ]
-    assert _outputs(g) == [("n2", "audio", None)]
 
 
-def test_one_predicate_trims_video_and_audio_in_sync() -> None:
+def test_one_predicate_seeks_video_and_audio_in_sync() -> None:
     g = _lower(
         "SELECT a.video[1], a.audio[1] FROM input('x.mp4') a WHERE a.t BETWEEN 5 AND 10"
     )
-    assert _filters(g) == ["trim", "setpts", "atrim", "asetpts"]
-    assert g.nodes["n1"].inputs == ["src:a:v:0"]
-    assert g.nodes["n3"].inputs == ["src:a:a:0"]
-    assert _outputs(g) == [("n2", "video", None), ("n4", "audio", None)]
+    assert _filters(g) == []
+    assert g.input_trims == {"a": (5, 10)}
+    assert _outputs(g) == [("src:a:v:0", "video", None), ("src:a:a:0", "audio", None)]
 
 
-def test_trim_is_spliced_once_per_stream_and_shared() -> None:
+def test_one_window_serves_every_consumer_of_that_input() -> None:
     g = _lower(
         "SELECT overlay(a.frame, a.frame, 5, 5) FROM input('x.mp4') a "
         "WHERE a.t BETWEEN 0 AND 3"
     )
-    assert _filters(g) == ["trim", "setpts", "overlay"]
-    assert g.nodes["n3"].inputs == ["n2", "n2"]  # both arms, pre-split
+    assert _filters(g) == ["overlay"]
+    assert g.input_trims == {"a": (0, 3)}
+    assert g.nodes["n1"].inputs == ["src:a:v:0", "src:a:v:0"]  # both arms, pre-split
 
 
-def test_where_trims_only_the_named_alias() -> None:
+def test_where_seeks_only_the_named_alias() -> None:
     g = _lower(
         "SELECT overlay(a.frame, b.frame, 0, 0) "
         "FROM input('x.mp4') a, input('y.mp4') b WHERE b.t BETWEEN 2 AND 4"
     )
-    assert g.nodes["n1"].inputs == ["src:b:v:0"]
-    assert g.nodes["n3"].inputs == ["src:a:v:0", "n2"]
+    assert g.input_trims == {"b": (2, 4)}
+    assert g.nodes["n1"].inputs == ["src:a:v:0", "src:b:v:0"]
 
 
-def test_two_between_clauses_trim_both_aliases() -> None:
+def test_two_between_clauses_seek_both_inputs() -> None:
     g = _lower(
         "SELECT overlay(a.frame, b.frame, 0, 0) FROM input('x.mp4') a, input('y.mp4') b "
         "WHERE a.t BETWEEN 0 AND 1 AND b.t BETWEEN 2 AND 3"
     )
-    assert _filters(g) == ["trim", "setpts", "trim", "setpts", "overlay"]
-    assert g.nodes["n5"].inputs == ["n2", "n4"]
+    assert _filters(g) == ["overlay"]
+    assert g.input_trims == {"a": (0, 1), "b": (2, 3)}
+    assert g.nodes["n1"].inputs == ["src:a:v:0", "src:b:v:0"]
 
 
-def test_untouched_streams_of_a_trimmed_alias_cost_nothing() -> None:
-    """Trims are lazy: an unconsumed audio stream never gets an atrim."""
-    g = _lower("SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 0 AND 1")
-    assert _filters(g) == ["trim", "setpts"]
+def test_each_windowed_alias_gets_its_own_i_in_the_argv() -> None:
+    """Two inputs, two windows: each -ss/-to sits in front of its own -i."""
+    emitted = emit(
+        compile_sql(
+            "SELECT overlay(a.frame, b.frame, 0, 0) "
+            "FROM input('x.mp4') a, input('y.mp4') b "
+            "WHERE a.t BETWEEN 0 AND 1 AND b.t BETWEEN 2.5 AND 3",
+            probe=False,
+        )
+    )
+    assert emitted.input_trims == [(0, 1), (2.5, 3)]
+    args = build_ffmpeg_args(emitted, "out.mp4")
+    assert args[:11] == [
+        "ffmpeg",
+        "-ss",
+        "0",
+        "-to",
+        "1",
+        "-i",
+        "x.mp4",
+        "-ss",
+        "2.5",
+        "-to",
+        "3",
+    ]
+    assert args[11:13] == ["-i", "y.mp4"]
+
+
+def test_union_all_branches_seek_their_own_inputs() -> None:
+    """Per-alias windows survive a UNION ALL: one -i each, concat unchanged."""
+    g = compile_sql(
+        "SELECT a.frame FROM input('x.mp4') a WHERE a.t BETWEEN 0 AND 1 "
+        "UNION ALL "
+        "SELECT b.frame FROM input('y.mp4') b WHERE b.t BETWEEN 2 AND 3",
+        probe=False,
+    )
+    assert _filters(g) == ["concat"]
+    assert g.nodes["n1"].inputs == ["src:a:v:0", "src:b:v:0"]
+    assert g.input_trims == {"a": (0, 1), "b": (2, 3)}
+    assert emit(g).input_trims == [(0, 1), (2, 3)]
+
+
+def test_an_input_window_is_probe_independent() -> None:
+    """The bounds are pure numbers from the SQL: probe=False changes nothing."""
+    query = "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 1.5 AND 4"
+    assert compile_sql(query, probe=False).input_trims == {"a": (1.5, 4)}
+    assert compile_sql(query, probe=True).input_trims == {"a": (1.5, 4)}
+
+
+def test_the_seek_covers_the_whole_input_selected_or_not() -> None:
+    """A seek is an input option: unselected streams are seeked too (harmlessly
+    -- they are never -mapped), and no filter node is created for anything."""
+    g = _lower(
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 0 AND 1",
+        {"a": _probe_result(videos=1, audios=2)},
+    )
+    assert _filters(g) == []
+    assert g.input_trims == {"a": (0, 1)}
+    assert _outputs(g) == [("src:a:v:0", "video", None)]
 
 
 # ---------------------------------------------------------------------------
@@ -1146,12 +1212,27 @@ def test_a_single_array_video_cte_column_is_not_frame_sugar() -> None:
 
 
 def test_where_trims_a_cte_column_by_its_type() -> None:
+    """A CTE name is a filtergraph pad, not an -i, so its window stays a FILTER
+    trim (RFC-004: the one surviving use of trim/atrim)."""
     g = _lower(
         "WITH c AS (SELECT a.audio[1] AS snd FROM input('x.mp4') a) "
         "SELECT c.snd FROM c WHERE c.t BETWEEN 1 AND 2"
     )
     assert _filters(g) == ["atrim", "asetpts"]
     assert g.nodes["n1"].inputs == ["src:a:a:0"]
+    assert g.input_trims == {}  # nothing is seeked: the -i is untouched
+
+
+def test_a_where_inside_a_cte_body_still_seeks_the_input() -> None:
+    """The window is on `a`, an input alias, even though it is written inside a
+    CTE body -- aliases are globally unique, so the seek is a graph property."""
+    g = _lower(
+        "WITH c AS ("
+        "  SELECT hflip(a.frame) AS pic FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2"
+        ") SELECT vflip(c.pic) FROM c"
+    )
+    assert _filters(g) == ["hflip", "vflip"]
+    assert g.input_trims == {"a": (1, 2)}
 
 
 def test_cte_union_all_gets_its_own_concat() -> None:
@@ -1656,35 +1737,45 @@ def test_filtering_a_cte_subtitle_column_is_still_rejected() -> None:
     assert err.code is ErrorCode.UDF_ARG_TYPE
 
 
-# -- passthrough-only: WHERE cannot trim them (plan 035 lifts the input half)
+# -- passthrough-only: an INPUT seek trims them; a CTE's filter trim cannot
 
 
-def test_where_over_a_consumed_subtitle_stream_is_rejected() -> None:
-    err = _reject_lower(
+def test_where_over_a_consumed_subtitle_stream_is_seeked() -> None:
+    """Plan 035 flipped this: the window is an input seek, which cuts the
+    subtitle track along with everything else in the file."""
+    g = _lower(
         "SELECT a.subtitle[1] FROM input('x.mkv') a WHERE a.t BETWEEN 1 AND 2",
         {"a": _layout_probe("vas")},
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "captions cannot be trimmed yet" in err.message
+    assert _filters(g) == []
+    assert g.input_trims == {"a": (1, 2)}
+    assert _outputs(g) == [("src:a:s:0", "subtitle", None)]
 
 
-def test_where_over_a_consumed_data_stream_is_rejected() -> None:
-    err = _reject_lower(
+def test_where_over_a_consumed_data_stream_is_seeked() -> None:
+    g = _lower(
         "SELECT a.data FROM input('x.mkv') a WHERE a.t BETWEEN 1 AND 2",
         {"a": _layout_probe("vad")},
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "captions cannot be trimmed yet" in err.message
+    assert _filters(g) == []
+    assert g.input_trims == {"a": (1, 2)}
+    assert _outputs(g) == [("src:a:d:0", "data", None)]
 
 
-def test_star_plus_where_over_a_captioned_input_is_rejected() -> None:
-    """`SELECT *` consumes the caption track, so the trim rejection fires."""
-    err = _reject_lower(
+def test_star_plus_where_over_a_captioned_input_seeks_every_stream() -> None:
+    """RFC-004's caption story, whole: `SELECT *` under a WHERE remuxes every
+    stream of the file, all cut by the one seek on its -i."""
+    g = _lower(
         "SELECT * FROM input('x.mkv') a WHERE a.t BETWEEN 1 AND 2",
         {"a": _layout_probe("vas")},
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "captions cannot be trimmed yet" in err.message
+    assert _filters(g) == []
+    assert g.input_trims == {"a": (1, 2)}
+    assert _outputs(g) == [
+        ("src:a:v:0", "video", None),
+        ("src:a:a:0", "audio", None),
+        ("src:a:s:0", "subtitle", None),
+    ]
 
 
 def test_where_over_a_cte_carrying_a_subtitle_column_is_rejected() -> None:
@@ -1696,26 +1787,29 @@ def test_where_over_a_cte_carrying_a_subtitle_column_is_rejected() -> None:
         {"a": _layout_probe("vas")},
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "captions cannot be trimmed yet" in err.message
+    assert "a CTE's captions cannot be trimmed" in err.message
+    assert err.hint is not None and "INPUT alias" in err.hint
 
 
-def test_where_that_does_not_touch_the_caption_alias_still_trims() -> None:
-    """The rejection is about CONSUMPTION, not about the file having captions."""
+def test_where_that_does_not_touch_the_caption_alias_still_seeks_its_own_input() -> None:
+    """A window is per alias: b's caption track is mapped whole, a is seeked."""
     g = _lower(
         "SELECT a.video[1], b.subtitle[1] FROM input('x.mkv') a, input('y.mkv') b "
         "WHERE a.t BETWEEN 1 AND 2",
         {"a": _layout_probe("vas"), "b": _layout_probe("vas")},
     )
-    assert _filters(g) == ["trim", "setpts"]
-    assert _outputs(g) == [("n2", "video", None), ("src:b:s:0", "subtitle", None)]
+    assert _filters(g) == []
+    assert g.input_trims == {"a": (1, 2)}
+    assert _outputs(g) == [("src:a:v:0", "video", None), ("src:b:s:0", "subtitle", None)]
 
 
-def test_a_captioned_input_may_still_be_trimmed_when_captions_are_not_selected() -> None:
+def test_a_captioned_input_may_be_trimmed_when_captions_are_not_selected() -> None:
     g = _lower(
         "SELECT a.video[1] FROM input('x.mkv') a WHERE a.t BETWEEN 1 AND 2",
         {"a": _layout_probe("vas")},
     )
-    assert _filters(g) == ["trim", "setpts"]
+    assert _filters(g) == []
+    assert g.input_trims == {"a": (1, 2)}
 
 
 # -- passthrough-only: concat has no s/d pads -------------------------------
@@ -2977,19 +3071,22 @@ def test_crossfade_of_two_trimmed_segments_compiles(
 ) -> None:
     """Each side is trimmed to a 2s window via WHERE, then crossfaded over 1s
     starting 1s into the first segment -- exercises xfade as a real multi-input
-    tier-1 call against two independently trimmed/setpts-reset video streams."""
+    tier-1 call against two independently seeked inputs. Since plan 035 the
+    windows are input options (one per -i), so xfade consumes the raw refs and
+    the graph is the single node."""
     g = compile_sql(
         f"SELECT crossfade(a.frame, b.frame, 1, 1) "
         f"FROM input('{_av2_fixture}') a, input('{_av3_fixture}') b "
         f"WHERE a.t BETWEEN 0 AND 2 AND b.t BETWEEN 0 AND 2"
     )
-    assert _filters(g) == ["trim", "setpts", "trim", "setpts", "xfade"]
-    xfade = g.nodes["n5"]
+    assert _filters(g) == ["xfade"]
+    assert g.input_trims == {"a": (0, 2), "b": (0, 2)}
+    xfade = g.nodes["n1"]
     assert xfade.filter == "xfade"
     assert xfade.args == {"duration": 1, "offset": 1}
-    assert xfade.inputs == ["n2", "n4"]
+    assert xfade.inputs == ["src:a:v:0", "src:b:v:0"]
     assert xfade.outputs == ["video"]
-    assert _outputs(g) == [("n5", "video", None)]
+    assert _outputs(g) == [("n1", "video", None)]
 
 
 # ---------------------------------------------------------------------------

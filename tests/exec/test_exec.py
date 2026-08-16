@@ -195,6 +195,111 @@ def test_trim_reports_expected_duration(tmp_path: Path) -> None:
     assert duration == pytest.approx(1.0, abs=0.2)
 
 
+# ---------------------------------------------------------------------------
+# RFC-004 input-seek amendment (plan 035): WHERE on an input alias is -ss/-to
+#
+# Accuracy contract, exec-tested on both sides:
+#   * DECODED streams (anything filtered/re-encoded) are frame-accurate --
+#     ffmpeg decodes from the preceding keyframe and discards up to the seek
+#     point, so the output is exactly the requested window.
+#   * STREAM-COPIED streams snap back to the preceding keyframe, so the cut may
+#     start up to a GOP early and the output can only be LONGER than the
+#     requested window (never shorter), bounded above by the whole input.
+#
+# Measured keyframe layout of the fixture these bounds are chosen for
+# (`ffprobe -select_streams v -show_frames -show_entries frame=key_frame,pts_time`
+# on tests/fixtures/testsrc.mp4): 30 frames at 15 fps over 2.000s, and exactly
+# ONE keyframe, at pts_time 0.000 -- the GOP is the entire file. A copied
+# 0.5..1.5 cut therefore snaps its start all the way back to t=0; the measured
+# output duration is 1.367s (requested window 1.0s, whole input 2.0s), which is
+# why the copy-path assertion below is a RANGE and not an approx().
+# ---------------------------------------------------------------------------
+
+_TRIM_START = 0.5
+_TRIM_END = 1.5
+_TRIM_WINDOW = _TRIM_END - _TRIM_START
+# Slack for container/frame-quantization rounding on both ends of the range
+# (one frame at the fixture's 15 fps is 0.067s).
+_DURATION_SLACK = 0.1
+
+
+def test_input_seek_is_frame_accurate_when_the_stream_is_re_encoded(
+    tmp_path: Path,
+) -> None:
+    """The decoded half of the accuracy contract: hflip forces a re-encode, so
+    the seek lands exactly on the requested window regardless of keyframes."""
+    _require_fixture(_TESTSRC)
+    out_path = tmp_path / "reencoded.mp4"
+    query = (
+        f"SELECT hflip(a.frame) FROM input('{_sql_path(_TESTSRC)}') a "
+        f"WHERE a.t BETWEEN {_TRIM_START} AND {_TRIM_END}"
+    )
+
+    emitted = emit(compile_sql(query))
+    args = build_ffmpeg_args(emitted, str(out_path))
+    assert args[:6] == ["ffmpeg", "-ss", "0.5", "-to", "1.5", "-i"]
+
+    _compile_and_run(query, out_path)
+
+    assert _ffprobe_duration(out_path) == pytest.approx(_TRIM_WINDOW, abs=_DURATION_SLACK)
+
+
+def test_a_trimmed_passthrough_is_stream_copied_within_keyframe_tolerance(
+    tmp_path: Path,
+) -> None:
+    """The new capability: `SELECT a.video[1] ... WHERE` stream-copies.
+
+    Before plan 035 the window spliced a trim filter, which forced a re-encode.
+    Now the src ref survives lowering untouched, so the output is `-map` +
+    `-c:0 copy` with the window as input options -- and the duration obeys the
+    copy half of the accuracy contract (see the measured keyframe layout above:
+    at least the requested window, at most the whole input).
+    """
+    _require_fixture(_TESTSRC)
+    out_path = tmp_path / "copied.mp4"
+    query = (
+        f"SELECT a.video[1] FROM input('{_sql_path(_TESTSRC)}') a "
+        f"WHERE a.t BETWEEN {_TRIM_START} AND {_TRIM_END}"
+    )
+
+    emitted = emit(compile_sql(query))
+    assert emitted.filter_complex == ""  # nothing decodes: a trimmed remux
+    assert emitted.input_trims == [(_TRIM_START, _TRIM_END)]
+    args = build_ffmpeg_args(emitted, str(out_path))
+    assert args[:7] == ["ffmpeg", "-ss", "0.5", "-to", "1.5", "-i", _sql_path(_TESTSRC)]
+    assert "-c:0" in args and args[args.index("-c:0") + 1] == "copy"
+
+    _compile_and_run(query, out_path)
+
+    source_duration = _ffprobe_duration(_TESTSRC)
+    duration = _ffprobe_duration(out_path)
+    assert duration >= _TRIM_WINDOW - _DURATION_SLACK
+    assert duration <= source_duration + _DURATION_SLACK
+
+
+def test_a_trimmed_star_keeps_the_caption_track(tmp_path: Path) -> None:
+    """RFC-004's caption story, whole: a WHERE over a captioned input used to be
+    rejected outright; the seek cuts video, audio and subtitles coherently."""
+    _require_fixture(_AVS)
+    out_path = tmp_path / "trimmed-star.mkv"
+    query = (
+        f"SELECT * FROM input('{_sql_path(_AVS)}') a "
+        f"WHERE a.t BETWEEN {_TRIM_START} AND {_TRIM_END}"
+    )
+
+    emitted = emit(compile_sql(query))
+    assert emitted.filter_complex == ""
+    assert [m.target for m in emitted.maps] == ["0:v:0", "0:a:0", "0:s:0"]
+    assert emitted.input_trims == [(_TRIM_START, _TRIM_END)]
+
+    _compile_and_run(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["video", "audio", "subtitle"]
+    assert streams[2]["codec_name"] == "subrip"
+    assert streams[2]["tags"]["language"] == "eng"
+
+
 def test_hflip_matches_pil_flipped_source_by_phash(tmp_path: Path) -> None:
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "hflipped.mp4"

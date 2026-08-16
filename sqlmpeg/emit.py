@@ -38,6 +38,18 @@ A graph whose outputs are all passthrough has NO nodes and therefore an empty
 ``filter_complex``; ``build_ffmpeg_args`` omits ``-filter_complex`` entirely
 in that case.
 
+Input seeking (RFC-004 amendment)
+---------------------------------
+``Graph.input_trims`` maps an alias to a ``(start, end)`` window. Since an
+alias owns exactly one ``-i`` slot, emit resolves it against ``Graph.sources``
+into :attr:`Emitted.input_trims`, a list parallel to :attr:`Emitted.inputs`,
+and ``build_ffmpeg_args`` renders ``-ss <start> -to <end>`` immediately BEFORE
+the owning ``-i`` — an input option, so the demuxer seeks and every stream of
+that input is cut coherently, subtitle and data streams included. Both bounds
+are on the input's own timeline. A seeked input can still be stream-copied (a
+window no longer forces a filter node into the graph), and then the cut snaps
+back to the preceding keyframe; a decoded stream is frame-accurate.
+
 Pad label scheme
 ----------------
 Every node output pad gets exactly one label, derived from the node id
@@ -84,7 +96,7 @@ values do NOT: they are passed as argv words, not parsed as a filtergraph.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .errors import ErrorCode, SqlmpegError
 from .ir import FrameRef, Graph, Node, Output, Sink, StreamType, is_src, src_parts
@@ -140,6 +152,12 @@ class Emitted:
     filter_complex: str  # "" when every output is a passthrough
     maps: list[OutputMap]  # one per Graph.outputs entry, same order
     sink: Sink | None = None  # copied from Graph.sink (RFC-002, plan 027)
+    # RFC-004 input-seek amendment: entry `i` is the (start, end) window of the
+    # `-i` at index `i`, or None if that input is not seeked. :func:`emit`
+    # always fills this in parallel with `inputs` (all None when the graph has
+    # no `input_trims`); the empty default is for hand-built Emitted objects and
+    # means the same thing -- no input is seeked.
+    input_trims: list[tuple[float, float] | None] = field(default_factory=list)
 
 
 def emit(g: Graph) -> Emitted:
@@ -168,6 +186,7 @@ def emit(g: Graph) -> Emitted:
         filter_complex=filter_complex,
         maps=maps,
         sink=_copy_sink(g.sink),
+        input_trims=_input_windows(g),
     )
 
 
@@ -175,6 +194,32 @@ def _copy_sink(sink: Sink | None) -> Sink | None:
     if sink is None:
         return None
     return Sink(path=sink.path, options=dict(sink.options))
+
+
+def _input_windows(g: Graph) -> list[tuple[float, float] | None]:
+    """``g.input_trims`` (alias-keyed) resolved into a per-``-i`` list.
+
+    An alias owns exactly one input slot (``g.sources``), so a window on an
+    alias is a window on that ``-i``. The result is parallel to
+    ``g.input_paths``: entry `i` is that input's ``(start, end)``, or None.
+    """
+    windows: list[tuple[float, float] | None] = [None] * len(g.input_paths)
+    for alias, window in g.input_trims.items():
+        index = g.sources.get(alias)
+        if index is None:
+            raise _internal(f"input trim names unknown source alias {alias!r}")
+        if not 0 <= index < len(g.input_paths):
+            raise _internal(
+                f"input trim on alias {alias!r} maps to out-of-range input index {index}"
+            )
+        previous = windows[index]
+        if previous is not None and previous != window:
+            raise _internal(
+                f"input {index} carries two different trim windows, {previous} and "
+                f"{window}; each alias must own its own -i (lower/split bug)"
+            )
+        windows[index] = window
+    return windows
 
 
 def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
@@ -191,6 +236,12 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     and ``-metadata:s:<i> k=v`` (keys sorted) for provenance metadata. v0's
     implicit ``-map 0:a? -c:a copy`` tail is gone. ``-filter_complex`` is
     omitted when the graph is pure passthrough.
+
+    Input options come first: an input carrying a window in `e.input_trims`
+    gets ``-ss <start> -to <end>`` immediately before its own ``-i`` (RFC-004's
+    input seek). A short or empty `input_trims` list simply leaves the
+    remaining inputs unseeked, so a hand-built :class:`Emitted` needs no
+    windows at all.
 
     Sink option rendering (RFC-002, plan 027): after the -map/-metadata
     block, `e.sink.options` render in insertion order purely from
@@ -218,7 +269,10 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     copy_suppressed_scopes = _copy_suppressed_scopes(e.sink)
 
     args = ["ffmpeg"]
-    for input_path in e.inputs:
+    for index, input_path in enumerate(e.inputs):
+        window = e.input_trims[index] if index < len(e.input_trims) else None
+        if window is not None:
+            args += ["-ss", _render_number(window[0]), "-to", _render_number(window[1])]
         args += ["-i", input_path]
     if e.filter_complex:
         args += ["-filter_complex", e.filter_complex]
@@ -595,11 +649,20 @@ def _render_filter(node: Node) -> str:
     return f"{node.filter}={':'.join(parts)}"
 
 
+def _render_number(value: int | float) -> str:
+    """Render a numeric scalar: ``12.5`` -> ``"12.5"``, ``5`` -> ``"5"``.
+
+    The one place numbers become argv/filtergraph text, so a filter argument
+    and an ``-ss``/``-to`` seek time render by the same rule.
+    """
+    return str(value)
+
+
 def _render_scalar(node: Node, key: str, value: object) -> str:
     if isinstance(value, bool):
         return "1" if value else "0"
     if isinstance(value, int | float):
-        return str(value)
+        return _render_number(value)
     if isinstance(value, str):
         return value
     raise _internal(
