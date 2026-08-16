@@ -304,10 +304,27 @@ not one of the entries in `sqlmpeg.sink.SINK_OPTIONS`.
 doesn't exist -- e.g. `video_codc 'libx264'` instead of `video_codec
 'libx264'`, or an option outside the v1 table entirely.
 
-**Example query and JSON:** the parser does not accept `COPY` yet (that
-lands with plan 026/028); this code is raised by `sqlmpeg.sink.validate_option`
-today and will get a real captured example once `COPY ... WITH (...)` is
-parseable end to end.
+**Example query:**
+
+```sql
+COPY (
+  SELECT a.video[1]
+  FROM input('x.mp4') a
+) TO 'out.mp4' WITH (
+  video_codc 'libx264'
+)
+```
+
+**Error JSON:**
+
+```json
+{"line": 5, "col": 14, "code": "UNKNOWN_SINK_OPTION", "message": "unknown sink option 'video_codc'", "hint": "did you mean 'video_codec'?"}
+```
+
+The anchor lands on the option's VALUE, not its name: sqlglot records no
+token position on a bare `WITH (...)` option name, only on a string/number
+literal value (see "Anchoring is coarse" in the parser notes) -- `line`/`col`
+here point at the `'libx264'` literal, one line below the misspelled name.
 
 ## SINK_OPTION_TYPE
 
@@ -321,10 +338,22 @@ given anything other than `true`/`false` -- e.g. `crf '20'` (a string where
 `crf` wants an int) or `faststart 1` (an int where `faststart` wants a
 bool).
 
-**Example query and JSON:** the parser does not accept `COPY` yet (that
-lands with plan 026/028); this code is raised by `sqlmpeg.sink.validate_option`
-today and will get a real captured example once `COPY ... WITH (...)` is
-parseable end to end.
+**Example query:**
+
+```sql
+COPY (
+  SELECT a.video[1]
+  FROM input('x.mp4') a
+) TO 'out.mp4' WITH (
+  crf 'high'
+)
+```
+
+**Error JSON:**
+
+```json
+{"line": 5, "col": 7, "code": "SINK_OPTION_TYPE", "message": "option 'crf' expects an int, got 'high'", "hint": "crf takes a bare integer literal, e.g. crf 20"}
+```
 
 ## INTERNAL
 

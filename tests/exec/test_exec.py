@@ -331,3 +331,47 @@ def test_pip_mix_flagship_composites_video_and_keeps_both_language_tags(
 
     video = _ffprobe_video_stream(out_path)
     assert (video["width"], video["height"]) == (_SRC_WIDTH, _SRC_HEIGHT)
+
+
+# ---------------------------------------------------------------------------
+# COPY ... TO ... WITH (...) sink options: end to end (RFC-002, plan 028)
+# ---------------------------------------------------------------------------
+
+
+def test_copy_sink_codec_options_land_in_the_real_encode(tmp_path: Path) -> None:
+    """Wrap the union-splat headline in a COPY and check the WITH (...) codec
+    options actually reach ffmpeg, not just that the sink dict was built.
+
+    The query concatenates av2 and av3 (splatting each file's whole audio
+    array, same as the README headline) and asks for libx264/aac re-encodes
+    at explicit bitrates; the sink's own TO path (not `-o`) is what
+    `build_ffmpeg_args` resolves, and ffprobe on the real output confirms the
+    video and both audio streams were actually re-encoded to the requested
+    codecs.
+    """
+    _require_fixture(_AV2)
+    _require_fixture(_AV3)
+    out_path = tmp_path / "sink.mkv"
+    query = (
+        "COPY (\n"
+        f"  SELECT a.frame, a.audio FROM input('{_sql_path(_AV2)}') a\n"
+        "  UNION ALL\n"
+        f"  SELECT b.frame, b.audio FROM input('{_sql_path(_AV3)}') b\n"
+        f") TO '{_sql_path(out_path)}' WITH (\n"
+        "  video_codec 'libx264', crf 28, audio_codec 'aac', audio_bitrate '96k'\n"
+        ")"
+    )
+
+    graph = compile_sql(query)
+    emitted = emit(graph)
+    args = build_ffmpeg_args(emitted)  # no -o override: the sink's own path is used
+    args.insert(1, "-y")
+    result = subprocess.run(args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)
+    assert result.returncode == 0, result.stderr
+    assert out_path.exists()
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["video", "audio", "audio"]
+    assert streams[0]["codec_name"] == "h264"
+    assert streams[1]["codec_name"] == "aac"
+    assert streams[2]["codec_name"] == "aac"

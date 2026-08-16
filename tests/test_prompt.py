@@ -19,6 +19,7 @@ from sqlmpeg import cli
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.prompt import build_system_prompt
+from sqlmpeg.sink import SINK_OPTIONS
 from sqlmpeg.stdlib import FUNCTIONS
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -79,6 +80,14 @@ def test_every_parameter_name_and_kind_is_documented() -> None:
 def test_every_error_code_has_repair_guidance() -> None:
     for code in ErrorCode:
         assert f"`{code.value}`" in PROMPT, code.value
+
+
+def test_every_sink_option_is_documented() -> None:
+    """The Output section's table is rendered from SINK_OPTIONS (plan 028) --
+    a new option cannot silently go undocumented in the prompt."""
+    for spec in SINK_OPTIONS.values():
+        assert f"`{spec.name}`" in PROMPT, spec.name
+        assert spec.doc in PROMPT, spec.name
 
 
 def test_prompt_is_deterministic() -> None:

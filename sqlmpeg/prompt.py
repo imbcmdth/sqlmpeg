@@ -30,6 +30,7 @@ on consoles whose encoding is not UTF-8.
 from __future__ import annotations
 
 from sqlmpeg.errors import ErrorCode
+from sqlmpeg.sink import SINK_OPTIONS
 from sqlmpeg.stdlib import FUNCTIONS, Param
 
 __all__ = ["build_system_prompt"]
@@ -173,6 +174,61 @@ statement is not. `--` and `/* */` comments are allowed.
 - `str` is a single-quoted literal; double a quote to escape it (`'it''s'`).
   In Postgres double quotes mean identifier, never string.
 - Function names are case-insensitive."""
+
+
+# ---------------------------------------------------------------------------
+# output: COPY ... TO ... WITH (...) (option table rendered from SINK_OPTIONS)
+# ---------------------------------------------------------------------------
+
+_OUTPUT_HEADER = """\
+## Output
+
+By default a query has no destination: `sqlmpeg compile` writes to `-o` if
+given, else a placeholder `out.mp4`; `sqlmpeg run` writes to `-o` if given,
+else refuses with an error unless the query names its own destination. To
+put the destination and the encoding in the query itself, wrap it in
+`COPY (<query>) TO '<path>' WITH (<options>)`:
+
+```sql
+COPY (
+  SELECT a.video[1], a.audio[1]
+  FROM input('clip.mp4') a
+) TO 'out.mkv' WITH (
+  video_codec 'libx264', crf 20, audio_codec 'aac'
+)
+```
+
+The query inside `COPY (...)` is a normal query -- everything above still
+applies. `<path>` is a single-quoted string literal, on its own `TO` line.
+`WITH (...)` is a comma-separated list of `name value` pairs, no `=`: a
+single-quoted string for a `str` option (`video_codec 'libx264'`), a bare
+integer literal for an `int` option (`crf 20`), or `true`/`false` for a
+`bool` option (`faststart true`) -- a bare word with no quotes
+(`preset slow`) or a computed value are both rejected. `-o` on the CLI
+overrides only the path; it never supplies or overrides options.
+
+### Options
+
+An option applies to every output stream in its scope: a `video` option to
+every video output stream, an `audio` option to every audio output stream, a
+`container` option once for the whole file -- there is no per-stream
+override. Setting a codec option (`video_codec`/`audio_codec`) re-encodes
+every output stream of that type, even one that would otherwise be a plain
+stream copy."""
+
+
+def _output_section() -> str:
+    lines = [_OUTPUT_HEADER, ""]
+    for spec in SINK_OPTIONS.values():
+        lines.append(f"- `{spec.name}` ({spec.type}, {spec.scope}) -- {spec.doc}")
+    lines.append("")
+    lines.append(
+        "An option name outside this list is `UNKNOWN_SINK_OPTION`; a value "
+        "whose shape does not match the option's type is `SINK_OPTION_TYPE` "
+        "-- both are typed, anchored rejections with repair guidance below "
+        "(see Repair loop)."
+    )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +556,7 @@ def build_system_prompt() -> str:
     sections = (
         _ROLE,
         _DIALECT,
+        _output_section(),
         _REJECTED,
         _function_reference(),
         _examples(),

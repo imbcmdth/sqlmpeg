@@ -2,7 +2,7 @@
 
 A standalone CLI that compiles SQL into an ffmpeg `-filter_complex` invocation. Write a `SELECT` statement; get a runnable ffmpeg command. FFmpeg is the executor — this tool never touches pixels.
 
-**Status: Work in progress (v0.2.0)**
+**Status: Work in progress (v0.3.0)**
 
 ## Example
 
@@ -24,6 +24,31 @@ ffmpeg -i commentary.mkv -i film.mkv -filter_complex '[0:v:0]scale=w=iw*0.25:h=-
 ```
 
 Both `amix` pairs mix one language with itself across the two sources, so each keeps that language's tag; the composited video carries none -- `overlay` mixes two streams too, and here neither side has a tag to agree on.
+
+## Encoding
+
+The query above only describes the edit -- the container, the codecs, and the encoder settings default to whatever `-o` and ffmpeg supply. Wrap it in `COPY (<query>) TO '<path>' WITH (<options>)` (RFC-002) to put the destination and the encode in the query itself:
+
+```sql
+COPY (
+  WITH pip AS (
+    SELECT scale(c.frame, 0.25) AS frame, c.audio AS sound
+    FROM input('commentary.mkv') c
+  )
+  SELECT overlay(f.frame, pip.frame, 20, 20),
+         amix(volume(f.audio, 0.65), volume(pip.sound, 0.35))
+  FROM input('film.mkv') f, pip
+) TO 'pip.mkv' WITH (
+  video_codec 'libx264', crf 20, audio_codec 'aac', audio_bitrate '192k'
+)
+```
+
+```
+$ sqlmpeg run query.sql
+ffmpeg -i commentary.mkv -i film.mkv -filter_complex '[0:v:0]scale=w=iw*0.25:h=-2[n1];[1:v:0][n1]overlay=x=20:y=20[out0];[1:a:0]volume=volume=0.65[n3];[1:a:1]volume=volume=0.65[n4];[0:a:0]volume=volume=0.35[n5];[0:a:1]volume=volume=0.35[n6];[n3][n5]amix=inputs=2[out1];[n4][n6]amix=inputs=2[out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra -c:0 libx264 -crf:0 20 -c:1 aac -c:2 aac -b:1 192k -b:2 192k pip.mkv
+```
+
+`video_codec` and `audio_codec` re-encode every video/audio output respectively, even one that would otherwise stream-copy unchanged; `crf` and `audio_bitrate` apply the same way, scoped by stream type. `-o` on the CLI still works here -- it overrides only the path, never the options -- and a query with no `COPY` falls back to `-o`, or a placeholder path for `compile` alone.
 
 A second example -- two dual-language episodes, played back to back. Each branch splats `<alias>.audio` -- the whole audio array, not one track -- so `UNION ALL`'s column matching pairs the streams up for you: video with video, English with English, French with French.
 

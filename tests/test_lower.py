@@ -55,11 +55,21 @@ def _readme_text() -> str:
     return (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
 
-def _readme_block(needle: str) -> str:
-    """The one ```sql block of README.md containing `needle`, verbatim."""
+def _readme_block(needle: str, *, exclude: str | None = None) -> str:
+    """The one ```sql block of README.md containing `needle`, verbatim.
+
+    `exclude`, if given, drops any block that ALSO contains that substring --
+    needed for the Encoding section (plan 028), whose ```sql block wraps the
+    flagship query verbatim in `COPY (...)`, so it contains every needle the
+    flagship's own block does (e.g. "commentary").
+    """
     blocks = re.findall(r"```sql\n(.*?)```", _readme_text(), re.DOTALL)
     assert blocks, "README.md no longer contains a ```sql block"
-    matching = [str(block) for block in blocks if needle in block]
+    matching = [
+        str(block)
+        for block in blocks
+        if needle in block and (exclude is None or exclude not in block)
+    ]
     assert len(matching) == 1, f"expected exactly one README ```sql block with {needle!r}"
     return matching[0]
 
@@ -214,7 +224,7 @@ def _readme_flagship_sql() -> str:
     how many streams there are, same reason the union-splat example below
     needs one.
     """
-    sql = _readme_block("commentary")
+    sql = _readme_block("commentary", exclude="COPY (")
     for shown, fixture in _FLAGSHIP_README_PATHS.items():
         sql = sql.replace(shown, (FIXTURES_DIR / fixture).as_posix())
     return sql
@@ -273,6 +283,53 @@ def test_readme_flagship_command_is_the_real_compilation(_fixtures: None) -> Non
     """The command shown under the headline is what sqlmpeg actually prints for
     that query, with only the fixture paths written back to the shown names."""
     args = build_ffmpeg_args(emit(compile_sql(_readme_flagship_sql())), "pip.mkv")
+    shown = shlex.join(args)
+    for name, fixture in _FLAGSHIP_README_PATHS.items():
+        shown = shown.replace((FIXTURES_DIR / fixture).as_posix(), name)
+    assert shown in _readme_text(), shown
+
+
+# ---------------------------------------------------------------------------
+# the README Encoding section: the flagship wrapped in COPY (plan 028)
+# ---------------------------------------------------------------------------
+
+
+def _readme_encoding_sql() -> str:
+    """The Encoding section's ```sql block: the flagship verbatim inside a
+    COPY ... TO ... WITH (...), re-pointed at the real fixtures the same way."""
+    sql = _readme_block("COPY (")
+    for shown, fixture in _FLAGSHIP_README_PATHS.items():
+        sql = sql.replace(shown, (FIXTURES_DIR / fixture).as_posix())
+    return sql
+
+
+@pytest.mark.exec
+def test_readme_encoding_wraps_the_flagship_query_in_a_sink(_fixtures: None) -> None:
+    """Wrapping the flagship in COPY adds a sink and leaves the rest of the
+    graph untouched -- same shape as `test_sink_does_not_change_the_graph_shape`."""
+    plain = compile_sql(_readme_flagship_sql()).to_dict()
+    wrapped = compile_sql(_readme_encoding_sql()).to_dict()
+    assert wrapped.pop("sink") == {
+        "path": "pip.mkv",
+        "options": {
+            "video_codec": "libx264",
+            "crf": 20,
+            "audio_codec": "aac",
+            "audio_bitrate": "192k",
+        },
+    }
+    assert wrapped == plain
+
+
+@pytest.mark.exec
+def test_readme_encoding_command_is_the_real_compilation(_fixtures: None) -> None:
+    """The command shown under Encoding is what sqlmpeg actually prints for
+    that query, with only the fixture paths written back to the shown names.
+
+    No `-o` override: the sink's own `TO 'pip.mkv'` supplies the path, same
+    precedence `sqlmpeg run query.sql` (no `-o`) would use.
+    """
+    args = build_ffmpeg_args(emit(compile_sql(_readme_encoding_sql())))
     shown = shlex.join(args)
     for name, fixture in _FLAGSHIP_README_PATHS.items():
         shown = shown.replace((FIXTURES_DIR / fixture).as_posix(), name)

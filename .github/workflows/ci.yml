@@ -42,4 +42,4 @@ jobs:
         run: python scripts/gen_fixtures.py
 
       - name: Exec tests (real ffmpeg)
-        run: python -m pytest -m exec tests/exec -q
+        run: python -m pytest -m exec tests/ -q

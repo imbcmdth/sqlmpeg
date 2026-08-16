@@ -130,6 +130,54 @@ statement is not. `--` and `/* */` comments are allowed.
   In Postgres double quotes mean identifier, never string.
 - Function names are case-insensitive.
 
+## Output
+
+By default a query has no destination: `sqlmpeg compile` writes to `-o` if
+given, else a placeholder `out.mp4`; `sqlmpeg run` writes to `-o` if given,
+else refuses with an error unless the query names its own destination. To
+put the destination and the encoding in the query itself, wrap it in
+`COPY (<query>) TO '<path>' WITH (<options>)`:
+
+```sql
+COPY (
+  SELECT a.video[1], a.audio[1]
+  FROM input('clip.mp4') a
+) TO 'out.mkv' WITH (
+  video_codec 'libx264', crf 20, audio_codec 'aac'
+)
+```
+
+The query inside `COPY (...)` is a normal query -- everything above still
+applies. `<path>` is a single-quoted string literal, on its own `TO` line.
+`WITH (...)` is a comma-separated list of `name value` pairs, no `=`: a
+single-quoted string for a `str` option (`video_codec 'libx264'`), a bare
+integer literal for an `int` option (`crf 20`), or `true`/`false` for a
+`bool` option (`faststart true`) -- a bare word with no quotes
+(`preset slow`) or a computed value are both rejected. `-o` on the CLI
+overrides only the path; it never supplies or overrides options.
+
+### Options
+
+An option applies to every output stream in its scope: a `video` option to
+every video output stream, an `audio` option to every audio output stream, a
+`container` option once for the whole file -- there is no per-stream
+override. Setting a codec option (`video_codec`/`audio_codec`) re-encodes
+every output stream of that type, even one that would otherwise be a plain
+stream copy.
+
+- `video_codec` (str, video) -- Video codec name, e.g. 'libx264'.
+- `audio_codec` (str, audio) -- Audio codec name, e.g. 'aac'.
+- `crf` (int, video) -- Constant rate factor (encoder-dependent quality target).
+- `preset` (str, video) -- Encoder speed/quality preset, e.g. 'slow'.
+- `pix_fmt` (str, video) -- Pixel format, e.g. 'yuv420p'.
+- `video_bitrate` (str, video) -- Target video bitrate, e.g. '4M'.
+- `audio_bitrate` (str, audio) -- Target audio bitrate, e.g. '192k'.
+- `sample_rate` (int, audio) -- Output audio sample rate in Hz, e.g. 48000.
+- `format` (str, container) -- Container format, e.g. 'mp4' (else inferred from the path extension).
+- `faststart` (bool, container) -- Move the MP4 moov atom to the front of the file for progressive playback.
+
+An option name outside this list is `UNKNOWN_SINK_OPTION`; a value whose shape does not match the option's type is `SINK_OPTION_TYPE` -- both are typed, anchored rejections with repair guidance below (see Repair loop).
+
 ## Rejected
 
 These are typed errors, never a best-effort graph. Do not reach for them.
