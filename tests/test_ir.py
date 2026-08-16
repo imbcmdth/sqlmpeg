@@ -356,3 +356,55 @@ def test_graph_input_trims_open_lower_round_trips_as_json_null() -> None:
     g2 = Graph.from_dict(d)
     assert g2.input_trims == {"a": (None, 60.0)}
     assert g2.to_dict() == d
+
+
+# ---------------------------------------------------------------------------
+# Graph.input_options (RFC-005 SS4, plan 041)
+# ---------------------------------------------------------------------------
+
+
+def test_graph_input_options_defaults_empty() -> None:
+    g = _build_graph()
+    assert g.input_options == {}
+    assert "input_options" not in g.to_dict()
+
+
+def test_graph_input_options_round_trip() -> None:
+    g = _build_graph()
+    g.input_options = {"a": {"loop": True, "framerate": 15}}
+    d1 = g.to_dict()
+    assert d1["input_options"] == {"a": {"loop": True, "framerate": 15}}
+    g2 = Graph.from_dict(d1)
+    assert g2.input_options == {"a": {"loop": True, "framerate": 15}}
+    d2 = g2.to_dict()
+    assert d1 == d2
+
+
+def test_graph_input_options_multiple_aliases_round_trip() -> None:
+    g = _build_graph()
+    g.input_options = {"a": {"loop": True}, "b": {"hwaccel": "cuda"}}
+    d = g.to_dict()
+    g2 = Graph.from_dict(d)
+    assert g2.input_options == {"a": {"loop": True}, "b": {"hwaccel": "cuda"}}
+
+
+def test_graph_from_dict_tolerates_missing_input_options_key() -> None:
+    g = _build_graph()
+    d = g.to_dict()
+    assert "input_options" not in d
+    g2 = Graph.from_dict(d)
+    assert g2.input_options == {}
+
+
+def test_graph_input_options_are_independent_of_sink_and_input_trims() -> None:
+    """The three "additive, omit-when-empty" fields do not interfere."""
+    g = _build_graph()
+    g.input_options = {"a": {"itsoffset": -1.5}}
+    g.input_trims = {"a": (0.0, 2.0)}
+    d = g.to_dict()
+    assert d["input_options"] == {"a": {"itsoffset": -1.5}}
+    assert d["input_trims"] == {"a": [0.0, 2.0]}
+    assert "sink" not in d
+    g2 = Graph.from_dict(d)
+    assert g2.input_options == g.input_options
+    assert g2.input_trims == g.input_trims

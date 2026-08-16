@@ -226,6 +226,15 @@ class Graph:
     # omits "-to" -- but not both (a WHERE clause always supplies at least
     # one bound; see parser._time_bounds).
     input_trims: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
+    # RFC-005 SS4 (plan 041): alias -> its validated `input('path', name =>
+    # value, ...)` options, insertion-ordered, values already normalized
+    # against `sqlmpeg.inputs.INPUT_OPTIONS`. Emit (plan 041) resolves this
+    # alias-keyed map into a per-`-i` list, same as `input_trims`, and renders
+    # each input's options immediately before its own `-i` (before any
+    # `-ss`/`-to` from `input_trims`). Empty by default; to_dict emits the
+    # "input_options" key only when non-empty (same golden-compat pattern as
+    # "sink"/"input_trims" above).
+    input_options: dict[str, dict[str, object]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         d: dict[str, object] = {
@@ -234,15 +243,19 @@ class Graph:
             "nodes": [node.to_dict() for node in self.nodes.values()],
             "outputs": [output.to_dict() for output in self.outputs],
         }
-        # "sink" and "input_trims" are emitted ONLY when present/non-empty,
-        # so every existing golden .ir.json stays byte-identical -- these
-        # changes are additive.
+        # "sink", "input_trims" and "input_options" are emitted ONLY when
+        # present/non-empty, so every existing golden .ir.json stays
+        # byte-identical -- these changes are additive.
         if self.sink is not None:
             d["sink"] = self.sink.to_dict()
         if self.input_trims:
             d["input_trims"] = {
                 alias: [start, end] for alias, (start, end) in self.input_trims.items()
             }  # None bounds render as JSON null, same as any other field
+        if self.input_options:
+            d["input_options"] = {
+                alias: dict(options) for alias, options in self.input_options.items()
+            }
         return d
 
     @classmethod
@@ -285,6 +298,14 @@ class Graph:
                     float(end) if end is not None else None,
                 )
 
+        raw_input_options = d.get("input_options")
+        input_options: dict[str, dict[str, object]] = {}
+        if raw_input_options is not None:
+            assert isinstance(raw_input_options, dict)
+            for alias, options in raw_input_options.items():
+                assert isinstance(options, dict)
+                input_options[str(alias)] = dict(options)
+
         return cls(
             input_paths=[str(p) for p in raw_inputs],
             sources={str(k): int(v) for k, v in raw_sources.items()},
@@ -292,4 +313,5 @@ class Graph:
             outputs=outputs,
             sink=sink,
             input_trims=input_trims,
+            input_options=input_options,
         )

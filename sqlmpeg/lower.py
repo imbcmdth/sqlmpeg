@@ -211,6 +211,7 @@ from dataclasses import dataclass, field
 from sqlglot import exp
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
+from sqlmpeg.inputs import validate_option as validate_input_option
 from sqlmpeg.ir import FrameRef, Graph, Node, Output, Sink, StreamType
 from sqlmpeg.parser import (
     FILTER_NAMESPACE,
@@ -226,7 +227,7 @@ from sqlmpeg.parser import (
 from sqlmpeg.parser import _ident_name as _fold
 from sqlmpeg.probe import ProbeResult, StreamMeta
 from sqlmpeg.registry import DynamicFilter, FilterOption, Registry
-from sqlmpeg.sink import validate_option
+from sqlmpeg.sink import validate_option as validate_sink_option
 from sqlmpeg.stdlib import FUNCTIONS, ExpandCtx, FuncSpec, Param, VariantImpl, signatures
 
 __all__ = ["lower"]
@@ -580,6 +581,26 @@ def _sink_value(node: exp.Expr) -> object:
     return _Unrepresentable(_sink_describe(node))
 
 
+def _input_value(node: exp.Expr) -> object:
+    """One `input('path', name => value)` value as a python scalar.
+
+    Mirrors :func:`_sink_value`, with one addition: INPUT_OPTIONS has a
+    ``"num"`` type (``framerate``, ``itsoffset``) whose value may carry a
+    leading ``-`` -- ``itsoffset`` legitimately takes a negative offset.
+    ``exp.Neg`` is unwrapped first, the same rule :func:`_number` applies to
+    positional numeric literals. Never raises: an unusable shape comes back
+    as an :class:`_Unrepresentable`, exactly like `_sink_value`, and the
+    option table decides.
+    """
+    node = _unwrap(node)
+    if not (isinstance(node, exp.Neg) and isinstance(node.this, exp.Expr)):
+        return _sink_value(node)
+    inner = _sink_value(_unwrap(node.this))
+    if isinstance(inner, int | float) and not isinstance(inner, bool):
+        return -inner
+    return _Unrepresentable(_sink_describe(node))
+
+
 # ---------------------------------------------------------------------------
 # typed values, bindings, per-branch environment
 # ---------------------------------------------------------------------------
@@ -757,6 +778,7 @@ class _Lowerer:
         ]
         if self.res.sink is not None:
             self.graph.sink = self._lower_sink(self.res.sink)
+        self.graph.input_options = self._lower_input_options()
         return self.graph
 
     # -- the COPY sink (RFC-002) -------------------------------------------
@@ -773,10 +795,32 @@ class _Lowerer:
         options: dict[str, object] = {}
         for option in raw.options:
             line, col = _pos(option.name_node, option.value, raw.path_node)
-            options[option.name] = validate_option(
+            options[option.name] = validate_sink_option(
                 option.name, _sink_value(option.value), line=line, col=col
             )
         return Sink(path=raw.path, options=options)
+
+    # -- input() named options (RFC-005 SS4, plan 041) ---------------------
+
+    def _lower_input_options(self) -> dict[str, dict[str, object]]:
+        """Validate every `input('path', name => value, ...)`'s trailing options.
+
+        Mirrors `_lower_sink`: anchor falls back through the name node to the
+        value node to the input()'s own path literal, since neither a
+        Kwarg's `Var` name nor a `Boolean`/`Var`/`Null` value carries a token
+        position (same gap sink option names have).
+        """
+        result: dict[str, dict[str, object]] = {}
+        for alias, raw_options in self.res.input_options.items():
+            options: dict[str, object] = {}
+            for option in raw_options:
+                line, col = _pos(option.name_node, option.value, option.path_node)
+                options[option.name] = validate_input_option(
+                    option.name, _input_value(option.value), line=line, col=col
+                )
+            if options:
+                result[alias] = options
+        return result
 
     # -- a query (one SELECT, or a UNION ALL of them) ----------------------
 

@@ -32,6 +32,8 @@
         "SINK_OPTION_TYPE",
         "UNKNOWN_FILTER_OPTION",
         "FILTER_OPTION_TYPE",
+        "UNKNOWN_INPUT_OPTION",
+        "INPUT_OPTION_TYPE",
         "INTERNAL"
       ]
     },

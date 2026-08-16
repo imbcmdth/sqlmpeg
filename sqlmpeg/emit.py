@@ -53,6 +53,21 @@ input's own timeline. A seeked input can still be stream-copied (a window no
 longer forces a filter node into the graph), and then the cut snaps back to
 the preceding keyframe; a decoded stream is frame-accurate.
 
+Input options (RFC-005 SS4, plan 041)
+--------------------------------------
+``Graph.input_options`` maps an alias to its validated
+``input('path', name => value, ...)`` options (``sqlmpeg.inputs.INPUT_OPTIONS``
+-- ``loop``, ``stream_loop``, ``framerate``, ``itsoffset``, ``hwaccel``),
+resolved the same way ``input_trims`` is, into :attr:`Emitted.input_options`, a
+list parallel to :attr:`Emitted.inputs`. ``build_ffmpeg_args`` renders them
+immediately before that input's ``-i``, and BEFORE any ``-ss``/``-to`` from
+``input_trims`` -- verified empirically against a real ffmpeg 7.1
+(``-loop 1 -framerate 15 -to 2 -i frame.png`` runs correctly; ffmpeg input
+options are order-INSENSITIVE among themselves, but this fixed order --
+options, then seek flags, then ``-i`` -- is what sqlmpeg always emits). A bool
+value of ``False`` (e.g. ``loop => false``) is never rendered, same as a sink
+option's False bool.
+
 Pad label scheme
 ----------------
 Every node output pad gets exactly one label, derived from the node id
@@ -102,6 +117,7 @@ import re
 from dataclasses import dataclass, field
 
 from .errors import ErrorCode, SqlmpegError
+from .inputs import INPUT_OPTIONS, InputOptionSpec
 from .ir import FrameRef, Graph, Node, Output, Sink, StreamType, is_src, src_parts
 from .sink import SINK_OPTIONS, SinkOptionSpec
 
@@ -162,6 +178,10 @@ class Emitted:
     # no `input_trims`); the empty default is for hand-built Emitted objects and
     # means the same thing -- no input is seeked.
     input_trims: list[tuple[float | None, float | None] | None] = field(default_factory=list)
+    # RFC-005 SS4 (plan 041): entry `i` is the validated options of the `-i`
+    # at index `i` (insertion-ordered), or an empty dict if that input set
+    # none. Parallel to `inputs`, same convention as `input_trims`.
+    input_options: list[dict[str, object]] = field(default_factory=list)
 
 
 def emit(g: Graph) -> Emitted:
@@ -191,6 +211,7 @@ def emit(g: Graph) -> Emitted:
         maps=maps,
         sink=_copy_sink(g.sink),
         input_trims=_input_windows(g),
+        input_options=_input_option_list(g),
     )
 
 
@@ -226,6 +247,32 @@ def _input_windows(g: Graph) -> list[tuple[float | None, float | None] | None]:
     return windows
 
 
+def _input_option_list(g: Graph) -> list[dict[str, object]]:
+    """``g.input_options`` (alias-keyed) resolved into a per-``-i`` list.
+
+    An alias owns exactly one input slot (``g.sources``), so this is the
+    exact same resolution ``_input_windows`` does for trims -- entry `i` is
+    that input's options dict (insertion-ordered), empty for an input that
+    set none.
+    """
+    options: list[dict[str, object]] = [{} for _ in g.input_paths]
+    for alias, alias_options in g.input_options.items():
+        index = g.sources.get(alias)
+        if index is None:
+            raise _internal(f"input options name unknown source alias {alias!r}")
+        if not 0 <= index < len(g.input_paths):
+            raise _internal(
+                f"input options on alias {alias!r} map to out-of-range input index {index}"
+            )
+        if options[index]:
+            raise _internal(
+                f"input {index} carries two different option sets; each alias "
+                "must own its own -i (lower/split bug)"
+            )
+        options[index] = dict(alias_options)
+    return options
+
+
 def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     """Full ffmpeg argv for `e`, writing to the resolved output path.
 
@@ -241,12 +288,15 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     implicit ``-map 0:a? -c:a copy`` tail is gone. ``-filter_complex`` is
     omitted when the graph is pure passthrough.
 
-    Input options come first: an input carrying a window in `e.input_trims`
-    gets ``-ss <start>`` and/or ``-to <end>`` immediately before its own
-    ``-i`` (RFC-004's input seek; plan 039 lets either half be absent for an
-    open-ended window). A short or empty `input_trims` list simply leaves the
-    remaining inputs unseeked, so a hand-built :class:`Emitted` needs no
-    windows at all.
+    Per-``-i`` flags come first, in a fixed order (verified against real
+    ffmpeg -- see the module docstring's "Input options" section): an input
+    carrying entries in `e.input_options` gets its ``sqlmpeg.inputs.INPUT_OPTIONS``
+    flags (e.g. ``-loop 1``, ``-framerate 15``) rendered FIRST, then an input
+    carrying a window in `e.input_trims` gets ``-ss <start>`` and/or
+    ``-to <end>`` (RFC-004's input seek; plan 039 lets either half be absent
+    for an open-ended window), and only then its own ``-i``. Short or empty
+    `input_options`/`input_trims` lists simply leave the remaining inputs
+    plain, so a hand-built :class:`Emitted` needs neither at all.
 
     Sink option rendering (RFC-002, plan 027): after the -map/-metadata
     block, `e.sink.options` render in insertion order purely from
@@ -275,6 +325,8 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
 
     args = ["ffmpeg"]
     for index, input_path in enumerate(e.inputs):
+        options = e.input_options[index] if index < len(e.input_options) else {}
+        args += _render_input_options(options)
         window = e.input_trims[index] if index < len(e.input_trims) else None
         if window is not None:
             start, end = window
@@ -293,6 +345,38 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
             args += [f"-metadata:s:{index}", f"{key}={mapping.metadata[key]}"]
     args += _render_sink_options(e)
     args.append(path)
+    return args
+
+
+# ---------------------------------------------------------------------------
+# input option rendering (RFC-005 SS4, plan 041)
+# ---------------------------------------------------------------------------
+
+
+def _render_input_option_value(spec: InputOptionSpec, value: object) -> str | None:
+    """Render one input option's value per its spec, or None to omit entirely.
+
+    A bool value of False is always omitted (e.g. plain ``loop => false``);
+    ``num``/``int`` go through :func:`_render_number` (so a negative
+    ``itsoffset`` renders as ``-1``, not ``-1.0``); a bool True renders
+    ``"1"`` (ffmpeg's own spelling for e.g. ``-loop 1``); ``str`` renders
+    as-is.
+    """
+    if spec.type == "bool":
+        return "1" if value is True else None
+    if spec.type in ("int", "num") and isinstance(value, int | float):
+        return _render_number(value)
+    return str(value)
+
+
+def _render_input_options(options: dict[str, object]) -> list[str]:
+    args: list[str] = []
+    for name, value in options.items():
+        spec = INPUT_OPTIONS[name]
+        rendered = _render_input_option_value(spec, value)
+        if rendered is None:
+            continue
+        args += [spec.flag, rendered]
     return args
 
 

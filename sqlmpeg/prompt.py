@@ -37,6 +37,7 @@ on consoles whose encoding is not UTF-8.
 from __future__ import annotations
 
 from sqlmpeg.errors import ErrorCode
+from sqlmpeg.inputs import INPUT_OPTIONS
 from sqlmpeg.registry import Registry
 from sqlmpeg.sink import SINK_OPTIONS
 from sqlmpeg.stdlib import FUNCTIONS, Param
@@ -65,7 +66,7 @@ dialect cannot express, output a single line starting with
 # dialect
 # ---------------------------------------------------------------------------
 
-_DIALECT = """\
+_DIALECT_HEAD = """\
 ## Dialect
 
 Postgres syntax, one statement, read-only. A query is a single `SELECT`, or
@@ -90,8 +91,30 @@ statement is not. `--` and `/* */` comments are allowed.
   that is how you composite a clip onto itself.
 - Every alias and CTE name must be unique across the WHOLE query, including
   across `UNION ALL` branches.
-- Unquoted identifiers fold to lowercase. Never double-quote an identifier.
+- Unquoted identifiers fold to lowercase. Never double-quote an identifier."""
 
+_INPUT_OPTIONS_HEADER = """\
+- `input('path', <name> => <value>, ...)` also takes trailing named options,
+  same `=>` syntax as a call's named arguments (RFC-003) -- CASE-SENSITIVE,
+  unlike a sink option name. They set ffmpeg's own per-input flags, rendered
+  immediately before that input's own `-i`:"""
+
+
+def _input_options_section() -> str:
+    lines = [_INPUT_OPTIONS_HEADER]
+    for spec in INPUT_OPTIONS.values():
+        lines.append(f"  - `{spec.name}` ({spec.type}) -- {spec.doc}")
+    lines.append(
+        "  An option name outside this list is `UNKNOWN_INPUT_OPTION`; a "
+        "value whose shape does not match the option's type is "
+        "`INPUT_OPTION_TYPE` -- both typed and anchored, same as a sink "
+        "option's rejections (see Repair loop). Example: a still-image title "
+        "card, `input('logo.png', loop => true, framerate => 15)`."
+    )
+    return "\n".join(lines)
+
+
+_DIALECT_TAIL = """\
 ### Columns
 - `<alias>.video`, `<alias>.audio`, `<alias>.subtitle`, and `<alias>.data` are
   array-typed pseudo-columns, one entry per stream of that type in the file,
@@ -286,6 +309,12 @@ statement is not. `--` and `/* */` comments are allowed.
 - If the filter set is unavailable (no ffmpeg, or `--portable`), every such
   call is `UNKNOWN_FUNCTION` and every named argument is `UNSUPPORTED_SQL`;
   the message says which."""
+
+
+def _dialect_section() -> str:
+    """## Dialect, with the input-options bullets (RFC-005 SS4, plan 041)
+    rendered from INPUT_OPTIONS spliced in after the Sources bullets."""
+    return "\n".join((_DIALECT_HEAD, _input_options_section(), _DIALECT_TAIL))
 
 
 # ---------------------------------------------------------------------------
@@ -683,6 +712,22 @@ _REPAIR: dict[ErrorCode, str] = {
         "point (e.g. `crf 20`), and a `bool` option needs exactly `true` or "
         "`false` with no quotes."
     ),
+    ErrorCode.UNKNOWN_INPUT_OPTION: (
+        "The name inside `input('path', ...)`'s trailing `name => value` "
+        "arguments is not a known input option. Take the did-you-mean from "
+        "`hint` if there is one, otherwise pick from the exact set of option "
+        "names sqlmpeg supports (see Dialect > Sources); do not invent an "
+        "ffmpeg flag name or option that isn't in that set. Unlike a sink "
+        "option name, an input option name is CASE-SENSITIVE."
+    ),
+    ErrorCode.INPUT_OPTION_TYPE: (
+        "The value given for that `input(...)` option does not match its "
+        "expected type, named in `message`. A `str` option needs a "
+        "single-quoted literal, an `int` option needs a bare integer literal "
+        "with no quotes and no decimal point, a `num` option needs a bare "
+        "numeric literal (a leading `-` is fine, e.g. `itsoffset => -1`), and "
+        "a `bool` option needs exactly `true` or `false` with no quotes."
+    ),
     ErrorCode.UNKNOWN_FILTER_OPTION: (
         "A `<name> => <value>` argument names an option the ffmpeg filter does "
         "not have. Take the did-you-mean from `hint` if there is one; otherwise "
@@ -779,7 +824,7 @@ def build_system_prompt(dynamic: Registry | None = None) -> str:
     """
     sections: tuple[str, ...] = (
         _ROLE,
-        _DIALECT,
+        _dialect_section(),
         _output_section(),
         _REJECTED,
         _function_reference(),

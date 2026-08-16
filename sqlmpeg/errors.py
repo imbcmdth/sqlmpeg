@@ -34,6 +34,10 @@ class ErrorCode(str, Enum):
     # names an option the ffmpeg filter it targets does not have (RFC-003)
     FILTER_OPTION_TYPE = "FILTER_OPTION_TYPE"  # a `name => value` argument's value
     # does not match the option's introspected type, range or constant set
+    UNKNOWN_INPUT_OPTION = "UNKNOWN_INPUT_OPTION"  # input('path', name => value)
+    # names an option not in sqlmpeg.inputs.INPUT_OPTIONS
+    INPUT_OPTION_TYPE = "INPUT_OPTION_TYPE"  # input('path', name => value)'s
+    # value doesn't match its declared type (str/int/bool/num)
     INTERNAL = "INTERNAL"  # bug backstop; fuzz asserts this never fires
 
 

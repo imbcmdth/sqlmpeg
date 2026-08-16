@@ -315,6 +315,44 @@ FROM input('x.mp4') a
 
 Enum options quote their constant name (`transition => 'wipeleft'`), and the message lists the constants, truncated with a count when there are many (`xfade`'s `transition` alone has 59). Anchoring matches `UNKNOWN_FILTER_OPTION`: the value, not the name.
 
+## UNKNOWN_INPUT_OPTION
+
+**Meaning:** An `input('path', <name> => <value>, ...)` trailing named option names something outside `sqlmpeg.inputs.INPUT_OPTIONS` (RFC-005, plan 041). This table is curated and fixed, exactly like `SINK_OPTIONS` -- there is no escape hatch to an arbitrary ffmpeg input flag.
+
+**Fires when:** the option name is misspelled or simply isn't one of `loop`, `stream_loop`, `framerate`, `itsoffset`, `hwaccel`. Unlike a sink option name (folded lowercase from `WITH (name value)`), an input option name is the same `=>` named-argument syntax RFC-003 gives every call, so it is checked CASE-SENSITIVELY.
+
+**Example query:**
+
+```sql
+SELECT p.frame FROM input('logo.png', loob => true) p
+```
+
+**Error JSON:**
+
+```json
+{"line": 1, "col": 27, "code": "UNKNOWN_INPUT_OPTION", "message": "unknown input option 'loob'", "hint": "did you mean 'loop'?"}
+```
+
+Anchoring: like a named argument's `exp.Var` name (`UNKNOWN_FILTER_OPTION`) and a `WITH (...)` option name (`UNKNOWN_SINK_OPTION`), sqlglot records no token position on the `Var` holding an `=>` name, so the anchor falls back to the option's VALUE -- except here the value is `true`, an `exp.Boolean`, which ALSO carries none, so it falls back one step further, to the `input()`'s own path string literal (`'logo.png'`), which is why `line`/`col` land there instead.
+
+## INPUT_OPTION_TYPE
+
+**Meaning:** An `input('path', <name> => <value>, ...)` option's value doesn't match the type declared for it in `sqlmpeg.inputs.INPUT_OPTIONS` (`str` / `int` / `bool` / `num`). `num` is new relative to the sink table's vocabulary: it accepts an `int` OR a `float`, and -- for `itsoffset` specifically -- a negative one (ffmpeg legitimately shifts a stream's timestamps earlier).
+
+**Fires when:** a `bool` option (`loop`) gets anything but `true`/`false`; an `int` option (`stream_loop`) gets a float, string, or bool; a `num` option (`framerate`, `itsoffset`) gets a string or bool; a `str` option (`hwaccel`) gets anything but a single-quoted literal.
+
+**Example query:**
+
+```sql
+SELECT p.frame FROM input('logo.png', framerate => 'fast') p
+```
+
+**Error JSON:**
+
+```json
+{"line": 1, "col": 52, "code": "INPUT_OPTION_TYPE", "message": "option 'framerate' expects a number, got 'fast'", "hint": "framerate takes a bare numeric literal, e.g. framerate 15"}
+```
+
 ## INTERNAL
 
 **Bug backstop, not a user-input error.** Every compiler pass (`parse`, `lower`, `insert_splits`, via `compile_sql`) wraps its body in a catch-all that converts any unexpected exception (a sqlglot internal, a `RecursionError` on a pathologically nested query, or an actual bug in sqlmpeg) into `ErrorCode.INTERNAL` rather than letting a raw traceback escape (guardrail #7: no panics on user input, ever). The fuzz corpus in `tests/test_fuzz.py` asserts this code never fires across its mutated queries. If you see `INTERNAL` in the wild, sqlmpeg has a bug, and we would genuinely like the query that triggered it. No example JSON here, because no known SQL input reaches this path, and we intend to keep it that way.

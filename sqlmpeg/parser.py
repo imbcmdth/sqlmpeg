@@ -78,6 +78,7 @@ from sqlmpeg.errors import ErrorCode, SqlmpegError
 
 __all__ = [
     "FILTER_NAMESPACE",
+    "RawInputOption",
     "RawSink",
     "RawSinkOption",
     "Resolved",
@@ -491,6 +492,32 @@ class RawSink:
     options: tuple[RawSinkOption, ...] = ()
 
 
+@dataclass(frozen=True)
+class RawInputOption:
+    """One ``input('path', name => value)`` trailing named argument (RFC-005, plan 041).
+
+    Shape only, mirroring ``RawSinkOption``: `lower` turns `value` into a
+    python scalar and checks it against ``sqlmpeg.inputs.INPUT_OPTIONS``; the
+    parser deliberately knows nothing about which options exist.
+
+    `name` is kept VERBATIM (see :func:`kwarg_name`) -- input options reuse
+    the ``name => value`` named-argument syntax RFC-003 gives every call,
+    NOT COPY's folded ``WITH (name value)`` one, so case matters exactly like
+    a dynamic filter option's name does.
+
+    `name_node` is the ``exp.Kwarg``'s ``Var`` (or the ``Kwarg`` itself, if
+    that shape ever changes) -- it carries no token position, same gap a sink
+    option name has. `path_node` is the input()'s own path string literal,
+    the nearest node that reliably carries one, kept as the last-resort
+    anchor exactly like ``RawSink.path_node``.
+    """
+
+    name: str
+    value: exp.Expr
+    name_node: exp.Expr
+    path_node: exp.Expr
+
+
 @dataclass
 class Resolved:
     """Output of the resolve pass — the validated query plus its input table."""
@@ -512,6 +539,10 @@ class Resolved:
 
     sink: RawSink | None = None
     """The ``COPY ... TO ...`` wrapper, if there was one. None for a bare SELECT."""
+
+    input_options: dict[str, tuple[RawInputOption, ...]] = field(default_factory=dict)
+    """Input alias -> its trailing named options (RFC-005). Only aliases that
+    wrote at least one option get an entry -- absent means none."""
 
 
 def _unwrap(node: exp.Expr) -> exp.Expr:
@@ -749,11 +780,70 @@ def _sink_options(copy: exp.Copy, target: exp.Expr) -> tuple[RawSinkOption, ...]
     return tuple(options)
 
 
+def _input_options(rest: list[exp.Expr], path_node: exp.Expr) -> tuple[RawInputOption, ...]:
+    """``input('path', name => value, ...)``'s trailing arguments, shape-checked.
+
+    The path (already consumed by the caller) is the sole positional
+    argument; everything after it must be an ``exp.Kwarg`` -- a second bare
+    positional (before OR after any named one) is rejected the same as
+    RFC-003's "positional arguments must come before named arguments" rule,
+    just stricter: input() allows no second positional at all. Which option
+    names actually exist is ``sqlmpeg.inputs.INPUT_OPTIONS``' business, not
+    the parser's (mirrors ``RawSinkOption`` / ``_sink_options``).
+    """
+    options: list[RawInputOption] = []
+    seen: set[str] = set()
+    for arg in rest:
+        if not isinstance(arg, exp.Kwarg):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "input() takes one positional path; every argument after it "
+                "must be a named option",
+                arg,
+                fallback=path_node,
+                hint=_KWARG_HINT,
+            )
+        name = kwarg_name(arg)
+        value = arg.args.get("expression")
+        anchor = value if isinstance(value, exp.Expr) else arg
+        if not name:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "malformed named argument",
+                anchor,
+                fallback=path_node,
+                hint=_KWARG_HINT,
+            )
+        if not isinstance(value, exp.Expr):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"named argument '{name}' has no value",
+                arg,
+                fallback=path_node,
+                hint=_KWARG_HINT,
+            )
+        if name in seen:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"duplicate named argument '{name}'",
+                anchor,
+                fallback=path_node,
+                hint="each named argument may be given at most once",
+            )
+        seen.add(name)
+        name_node = arg.this if isinstance(arg.this, exp.Expr) else arg
+        options.append(
+            RawInputOption(name=name, value=value, name_node=name_node, path_node=path_node)
+        )
+    return tuple(options)
+
+
 class _Resolver:
     def __init__(self) -> None:
         self.input_paths: list[str] = []
         self.sources: dict[str, int] = {}
         self.ctes: dict[str, QueryExpr] = {}
+        self.input_options: dict[str, tuple[RawInputOption, ...]] = {}
 
     # -- entry point ------------------------------------------------------
 
@@ -793,6 +883,7 @@ class _Resolver:
             ctes=self.ctes,
             branches=branches,
             sink=sink,
+            input_options=self.input_options,
         )
 
     # -- CTEs -------------------------------------------------------------
@@ -1158,15 +1249,18 @@ class _Resolver:
                 hint="the only table function is input('path')",
             )
         args = func.expressions
-        if len(args) != 1 or not (isinstance(args[0], exp.Literal) and args[0].is_string):
+        if not args or not (isinstance(args[0], exp.Literal) and args[0].is_string):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                "input() takes exactly one string literal path",
+                "input() takes a string literal path, optionally followed by "
+                "named options",
                 func,
                 fallback=table,
-                hint="use input('clip.mp4')",
+                hint="use input('clip.mp4') or input('logo.png', loop => true)",
             )
-        path = str(args[0].this)
+        path_node = args[0]
+        path = str(path_node.this)
+        options = _input_options(args[1:], path_node)
         if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -1185,6 +1279,8 @@ class _Resolver:
         # is two -i entries (see the README PiP example).
         self.sources[alias] = len(self.input_paths)
         self.input_paths.append(path)
+        if options:
+            self.input_options[alias] = options
         scope[alias] = "input"
 
     def _known_hint(self, names: set[str] | dict[str, str]) -> str:

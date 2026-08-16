@@ -30,6 +30,7 @@ pytestmark = pytest.mark.exec
 
 _FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 _TESTSRC = _FIXTURES_DIR / "testsrc.mp4"
+_FRAME_PNG = _FIXTURES_DIR / "frame.png"
 _AV2 = _FIXTURES_DIR / "av2.mp4"
 _AV3 = _FIXTURES_DIR / "av3.mp4"
 # RFC-004 caption fixtures: avs.mkv is video + audio + an srt track tagged
@@ -875,3 +876,51 @@ def test_ad_splice_tail_trim_needs_no_between_placeholder(tmp_path: Path) -> Non
 
     expected_duration = 1.0 + _ffprobe_duration(_AV3) + (_ffprobe_duration(_AV2) - 1.0)
     assert _ffprobe_duration(out_path) == pytest.approx(expected_duration, abs=0.3)
+
+
+# ---------------------------------------------------------------------------
+# plan 041: input('path', name => value, ...) -- RFC-005 SS4
+# ---------------------------------------------------------------------------
+
+
+def test_looped_png_title_card_composites_onto_testsrc(tmp_path: Path) -> None:
+    """The flagship input-options case: a still image, looped and given a
+    frame rate so it becomes a real video stream, overlaid onto testsrc.mp4.
+
+    `loop => true` + `framerate => 15` render as `-loop 1 -framerate 15`
+    before the png's own `-i`; `WHERE p.t <= 2` becomes a `-to 2` input seek
+    on that same `-i`, rendered AFTER the options and still before `-i` (the
+    order this module's emit.py chose and verified against real ffmpeg).
+    `overlay`'s main input is testsrc.mp4 (the fixture's own 2s duration), so
+    the composite runs exactly as long as it does regardless of the png's
+    (effectively infinite, looped) length -- loop forces the png through the
+    encoder rather than a stream copy, hence the wider tolerance.
+    """
+    _require_fixture(_TESTSRC)
+    _require_fixture(_FRAME_PNG)
+    out_path = tmp_path / "title-card.mp4"
+    query = (
+        "SELECT overlay(v.frame, p.frame, 20, 20) "
+        f"FROM input('{_sql_path(_TESTSRC)}') v, "
+        f"input('{_sql_path(_FRAME_PNG)}', loop => true, framerate => 15) p "
+        "WHERE p.t <= 2"
+    )
+
+    graph = compile_sql(query)
+    assert graph.input_options == {"p": {"loop": True, "framerate": 15}}
+    assert graph.input_trims == {"p": (None, 2.0)}
+
+    emitted = emit(graph)
+    args = build_ffmpeg_args(emitted, str(out_path))
+    assert args[:3] == ["ffmpeg", "-i", _sql_path(_TESTSRC)]  # v: no options, no trim
+    png_start = args.index("-loop")
+    assert args[png_start : png_start + 8] == [
+        "-loop", "1",
+        "-framerate", "15",
+        "-to", "2",
+        "-i", _sql_path(_FRAME_PNG),
+    ]
+
+    _compile_and_run(query, out_path)
+
+    assert _ffprobe_duration(out_path) == pytest.approx(2.0, abs=0.2)

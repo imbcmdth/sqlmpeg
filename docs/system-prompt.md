@@ -38,7 +38,16 @@ statement is not. `--` and `/* */` comments are allowed.
 - Every alias and CTE name must be unique across the WHOLE query, including
   across `UNION ALL` branches.
 - Unquoted identifiers fold to lowercase. Never double-quote an identifier.
-
+- `input('path', <name> => <value>, ...)` also takes trailing named options,
+  same `=>` syntax as a call's named arguments (RFC-003) -- CASE-SENSITIVE,
+  unlike a sink option name. They set ffmpeg's own per-input flags, rendered
+  immediately before that input's own `-i`:
+  - `loop` (bool) -- Loop a single-frame input (e.g. a still image) indefinitely.
+  - `stream_loop` (int) -- Loop the whole input this many extra times (-1 loops forever).
+  - `framerate` (num) -- Force the input's frame rate, e.g. for a looped still image.
+  - `itsoffset` (num) -- Shift the input's timestamps by this many seconds (negative shifts earlier).
+  - `hwaccel` (str) -- Request a hardware decoder for this input, e.g. 'cuda'.
+  An option name outside this list is `UNKNOWN_INPUT_OPTION`; a value whose shape does not match the option's type is `INPUT_OPTION_TYPE` -- both typed and anchored, same as a sink option's rejections (see Repair loop). Example: a still-image title card, `input('logo.png', loop => true, framerate => 15)`.
 ### Columns
 - `<alias>.video`, `<alias>.audio`, `<alias>.subtitle`, and `<alias>.data` are
   array-typed pseudo-columns, one entry per stream of that type in the file,
@@ -567,4 +576,6 @@ not in the dialect.
 - `SINK_OPTION_TYPE` -- The value given for that `COPY ... WITH (...)` option does not match its expected type, named in `message`. A `str` option needs a single-quoted literal (e.g. `video_codec 'libx264'`), an `int` option needs a bare integer literal with no quotes and no decimal point (e.g. `crf 20`), and a `bool` option needs exactly `true` or `false` with no quotes.
 - `UNKNOWN_FILTER_OPTION` -- A `<name> => <value>` argument names an option the ffmpeg filter does not have. Take the did-you-mean from `hint` if there is one; otherwise pick from the option names `hint` lists -- they were read out of the installed ffmpeg, so they are the complete set for that filter. Never invent an option name, and never move the value to a positional argument: a dynamic filter takes only its stream inputs positionally.
 - `FILTER_OPTION_TYPE` -- The value of a `<name> => <value>` argument does not match what the option accepts, and `message` says exactly what it does accept: a bare number (with the allowed range, if ffmpeg declares one), the bare word `true`/`false`, or one of a listed set of named constants -- those go in single quotes, e.g. `transition => 'wipeleft'`. Change the value only; the option name was accepted.
+- `UNKNOWN_INPUT_OPTION` -- The name inside `input('path', ...)`'s trailing `name => value` arguments is not a known input option. Take the did-you-mean from `hint` if there is one, otherwise pick from the exact set of option names sqlmpeg supports (see Dialect > Sources); do not invent an ffmpeg flag name or option that isn't in that set. Unlike a sink option name, an input option name is CASE-SENSITIVE.
+- `INPUT_OPTION_TYPE` -- The value given for that `input(...)` option does not match its expected type, named in `message`. A `str` option needs a single-quoted literal, an `int` option needs a bare integer literal with no quotes and no decimal point, a `num` option needs a bare numeric literal (a leading `-` is fine, e.g. `itsoffset => -1`), and a `bool` option needs exactly `true` or `false` with no quotes.
 - `INTERNAL` -- A compiler bug, not your SQL. Re-emit the simplest query that still expresses the request and report the original as a bug.

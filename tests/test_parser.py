@@ -5,6 +5,7 @@ from sqlglot import exp
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.parser import (
+    RawInputOption,
     Resolved,
     parse,
     resolve,
@@ -719,6 +720,72 @@ def test_input_requires_one_string_literal(sql: str) -> None:
 
 def test_unknown_table_function() -> None:
     assert _reject("SELECT a.frame FROM stream('x') a").code is ErrorCode.UNSUPPORTED_SQL
+
+
+# ---------------------------------------------------------------------------
+# input() named options (RFC-005 SS4, plan 041)
+# ---------------------------------------------------------------------------
+
+
+def test_input_with_no_named_options_has_no_input_options_entry() -> None:
+    res = _resolve("SELECT a.frame FROM input('x.mp4') a")
+    assert res.input_options == {}
+
+
+def test_input_named_option_is_collected() -> None:
+    res = _resolve("SELECT a.frame FROM input('x.png', loop => true) a")
+    assert list(res.input_options) == ["a"]
+    options = res.input_options["a"]
+    assert len(options) == 1
+    option = options[0]
+    assert isinstance(option, RawInputOption)
+    assert option.name == "loop"
+    assert isinstance(option.value, exp.Boolean)
+
+
+def test_input_multiple_named_options_keep_written_order() -> None:
+    res = _resolve(
+        "SELECT a.frame FROM input('x.png', loop => true, framerate => 15) a"
+    )
+    assert [o.name for o in res.input_options["a"]] == ["loop", "framerate"]
+
+
+def test_input_option_name_is_verbatim_not_folded() -> None:
+    """Unlike a sink option, input options reuse Kwarg's case-sensitive name."""
+    res = _resolve("SELECT a.frame FROM input('x.mp4', HwAccel => 'cuda') a")
+    assert res.input_options["a"][0].name == "HwAccel"
+
+
+def test_two_input_aliases_keep_separate_option_sets() -> None:
+    res = _resolve(
+        "SELECT a.frame, b.frame FROM input('x.png', loop => true) a, "
+        "input('y.mp4', hwaccel => 'cuda') b"
+    )
+    assert [o.name for o in res.input_options["a"]] == ["loop"]
+    assert [o.name for o in res.input_options["b"]] == ["hwaccel"]
+
+
+def test_input_duplicate_named_option_is_rejected() -> None:
+    err = _reject(
+        "SELECT a.frame FROM input('x.png', loop => true, loop => false) a"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_input_positional_after_named_option_is_rejected() -> None:
+    err = _reject("SELECT a.frame FROM input('x.png', loop => true, 5) a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_input_second_positional_before_any_named_option_is_rejected() -> None:
+    err = _reject("SELECT a.frame FROM input('x.png', 5, loop => true) a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_input_named_option_with_no_value_is_rejected() -> None:
+    # sqlglot itself rejects a valueless `=>` -- never reaches the resolver.
+    err = _reject("SELECT a.frame FROM input('x.png', loop =>) a")
+    assert err.code is ErrorCode.PARSE_ERROR
 
 
 @pytest.mark.parametrize(

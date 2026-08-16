@@ -56,6 +56,7 @@ def _graph(
     sources: dict[str, int] | None = None,
     sink: Sink | None = None,
     input_trims: dict[str, tuple[float | None, float | None]] | None = None,
+    input_options: dict[str, dict[str, object]] | None = None,
 ) -> Graph:
     return Graph(
         input_paths=list(input_paths or ["a.mp4"]),
@@ -64,6 +65,7 @@ def _graph(
         outputs=list(outputs),
         sink=sink,
         input_trims=dict(input_trims or {}),
+        input_options={k: dict(v) for k, v in (input_options or {}).items()},
     )
 
 
@@ -1298,6 +1300,133 @@ def test_two_aliases_disagreeing_on_one_inputs_window_is_internal_error() -> Non
     )
     err = _assert_internal(g)
     assert "two different trim windows" in err.message
+
+
+# ---------------------------------------------------------------------------
+# RFC-005 SS4 input options (plan 041): rendered before -ss/-to, before -i
+# ---------------------------------------------------------------------------
+
+
+def test_emitted_input_options_default_to_all_empty() -> None:
+    """Always parallel to `inputs`, so a consumer can index it directly."""
+    g = _graph([], [_out("src:a:v:0")], input_paths=["a.mp4", "b.mp4"], sources={"a": 0, "b": 1})
+    assert emit(g).input_options == [{}, {}]
+
+
+def test_alias_keyed_options_resolve_to_input_positions() -> None:
+    """`Graph.input_options` is alias-keyed; `Emitted.input_options` is -i-ordered."""
+    g = _graph(
+        [],
+        [_out("src:b:v:0")],
+        input_paths=["a.mp4", "b.mp4", "c.mp4"],
+        sources={"a": 0, "b": 1, "c": 2},
+        input_options={"c": {"hwaccel": "cuda"}, "a": {"loop": True}},
+    )
+    assert emit(g).input_options == [{"loop": True}, {}, {"hwaccel": "cuda"}]
+
+
+def test_build_ffmpeg_args_renders_options_before_the_owning_input() -> None:
+    g = _graph(
+        [],
+        [_out("src:a:v:0"), _out("src:b:a:0", "audio")],
+        input_paths=["a.mp4", "b.mp4"],
+        sources={"a": 0, "b": 1},
+        input_options={"b": {"loop": True, "framerate": 15}},
+    )
+    assert build_ffmpeg_args(emit(g), "out.mp4") == [
+        "ffmpeg",
+        "-i",
+        "a.mp4",
+        "-loop",
+        "1",
+        "-framerate",
+        "15",
+        "-i",
+        "b.mp4",
+        "-map",
+        "0:v:0",
+        "-c:0",
+        "copy",
+        "-map",
+        "1:a:0",
+        "-c:1",
+        "copy",
+        "out.mp4",
+    ]
+
+
+def test_input_options_render_before_seek_flags() -> None:
+    """Verified order (module docstring / plan 041): options, then -ss/-to, then -i."""
+    g = _graph(
+        [],
+        [_out("src:a:v:0")],
+        input_options={"a": {"loop": True}},
+        input_trims={"a": (0, 2)},
+    )
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args[:7] == ["ffmpeg", "-loop", "1", "-ss", "0", "-to", "2"]
+
+
+def test_loop_false_is_never_rendered() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_options={"a": {"loop": False}})
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert "-loop" not in args
+
+
+def test_itsoffset_renders_a_negative_number() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_options={"a": {"itsoffset": -1.5}})
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args[:3] == ["ffmpeg", "-itsoffset", "-1.5"]
+
+
+def test_stream_loop_renders_as_a_bare_int() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_options={"a": {"stream_loop": -1}})
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args[:3] == ["ffmpeg", "-stream_loop", "-1"]
+
+
+def test_hwaccel_renders_as_a_bare_string() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_options={"a": {"hwaccel": "cuda"}})
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args[:3] == ["ffmpeg", "-hwaccel", "cuda"]
+
+
+def test_input_options_render_in_insertion_order() -> None:
+    g = _graph(
+        [],
+        [_out("src:a:v:0")],
+        input_options={"a": {"framerate": 15, "loop": True}},
+    )
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args[:5] == ["ffmpeg", "-framerate", "15", "-loop", "1"]
+
+
+def test_a_hand_built_emitted_needs_no_input_options() -> None:
+    """The empty default means "no input set options", same contract as
+    `input_trims`'s hand-built-Emitted case."""
+    e = Emitted(
+        inputs=["a.mp4"],
+        filter_complex="",
+        maps=[OutputMap(target="0:v:0", type="video", copy=True, metadata={})],
+    )
+    assert build_ffmpeg_args(e, "out.mp4")[:3] == ["ffmpeg", "-i", "a.mp4"]
+
+
+def test_input_options_on_an_unknown_alias_is_internal_error() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_options={"nope": {"loop": True}})
+    err = _assert_internal(g)
+    assert "unknown source alias" in err.message
+
+
+def test_two_aliases_disagreeing_on_one_inputs_option_set_is_internal_error() -> None:
+    g = _graph(
+        [],
+        [_out("src:a:v:0")],
+        sources={"a": 0, "b": 0},
+        input_options={"a": {"loop": True}, "b": {"hwaccel": "cuda"}},
+    )
+    err = _assert_internal(g)
+    assert "two different option sets" in err.message
 
 
 # ---------------------------------------------------------------------------

@@ -48,6 +48,7 @@ _AV2_NAME = "av2.mp4"
 _AV3_NAME = "av3.mp4"
 _SUBS_NAME = "subs.en.vtt"
 _AVS_NAME = "avs.mkv"
+_FRAME_PNG_NAME = "frame.png"
 
 _SUBS_VTT = """WEBVTT
 
@@ -176,6 +177,22 @@ def _generate_avs(subs_path: Path) -> None:
     )
 
 
+def _generate_frame_png() -> None:
+    """One still frame of testsrc.mp4 (RFC-005 SS4, plan 041's PNG title-card
+    exec test): `input(frame.png, loop => true, framerate => 15)` needs a
+    single-frame image input, and this is the cheapest way to make one that
+    is still visually distinguishable from a blank canvas. Must run after
+    testsrc.mp4 exists."""
+    _run(
+        FIXTURES_DIR / _FRAME_PNG_NAME,
+        [
+            "-i", str(FIXTURES_DIR / "testsrc.mp4"),
+            "-frames:v", "1",
+            "-update", "1",
+        ],
+    )
+
+
 def main() -> int:
     if not _ffmpeg_available():
         print("error: ffmpeg not found on PATH", file=sys.stderr)
@@ -187,6 +204,7 @@ def main() -> int:
     _generate_av3()
     subs_path = _generate_subs_vtt()
     _generate_avs(subs_path)
+    _generate_frame_png()
     return 0
 
 

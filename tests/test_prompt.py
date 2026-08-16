@@ -18,6 +18,7 @@ import pytest
 from sqlmpeg import cli
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.errors import ErrorCode, SqlmpegError
+from sqlmpeg.inputs import INPUT_OPTIONS
 from sqlmpeg.prompt import build_system_prompt
 from sqlmpeg.sink import SINK_OPTIONS
 from sqlmpeg.stdlib import FUNCTIONS
@@ -86,6 +87,14 @@ def test_every_sink_option_is_documented() -> None:
     """The Output section's table is rendered from SINK_OPTIONS (plan 028) --
     a new option cannot silently go undocumented in the prompt."""
     for spec in SINK_OPTIONS.values():
+        assert f"`{spec.name}`" in PROMPT, spec.name
+        assert spec.doc in PROMPT, spec.name
+
+
+def test_every_input_option_is_documented() -> None:
+    """The Dialect > Sources input-options bullets are rendered from
+    INPUT_OPTIONS (plan 041) -- a new option cannot silently go undocumented."""
+    for spec in INPUT_OPTIONS.values():
         assert f"`{spec.name}`" in PROMPT, spec.name
         assert spec.doc in PROMPT, spec.name
 

@@ -382,3 +382,35 @@ def test_input_trims_survive_a_graph_that_does_split() -> None:
     out = insert_splits(g)
     assert out.nodes["n0_split"].outputs == ["video", "video"]
     assert out.input_trims == {"a": (0, 3)}
+
+
+# ---------------------------------------------------------------------------
+# RFC-005 SS4 input options: not part of the pad shape either (plan 041)
+# ---------------------------------------------------------------------------
+
+
+def test_input_options_survive_the_split_pass() -> None:
+    """This pass rewrites pads; an option set belongs to an `-i`, so it passes
+    through verbatim (the same rule `sink`/`input_trims` follow)."""
+    g = _no_fanout_graph()
+    g.input_options = {"a": {"loop": True}, "b": {"framerate": 15}}
+    out = insert_splits(g)
+    assert out.input_options == {"a": {"loop": True}, "b": {"framerate": 15}}
+    assert out.nodes.keys() == g.nodes.keys()  # nothing else changed either
+
+
+def test_input_options_are_copied_not_shared() -> None:
+    """Purity: mutating the result must not reach back into the input graph."""
+    g = _no_fanout_graph()
+    g.input_options = {"b": {"loop": True}}
+    out = insert_splits(g)
+    out.input_options["b"]["loop"] = False
+    assert g.input_options == {"b": {"loop": True}}
+
+
+def test_input_options_survive_a_graph_that_does_split() -> None:
+    g = _node_fanout_graph()
+    g.input_options = {"a": {"stream_loop": -1}}
+    out = insert_splits(g)
+    assert out.nodes["n0_split"].outputs == ["video", "video"]
+    assert out.input_options == {"a": {"stream_loop": -1}}

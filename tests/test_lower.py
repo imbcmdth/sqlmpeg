@@ -2304,6 +2304,110 @@ def test_sink_does_not_change_the_graph_shape() -> None:
 
 
 # ---------------------------------------------------------------------------
+# input() named options (RFC-005 SS4, plan 041)
+# ---------------------------------------------------------------------------
+
+
+def test_input_with_no_options_has_no_input_options_entry() -> None:
+    g = _lower(SINK_QUERY)
+    assert g.input_options == {}
+    assert "input_options" not in g.to_dict()
+
+
+def test_input_options_lower_to_normalized_scalars() -> None:
+    g = _lower(
+        "SELECT p.frame FROM input('logo.png', loop => true, framerate => 15) p"
+    )
+    assert g.input_options == {"p": {"loop": True, "framerate": 15}}
+    assert [type(v) for v in g.input_options["p"].values()] == [bool, int]
+
+
+def test_input_options_keep_their_written_order() -> None:
+    g = _lower(
+        "SELECT p.frame FROM input("
+        "'logo.png', framerate => 15, hwaccel => 'cuda', loop => true"
+        ") p"
+    )
+    assert list(g.input_options["p"]) == ["framerate", "hwaccel", "loop"]
+
+
+def test_itsoffset_accepts_a_negative_number() -> None:
+    g = _lower("SELECT a.frame FROM input('x.mp4', itsoffset => -1.5) a")
+    assert g.input_options == {"a": {"itsoffset": -1.5}}
+
+
+def test_stream_loop_accepts_a_negative_int() -> None:
+    g = _lower("SELECT a.frame FROM input('x.mp4', stream_loop => -1) a")
+    assert g.input_options == {"a": {"stream_loop": -1}}
+
+
+def test_two_input_aliases_get_independent_option_dicts() -> None:
+    g = _lower(
+        "SELECT a.frame, b.frame FROM input('x.png', loop => true) a, "
+        "input('y.mp4', hwaccel => 'cuda') b"
+    )
+    assert g.input_options == {"a": {"loop": True}, "b": {"hwaccel": "cuda"}}
+
+
+def test_input_options_survive_the_split_pass_and_serialize() -> None:
+    g = compile_sql(
+        "SELECT p.frame, p.frame FROM input('logo.png', loop => true) p"
+    )
+    # the projection is used twice, so the split pass rebuilt the graph
+    assert "split" in _filters(g)
+    assert g.to_dict()["input_options"] == {"p": {"loop": True}}
+    assert Graph.from_dict(g.to_dict()).to_dict() == g.to_dict()
+
+
+def test_unknown_input_option_is_anchored_on_its_value() -> None:
+    err = _reject("SELECT a.frame FROM input('x.mp4', bogus_option => 1) a")
+    assert err.code is ErrorCode.UNKNOWN_INPUT_OPTION
+    assert "unknown input option 'bogus_option'" in err.message
+
+
+def test_unknown_input_option_suggests_the_near_miss() -> None:
+    err = _reject("SELECT a.frame FROM input('x.png', loob => true) a")
+    assert err.code is ErrorCode.UNKNOWN_INPUT_OPTION
+    assert err.hint == "did you mean 'loop'?"
+
+
+@pytest.mark.parametrize(
+    "option, message",
+    [
+        ("loop => 1", "expects a bool, got 1"),
+        ("loop => 'yes'", "expects a bool, got 'yes'"),
+        ("stream_loop => 1.5", "expects an int, got 1.5"),
+        ("stream_loop => true", "expects an int, got True"),
+        ("framerate => 'fast'", "expects a number, got 'fast'"),
+        ("framerate => true", "expects a number, got True"),
+        ("hwaccel => 42", "expects a str, got 42"),
+        ("hwaccel => true", "expects a str, got True"),
+    ],
+)
+def test_bad_input_option_value_is_a_type_error(option: str, message: str) -> None:
+    err = _reject(f"SELECT a.frame FROM input('x.mp4', {option}) a")
+    assert err.code is ErrorCode.INPUT_OPTION_TYPE
+    assert message in err.message
+    assert err.hint is not None
+
+
+def test_input_option_name_is_case_sensitive() -> None:
+    """Unlike a sink option (folded), an input option is Kwarg-verbatim."""
+    err = _reject("SELECT a.frame FROM input('x.mp4', Loop => true) a")
+    assert err.code is ErrorCode.UNKNOWN_INPUT_OPTION
+
+
+def test_itsoffset_compiles_to_a_negative_argv_flag() -> None:
+    """Compile-level, not hand-built IR: a negative itsoffset survives the
+    whole pipeline (parser -> lower -> emit -> build_ffmpeg_args)."""
+    graph = compile_sql("SELECT a.frame FROM input('x.mp4', itsoffset => -1.5) a")
+    assert graph.input_options == {"a": {"itsoffset": -1.5}}
+    emitted = emit(graph)
+    args = build_ffmpeg_args(emitted, "out.mp4")
+    assert args[:4] == ["ffmpeg", "-itsoffset", "-1.5", "-i"]
+
+
+# ---------------------------------------------------------------------------
 # RFC-003: dynamic filters + named arguments, against an OFFLINE registry
 # ---------------------------------------------------------------------------
 #
