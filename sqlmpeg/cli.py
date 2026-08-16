@@ -31,12 +31,12 @@ Subcommands:
   ``compile``, ``run`` never falls back to a placeholder path. A multi-COPY
   script runs as the single ffmpeg command it compiles to, writing every
   COPY's file; ``-o`` against one is the same usage error ``compile`` gives.
-* ``prompt [--dynamic]`` -- print the portable LLM system prompt (plan 012)
-  to stdout; takes no other arguments and never touches the filesystem.
-  ``--dynamic`` (plan 032, RFC-003) appends an "Installed filters" section
-  built from this machine's ``ffmpeg -filters``/``-help`` output -- the one
-  part of the printed prompt that is machine-dependent; without the flag,
-  the output is identical to the portable, tier-1-only base prompt.
+* ``prompt`` -- print the LLM system prompt (plan 012; rewritten 053b) to
+  stdout; takes no arguments and never touches the filesystem itself, though
+  it calls ``registry.load()`` to render the filter reference from this
+  machine's ``ffmpeg -filters``/``-help`` output when ffmpeg is on PATH, and
+  falls back to a note that filter names/options resolve against the
+  installed ffmpeg when it is not.
 
 ``compile``/``explain``/``validate``/``run`` take the query as SQL TEXT
 directly on the command line -- ``sqlmpeg compile "SELECT ... FROM
@@ -166,12 +166,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "-y", action="store_true", dest="overwrite", help="pass -y (overwrite) to ffmpeg"
     )
 
-    prompt_p = subparsers.add_parser("prompt", help="print the LLM system prompt for this dialect")
-    prompt_p.add_argument(
-        "--dynamic",
-        action="store_true",
-        help="append this machine's installed ffmpeg filter list (machine-dependent)",
-    )
+    subparsers.add_parser("prompt", help="print the LLM system prompt for this dialect")
 
     return parser
 
@@ -413,8 +408,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_prompt(args: argparse.Namespace) -> int:
-    dynamic = registry_module.load() if args.dynamic else None
-    print(build_system_prompt(dynamic=dynamic))
+    print(build_system_prompt(registry_module.load()))
     return 0
 
 

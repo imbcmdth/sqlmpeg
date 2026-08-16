@@ -727,8 +727,8 @@ def test_ad_insert_composites_a_delayed_clip_over_the_film(tmp_path: Path) -> No
     _require_fixture(_AV3)
     out_path = tmp_path / "ad-insert.mp4"
     query = (
-        "SELECT overlay(f.frame, delay(scale(a.frame, 0.33), 1), 20, 20), "
-        "       amix(f.audio[1], volume(delay(a.audio[1], 1), 0.5)) "
+        "SELECT overlay(f.frame, sqlmpeg.delay(scale(a.frame, 'iw*0.33', 'ih*0.33'), 1), 20, 20), "
+        "       amix(f.audio[1], volume(adelay(a.audio[1], 1000), 0.5)) "
         f"FROM input('{_sql_path(_AV2)}') f, input('{_sql_path(_AV3)}') a"
     )
 
@@ -783,7 +783,8 @@ def test_a_delayed_video_is_transparent_before_and_after_its_clip(
     _compile_and_run(base_cte + "SELECT base.frame FROM base", base_path)
     _compile_and_run(
         base_cte
-        + "SELECT overlay(base.frame, delay(scale(a.frame, 0.33), 1), 20, 20) "
+        + "SELECT overlay(base.frame, "
+        "sqlmpeg.delay(scale(a.frame, 'iw*0.33', 'ih*0.33'), 1), 20, 20) "
         f"FROM base, input('{_sql_path(_AV3)}') a",
         composite_path,
     )

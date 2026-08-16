@@ -12,8 +12,8 @@
       "id": "n1",
       "filter": "scale",
       "args": {
-        "w": "iw*0.33",
-        "h": "-2"
+        "width": "iw*0.33",
+        "height": "ih*0.33"
       },
       "inputs": [
         "src:a:v:0"
@@ -69,8 +69,7 @@
       "id": "n5",
       "filter": "adelay",
       "args": {
-        "delays": 1000,
-        "all": 1
+        "delays": 1000
       },
       "inputs": [
         "src:a:a:0"

@@ -1406,12 +1406,6 @@ def test_function_lookup_is_case_insensitive() -> None:
     assert _filters(g) == ["scale"]
 
 
-def test_macro_expands_to_several_nodes() -> None:
-    g = _lower("SELECT blur_regions(a.frame, 10, 20, 30, 40, 8) FROM input('x.mp4') a")
-    assert _filters(g) == ["crop", "gblur", "overlay"]
-    assert list(g.nodes) == ["n1", "n2", "n3"]
-
-
 def test_negative_numeric_literals_survive() -> None:
     g = _lower("SELECT scale(a.frame, -2, 720) FROM input('x.mp4') a")
     assert g.nodes["n1"].args == {"width": -2, "height": 720}
@@ -3445,7 +3439,7 @@ def test_crossfade_of_two_trimmed_segments_compiles(
     windows are input options (one per -i), so xfade consumes the raw refs and
     the graph is the single node."""
     g = compile_sql(
-        f"SELECT crossfade(a.frame, b.frame, 1, 1) "
+        f"SELECT xfade(a.frame, b.frame, duration => 1, offset => 1) "
         f"FROM input('{_av2_fixture}') a, input('{_av3_fixture}') b "
         f"WHERE a.t BETWEEN 0 AND 2 AND b.t BETWEEN 0 AND 2"
     )
@@ -3460,66 +3454,27 @@ def test_crossfade_of_two_trimmed_segments_compiles(
 
 
 # ---------------------------------------------------------------------------
-# plan 038: delay's VIDEO overload (per-variant expansion)
+# plan 038 / 053b: sqlmpeg.delay -- the macro's VIDEO-only expansion
 # ---------------------------------------------------------------------------
 #
-# `delay` is the only spec whose overloads differ in more than arity: both are
-# (stream, seconds), so nothing but the matched variant INDEX can tell an
-# adelay node from the format+tpad macro. These pin that the index really is
-# what selects the expansion, the output type and the named-argument target.
+# The single-expansion shape (format+tpad), the arity/type-mismatch errors,
+# and the named-argument rejection are all covered once, generically, by
+# tests/test_macros.py -- what's left here is behavior distinct enough that
+# duplicating the macro wouldn't exercise it: provenance threading, the
+# audio-delay-is-now-bare-adelay ad-insert composition, and the
+# subtitle-argument rejection's specific message.
 
 _AD_INSERT = (
-    "SELECT overlay(f.video[1], delay(scale(a.video[1], 0.33), 1), 20, 20), "
-    "       amix(f.audio[1], volume(delay(a.audio[1], 1), 0.5)) "
+    "SELECT overlay(f.video[1], sqlmpeg.delay(scale(a.video[1], 'iw*0.33', 'ih*0.33'), 1), 20, 20), "
+    "       amix(f.audio[1], volume(adelay(a.audio[1], 1000), 0.5)) "
     "FROM input('film.mp4') f, input('ad.mp4') a"
 )
 
 
-def test_video_delay_expands_to_format_plus_tpad() -> None:
-    g = _lower("SELECT delay(a.frame, 1) FROM input('x.mp4') a")
-    assert _filters(g) == ["format", "tpad"]
-    assert g.nodes["n1"].args == {"pix_fmts": "yuva420p"}
-    assert g.nodes["n2"].args == {"start_duration": 1, "stop": 1, "color": "black@0"}
-    assert g.nodes["n2"].inputs == ["n1"]
-    assert _outputs(g) == [("n2", "video", None)]
-
-
-def test_audio_delay_still_expands_to_one_adelay() -> None:
-    g = _lower("SELECT delay(a.audio[1], 1) FROM input('x.mp4') a")
-    assert _filters(g) == ["adelay"]
-    assert g.nodes["n1"].args == {"delays": 1000, "all": 1}
-    assert _outputs(g) == [("n1", "audio", None)]
-
-
-def test_the_stream_kind_alone_picks_the_delay_overload() -> None:
-    """Same name, same arity, same literal -- two different expansions."""
-    g = _lower(
-        "SELECT delay(a.frame, 1), delay(a.audio[1], 1) FROM input('x.mp4') a"
-    )
-    assert _filters(g) == ["format", "tpad", "adelay"]
-    assert [o.type for o in g.outputs] == ["video", "audio"]
-
-
-def test_a_delayed_video_is_classified_as_video_by_its_caller() -> None:
-    """The nested-call type check reads the matched OVERLOAD's return type, so
-    a video delay satisfies overlay's second video parameter."""
-    g = _lower(
-        "SELECT overlay(a.frame, delay(b.frame, 1), 20, 20) "
-        "FROM input('x.mp4') a, input('y.mp4') b"
-    )
-    assert _filters(g) == ["format", "tpad", "overlay"]
-    assert g.nodes["n3"].inputs == ["src:a:v:0", "n2"]
-
-
-def test_a_delayed_audio_is_still_classified_as_audio() -> None:
-    g = _lower("SELECT volume(delay(a.audio[1], 1), 0.5) FROM input('x.mp4') a")
-    assert _filters(g) == ["adelay", "volume"]
-    assert g.nodes["n2"].inputs == ["n1"]
-
-
 def test_the_ad_insert_composition_lowers_end_to_end() -> None:
-    """The plan 038 driving case: a clip delayed onto a film, video and audio
-    (golden 096-ad-insert pins the whole IR; this pins the shape)."""
+    """The plan 038 driving case: a clip delayed onto a film, video via
+    `sqlmpeg.delay`, audio via bare `adelay` in milliseconds (golden
+    096-ad-insert pins the whole IR; this pins the shape)."""
     g = _lower(_AD_INSERT)
     assert _filters(g) == [
         "scale",
@@ -3535,54 +3490,16 @@ def test_the_ad_insert_composition_lowers_end_to_end() -> None:
     assert [o.type for o in g.outputs] == ["video", "audio"]
 
 
-def test_delay_arity_error_lists_both_overloads() -> None:
-    err = _reject_lower("SELECT delay(a.frame, a.frame) FROM input('x.mp4') a", {})
-    assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "delay(audio, num) | delay(video, num)" in err.message
-    assert "got delay(video, video)" in err.message
-
-
-def test_video_delay_broadcasts_over_a_video_array() -> None:
-    g = _lower(
-        "SELECT delay(a.video, 1) FROM input('x.mp4') a",
-        {"a": _probe_result(videos=2, audios=0)},
-    )
-    assert _filters(g) == ["format", "tpad", "format", "tpad"]
-    assert g.nodes["n1"].inputs == ["src:a:v:0"]
-    assert g.nodes["n3"].inputs == ["src:a:v:1"]
-
-
 def test_video_delay_threads_provenance_like_any_1_to_1_chain() -> None:
     g = _lower(
-        "SELECT delay(a.frame, 1) FROM input('x.mp4') a",
+        "SELECT sqlmpeg.delay(a.frame, 1) FROM input('x.mp4') a",
         {"a": _probe_result(video_tags={"language": "eng"})},
     )
     assert [o.metadata for o in g.outputs] == [{"language": "eng"}]
 
 
-def test_video_delay_rejects_named_extras_as_a_macro(_registry: Registry) -> None:
-    """The video overload is two filters, so there is no single option set to
-    reach through to -- the same rule blur_regions follows."""
-    err = _reject_dyn(
-        "SELECT delay(a.frame, 1, color => 'red') FROM input('x.mp4') a", _registry
-    )
-    assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "expands to more than one ffmpeg filter" in err.message
-
-
-def test_audio_delay_still_targets_adelay_for_named_extras(_registry: Registry) -> None:
-    """named_target is per OVERLOAD: the audio one still reaches adelay, which
-    the fixture ffmpeg does not have -- so the rejection NAMES adelay rather
-    than calling the call a macro."""
-    err = _reject_dyn(
-        "SELECT delay(a.audio[1], 1, all => false) FROM input('x.mp4') a", _registry
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "'adelay'" in err.message
-
-
 def test_delay_over_a_passthrough_stream_is_still_udf_arg_type() -> None:
-    err = _reject_lower("SELECT delay(a.subtitle[1], 1) FROM input('x.mp4') a", {})
+    err = _reject_lower("SELECT sqlmpeg.delay(a.subtitle[1], 1) FROM input('x.mp4') a", {})
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "cannot take a subtitle stream" in err.message
 
@@ -4781,15 +4698,16 @@ def test_enable_on_a_stdlib_call_follows_the_underlying_filters_flag(
 
 
 def test_enable_on_a_macro_is_still_the_macro_rejection(_registry: Registry) -> None:
-    """`blur_regions` has no single filter to set anything on, and that check
-    comes first -- `enable` is not a way around it."""
+    """`enable` is a named argument like any other, and a sqlmpeg macro's
+    arguments are positional only -- `enable` is not a way around that,
+    same as any other named extra."""
     err = _reject_dyn(
-        "SELECT blur_regions(a.frame, 0, 0, 10, 10, 5, enable => 'gt(t,1)') "
+        "SELECT sqlmpeg.blur_regions(a.frame, 0, 0, 10, 10, 5, enable => 'gt(t,1)') "
         "FROM input('x.mp4') a",
         _registry,
     )
-    assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "expands to more than one ffmpeg filter" in err.message
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "positional" in err.message
 
 
 def test_enable_on_a_generated_source_is_rejected(_registry: Registry) -> None:

@@ -1,33 +1,29 @@
-"""The portable LLM system prompt for sqlmpeg (plan 012; plan 032 for ``--dynamic``).
+"""The LLM system prompt for sqlmpeg (plan 012; rewritten 053b, RFC-007).
 
 ``build_system_prompt()`` returns the text a user hands to whatever model they
 like as a system prompt, so that "describe the edit in English, get a runnable
 ffmpeg command" works without sqlmpeg ever calling an API itself.
 
-Two properties the no-arg path (``dynamic=None``) must keep:
+RFC-007 collapsed the old two-tier stdlib/dynamic split into ONE calling
+convention: every function is either a filter of the installed ffmpeg (bare
+or ``ffmpeg.<name>``) or one of three ``sqlmpeg.<name>`` macros. There is no
+longer a "base" and a "dynamic" prompt -- ``build_system_prompt(registry)``
+takes the (optional) live :class:`~sqlmpeg.registry.Registry` straight
+through and renders one "Installed filters" section from it; called with no
+registry (or an unavailable one) it renders a short note instead, since
+filter names and options are inherently machine-dependent (what ffmpeg has).
 
-* **Deterministic and pure.** No I/O, no clock, no environment. The same string
-  every call, on every machine -- ``scripts/gen_prompt.py`` commits it to
-  ``docs/system-prompt.md`` and a test asserts the committed copy is fresh.
+Two properties the no-registry path (the default) must keep:
+
+* **Deterministic and pure.** No I/O, no clock, no environment. The same
+  string every call, on every machine -- ``scripts/gen_prompt.py`` commits it
+  to ``docs/system-prompt.md`` and a test asserts the committed copy is
+  fresh.
 * **Generated from the real surface.** The repair guidance is keyed by
-  :class:`sqlmpeg.errors.ErrorCode`, so a new code cannot silently go
-  undocumented.
-
-.. note::
-   PLAN 051 STUB. The stdlib this module documented is deleted (RFC-007):
-   there is one calling convention now, and every function is a filter of the
-   installed ffmpeg. The prose below still describes the old two-tier surface
-   and the ``## Functions`` section is a placeholder -- ``tests/test_prompt.py``
-   and ``tests/test_docs.py`` are EXPECTED RED until wave 053/054 rewrites this
-   module against the new surface. Nothing here is touched beyond what import
-   breakage forced.
-
-``build_system_prompt(dynamic=registry.load())`` (``sqlmpeg prompt --dynamic``)
-appends one more, deliberately impure section: what THIS machine's installed
-ffmpeg additionally supports (RFC-003 tier 2), name + pad signature + doc, no
-options (the repair loop's ``UNKNOWN_FILTER_OPTION``/``FILTER_OPTION_TYPE``
-cover those). It is strictly additive -- every section above it is identical
-to the base prompt, which is what keeps the freshness test passing unchanged.
+  :class:`sqlmpeg.errors.ErrorCode`, the sink/input option tables are
+  rendered from :data:`sqlmpeg.sink.SINK_OPTIONS` /
+  :data:`sqlmpeg.inputs.INPUT_OPTIONS`, so a new code or option cannot
+  silently go undocumented.
 
 Marker convention (relied on by ``tests/test_prompt.py``): every fenced
 ```sql block in the prompt is one complete query that ``compile_sql`` accepts
@@ -160,8 +156,8 @@ _DIALECT_TAIL = """\
   a bare array cannot be sized and is rejected.
 - `subtitle` and `data` streams are PASSTHROUGH-ONLY: select them (bare,
   subscripted, splatted, or carried through a CTE column), but never filter
-  them. Passing one to any function -- stdlib or a filter beyond the stdlib --
-  is `UDF_ARG_TYPE` ("cannot be filtered, only selected"); putting one in a
+  them. Passing one to any function is `UDF_ARG_TYPE` ("cannot be filtered,
+  only selected"); putting one in a
   `UNION ALL` branch is `UNSUPPORTED_SQL` (ffmpeg's `concat` has video/audio
   pads only). A caption or data track's `language`/`title` tag rides straight
   through to the output, exactly like an untouched audio track's.
@@ -302,105 +298,101 @@ _DIALECT_TAIL = """\
 - Plain `UNION` is rejected: deduplication has no streaming meaning.
 - Legal at the top level and as a CTE body.
 
-### Arguments
-- Calls nest. A `video` parameter takes `<alias>.video[k]`, `<alias>.frame`,
-  or another call that returns `video`. An `audio` parameter takes
-  `<alias>.audio[k]` or another call that returns `audio`. A bare array in
-  either slot broadcasts (see Broadcasting).
-- `num` is a bare numeric literal. `0.5`, `.5`, `-10`, `24` are fine.
-  `1+1`, `2*w`, `'5'`, `a.t`, and casts are all rejected -- compute the value
-  yourself and write the literal.
-- `str` is a single-quoted literal; double a quote to escape it (`'it''s'`).
-  In Postgres double quotes mean identifier, never string.
-- `expr` is a number, OR a single-quoted ffmpeg expression that ffmpeg
-  evaluates per frame: `overlay(f.frame, p.frame, '(W-w)/2', '(H-h)/2')`
-  centers the overlay, `crop(f.frame, 0, 0, 'iw/2', 'ih')` keeps the left
-  half. The variable vocabulary is per-filter (`iw`/`ih` input size, `W`/`H`
-  and `w`/`h` in `overlay`, `t` for time, ...) and is checked by ffmpeg at
-  RUN time, not at compile time -- a bad variable name compiles and then
-  fails when the command runs, so only use variables you are sure of. Still
-  a literal either way: `'(W-w)/2'` is quoted text, not SQL arithmetic.
-- Function names are case-insensitive.
+### Calling convention
+Every function name resolves in exactly one of three namespaces. There is no
+curated function table to memorize -- what a name means, how many positional
+arguments it takes, and what options it has all come from the installed
+ffmpeg itself (except the three `sqlmpeg.*` macros, which are sqlmpeg's own).
 
-### Named arguments
-- Any call may take trailing `<name> => <value>` arguments, which set options
-  on the ffmpeg filter behind it: `blur(a.frame, 5, planes => 1)`,
-  `scale(a.frame, 1280, 720, flags => 'lanczos')`. They come AFTER every
-  positional argument, at most one per name.
-- Option names are case-sensitive and are exactly ffmpeg's own (`sigmaV`,
-  `luma_msize_x`). They are checked against the installed ffmpeg, so a wrong
-  name is `UNKNOWN_FILTER_OPTION` with the real list in `hint`, and a wrong
-  value is `FILTER_OPTION_TYPE` with the type, range or constants in
-  `message`. Values are bare numbers, `true`/`false`, or single-quoted
-  strings -- enum options take a quoted constant name, never its number.
-- A named argument may not set something the call already sets: the positional
-  form wins, and `crop(a.frame, 0, 0, 10, 10, w => 5)` is rejected rather than
-  silently overridden. Use the overload that takes the value positionally.
-- `enable => '<expression>'` is the one named argument that is not an option of
-  the filter: it is ffmpeg's TIMELINE switch, and it turns the filter on and
-  off as the stream plays. `blur(a.frame, 5, enable => 'between(t,0.5,1.5)')`
-  blurs only that one second; outside it the frames pass through untouched.
-  The expression is over `t` (seconds), `n` (frame number) or `pos`, and its
-  content is checked by ffmpeg at run time. Only filters your ffmpeg flags
-  with timeline support take it -- `gblur`, `drawbox`, `drawtext`, `overlay`,
-  `eq` do; `scale`, `pad`, `fps`, `xfade` do not, and asking anyway is
-  `UNKNOWN_FILTER_OPTION`, worded to say so. It is never valid on a generated
-  source (there is no upstream frame to switch), and, like every named
-  argument, it needs the installed ffmpeg.
-- A call that expands to more than one ffmpeg filter takes no named arguments
-  at all, because there is no single filter to set them on: `blur_regions`,
-  and `delay` on a VIDEO stream. `delay` on an AUDIO stream is one filter and
-  does take them.
-- `overlay` is the one function that cannot take them either: Postgres has a
-  builtin `OVERLAY(...)` and `=>` inside it is a `PARSE_ERROR`. Write
-  `overlay(base, top, x, y)` positionally, or use the namespaced raw filter
-  `ffmpeg.overlay(base, top, x => 20, y => 20, ...)` (see Beyond the stdlib),
-  which has no such grammar problem and reaches every overlay option.
+1. **A bare filter name** -- `<filter>(<streams...>, <positional
+   options...>, <named options...>)` -- resolves directly against the
+   installed ffmpeg's filter set. Stream arguments come first, positional,
+   one per the filter's own input pad, in the filter's declared pad order
+   (one for a `V->V` filter like `gblur`, two for a `VV->V` one like
+   `overlay` or `xfade`). After the streams, that filter's OWN options bind
+   positionally in ffmpeg's own declared order -- `gblur(a.frame, 5)` sets
+   its first option, `sigma`; `crop(a.frame, 640, 360, 100, 50)` sets
+   `out_w`, `out_h`, `x`, `y` in that order, because that is `crop`'s real
+   option order. Any option not given positionally can instead be given by
+   name, `<name> => <value>`, in any order, after every positional argument;
+   at most one of each.
+2. **`ffmpeg.<filter>(...)`** -- the exact same filter set, explicitly
+   namespaced: streams still positional, but every option is named, none
+   positional. Use it for a name Postgres's own grammar claims specially --
+   `overlay`, `trim`, `format`, `pad`, `normalize`, `reverse`, `median`,
+   `random`, `corr`, `copy`, `null` -- where the bare spelling either means
+   something else to Postgres or (for `overlay`, which is a Postgres
+   builtin) cannot even parse a `=>` argument at all (`PARSE_ERROR`):
+   `ffmpeg.overlay(base, top, x => 20, y => 20)`. `ffmpeg.trim(a.frame,
+   start => 1)` is the filter; bare `trim(a.frame)` is Postgres's string
+   `TRIM` and silently loses the argument. `ffmpeg` is a reserved name:
+   never use it as an alias or a CTE name.
+3. **`sqlmpeg.<name>(...)`** -- three fixed macros, each a small filter
+   subgraph no single ffmpeg filter provides. Their signature is sqlmpeg's
+   own, POSITIONAL ONLY -- no `=>`, ever; a named argument to a macro
+   (`enable` included) is `UNSUPPORTED_SQL`:
+   - `sqlmpeg.blur_regions(f, x, y, w, h, sigma)` -- crop the `w`x`h` region
+     at `(x, y)` out of video `f`, blur it by `sigma`, and lay it back over
+     the original frame at the same position. The license-plate/face
+     special.
+   - `sqlmpeg.speed(f, factor)` -- retime video `f` by `factor` (`2` is
+     double speed, `0.5` is half). Pair it with `atempo(<alias>.audio[k],
+     factor)` for the matching audio.
+   - `sqlmpeg.delay(f, seconds)` -- pad video `f` with `seconds` of
+     transparency at the start, so it composes with a plain `overlay` for a
+     timed insert with no trim/concat bookkeeping. VIDEO ONLY: `sqlmpeg` is
+     reserved, `sqlmpeg.delay` on an audio stream is `UDF_ARG_TYPE`, and its
+     hint names the replacement -- delay AUDIO with the bare filter
+     directly, in MILLISECONDS: `adelay(a.audio[1], 2000)`.
 
-### Beyond the stdlib
-- Any filter the installed ffmpeg reports can be called directly by its ffmpeg
-  name, with its stream inputs positional and every option named:
-  `unsharp(a.frame, luma_msize_x => 7, luma_amount => 1.5)`,
-  `curves(a.frame, preset => 'lighter')`, `atadenoise(a.frame)`. The number
-  and types of the positional arguments are that filter's input pads -- one
-  for `V->V` filters, two for `VV->V` ones like `xfade` -- and nothing else is
-  positional.
-- EVERY filter is also callable as `ffmpeg.<name>(...)`, e.g.
-  `ffmpeg.unsharp(a.frame, luma_amount => 1.5)`. That spelling resolves in the
-  installed ffmpeg's filter set ONLY -- never the stdlib -- so
-  `ffmpeg.scale(a.frame, w => 640, h => -2)` is ffmpeg's own `scale` filter
-  rather than the stdlib function of the same name. Use it whenever you want
-  the raw filter, and ALWAYS for a name Postgres parses specially: `trim`,
-  `format`, `overlay`, `pad`, `normalize`, `reverse`, `median`, `random`,
-  `corr`, `copy`, `null`. Bare `trim(a.frame)` is Postgres's string `TRIM` and
-  loses the argument; `ffmpeg.trim(a.frame, start => 1)` is the filter.
-  `ffmpeg` is a reserved name: never use it as an alias or a CTE name.
-- Filters with a variable number of pads (`split`, `concat`) or more than one
-  output are NOT callable under either spelling. Neither is a zero-input
-  filter: `ffmpeg.testsrc(...)` is a generated SOURCE and belongs in `FROM`
-  (see Dialect > Sources), never in the SELECT list.
-- Three of those otherwise-excluded filters ARE callable, through the
-  namespace ONLY, because their pad count is fixed by one of their own
-  options rather than genuinely variable: `ffmpeg.channelsplit(audio)` (one
-  stream per channel of `channel_layout`, or the narrower `channels`
-  subset), `ffmpeg.acrossover(audio)` (one band per `split` frequency, plus
-  one), and `ffmpeg.extractplanes(video)` (one per requested plane). Each
-  RETURNS AN ARRAY, exactly like an input's bare `<alias>.audio`: splat it
-  into the SELECT list, subscript one element through a CTE column
-  (`s.ch[2]`), or broadcast a call over every element. The bare name still
-  resolves nowhere -- only the namespaced spelling reaches these three. A
-  count-deciding option whose value is well-typed but not a count ffmpeg
-  could actually produce is `FILTER_OPTION_TYPE`, naming that option.
-- This is machine-dependent, and it is the only part of the dialect that is:
-  the stdlib above compiles anywhere, while a query naming a filter (or a
-  named option) only compiles where that ffmpeg has it. Prefer a stdlib
-  function whenever one does the job, and reach for a raw filter name for
-  effects the stdlib does not cover. A stdlib name always wins the BARE
-  spelling: `scale` is the function above, not ffmpeg's `scale` filter --
-  `ffmpeg.scale` is how you ask for the filter.
-- If the filter set is unavailable (no ffmpeg, or `--portable`), every such
-  call is `UNKNOWN_FUNCTION` and every named argument is `UNSUPPORTED_SQL`;
-  the message says which."""
+   `sqlmpeg` is a reserved name too: never use it as an alias or a CTE name.
+
+For any filter (namespace 1 or 2): option names are case-sensitive and are
+exactly ffmpeg's own (`sigmaV`, `luma_msize_x`), checked against the
+installed ffmpeg -- a wrong name is `UNKNOWN_FILTER_OPTION` with the real
+list in `hint`, a wrong value is `FILTER_OPTION_TYPE` with the type, range or
+constants in `message`. Values are bare numbers, `true`/`false`, or
+single-quoted strings; enum options take a quoted constant name, never its
+number. A named argument may not set something a positional argument already
+set -- the positional form wins, and the named one is rejected rather than
+silently overridden.
+
+`enable => '<expression>'` is the one named argument that is not an option of
+the filter behind it: it is ffmpeg's TIMELINE switch, turning the filter on
+and off as the stream plays. `gblur(a.frame, 5, enable =>
+'between(t,0.5,1.5)')` blurs only that one second; outside it the frames pass
+through untouched. The expression is over `t` (seconds), `n` (frame number)
+or `pos`, checked by ffmpeg at RUN time, not compile time. Only filters your
+ffmpeg flags with timeline support take it; asking on one that does not is
+`UNKNOWN_FILTER_OPTION`. It is never valid on a generated source or on a
+`sqlmpeg.*` macro (see above).
+
+A handful of names are exceptions to "one stream in, one filter, one call":
+- `amix`, `hstack`, `vstack` take ANY NUMBER of same-type stream arguments
+  (two or more), all positional, no named options before them: `amix(a, b,
+  c)` mixes three audio streams. The count sqlmpeg passes to ffmpeg is
+  however many streams you wrote; give `inputs => <n>` explicitly only if
+  you need to override that.
+- `ffmpeg.channelsplit(audio)`, `ffmpeg.acrossover(audio)`, and
+  `ffmpeg.extractplanes(video)` are the one exception to "namespaced options
+  are all named": each RETURNS AN ARRAY (one stream per channel, per
+  frequency band, per plane), exactly like an input's bare `<alias>.audio`.
+  Splat it into the SELECT list, subscript one element through a CTE column
+  (`s.ch[2]`), or broadcast a call over every element. These three resolve
+  ONLY through the namespace -- the bare name reaches nowhere.
+- A filter with a variable pad count (`split`, `concat`) or more than one
+  output is not callable under either filter spelling. Neither is a
+  zero-input filter: `ffmpeg.testsrc(...)` is a generated SOURCE, and it
+  belongs in `FROM` (see Dialect > Sources), never in the SELECT list.
+
+Function names are case-insensitive; option names are not. Filter calls are
+machine-dependent -- a query naming a filter (or an option) only compiles
+where the installed ffmpeg has it; the three `sqlmpeg.*` macros and the
+dialect otherwise compile anywhere. If the filter set is unavailable (no
+ffmpeg on PATH, or `--no-probe` cannot help here since this is about the
+filter LIST, not a specific file), every filter call is `UNKNOWN_FUNCTION`
+and every named argument on one is `UNSUPPORTED_SQL`; the message says
+which."""
 
 
 def _dialect_section() -> str:
@@ -484,10 +476,11 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   nested `WITH`, CTE column lists, table functions other than `input()`, a
   statement that is neither a `SELECT` nor (in a script) `CREATE VIEW` /
   `COPY`, a zero/negative/computed array subscript.
-- Any name that is neither a function listed below nor a filter the installed
-  ffmpeg provides (see "Beyond the stdlib"), including transitions between
-  concatenated branches, motion tracking, subtitle/data-stream filtering, and
-  anything requiring more than one pass over the stream.
+- Any name that is neither one of the three `sqlmpeg.*` macros nor a filter
+  the installed ffmpeg provides (see Calling convention), including
+  transitions between concatenated branches, motion tracking,
+  subtitle/data-stream filtering, and anything requiring more than one pass
+  over the stream.
 - A `WHERE` window on an alias whose subtitle/data column is ALSO selected in
   the same query (ffmpeg cannot retime captions under an input seek -- see
   Time selection); a subtitle/data column inside a CTE that also carries a
@@ -496,24 +489,61 @@ These are typed errors, never a best-effort graph. Do not reach for them.
 
 
 # ---------------------------------------------------------------------------
-# function reference -- PLAN 051 STUB
+# function reference (RFC-007, plan 053b): rendered from the live Registry
 # ---------------------------------------------------------------------------
 #
-# This section used to be generated from `sqlmpeg.stdlib.FUNCTIONS`, which no
-# longer exists (RFC-007 deleted the stdlib). Rewriting it against the new
-# surface -- the calling convention, the two namespaces, the macro trio -- is
-# wave 053/054's deliverable, and it is a PROSE job, not a mechanical one.
-# Until then this is the smallest thing that keeps the module importable.
+# Unlike the old stdlib table, this is genuinely machine-dependent -- what a
+# bare or `ffmpeg.<name>` call resolves to is exactly what THIS installed
+# ffmpeg reports. Name, pad signature, one-line doc, sorted alphabetically;
+# no per-filter option dump (~460 filters' worth of option tables would be
+# enormous -- validate --json's UNKNOWN_FILTER_OPTION / FILTER_OPTION_TYPE
+# cover that long tail instead). With no registry (or an unavailable one)
+# this degrades to one explanatory note instead -- that is the only part of
+# `build_system_prompt` that is not pure/deterministic, and it is what keeps
+# the default (no-registry) path, which `docs/system-prompt.md` pins,
+# unchanged regardless of what ffmpeg (if any) is on the machine that ran
+# the generator.
 
-_FUNCTIONS_HEADER = """## Functions
+_NO_REGISTRY_NOTE = (
+    "No installed ffmpeg was found on PATH (or its filter list could not be "
+    "read), so there is no per-machine filter list to render here; Calling "
+    "convention above still describes the mechanism -- bare and "
+    "`ffmpeg.<name>` calls both resolve against the installed ffmpeg's "
+    "filter set, whatever it turns out to be. `sqlmpeg.blur_regions` / "
+    "`sqlmpeg.speed` / `sqlmpeg.delay` need no registry at all and always "
+    "compile."
+)
 
-(This section is being rewritten: sqlmpeg's function surface is now the
-installed ffmpeg's filter set, called as `<filter>(<streams...>,
-<positional options...>, <named options...>)`.)"""
+
+def _filter_line(name: str, registry: Registry) -> str:
+    f = registry.get(name)
+    assert f is not None  # name came from registry.names() itself
+    signature = ", ".join(f.inputs)
+    return f"- `{name}({signature}) -> {f.output}` -- {f.doc}"
 
 
-def _function_reference() -> str:
-    return _FUNCTIONS_HEADER
+def _function_reference(registry: Registry | None) -> str:
+    if registry is None or not registry.available():
+        return f"## Functions\n\n{_NO_REGISTRY_NOTE}"
+    names = sorted(registry.names())
+    lines = [
+        f"## Functions ({len(names)} installed filters, plus the 3 sqlmpeg.* macros)",
+        "",
+        "Every filter this machine's installed ffmpeg reports -- name, pad "
+        "signature, one-line description, sorted alphabetically -- callable "
+        "bare or as `ffmpeg.<name>` (see Calling convention). This list is "
+        "machine-dependent: it is only what THIS ffmpeg reported when this "
+        "prompt was generated. Options are never dumped here -- pass them by "
+        "name (`<name> => <value>`) as usual and let `sqlmpeg validate "
+        "--json` report the real option set on a mistake "
+        "(`UNKNOWN_FILTER_OPTION` / `FILTER_OPTION_TYPE`); the repair loop "
+        "below covers the rest. The three `sqlmpeg.*` macros "
+        "(`blur_regions`, `speed`, `delay`) are not in this list -- their "
+        "signatures are fixed and given in full under Calling convention.",
+        "",
+    ]
+    lines.extend(_filter_line(name, registry) for name in names)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -525,11 +555,12 @@ def _function_reference() -> str:
 _EXAMPLES: tuple[tuple[str, str], ...] = (
     (
         "Make clip.mp4 half size.",
-        "SELECT scale(a.frame, 0.5)\nFROM input('clip.mp4') a",
+        "SELECT scale(a.frame, 'iw/2', 'ih/2')\nFROM input('clip.mp4') a",
     ),
     (
         "Crop the 640x360 region at (100, 50) out of clip.mp4 and double it.",
-        "SELECT scale(crop(a.frame, 100, 50, 640, 360), 2)\nFROM input('clip.mp4') a",
+        "SELECT scale(crop(a.frame, 640, 360, 100, 50), 'iw*2', 'ih*2')\n"
+        "FROM input('clip.mp4') a",
     ),
     (
         "Keep only the part of clip.mp4 from 5s to 12.5s.",
@@ -544,7 +575,7 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
         "in the top-left corner of game.mp4, and mix its audio under the main "
         "feed's at 65/35.",
         "WITH pip AS (\n"
-        "  SELECT scale(crop(b.frame, 1200, 50, 600, 200), 0.5) AS frame,\n"
+        "  SELECT scale(crop(b.frame, 600, 200, 1200, 50), 'iw/2', 'ih/2') AS frame,\n"
         "         b.audio[1] AS sound\n"
         "  FROM input('game.mp4') b\n"
         ")\n"
@@ -560,22 +591,24 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
     (
         "Halve the size of clip.mp4's video and keep its first audio track "
         "as-is.",
-        "SELECT scale(a.video[1], 0.5), a.audio[1]\nFROM input('clip.mp4') a",
+        "SELECT scale(a.video[1], 'iw/2', 'ih/2'), a.audio[1]\nFROM input('clip.mp4') a",
     ),
     (
         "Blur the 160x120 area at (220, 90) in clip.mp4.",
-        "SELECT blur_regions(a.frame, 220, 90, 160, 120, 20)\nFROM input('clip.mp4') a",
+        "SELECT sqlmpeg.blur_regions(a.frame, 220, 90, 160, 120, 20)\n"
+        "FROM input('clip.mp4') a",
     ),
     (
         "Outline a red 300x120 box at (40, 40) on clip.mp4 and label it "
         "TAKE 3 at (60, 70) in 36pt.",
-        "SELECT text(draw_box(a.frame, 40, 40, 300, 120, 'red'), 'TAKE 3', 60, 70, 36)\n"
+        "SELECT drawtext(drawbox(a.frame, 40, 40, 300, 120, 'red'), "
+        "text => 'TAKE 3', x => 60, y => 70, fontsize => 36)\n"
         "FROM input('clip.mp4') a",
     ),
     (
         "Center watermark.png over film.mp4, whatever size either of them is.",
-        # `expr` slots: ffmpeg evaluates (W-w)/2 against the real frame sizes,
-        # so this needs no probe and works for any pair of inputs.
+        # An expr argument: ffmpeg evaluates (W-w)/2 against the real frame
+        # sizes, so this needs no probe and works for any pair of inputs.
         "SELECT overlay(f.frame, logo.frame, '(W-w)/2', '(H-h)/2')\n"
         "FROM input('film.mp4') f, input('watermark.png') logo",
     ),
@@ -589,7 +622,8 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
         "Double-speed the 20-second clip.mp4 with a 1 second fade in and a "
         "1.5 second fade out at the end.",
         # 20s source at 2x -> 10s output; the fade-out window starts at 10 - 1.5.
-        "SELECT fade_out(fade_in(speed(a.frame, 2), 1), 1.5, 8.5)\n"
+        "SELECT fade(fade(sqlmpeg.speed(a.frame, 2), 'in', duration => 1), "
+        "'out', start_time => 8.5, duration => 1.5)\n"
         "FROM input('clip.mp4') a",
     ),
     (
@@ -627,9 +661,9 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
 # extractor does not match, deliberately excluding them from that guarantee.
 _PROBED_EXAMPLES: tuple[tuple[str, str], ...] = (
     (
-        "Add reverb to every audio track in film.mkv, whatever language each "
-        "one is in.",
-        "SELECT v.video[1], reverb(v.audio, 0.3)\nFROM input('film.mkv') v",
+        "Add echo/reverb to every audio track in film.mkv, whatever language "
+        "each one is in.",
+        "SELECT v.video[1], aecho(v.audio, 0.8, 0.9, 60, 0.3)\nFROM input('film.mkv') v",
     ),
     (
         "Play episode1.mkv then episode2.mkv as one file, keeping every "
@@ -643,7 +677,7 @@ _PROBED_EXAMPLES: tuple[tuple[str, str], ...] = (
         "corner of film.mkv, and mix every language track of both under it, "
         "the film at 65% and the commentary at 35%.",
         "WITH pip AS (\n"
-        "  SELECT scale(c.frame, 0.25) AS frame, c.audio AS sound\n"
+        "  SELECT scale(c.frame, 'iw/4', 'ih/4') AS frame, c.audio AS sound\n"
         "  FROM input('commentary.mkv') c\n"
         ")\n"
         "SELECT overlay(f.frame, pip.frame, 20, 20),\n"
@@ -726,14 +760,15 @@ _REPAIR: dict[ErrorCode, str] = {
         "well-formed SELECT."
     ),
     ErrorCode.UNKNOWN_FUNCTION: (
-        "That name is neither a stdlib function nor a filter the installed "
-        "ffmpeg has. Take the did-you-mean from `hint` if there is one -- it "
-        "comes back in the spelling that works, so `ffmpeg.<name>()` in the "
-        "hint means write it with the namespace. Otherwise rebuild the effect "
-        "from the listed functions, or declare it inexpressible. Do not invent "
-        "ffmpeg filter names, and do not retry a bare name as "
-        "`ffmpeg.<name>` unless the filter really exists: the namespace "
-        "changes which tier resolves the name, not which filters exist."
+        "That name is neither one of the 3 `sqlmpeg.*` macros nor a filter "
+        "the installed ffmpeg has. Take the did-you-mean from `hint` if "
+        "there is one -- it comes back in the spelling that works, so "
+        "`ffmpeg.<name>()` in the hint means write it with the namespace. "
+        "Otherwise rebuild the effect from the Functions list, or declare "
+        "it inexpressible. Do not invent ffmpeg filter names, and do not "
+        "retry a bare name as `ffmpeg.<name>` unless the filter really "
+        "exists: the namespace changes how the name resolves, not which "
+        "filters exist."
     ),
     ErrorCode.UNKNOWN_ALIAS: (
         "The qualifier before the dot is not in this SELECT's FROM. Add "
@@ -771,7 +806,8 @@ _REPAIR: dict[ErrorCode, str] = {
         "columns, the same types, in the same order (a splatted array counts "
         "one column per element, so array lengths must match too); if it is a "
         "resolution/frame-rate mismatch, wrap each branch's video column in "
-        "`scale(<expr>, w, h)` with the same w and h everywhere."
+        "`scale(<expr>, width, height)` with the same width and height "
+        "everywhere."
     ),
     ErrorCode.STREAM_NOT_FOUND: (
         "The subscript is out of range for the actual stream count named in "
@@ -862,78 +898,28 @@ def _repair_section() -> str:
 
 
 # ---------------------------------------------------------------------------
-# dynamic filter list (plan 032, opt-in via `sqlmpeg prompt --dynamic`)
-# ---------------------------------------------------------------------------
-#
-# NOT part of the base prompt: this section is appended only when a caller
-# passes a Registry to build_system_prompt, so the no-arg path (what
-# docs/system-prompt.md pins) is untouched. It lists every filter this
-# machine's installed ffmpeg reports -- name, pad signature, one-line doc --
-# with no per-filter option dump (the RFC's call: ~460 filters' worth of
-# option tables would be enormous; validate --json's UNKNOWN_FILTER_OPTION /
-# FILTER_OPTION_TYPE cover that long tail instead).
-
-_DYNAMIC_UNAVAILABLE_NOTE = (
-    "No installed ffmpeg was found on PATH (or its filter list could not be "
-    "read), so there is no per-machine filter list to append here; \"Beyond "
-    "the stdlib\" above still describes the mechanism, it simply has nothing "
-    "to compile against on this machine."
-)
-
-
-def _dynamic_filter_line(name: str, registry: Registry) -> str:
-    f = registry.get(name)
-    assert f is not None  # name came from registry.names() itself
-    signature = ", ".join(f.inputs)
-    return f"- `{name}({signature}) -> {f.output}` -- {f.doc}"
-
-
-def _dynamic_section(registry: Registry) -> str:
-    if not registry.available():
-        return _DYNAMIC_UNAVAILABLE_NOTE
-    names = sorted(registry.names())
-    lines = [
-        f"## Installed filters ({len(names)})",
-        "",
-        "Every filter this machine's installed ffmpeg reports, beyond the "
-        "curated stdlib above -- name, pad signature, one-line description, "
-        "sorted alphabetically. This list is machine-dependent, exactly like "
-        "the rest of \"Beyond the stdlib\": it is only what THIS ffmpeg "
-        "reported when this prompt was generated. Options are never dumped "
-        "here -- pass them by name (`<name> => <value>`) as usual and let "
-        "`sqlmpeg validate --json` report the real option set on a mistake "
-        "(`UNKNOWN_FILTER_OPTION` / `FILTER_OPTION_TYPE`); the repair loop "
-        "above covers the rest.",
-        "",
-    ]
-    lines.extend(_dynamic_filter_line(name, registry) for name in names)
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------------------
 
 
-def build_system_prompt(dynamic: Registry | None = None) -> str:
-    """The sqlmpeg system prompt: deterministic, pure, ASCII, no trailing newline.
+def build_system_prompt(registry: Registry | None = None) -> str:
+    """The sqlmpeg system prompt: ASCII, no trailing newline.
 
-    With `dynamic=None` (the default) this is exactly the portable, tier-1
-    prompt -- pure and machine-independent, byte-identical to
-    `docs/system-prompt.md`. Passing a `Registry` (`sqlmpeg prompt --dynamic`)
-    appends an "Installed filters" section listing what THIS machine's ffmpeg
-    additionally supports; that section is the only impure, machine-dependent
-    part of the output, and it never changes anything above it.
+    `registry=None` (the default) is deterministic and pure -- no I/O, no
+    clock, no environment -- and is byte-identical to `docs/system-prompt.md`:
+    the Functions section degrades to one explanatory note instead of a
+    filter list. Passing a live `Registry` (`sqlmpeg prompt` does, via
+    `registry.load()`) renders the real Functions section from THIS
+    machine's installed ffmpeg; that is the only impure, machine-dependent
+    part of the output, and it never changes anything else.
     """
     sections: tuple[str, ...] = (
         _ROLE,
         _dialect_section(),
         _output_section(),
         _REJECTED,
-        _function_reference(),
+        _function_reference(registry),
         _examples(),
         _repair_section(),
     )
-    if dynamic is not None:
-        sections = sections + (_dynamic_section(dynamic),)
     return "\n\n".join(sections)

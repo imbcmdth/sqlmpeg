@@ -6,8 +6,8 @@ Real tasks, in roughly the order people meet them. Each recipe is the question a
 
 Two kinds of query fence, checked by `tests/test_examples.py`:
 
-- ` ```sql ` - compiles anywhere: stdlib functions and explicit stream subscripts, no probing, no filter registry. The command shown is what a machine with no ffmpeg installed at all would print.
-- ` ```sql-exec ` - needs the installed ffmpeg to compile: a filter outside the stdlib, a named option, a generated source, or a whole-array splat whose length only a real file knows.
+- ` ```sql ` - compiles anywhere, even with no ffmpeg installed: stream selection, remaps, trims and sinks, but no filter calls (a filter call needs a binary to resolve against). The command shown is what such a machine would print.
+- ` ```sql-exec ` - needs the installed ffmpeg to compile: any filter call, a generated source, or a whole-array splat whose length only a real file knows.
 
 Every query fence is followed by a plain fence holding the `$ sqlmpeg compile -f query.sql ...` invocation and exactly what it prints. Paths are illustrative (`film.mp4` doesn't need to exist to compile); the recipes that genuinely need a readable file use this repo's `tests/fixtures/` paths verbatim.
 
@@ -105,21 +105,21 @@ $ sqlmpeg compile -f query.sql -o small.mp4
 ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=1280:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy small.mp4
 ```
 
-Or give `scale` one factor instead of a width and height:
+Or express the width relative to the input - any string-typed option takes an ffmpeg expression - and let `-2` keep the aspect:
 
 ```sql-exec
-SELECT scale(f.frame, 'iw/2'), f.audio[1]
+SELECT scale(f.frame, 'iw/2', -2), f.audio[1]
 FROM input('film.mp4') f
 ```
 
 ```
 $ sqlmpeg compile -f query.sql -o half.mp4
-ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=iw/2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy half.mp4
+ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=iw/2:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy half.mp4
 ```
 
 ## 6. Rotate a phone video 90 degrees
 
-For quarter turns, ffmpeg's `transpose` is the right tool (it swaps the axes rather than resampling). The stdlib's `rotate(f.frame, degrees)` handles arbitrary angles:
+For quarter turns, ffmpeg's `transpose` is the right tool (it swaps the axes rather than resampling). For arbitrary angles there's `rotate`, whose angle is an expression in radians - `rotate(f.frame, '7*PI/180')` leans a clip seven degrees:
 
 ```sql-exec
 SELECT transpose(v.frame, dir => 'clock'), v.audio[1]
@@ -133,7 +133,7 @@ ffmpeg -i phone.mp4 -filter_complex '[0:v:0]transpose=dir=clock[out0]' -map '[ou
 
 ## 7. Sharpen a soft-looking video
 
-Any of your ffmpeg's filters is callable directly, options by name, checked against what the binary actually supports. (`sharpen(f.frame, amount)` is the portable one-knob version if you don't need the fine control.)
+Any of your ffmpeg's filters is callable directly, options by name, checked against what the binary actually supports. (The one-knob version, if you don't need the fine control: `unsharp(f.frame, 5, 5, 1.5)`, matrix sizes then amount, positionally in unsharp's own order.)
 
 ```sql-exec
 SELECT unsharp(a.frame, luma_msize_x => 7, luma_amount => 1.5), a.audio[1]
@@ -233,10 +233,10 @@ ffmpeg -i film.mp4 -filter_complex '[0:v:0]subtitles=filename=subs.en.srt[out0]'
 
 ## 12. Speed a clip up 2x, picture and sound together
 
-Two functions because the two stream types speed up differently: `speed` restamps video frames, `atempo` resamples audio while keeping the pitch (so nobody turns into a chipmunk):
+Two functions because the two stream types speed up differently: `sqlmpeg.speed` restamps video frames, `atempo` resamples audio while keeping the pitch (so nobody turns into a chipmunk):
 
-```sql
-SELECT speed(f.frame, 2), atempo(f.audio[1], 2)
+```sql-exec
+SELECT sqlmpeg.speed(f.frame, 2), atempo(f.audio[1], 2)
 FROM input('film.mp4') f
 ```
 
@@ -247,7 +247,7 @@ ffmpeg -i film.mp4 -filter_complex '[0:v:0]setpts=PTS/2[out0];[0:a:0]atempo=temp
 
 ## 13. Crossfade between two clips
 
-`crossfade(a, b, duration, offset)` - the offset is seconds into the FIRST clip where the fade begins, so a 10-second clip with a 1-second fade starts dissolving at 9. `acrossfade` does the same for the sound:
+`xfade` takes both clips, then `duration` and `offset` by name (its first option is the transition style, which defaults to a plain dissolve) - the offset is seconds into the FIRST clip where the fade begins, so a 10-second clip with a 1-second fade starts dissolving at 9. `acrossfade` does the same for the sound:
 
 ```sql-exec
 SELECT xfade(a.frame, b.frame, duration => 1, offset => 9),
@@ -321,13 +321,13 @@ ffmpeg -i film.mp4 -i music.m4a -filter_complex '[0:a:0]asplit=2[src_v_a_0_split
 A quarter-size camera in the bottom-right corner, 20 pixels off each edge - the expressions mean the position holds whatever the two resolutions are. (The dual-language version, with the audio mixed per language, is the README's opening demo.)
 
 ```sql-exec
-SELECT overlay(f.frame, scale(c.frame, 'iw/4'), 'W-w-20', 'H-h-20'), f.audio[1]
+SELECT overlay(f.frame, scale(c.frame, 'iw/4', -2), 'W-w-20', 'H-h-20'), f.audio[1]
 FROM input('film.mp4') f, input('camera.mp4') c
 ```
 
 ```
 $ sqlmpeg compile -f query.sql -o pip.mp4
-ffmpeg -i film.mp4 -i camera.mp4 -filter_complex '[1:v:0]scale=width=iw/4[n1];[0:v:0][n1]overlay=x=W-w-20:y=H-h-20[out0]' -map '[out0]' -map 0:a:0 -c:1 copy pip.mp4
+ffmpeg -i film.mp4 -i camera.mp4 -filter_complex '[1:v:0]scale=width=iw/4:height=-2[n1];[0:v:0][n1]overlay=x=W-w-20:y=H-h-20[out0]' -map '[out0]' -map 0:a:0 -c:1 copy pip.mp4
 ```
 
 ## 17. Insert a clip at a timestamp
@@ -349,8 +349,8 @@ ffmpeg -to 120 -i film.mp4 -i promo.mp4 -ss 120 -i film.mp4 -filter_complex '[0:
 
 Or keep the main video playing and overlay the insert on top: a delayed video stream is transparent until its start time (and after it ends), so it composes with a plain `overlay` - no timeline bookkeeping:
 
-```sql
-SELECT overlay(f.frame, delay(promo.frame, 120), 20, 20), f.audio[1]
+```sql-exec
+SELECT overlay(f.frame, sqlmpeg.delay(promo.frame, 120), 20, 20), f.audio[1]
 FROM input('film.mp4') f, input('promo.mp4') promo
 ```
 
@@ -361,7 +361,7 @@ ffmpeg -i film.mp4 -i promo.mp4 -filter_complex '[1:v:0]format=pix_fmts=yuva420p
 
 ## 18. Normalize loudness on every language track at once
 
-A bare `.audio` is the whole track array; handing it to a filter broadcasts, one node per language, and every output keeps its language tag. (One honest wart: the stdlib's `normalize()` is currently unreachable by its bare name - Postgres grammar claims it, the same way it claims `pad` - so this recipe uses the filter's own spelling. `I` is EBU R128 integrated loudness, and yes, it's a capital I.)
+A bare `.audio` is the whole track array; handing it to a filter broadcasts, one node per language, and every output keeps its language tag. (`ffmpeg.loudnorm` rather than bare `loudnorm` only out of habit here - the bare name works too; the namespace is the spelling that never collides with Postgres grammar. `I` is EBU R128 integrated loudness, and yes, it's a capital I.)
 
 ```sql-exec
 SELECT f.video[1], ffmpeg.loudnorm(f.audio, I => -23)
@@ -375,16 +375,16 @@ ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:a:0]loudnorm=I=-23[out1];[0
 
 ## 19. Blur a region, or blur during a time window
 
-`blur_regions` is crop, blur and overlay in one call - the license-plate special:
+`sqlmpeg.blur_regions` is crop, blur and overlay in one call - the license-plate special:
 
-```sql
-SELECT blur_regions(f.frame, 900, 60, 320, 180, 20), f.audio[1]
+```sql-exec
+SELECT sqlmpeg.blur_regions(f.frame, 900, 60, 320, 180, 20), f.audio[1]
 FROM input('interview.mp4') f
 ```
 
 ```
 $ sqlmpeg compile -f query.sql -o anonymized.mp4
-ffmpeg -i interview.mp4 -filter_complex '[0:v:0]split=2[src_f_v_0_split0][src_f_v_0_split1];[src_f_v_0_split0]crop=w=320:h=180:x=900:y=60,gblur=sigma=20[n2];[src_f_v_0_split1][n2]overlay=x=900:y=60[out0]' -map '[out0]' -map 0:a:0 -c:1 copy anonymized.mp4
+ffmpeg -i interview.mp4 -filter_complex '[0:v:0]split=2[src_f_v_0_split0][src_f_v_0_split1];[src_f_v_0_split0]crop=out_w=320:out_h=180:x=900:y=60,gblur=sigma=20[n2];[src_f_v_0_split1][n2]overlay=x=900:y=60[out0]' -map '[out0]' -map 0:a:0 -c:1 copy anonymized.mp4
 ```
 
 To apply an effect only during a time window, `enable` is the switch - no trimming, no branches, no concat, just a filter that turns itself on and off:

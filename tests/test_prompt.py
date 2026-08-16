@@ -1,9 +1,14 @@
-"""Tests for the LLM system prompt (plan 012).
+"""Tests for the LLM system prompt (plan 012; rewritten 053b, RFC-007).
 
 The load-bearing one is :func:`test_every_sql_example_compiles`: the prompt is
 a contract with a model, so every query it shows off must actually compile.
 The marker convention is a fenced ``sql`` block -- prompt.py only ever puts
 complete, accepted queries inside one.
+
+Content-keyed rather than full-text pinned (RFC-007 collapsed the old
+stdlib/dynamic split into one calling convention, three namespaces): these
+assert the prompt SAYS the load-bearing facts, not that it says them in one
+exact wording, since prose is expected to keep improving.
 """
 
 from __future__ import annotations
@@ -20,8 +25,8 @@ from sqlmpeg.compiler import compile_sql
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import INPUT_OPTIONS
 from sqlmpeg.prompt import build_system_prompt
+from sqlmpeg.registry import Registry, load
 from sqlmpeg.sink import SINK_OPTIONS
-from sqlmpeg.stdlib import FUNCTIONS
 
 ROOT = Path(__file__).resolve().parent.parent
 DOC_PATH = ROOT / "docs" / "system-prompt.md"
@@ -56,26 +61,63 @@ def test_every_sql_example_compiles(query: str) -> None:
 
 def test_examples_cover_the_headline_constructs() -> None:
     joined = "\n".join(_sql_examples(PROMPT))
-    for construct in ("WITH ", "UNION ALL", "WHERE ", "BETWEEN ", "overlay(", "blur_regions("):
+    for construct in (
+        "WITH ",
+        "UNION ALL",
+        "WHERE ",
+        "BETWEEN ",
+        "overlay(",
+        "sqlmpeg.blur_regions(",
+        "sqlmpeg.speed(",
+    ):
         assert construct in joined, construct
+
+
+# ---------------------------------------------------------------------------
+# the calling convention: three namespaces, the macro trio's exact signatures
+# ---------------------------------------------------------------------------
+
+
+def test_calling_convention_names_the_three_namespaces() -> None:
+    assert "### Calling convention" in PROMPT
+    assert "ffmpeg.<filter>" in PROMPT
+    assert "sqlmpeg.<name>" in PROMPT
+
+
+def test_macro_signatures_are_documented_exactly() -> None:
+    assert "sqlmpeg.blur_regions(f, x, y, w, h, sigma)" in PROMPT
+    assert "sqlmpeg.speed(f, factor)" in PROMPT
+    assert "sqlmpeg.delay(f, seconds)" in PROMPT
+
+
+def test_macros_are_documented_as_positional_only() -> None:
+    assert "POSITIONAL ONLY" in PROMPT
+    assert "UNSUPPORTED_SQL" in PROMPT
+
+
+def test_delay_audio_hint_is_documented() -> None:
+    assert "adelay(a.audio[1], 2000)" in PROMPT
+    assert "VIDEO ONLY" in PROMPT
+
+
+def test_n_input_functions_are_documented() -> None:
+    assert "amix" in PROMPT and "hstack" in PROMPT and "vstack" in PROMPT
+    assert "ANY NUMBER" in PROMPT
+
+
+def test_array_returning_trio_is_documented() -> None:
+    for name in ("channelsplit", "acrossover", "extractplanes"):
+        assert f"ffmpeg.{name}" in PROMPT
+
+
+def test_sqlmpeg_and_ffmpeg_are_documented_as_reserved() -> None:
+    assert "`ffmpeg` is a reserved name" in PROMPT
+    assert "`sqlmpeg` is a reserved name" in PROMPT
 
 
 # ---------------------------------------------------------------------------
 # generated from the real surface
 # ---------------------------------------------------------------------------
-
-
-def test_every_function_is_documented() -> None:
-    for name, spec in FUNCTIONS.items():
-        assert name in PROMPT, name
-        assert spec.doc in PROMPT, name
-
-
-def test_every_parameter_name_and_kind_is_documented() -> None:
-    for spec in FUNCTIONS.values():
-        for variant in spec.variants:
-            rendered = ", ".join(f"{p.name}: {p.kind}" for p in variant)
-            assert f"{spec.name}({rendered})" in PROMPT, spec.name
 
 
 def test_every_error_code_has_repair_guidance() -> None:
@@ -171,7 +213,10 @@ def test_cli_prompt_prints_it(capsys: pytest.CaptureFixture[str]) -> None:
     captured = capsys.readouterr()
     assert code == 0
     assert captured.err == ""
-    assert captured.out == PROMPT + "\n"
+    # The CLI always loads the live registry now (no --dynamic flag left),
+    # so its printed prompt need not equal the no-registry PROMPT constant --
+    # only the note-vs-filter-list part of the Functions section can differ.
+    assert captured.out.startswith(PROMPT.split("## Functions", 1)[0])
 
 
 def test_cli_prompt_takes_no_query_argument() -> None:
@@ -180,67 +225,56 @@ def test_cli_prompt_takes_no_query_argument() -> None:
     assert exc_info.value.code == 2
 
 
+def test_cli_prompt_dynamic_flag_is_gone() -> None:
+    """RFC-007/053b: the base/--dynamic split collapsed into one prompt; the
+    flag is deleted outright (pre-1.0), not kept-but-ignored."""
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["prompt", "--dynamic"])
+    assert exc_info.value.code == 2
+
+
 # ---------------------------------------------------------------------------
-# --dynamic (plan 032, RFC-003): appends the installed ffmpeg's filter list
+# the Functions section: rendered from the live Registry, or a fallback note
 # ---------------------------------------------------------------------------
 
 
-def test_dynamic_prompt_with_no_registry_equals_the_base_prompt() -> None:
-    """The no-arg / dynamic=None path must stay byte-identical: this is what
-    keeps docs/system-prompt.md's freshness test passing unchanged."""
-    assert build_system_prompt(dynamic=None) == PROMPT
-    assert build_system_prompt() == PROMPT
+def test_functions_section_without_a_registry_is_one_note() -> None:
+    assert "## Functions" in PROMPT
+    assert "No installed ffmpeg was found on PATH" in PROMPT
+    # No per-machine filter list leaked into the no-registry (pinned) prompt.
+    assert "-> video`" not in PROMPT
+    assert "-> audio`" not in PROMPT
 
 
-def test_dynamic_prompt_when_registry_unavailable_appends_one_note(
+def test_functions_section_with_an_unavailable_registry_is_the_same_note(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No ffmpeg on PATH (or a registry that failed to load) still exits
-    cleanly: the base prompt plus one explanatory note, never an error and
-    never the "Installed filters" section itself."""
-    from sqlmpeg.registry import Registry
-
     empty = Registry()
     monkeypatch.setattr(empty, "available", lambda: False)
-    text = build_system_prompt(dynamic=empty)
-    assert text.startswith(PROMPT + "\n\n")
-    assert "## Installed filters" not in text
-    assert "ffmpeg" in text[len(PROMPT) :].lower()
+    text = build_system_prompt(empty)
+    assert text == PROMPT
 
 
 @pytest.mark.exec
-def test_dynamic_prompt_contains_gblur_and_its_signature() -> None:
-    from sqlmpeg.registry import load
-
-    text = build_system_prompt(dynamic=load())
-    assert "## Installed filters" in text
+def test_functions_section_with_a_live_registry_lists_gblur() -> None:
+    text = build_system_prompt(load())
     assert "gblur(video) -> video" in text
+    assert text != PROMPT
 
 
-def test_cli_prompt_without_dynamic_never_touches_the_registry(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    def _boom() -> None:
-        raise AssertionError("registry should not be loaded without --dynamic")
+def test_cli_prompt_loads_the_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unlike the old --dynamic-gated CLI, `sqlmpeg prompt` always renders the
+    Functions section from the live registry now -- so it always loads one."""
+    called = False
 
-    monkeypatch.setattr(cli.registry_module, "load", _boom)
+    def _tracked() -> Registry:
+        nonlocal called
+        called = True
+        empty = Registry()
+        monkeypatch.setattr(empty, "available", lambda: False)
+        return empty
+
+    monkeypatch.setattr(cli.registry_module, "load", _tracked)
     code = cli.main(["prompt"])
-    captured = capsys.readouterr()
     assert code == 0
-    assert captured.out == PROMPT + "\n"
-
-
-def test_cli_prompt_dynamic_flag_is_wired(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """CLI wiring only, kept offline by monkeypatching the registry."""
-    from sqlmpeg.registry import Registry
-
-    empty = Registry()
-    monkeypatch.setattr(empty, "available", lambda: False)
-    monkeypatch.setattr(cli.registry_module, "load", lambda: empty)
-    code = cli.main(["prompt", "--dynamic"])
-    captured = capsys.readouterr()
-    assert code == 0
-    assert captured.out.startswith(PROMPT + "\n\n")
-    assert captured.out != PROMPT + "\n"
+    assert called
