@@ -166,19 +166,51 @@ class Output:
 
 
 @dataclass
+class Sink:
+    """One `COPY (query) TO 'path' WITH (options)` destination (RFC-002).
+
+    ``options`` is insertion-ordered and its values are already normalized
+    (validated against `sqlmpeg.sink.SINK_OPTIONS` by lower -- plan 026).
+    """
+
+    path: str
+    options: dict[str, object]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "options": dict(self.options),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, object]) -> Sink:
+        raw_path = d["path"]
+        raw_options = d["options"]
+        assert isinstance(raw_path, str)
+        assert isinstance(raw_options, dict)
+        return cls(path=raw_path, options=dict(raw_options))
+
+
+@dataclass
 class Graph:
     input_paths: list[str]  # -i order; index is the ffmpeg input index
     sources: dict[str, int]  # alias -> index into input_paths
     nodes: dict[str, Node] = field(default_factory=dict)  # insertion-ordered
     outputs: list[Output] = field(default_factory=list)  # order = -map order
+    sink: Sink | None = None  # COPY ... TO ... WITH (...); None for bare SELECT
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        d: dict[str, object] = {
             "inputs": list(self.input_paths),
             "sources": dict(self.sources),
             "nodes": [node.to_dict() for node in self.nodes.values()],
             "outputs": [output.to_dict() for output in self.outputs],
         }
+        # "sink" is emitted ONLY when present, so every existing golden
+        # .ir.json (no sink) stays byte-identical -- this change is additive.
+        if self.sink is not None:
+            d["sink"] = self.sink.to_dict()
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, object]) -> Graph:
@@ -202,9 +234,16 @@ class Graph:
             assert isinstance(raw_output, dict)
             outputs.append(Output.from_dict(raw_output))
 
+        raw_sink = d.get("sink")
+        sink: Sink | None = None
+        if raw_sink is not None:
+            assert isinstance(raw_sink, dict)
+            sink = Sink.from_dict(raw_sink)
+
         return cls(
             input_paths=[str(p) for p in raw_inputs],
             sources={str(k): int(v) for k, v in raw_sources.items()},
             nodes=nodes,
             outputs=outputs,
+            sink=sink,
         )

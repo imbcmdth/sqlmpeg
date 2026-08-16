@@ -295,6 +295,37 @@ FROM input('tests/fixtures/av2.mp4') a, input('tests/fixtures/av.mp4') b
 {"line": 1, "col": 8, "code": "BROADCAST_MISMATCH", "message": "amix() cannot broadcast over arrays of different lengths: a.audio has 2 streams, b.audio has 1 stream", "hint": "broadcast arrays zip elementwise, one output per element; subscript one of them to pair a single stream with the other, e.g. a.audio[1]"}
 ```
 
+## UNKNOWN_SINK_OPTION
+
+**Meaning:** A `COPY (query) TO 'path' WITH (...)` option name (RFC-002) is
+not one of the entries in `sqlmpeg.sink.SINK_OPTIONS`.
+
+**Fires when:** an option in the `WITH (...)` list is misspelled or simply
+doesn't exist -- e.g. `video_codc 'libx264'` instead of `video_codec
+'libx264'`, or an option outside the v1 table entirely.
+
+**Example query and JSON:** the parser does not accept `COPY` yet (that
+lands with plan 026/028); this code is raised by `sqlmpeg.sink.validate_option`
+today and will get a real captured example once `COPY ... WITH (...)` is
+parseable end to end.
+
+## SINK_OPTION_TYPE
+
+**Meaning:** A `COPY (query) TO 'path' WITH (...)` option's value does not
+match the type declared for it in `sqlmpeg.sink.SINK_OPTIONS` (`str` / `int`
+/ `bool`).
+
+**Fires when:** a `str`-typed option is given a number or bool, an
+`int`-typed option is given a string or a float, or a `bool`-typed option is
+given anything other than `true`/`false` -- e.g. `crf '20'` (a string where
+`crf` wants an int) or `faststart 1` (an int where `faststart` wants a
+bool).
+
+**Example query and JSON:** the parser does not accept `COPY` yet (that
+lands with plan 026/028); this code is raised by `sqlmpeg.sink.validate_option`
+today and will get a real captured example once `COPY ... WITH (...)` is
+parseable end to end.
+
 ## INTERNAL
 
 **Bug backstop, not a user-input error.** Every compiler pass (`parse`,

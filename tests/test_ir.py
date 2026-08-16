@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import Graph, Node, Output, is_src, src_alias, src_parts
+from sqlmpeg.ir import Graph, Node, Output, Sink, is_src, src_alias, src_parts
 
 
 def _build_graph() -> Graph:
@@ -185,3 +185,54 @@ def test_new_v2_error_codes_exist() -> None:
     assert ErrorCode.STREAM_NOT_FOUND.value == "STREAM_NOT_FOUND"
     assert ErrorCode.INPUT_NOT_FOUND.value == "INPUT_NOT_FOUND"
     assert ErrorCode.BROADCAST_MISMATCH.value == "BROADCAST_MISMATCH"
+
+
+def test_sink_error_codes_exist() -> None:
+    assert ErrorCode.UNKNOWN_SINK_OPTION.value == "UNKNOWN_SINK_OPTION"
+    assert ErrorCode.SINK_OPTION_TYPE.value == "SINK_OPTION_TYPE"
+
+
+# ---------------------------------------------------------------------------
+# Sink (plan 025)
+# ---------------------------------------------------------------------------
+
+
+def test_sink_round_trip() -> None:
+    s = Sink(
+        path="out.mkv",
+        options={"video_codec": "libx264", "crf": 20, "faststart": True},
+    )
+    d = s.to_dict()
+    s2 = Sink.from_dict(d)
+    assert s2 == s
+    assert d == {
+        "path": "out.mkv",
+        "options": {"video_codec": "libx264", "crf": 20, "faststart": True},
+    }
+
+
+def test_graph_without_sink_to_dict_has_no_sink_key() -> None:
+    g = _build_graph()
+    assert g.sink is None
+    d = g.to_dict()
+    assert "sink" not in d
+
+
+def test_graph_with_sink_round_trip() -> None:
+    g = _build_graph()
+    g.sink = Sink(path="out.mp4", options={"video_codec": "libx264"})
+    d1 = g.to_dict()
+    assert "sink" in d1
+    assert d1["sink"] == {"path": "out.mp4", "options": {"video_codec": "libx264"}}
+    g2 = Graph.from_dict(d1)
+    assert g2.sink == g.sink
+    d2 = g2.to_dict()
+    assert d1 == d2
+
+
+def test_graph_from_dict_tolerates_missing_sink_key() -> None:
+    g = _build_graph()
+    d = g.to_dict()
+    assert "sink" not in d
+    g2 = Graph.from_dict(d)
+    assert g2.sink is None

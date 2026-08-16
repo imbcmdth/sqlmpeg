@@ -462,6 +462,20 @@ _REPAIR: dict[ErrorCode, str] = {
         "unqualified column, a positive integer literal subscript instead of "
         "zero, a negative number, or a computed index."
     ),
+    ErrorCode.UNKNOWN_SINK_OPTION: (
+        "The name inside `COPY ... WITH (...)` is not a known sink option. "
+        "Take the did-you-mean from `hint` if there is one, otherwise pick "
+        "from the exact set of option names sqlmpeg supports; do not invent "
+        "an ffmpeg flag name or option that isn't in that set."
+    ),
+    ErrorCode.SINK_OPTION_TYPE: (
+        "The value given for that `COPY ... WITH (...)` option does not "
+        "match its expected type, named in `message`. A `str` option needs a "
+        "single-quoted literal (e.g. `video_codec 'libx264'`), an `int` "
+        "option needs a bare integer literal with no quotes and no decimal "
+        "point (e.g. `crf 20`), and a `bool` option needs exactly `true` or "
+        "`false` with no quotes."
+    ),
     ErrorCode.INTERNAL: (
         "A compiler bug, not your SQL. Re-emit the simplest query that still "
         "expresses the request and report the original as a bug."

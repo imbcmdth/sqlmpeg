@@ -26,6 +26,10 @@ class ErrorCode(str, Enum):
     # input and there is none
     BROADCAST_MISMATCH = "BROADCAST_MISMATCH"  # zip length mismatch across
     # broadcast-expanded array arguments
+    UNKNOWN_SINK_OPTION = "UNKNOWN_SINK_OPTION"  # COPY ... WITH (...) names an
+    # option not in sqlmpeg.sink.SINK_OPTIONS
+    SINK_OPTION_TYPE = "SINK_OPTION_TYPE"  # COPY ... WITH (...) option value
+    # doesn't match its declared type (str/int/bool)
     INTERNAL = "INTERNAL"  # bug backstop; fuzz asserts this never fires
 
 
