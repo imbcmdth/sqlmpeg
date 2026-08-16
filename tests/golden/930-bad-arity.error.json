@@ -1,7 +1,7 @@
 {
   "line": 1,
-  "col": 8,
+  "col": 35,
   "code": "UDF_ARG_TYPE",
-  "message": "blur() expects blur(video, num), got blur(video)",
-  "hint": "arguments are stream expressions or literals, in the order shown"
+  "message": "gblur() got 5 positional options, but the 'gblur' filter has 4",
+  "hint": "its options, in the order they bind: sigma, steps, planes, sigmaV"
 }

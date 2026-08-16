@@ -95,26 +95,26 @@ ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 18 -c:
 
 `-2` for the height means "keep the aspect ratio, rounded to an even number" - encoders insist on even dimensions, and this saves you doing the arithmetic:
 
-```sql
+```sql-exec
 SELECT scale(f.frame, 1280, -2), f.audio[1]
 FROM input('film.mp4') f
 ```
 
 ```
 $ sqlmpeg compile -f query.sql -o small.mp4
-ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=w=1280:h=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy small.mp4
+ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=1280:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy small.mp4
 ```
 
 Or give `scale` one factor instead of a width and height:
 
-```sql
-SELECT scale(f.frame, 0.5), f.audio[1]
+```sql-exec
+SELECT scale(f.frame, 'iw/2'), f.audio[1]
 FROM input('film.mp4') f
 ```
 
 ```
 $ sqlmpeg compile -f query.sql -o half.mp4
-ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=w=iw*0.5:h=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy half.mp4
+ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=iw/2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy half.mp4
 ```
 
 ## 6. Rotate a phone video 90 degrees
@@ -177,7 +177,7 @@ ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex '[0:v
 
 `loop => true` keeps a still image alive for the whole duration, and the position is an ffmpeg expression - `(W-w)/2` centers it without you knowing either file's dimensions:
 
-```sql
+```sql-exec
 SELECT overlay(f.frame, logo.frame, '(W-w)/2', '(H-h)/2'), f.audio[1]
 FROM input('film.mp4') f, input('watermark.png', loop => true) logo
 ```
@@ -221,7 +221,7 @@ ffmpeg -i film.mkv -map 0:s:0 -c:0 copy subs.en.srt
 
 Different from muxing a track: `subtitles()` is a video filter that renders the cues into the pixels. The subtitle file is read when ffmpeg runs, so it needs to exist then, not now:
 
-```sql
+```sql-exec
 SELECT subtitles(f.frame, 'subs.en.srt'), f.audio[1]
 FROM input('film.mp4') f
 ```
@@ -249,15 +249,15 @@ ffmpeg -i film.mp4 -filter_complex '[0:v:0]setpts=PTS/2[out0];[0:a:0]atempo=temp
 
 `crossfade(a, b, duration, offset)` - the offset is seconds into the FIRST clip where the fade begins, so a 10-second clip with a 1-second fade starts dissolving at 9. `acrossfade` does the same for the sound:
 
-```sql
-SELECT crossfade(a.frame, b.frame, 1, 9),
-       acrossfade(a.audio[1], b.audio[1], 1)
+```sql-exec
+SELECT xfade(a.frame, b.frame, duration => 1, offset => 9),
+       acrossfade(a.audio[1], b.audio[1], duration => 1)
 FROM input('one.mp4') a, input('two.mp4') b
 ```
 
 ```
 $ sqlmpeg compile -f query.sql -o dissolve.mp4
-ffmpeg -i one.mp4 -i two.mp4 -filter_complex '[0:v:0][1:v:0]xfade=duration=1:offset=9[out0];[0:a:0][1:a:0]acrossfade=d=1[out1]' -map '[out0]' -map '[out1]' dissolve.mp4
+ffmpeg -i one.mp4 -i two.mp4 -filter_complex '[0:v:0][1:v:0]xfade=duration=1:offset=9[out0];[0:a:0][1:a:0]acrossfade=duration=1[out1]' -map '[out0]' -map '[out1]' dissolve.mp4
 ```
 
 ## 14. Turn a clip into a GIF
@@ -275,7 +275,7 @@ FROM small
 
 ```
 $ sqlmpeg compile -f query.sql -o clip.gif
-ffmpeg -i clip.mp4 -filter_complex '[0:v:0]scale=w=480:h=-2,fps=fps=12,split=2[n2_split0][n2_split1];[n2_split0]palettegen[n3];[n2_split1][n3]paletteuse[out0]' -map '[out0]' clip.gif
+ffmpeg -i clip.mp4 -filter_complex '[0:v:0]scale=width=480:height=-2,fps=fps=12,split=2[n2_split0][n2_split1];[n2_split0]palettegen[n3];[n2_split1][n3]paletteuse[out0]' -map '[out0]' clip.gif
 ```
 
 ## 15. Replace a video's audio, or duck music under the dialogue
@@ -294,7 +294,7 @@ ffmpeg -i film.mp4 -i voiceover.wav -map 0:v:0 -c:0 copy -map 1:a:0 -c:1 copy du
 
 Keeping both, with the music turned down, is a mix:
 
-```sql
+```sql-exec
 SELECT v.video[1], amix(v.audio[1], volume(m.audio[1], 0.2))
 FROM input('film.mp4') v, input('music.m4a') m
 ```
@@ -320,14 +320,14 @@ ffmpeg -i film.mp4 -i music.m4a -filter_complex '[0:a:0]asplit=2[src_v_a_0_split
 
 A quarter-size camera in the bottom-right corner, 20 pixels off each edge - the expressions mean the position holds whatever the two resolutions are. (The dual-language version, with the audio mixed per language, is the README's opening demo.)
 
-```sql
-SELECT overlay(f.frame, scale(c.frame, 0.25), 'W-w-20', 'H-h-20'), f.audio[1]
+```sql-exec
+SELECT overlay(f.frame, scale(c.frame, 'iw/4'), 'W-w-20', 'H-h-20'), f.audio[1]
 FROM input('film.mp4') f, input('camera.mp4') c
 ```
 
 ```
 $ sqlmpeg compile -f query.sql -o pip.mp4
-ffmpeg -i film.mp4 -i camera.mp4 -filter_complex '[1:v:0]scale=w=iw*0.25:h=-2[n1];[0:v:0][n1]overlay=x=W-w-20:y=H-h-20[out0]' -map '[out0]' -map 0:a:0 -c:1 copy pip.mp4
+ffmpeg -i film.mp4 -i camera.mp4 -filter_complex '[1:v:0]scale=width=iw/4[n1];[0:v:0][n1]overlay=x=W-w-20:y=H-h-20[out0]' -map '[out0]' -map 0:a:0 -c:1 copy pip.mp4
 ```
 
 ## 17. Insert a clip at a timestamp
@@ -390,7 +390,7 @@ ffmpeg -i interview.mp4 -filter_complex '[0:v:0]split=2[src_f_v_0_split0][src_f_
 To apply an effect only during a time window, `enable` is the switch - no trimming, no branches, no concat, just a filter that turns itself on and off:
 
 ```sql-exec
-SELECT blur(a.frame, 12, enable => 'between(t,0.5,1.5)')
+SELECT gblur(a.frame, 12, enable => 'between(t,0.5,1.5)')
 FROM input('clip.mp4') a
 ```
 
@@ -465,7 +465,7 @@ ffmpeg -i song.m4a -filter_complex '[0:a:0]acrossover=split=300\ 3000[n10][n11][
 
 A `CREATE VIEW` is a named, shared piece of the graph, and each `COPY` after it is one output file - the whole script is a single ffmpeg run, so the watermarking happens once no matter how many files consume it. (The classic version of this, the ABR rendition ladder, is in the README.)
 
-```sql
+```sql-exec
 CREATE VIEW branded AS
   SELECT overlay(f.frame, logo.frame, 'W-w-20', 20) AS v, f.audio[1] AS a
   FROM input('film.mp4') f, input('watermark.png', loop => true) logo;
@@ -479,5 +479,5 @@ TO 'podcast.m4a' WITH (audio_codec 'aac', audio_bitrate '128k')
 
 ```
 $ sqlmpeg compile -f query.sql
-ffmpeg -i film.mp4 -loop 1 -i watermark.png -filter_complex '[0:v:0][1:v:0]overlay=x=W-w-20:y=20,scale=w=1280:h=-2[out0]' -map '[out0]' -map 0:a:0 -c:0 libx264 -crf:0 21 -c:1 aac web.mp4 -map 0:a:0 -c:0 aac -b:0 128k podcast.m4a
+ffmpeg -i film.mp4 -loop 1 -i watermark.png -filter_complex '[0:v:0][1:v:0]overlay=x=W-w-20:y=20,scale=width=1280:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:0 libx264 -crf:0 21 -c:1 aac web.mp4 -map 0:a:0 -c:0 aac -b:0 128k podcast.m4a
 ```

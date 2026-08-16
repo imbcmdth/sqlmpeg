@@ -12,8 +12,7 @@
       "id": "n1",
       "filter": "scale",
       "args": {
-        "w": "iw*0.3",
-        "h": "-2"
+        "width": "iw*0.3"
       },
       "inputs": [
         "src:b:v:0"

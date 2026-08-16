@@ -93,7 +93,7 @@ def test_readme_example_emits_crop_and_overlay() -> None:
     """Not a byte-exact golden (guardrail #5) -- just the load-bearing pieces."""
     text = (GOLDEN_DIR / "010-readme-pip.sql").read_text(encoding="utf-8")
     emitted = emit(compile_sql(text))
-    assert "crop=w=600:h=200:x=1200:y=50" in emitted.filter_complex
+    assert "crop=out_w=1200:out_h=50:x=600:y=200" in emitted.filter_complex
     assert "overlay=" in emitted.filter_complex
 
 

@@ -22,12 +22,9 @@ import imagehash
 import pytest
 from PIL import Image
 
-from sqlmpeg import registry as registry_module
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.emit import build_ffmpeg_args, emit
 from sqlmpeg.errors import SqlmpegError
-from sqlmpeg.ir import FrameRef, StreamType
-from sqlmpeg.stdlib import FUNCTIONS
 
 pytestmark = pytest.mark.exec
 
@@ -180,7 +177,9 @@ def _extract_frame(video: Path, t: float, out_png: Path) -> None:
 def test_scale_reports_expected_dimensions(tmp_path: Path) -> None:
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "scaled.mp4"
-    query = f"SELECT scale(a.frame, 0.5) FROM input('{_sql_path(_TESTSRC)}') a"
+    query = (
+        f"SELECT scale(a.frame, 'iw/2', 'ih/2') FROM input('{_sql_path(_TESTSRC)}') a"
+    )
 
     _compile_and_run(query, out_path)
 
@@ -427,11 +426,12 @@ def test_remap_only_stream_copies_the_selected_audio_track(tmp_path: Path) -> No
 
 
 def test_reverb_broadcast_produces_a_tagged_stream_per_language_track(tmp_path: Path) -> None:
-    """`reverb(a.audio, 0.3)` on a 2-audio-track file expands to two aecho
-    subgraphs, one per track, and each output keeps its source language tag."""
+    """`aecho(a.audio, 0.8, 0.9, 60, 0.3)` (reverb's replacement, RFC-007's
+    respelling) on a 2-audio-track file expands to two aecho subgraphs, one
+    per track, and each output keeps its source language tag."""
     _require_fixture(_AV2)
     out_path = tmp_path / "reverb.mp4"
-    query = f"SELECT reverb(a.audio, 0.3) FROM input('{_sql_path(_AV2)}') a"
+    query = f"SELECT aecho(a.audio, 0.8, 0.9, 60, 0.3) FROM input('{_sql_path(_AV2)}') a"
 
     _compile_and_run(query, out_path)
 
@@ -493,7 +493,7 @@ def test_pip_mix_flagship_composites_video_and_keeps_both_language_tags(
     out_path = tmp_path / "pip.mp4"
     query = (
         "WITH pip AS ("
-        f"  SELECT scale(c.frame, 0.25) AS frame, c.audio AS sound "
+        f"  SELECT scale(c.frame, 'iw/4', 'ih/4') AS frame, c.audio AS sound "
         f"  FROM input('{_sql_path(_AV3)}') c"
         ") "
         "SELECT overlay(f.frame, pip.frame, 20, 20), "
@@ -1102,7 +1102,7 @@ def test_enable_blurs_only_inside_its_timeline_window(tmp_path: Path) -> None:
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "enable-blur.mp4"
     query = (
-        "SELECT blur(a.frame, 12, enable => 'between(t,0.5,1.5)') "
+        "SELECT gblur(a.frame, 12, enable => 'between(t,0.5,1.5)') "
         f"FROM input('{_sql_path(_TESTSRC)}') a"
     )
 
@@ -1210,7 +1210,7 @@ def test_expression_crop_and_scale_run(tmp_path: Path) -> None:
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "expr-crop.mp4"
     query = (
-        "SELECT scale(crop(a.frame, 0, 0, 'iw/2', 'ih'), 'iw*2', 'ih') "
+        "SELECT scale(crop(a.frame, 'iw/2', 'ih', 0, 0), 'iw*2', 'ih') "
         f"FROM input('{_sql_path(_TESTSRC)}') a"
     )
 
@@ -1220,121 +1220,11 @@ def test_expression_crop_and_scale_run(tmp_path: Path) -> None:
     assert (stream["width"], stream["height"]) == (_SRC_WIDTH, _SRC_HEIGHT)
 
 
-class _ArgCollector:
-    """An ExpandCtx that records `(filter, args)` per node -- no graph."""
-
-    def __init__(self) -> None:
-        self.nodes: list[tuple[str, dict[str, object]]] = []
-
-    def node(
-        self,
-        filter: str,
-        args: dict[str, object],
-        inputs: list[FrameRef],
-        outputs: list[StreamType],
-    ) -> FrameRef:
-        self.nodes.append((filter, dict(args)))
-        return f"n{len(self.nodes)}"
-
-
-# ffmpeg gives several of these options two spellings (`w`/`width`,
-# `h`/`out_h`), and the registry keeps only the longer one of each pair while
-# the expansions write the shorter -- both are accepted on the command line, so
-# this is the "where the names differ" table the mapping needs, keyed by
-# (filter, the key the expansion actually wrote).
-_OPTION_ALIASES: dict[tuple[str, str], str] = {
-    ("scale", "w"): "width",
-    ("scale", "h"): "height",
-    ("crop", "w"): "out_w",
-    ("crop", "h"): "out_h",
-    ("pad", "w"): "width",
-    ("pad", "h"): "height",
-    ("drawbox", "w"): "width",
-    ("drawbox", "h"): "height",
-}
-
-_EXPR_SLOT_CENSUS = {
-    ("scale", "w"),
-    ("scale", "h"),
-    ("crop", "x"),
-    ("crop", "y"),
-    ("crop", "w"),
-    ("crop", "h"),
-    ("overlay", "x"),
-    ("overlay", "y"),
-    ("draw_box", "x"),
-    ("draw_box", "y"),
-    ("draw_box", "w"),
-    ("draw_box", "h"),
-    ("text", "x"),
-    ("text", "y"),
-    ("text", "size"),
-    ("pad", "w"),
-    ("pad", "h"),
-    ("pad", "x"),
-    ("pad", "y"),
-}
-
-
-def test_every_expr_slot_maps_to_a_string_typed_ffmpeg_option() -> None:
-    """THE faithfulness test (RFC-005 SS3): the stdlib may not claim expression
-    support ffmpeg does not have.
-
-    For every `expr` parameter of every overload, expand that overload with a
-    sentinel in its position, find which option of the overload's
-    ``named_target`` the sentinel landed in, and ask the INSTALLED ffmpeg what
-    that option's type is. Anything but `str` means the slot really takes a
-    number and the table is lying about it. The parameter -> option mapping is
-    DERIVED from the expansion rather than tabulated, so `text`'s `size` finds
-    `drawtext`'s `fontsize` without anyone writing that pair down.
-    """
-    registry = registry_module.load()
-    if not registry.available():
-        pytest.skip("no ffmpeg filter registry available")
-
-    checked: list[tuple[str, str, str]] = []
-    for name, spec in FUNCTIONS.items():
-        for index, variant in enumerate(spec.variants):
-            positions = [i for i, p in enumerate(variant) if p.kind == "expr"]
-            if not positions:
-                continue
-            impl = spec.impl(index)
-            target = impl.named_target
-            assert target is not None, f"{name}: an expr slot needs a named_target"
-            options = registry.options(target)
-            assert options is not None, f"{name}: this ffmpeg has no '{target}' filter"
-
-            ctx = _ArgCollector()
-            impl.expand(
-                ctx,
-                [
-                    "src:a" if p.kind in ("video", "audio") else f"<{i}>"
-                    for i, p in enumerate(variant)
-                ],
-            )
-            for position in positions:
-                sentinel = f"<{position}>"
-                keys = [
-                    key
-                    for filter_name, args in ctx.nodes
-                    if filter_name == target
-                    for key, value in args.items()
-                    if value == sentinel
-                ]
-                assert len(keys) == 1, (name, index, variant[position].name, keys)
-                written = keys[0]
-                introspected = _OPTION_ALIASES.get((target, written), written)
-                option = options.get(introspected)
-                assert option is not None, (name, target, written)
-                assert option.type == "str", (
-                    f"{name}({variant[position].name}) is declared expr, but this "
-                    f"ffmpeg types '{target}.{introspected}' as {option.type}"
-                )
-                checked.append((name, variant[position].name, introspected))
-
-    assert {(f, p) for f, p, _ in checked} == _EXPR_SLOT_CENSUS
-    # The one pair whose names differ -- and the reason the mapping is derived.
-    assert ("text", "size", "fontsize") in checked
+# test_every_expr_slot_maps_to_a_string_typed_ffmpeg_option (RFC-005 SS3's
+# stdlib FUNCTIONS-table faithfulness test) is removed rather than respelled:
+# there is no stdlib FUNCTIONS table post-RFC-007 for it to check, and no
+# `expr` ParamKind for it to verify -- see the matching removal in
+# tests/test_lower.py.
 
 
 # ---------------------------------------------------------------------------

@@ -1,2 +1,2 @@
-SELECT scale(a.frame, 0.5)
+SELECT scale(a.frame, 'iw/2')
 FROM input('clip.mp4') a

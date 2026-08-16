@@ -1,5 +1,5 @@
 WITH c AS (
-  SELECT scale(a.frame, 0.5) AS frame
+  SELECT scale(a.frame, 'iw/2') AS frame
   FROM input('clip.mp4') a
 )
 SELECT overlay(c.frame, c.frame, 10, 10)

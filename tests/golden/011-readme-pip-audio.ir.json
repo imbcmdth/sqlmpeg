@@ -12,10 +12,10 @@
       "id": "n1",
       "filter": "crop",
       "args": {
-        "w": 600,
-        "h": 200,
-        "x": 1200,
-        "y": 50
+        "out_w": 1200,
+        "out_h": 50,
+        "x": 600,
+        "y": 200
       },
       "inputs": [
         "src:b:v:0"
@@ -28,8 +28,7 @@
       "id": "n2",
       "filter": "scale",
       "args": {
-        "w": "iw*0.5",
-        "h": "-2"
+        "width": "iw/2"
       },
       "inputs": [
         "n1"

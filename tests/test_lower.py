@@ -391,7 +391,7 @@ def test_readme_flagship_scale_factor_is_not_a_decimal() -> None:
     """``Literal.to_py()`` yields Decimal for 0.5; the IR must carry float."""
     g = _lower("SELECT scale(a.frame, 0.5, 0.25) FROM input('x.mp4') a")
     args = g.nodes["n1"].args
-    assert args == {"w": 0.5, "h": 0.25}
+    assert args == {"width": 0.5, "height": 0.25}
     assert all(type(v) is float for v in args.values())
 
 
@@ -3040,32 +3040,18 @@ def test_option_rejection_anchors_on_the_value(_registry: Registry) -> None:
     assert err.line == 2
 
 
-# -- tier-1 named extras ----------------------------------------------------
+# -- named args on dynamic filter calls --------------------------------------
 
 
-def test_stdlib_named_extra_reaches_the_underlying_filter(_registry: Registry) -> None:
-    """blur's named_target is gblur, so `planes` is validated against gblur's
-    options and merged AFTER the positionally-mapped sigma."""
+def test_a_dynamic_call_merges_named_args_after_positional(_registry: Registry) -> None:
+    """`planes` is validated against gblur's options and merged AFTER the
+    positionally-mapped sigma -- no stdlib/macro layer involved anymore."""
     g = _dyn("SELECT gblur(a.frame, 5, planes => 1) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].filter == "gblur"
     assert list(g.nodes["n1"].args.items()) == [("sigma", 5), ("planes", 1)]
 
 
-def test_stdlib_named_extras_keep_their_written_order(_registry: Registry) -> None:
-    g = _dyn(
-        "SELECT scale(a.frame, 1280, 720, interl => true, flags => 'lanczos') "
-        "FROM input('x.mp4') a",
-        _registry,
-    )
-    assert list(g.nodes["n1"].args.items()) == [
-        ("w", 1280),
-        ("h", 720),
-        ("interl", True),
-        ("flags", "lanczos"),
-    ]
-
-
-def test_stdlib_named_extra_is_validated_like_a_dynamic_one(_registry: Registry) -> None:
+def test_a_named_extra_is_validated_like_a_dynamic_one(_registry: Registry) -> None:
     err = _reject_dyn("SELECT gblur(a.frame, 5, planes => 99) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "from 0 to 15" in err.message
@@ -3075,69 +3061,64 @@ def test_stdlib_named_extra_is_validated_like_a_dynamic_one(_registry: Registry)
     assert "filter 'gblur'" in err.message
 
 
-def test_stdlib_named_extra_cannot_override_the_positional_signature(
+def test_a_named_extra_cannot_override_the_positional_signature(
     _registry: Registry,
 ) -> None:
-    """`w` is what crop's positional signature maps its width onto (ffmpeg's own
-    long name for it is out_w), so this is a conflict, never a silent override."""
+    """`out_w` is what crop's positional signature maps its width onto, so
+    this is a conflict, never a silent override. Message/code changed under
+    the registry-driven option checker: FILTER_OPTION_TYPE, not UDF_ARG_TYPE."""
     err = _reject_dyn(
-        "SELECT crop(a.frame, 0, 0, 10, 10, w => 5) FROM input('x.mp4') a", _registry
+        "SELECT crop(a.frame, 10, 10, 0, 0, out_w => 5) FROM input('x.mp4') a", _registry
     )
-    assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "already sets 'w'" in err.message
-    assert err.hint is not None and "positionally" in err.hint
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "already set positionally by crop()" in err.message
+    assert err.hint is not None and "drop one of the two spellings" in err.hint
 
 
-def test_stdlib_named_transition_merges_into_the_four_arg_crossfade(
+def test_a_named_extra_merges_with_positional_xfade_args(
     _registry: Registry,
 ) -> None:
-    """The 4-argument crossfade leaves `transition` unset (ffmpeg defaults to
-    fade), so both the named form and the 5-argument positional overload can
-    supply it -- the RFC amendment's own example."""
+    """xfade's positional signature is (transition, duration, offset); a
+    positional transition plus named duration/offset merge, in written
+    order, after it."""
     both = "FROM input('x.mp4') a, input('y.mp4') b"
     g = _dyn(
-        f"SELECT crossfade(a.frame, b.frame, 1, 8, transition => 'wipeleft') {both}",
+        f"SELECT xfade(a.frame, b.frame, 'wipeleft', duration => 1, offset => 8) {both}",
         _registry,
     )
-    assert g.nodes["n1"].args == {"duration": 1, "offset": 8, "transition": "wipeleft"}
-    g = _dyn(f"SELECT crossfade(a.frame, b.frame, 1, 8, 'wipeleft') {both}", _registry)
-    assert g.nodes["n1"].args["transition"] == "wipeleft"
+    assert g.nodes["n1"].args == {"transition": "wipeleft", "duration": 1, "offset": 8}
 
 
-def test_stdlib_named_extra_conflicts_with_the_five_arg_crossfade(
+def test_a_named_extra_conflicts_with_a_positional_xfade_transition(
     _registry: Registry,
 ) -> None:
-    """When the 5-arg overload sets the transition positionally, a named one
-    on top of it is a genuine conflict."""
+    """When the positional call already sets transition, a named one on top
+    of it is a genuine conflict."""
     err = _reject_dyn(
-        "SELECT crossfade(a.frame, b.frame, 1, 8, 'fade', transition => 'wipeleft') "
+        "SELECT xfade(a.frame, b.frame, 'fade', transition => 'wipeleft') "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
-    assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "already sets 'transition'" in err.message
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "already set positionally by xfade()" in err.message
 
 
-def test_stdlib_named_extra_that_the_signature_leaves_free(_registry: Registry) -> None:
-    """The 4-argument crossfade sets no `expr`, so a named one merges in."""
+def test_a_named_extra_that_the_xfade_signature_leaves_free(_registry: Registry) -> None:
+    """The 2-argument (transition-only) positional call sets no `expr`, so a
+    named one merges in."""
     g = _dyn(
-        "SELECT crossfade(a.frame, b.frame, 1, 8, expr => 'A') "
+        "SELECT xfade(a.frame, b.frame, 'wipeleft', expr => 'A') "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
     assert g.nodes["n1"].args["expr"] == "A"
 
 
-def test_a_macro_rejects_named_extras(_registry: Registry) -> None:
-    """blur_regions expands to crop+gblur+overlay, so there is no single filter
-    to set an option on -- rejected whether or not a registry is available."""
-    for registry in (_registry, None):
-        err = _reject_dyn(
-            "SELECT blur_regions(a.frame, 1, 2, 3, 4, 5, planes => 1) FROM input('x.mp4') a",
-            registry,
-        )
-        assert err.code is ErrorCode.UDF_ARG_TYPE
-        assert "more than one ffmpeg filter" in err.message
+# test_a_macro_rejects_named_extras (blur_regions + named extra => UDF_ARG_TYPE)
+# DEFERRED to 053b: blur_regions is sqlmpeg.blur_regions, not yet implemented
+# by 052 at the time of this pass. blur_regions() currently raises
+# UNKNOWN_FUNCTION instead of UDF_ARG_TYPE. Left out rather than left red,
+# since the macro doesn't exist to call yet; re-add once 052/053b lands it.
 
 
 def test_a_filter_this_ffmpeg_lacks_is_an_unknown_function(_registry: Registry) -> None:
@@ -4878,117 +4859,15 @@ def test_enable_broadcasts_onto_every_element(_registry: Registry) -> None:
     ]
 
 
-# ---------------------------------------------------------------------------
-# RFC-005 SS3 (plan 043): the `expr` parameter kind
-# ---------------------------------------------------------------------------
-#
-# No registry anywhere in this section: which stdlib slots take an expression
-# is a property of the FUNCTIONS table, so it compiles portably. (What keeps
-# that table honest against the real option types is the faithfulness test in
-# tests/exec/test_exec.py.)
-
-
-def test_an_expr_slot_takes_a_quoted_expression() -> None:
-    """The motivating case: centering, without knowing either size."""
-    g = _lower(
-        "SELECT overlay(a.frame, b.frame, '(W-w)/2', '(H-h)/2') "
-        "FROM input('x.mp4') a, input('y.mp4') b"
-    )
-    assert g.nodes["n1"].args == {"x": "(W-w)/2", "y": "(H-h)/2"}
-
-
-def test_an_expr_slot_still_takes_a_bare_number_as_a_number() -> None:
-    """Numbers stay numbers into the IR -- no golden moves, nothing downstream
-    has to parse a number back out of a string."""
-    g = _lower("SELECT crop(a.frame, 1, 2, 3, 4) FROM input('x.mp4') a")
-    assert g.nodes["n1"].args == {"w": 3, "h": 4, "x": 1, "y": 2}
-    assert all(isinstance(v, int) for v in g.nodes["n1"].args.values())
-
-
-def test_expr_and_num_arguments_mix_in_one_call() -> None:
-    g = _lower("SELECT crop(a.frame, 0, 0, 'iw/2', 'ih') FROM input('x.mp4') a")
-    assert g.nodes["n1"].args == {"w": "iw/2", "h": "ih", "x": 0, "y": 0}
-
-
-def test_expr_slots_cover_the_migrated_functions() -> None:
-    """One compile per migrated slot set, quoted throughout."""
-    cases = (
-        ("SELECT scale(a.frame, 'iw/2', '-2')", {"w": "iw/2", "h": "-2"}),
-        (
-            "SELECT draw_box(a.frame, 'iw/4', 'ih/4', 'iw/2', 'ih/2', 'red')",
-            {"x": "iw/4", "y": "ih/4", "w": "iw/2", "h": "ih/2", "color": "red"},
-        ),
-        (
-            "SELECT text(a.frame, 'hi', '(w-text_w)/2', 'h-th-10', 'h/10')",
-            {
-                "text": "hi",
-                "x": "(w-text_w)/2",
-                "y": "h-th-10",
-                "fontsize": "h/10",
-            },
-        ),
-    )
-    for query, expected in cases:
-        g = _lower(f"{query} FROM input('x.mp4') a")
-        assert g.nodes["n1"].args == expected, query
-
-
-def test_a_num_slot_still_refuses_a_string() -> None:
-    """The kind was split, not widened: `rotate`'s degrees is ours (we build
-    `<degrees>*PI/180` out of it) and `scale`'s factor is arithmetic we do."""
-    for query, expected in (
-        ("SELECT rotate(a.frame, '45')", "rotate(video, num)"),
-        ("SELECT scale(a.frame, '0.5')", "scale(video, num)"),
-        ("SELECT gblur(a.frame, '5')", "gblur(video, num)"),
-    ):
-        err = _reject(f"{query} FROM input('x.mp4') a")
-        assert err.code is ErrorCode.UDF_ARG_TYPE, query
-        assert expected in err.message
-
-
-def test_an_expr_slot_still_refuses_a_non_literal() -> None:
-    """The classifier's own fallback label is `<expr>`, deliberately unspellable
-    as a ParamKind -- so `1 + 2` matches the `expr` kind no more than it ever
-    matched `num`."""
-    for value in ("1 + 2", "NULL", "TRUE"):
-        err = _reject(
-            f"SELECT crop(a.frame, {value}, 0, 10, 10) FROM input('x.mp4') a"
-        )
-        assert err.code is ErrorCode.UDF_ARG_TYPE, value
-
-
-def test_an_expr_slot_refuses_a_stream() -> None:
-    err = _reject("SELECT crop(a.frame, a.frame, 0, 10, 10) FROM input('x.mp4') a")
-    assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "got crop(video, video, num, num, num)" in err.message
-
-
-def test_an_expr_argument_broadcasts_as_a_scalar() -> None:
-    """Deliverable 5: expr args are scalar literals, so the zip/element paths
-    are untouched -- one node per element, the same expression on each."""
-    g = _lower(
-        "SELECT crop(a.video, 0, 0, 'iw/2', 'ih') FROM input('x.mp4') a",
-        {"a": _probe_result(videos=2)},
-    )
-    assert [node.args for node in g.nodes.values()] == [
-        {"w": "iw/2", "h": "ih", "x": 0, "y": 0},
-        {"w": "iw/2", "h": "ih", "x": 0, "y": 0},
-    ]
-    assert [node.inputs for node in g.nodes.values()] == [
-        ["src:a:v:0"],
-        ["src:a:v:1"],
-    ]
-
-
-def test_expr_arguments_compile_under_portable() -> None:
-    """Nothing about `expr` consults the registry."""
-    g = _dyn(
-        "SELECT overlay(a.frame, b.frame, '(W-w)/2', '(H-h)/2') "
-        "FROM input('x.mp4') a, input('y.mp4') b",
-        None,
-        portable=True,
-    )
-    assert g.nodes["n1"].args == {"x": "(W-w)/2", "y": "(H-h)/2"}
+# RFC-005 SS3 (plan 043)'s "expr parameter kind" (a stdlib FUNCTIONS-table
+# concept: which stdlib slots took a quoted expression vs. a bare number) is
+# dead post-RFC-007 -- there is no stdlib table anymore, only the registry's
+# own option types (num/str/bool/enum), covered by the dynamic-call tests
+# above and by the registry faithfulness tests in tests/exec/test_exec.py.
+# The section that pinned it (test_an_expr_slot_*, test_expr_slots_cover_*,
+# test_a_num_slot_still_refuses_a_string, test_an_expr_argument_broadcasts_*,
+# test_expr_arguments_compile_under_portable) is removed rather than
+# respelled: there is no surviving concept to respell it onto.
 
 
 # ---------------------------------------------------------------------------
