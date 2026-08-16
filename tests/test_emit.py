@@ -19,7 +19,7 @@ import pytest
 
 from sqlmpeg.emit import Emitted, OutputMap, _escape_value, build_ffmpeg_args, emit
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import Graph, Node, Output, StreamType
+from sqlmpeg.ir import Graph, Node, Output, Sink, StreamType
 
 
 def _node(
@@ -54,12 +54,14 @@ def _graph(
     *,
     input_paths: list[str] | None = None,
     sources: dict[str, int] | None = None,
+    sink: Sink | None = None,
 ) -> Graph:
     return Graph(
         input_paths=list(input_paths or ["a.mp4"]),
         sources=dict(sources or {"a": 0}),
         nodes={n.id: n for n in nodes},
         outputs=list(outputs),
+        sink=sink,
     )
 
 
@@ -788,6 +790,220 @@ def test_build_ffmpeg_args_metadata_values_are_passed_raw() -> None:
         ],
     )
     assert "title=12:30, take 'one'" in build_ffmpeg_args(e, "out.mp4")
+
+
+# ---------------------------------------------------------------------------
+# sink (RFC-002, plan 027) -- Graphs are hand-built with sink=Sink(...) here;
+# compile_sql cannot yet produce a sinked Graph while plan 026 is in flight.
+# ---------------------------------------------------------------------------
+
+
+def test_emitted_sink_defaults_to_none() -> None:
+    g = _graph([], [_out("src:a:v:0")])
+    e = emit(g)
+    assert e.sink is None
+
+
+def test_emit_copies_graph_sink() -> None:
+    """`emit` copies `g.sink`, not aliases it -- mutating one must not affect the other."""
+    sink = Sink(path="out.mkv", options={"video_codec": "libx264"})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    e = emit(g)
+    assert e.sink == sink
+    assert e.sink is not sink
+    assert e.sink is not None
+    e.sink.options["video_codec"] = "mangled"
+    assert sink.options["video_codec"] == "libx264"
+
+
+def test_build_ffmpeg_args_without_out_path_or_sink_raises() -> None:
+    g = _graph([], [_out("src:a:v:0")])
+    e = emit(g)
+    with pytest.raises(ValueError, match="no output path"):
+        build_ffmpeg_args(e)
+
+
+def test_build_ffmpeg_args_uses_sink_path_when_no_out_path() -> None:
+    sink = Sink(path="sink.mkv", options={})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    e = emit(g)
+    assert build_ffmpeg_args(e)[-1] == "sink.mkv"
+
+
+def test_build_ffmpeg_args_out_path_overrides_sink_path() -> None:
+    sink = Sink(path="sink.mkv", options={})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    e = emit(g)
+    assert build_ffmpeg_args(e, "override.mp4")[-1] == "override.mp4"
+
+
+def test_build_ffmpeg_args_no_sink_graph_unchanged_byte_for_byte() -> None:
+    """Regression pin: a sinkless graph's args are byte-for-byte what plan 027 found."""
+    g = _graph(
+        [
+            _node("n1", "crop", {"w": 600, "h": 200, "x": 1200, "y": 50}, ["src:b:v:0"]),
+            _node("n2", "scale", {"w": "iw*0.5", "h": "-2"}, ["n1"]),
+            _node("n3", "overlay", {"x": 20, "y": 20}, ["src:a:v:0", "n2"]),
+        ],
+        [_out("n3")],
+        input_paths=["game.mp4", "game.mp4"],
+        sources={"a": 0, "b": 1},
+    )
+    e = emit(g)
+    assert e.sink is None
+    assert build_ffmpeg_args(e, "out.mp4") == [
+        "ffmpeg",
+        "-i",
+        "game.mp4",
+        "-i",
+        "game.mp4",
+        "-filter_complex",
+        "[1:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];"
+        "[0:v:0][n2]overlay=x=20:y=20[out0]",
+        "-map",
+        "[out0]",
+        "out.mp4",
+    ]
+
+
+def test_sink_video_codec_and_crf_render_per_video_output() -> None:
+    sink = Sink(path="out.mp4", options={"video_codec": "libx264", "crf": 20})
+    g = _graph(
+        [
+            _node("n1", "hflip", {}, ["src:a:v:0"]),
+            _node("n2", "vflip", {}, ["src:b:v:0"]),
+        ],
+        [_out("n1"), _out("n2")],
+        input_paths=["a.mp4", "b.mp4"],
+        sources={"a": 0, "b": 1},
+        sink=sink,
+    )
+    e = emit(g)
+    args = build_ffmpeg_args(e)
+    assert args[args.index("-map") :] == [
+        "-map",
+        "[out0]",
+        "-map",
+        "[out1]",
+        "-c:0",
+        "libx264",
+        "-c:1",
+        "libx264",
+        "-crf:0",
+        "20",
+        "-crf:1",
+        "20",
+        "out.mp4",
+    ]
+
+
+def test_sink_audio_bitrate_renders_per_audio_output() -> None:
+    sink = Sink(path="out.mp4", options={"audio_bitrate": "192k"})
+    g = _graph(
+        [
+            _node("n1", "volume", {"volume": 1}, ["src:a:a:0"], ["audio"]),
+            _node("n2", "volume", {"volume": 2}, ["src:a:a:1"], ["audio"]),
+        ],
+        [_out("n1", "audio"), _out("n2", "audio")],
+        sink=sink,
+    )
+    e = emit(g)
+    args = build_ffmpeg_args(e)
+    assert args[args.index("-map") :] == [
+        "-map",
+        "[out0]",
+        "-map",
+        "[out1]",
+        "-b:0",
+        "192k",
+        "-b:1",
+        "192k",
+        "out.mp4",
+    ]
+
+
+def test_sink_format_and_faststart_render_once_at_container_level() -> None:
+    sink = Sink(path="out.mp4", options={"format": "mp4", "faststart": True})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    e = emit(g)
+    args = build_ffmpeg_args(e)
+    assert args[args.index("-map") :] == [
+        "-map",
+        "0:v:0",
+        "-c:0",
+        "copy",
+        "-f",
+        "mp4",
+        "-movflags",
+        "+faststart",
+        "out.mp4",
+    ]
+
+
+def test_sink_faststart_false_omits_movflags_entirely() -> None:
+    sink = Sink(path="out.mp4", options={"faststart": False})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    e = emit(g)
+    args = build_ffmpeg_args(e)
+    assert "-movflags" not in args
+    assert "+faststart" not in args
+
+
+def test_sink_options_render_in_insertion_order_not_table_order() -> None:
+    """SINK_OPTIONS lists video_codec before crf; Sink.options insertion order wins."""
+    sink = Sink(path="out.mp4", options={"crf": 20, "video_codec": "libx264"})
+    g = _graph([_node("n1", "hflip", {}, ["src:a:v:0"])], [_out("n1")], sink=sink)
+    e = emit(g)
+    args = build_ffmpeg_args(e)
+    assert args[args.index("-map") :] == [
+        "-map",
+        "[out0]",
+        "-crf:0",
+        "20",
+        "-c:0",
+        "libx264",
+        "out.mp4",
+    ]
+
+
+def test_sink_audio_codec_suppresses_passthrough_copy_for_audio_only() -> None:
+    """passthrough audio + audio_codec set -> no -c:<i> copy, codec rendered instead."""
+    sink = Sink(path="out.mp4", options={"audio_codec": "aac"})
+    g = _graph(
+        [_node("n1", "hflip", {}, ["src:a:v:0"])],
+        [_out("n1"), _out("src:a:a:0", "audio")],
+        sink=sink,
+    )
+    e = emit(g)
+    args = build_ffmpeg_args(e)
+    assert args[args.index("-map") :] == [
+        "-map",
+        "[out0]",
+        "-map",
+        "0:a:0",
+        "-c:1",
+        "aac",
+        "out.mp4",
+    ]
+
+
+def test_sink_video_codec_suppresses_only_video_passthrough_copy() -> None:
+    """A video-scoped codec option leaves an untouched audio passthrough's copy alone."""
+    sink = Sink(path="out.mp4", options={"video_codec": "libx264"})
+    g = _graph([], [_out("src:a:v:0"), _out("src:a:a:0", "audio")], sink=sink)
+    e = emit(g)
+    args = build_ffmpeg_args(e)
+    assert args[args.index("-map") :] == [
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-c:1",
+        "copy",
+        "-c:0",
+        "libx264",
+        "out.mp4",
+    ]
 
 
 # ---------------------------------------------------------------------------

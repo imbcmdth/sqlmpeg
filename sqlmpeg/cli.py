@@ -10,15 +10,21 @@ Subcommands:
   full ffmpeg command (POSIX-quoted via ``shlex.join``, even on Windows --
   it is documentation output, not something meant to be pasted into
   cmd.exe), or just the ``-filter_complex`` string with ``--graph-only``.
-* ``explain QUERY.sql [--no-probe]`` -- dump the IR graph as JSON.
+  Output path resolution (RFC-002, plan 027): ``-o`` if given, else the
+  query's ``COPY ... TO`` sink path if it has one, else the ``out.mp4``
+  placeholder (today's default).
+* ``explain QUERY.sql [--no-probe]`` -- dump the IR graph as JSON (the sink,
+  if any, is part of that JSON already).
 * ``validate QUERY.sql [--json] [--no-probe]`` -- exit 0 silent on success;
   on error, exit 1 with either a one-line human message or
   ``err.to_dict()`` JSON.
-* ``run QUERY.sql -o OUT [--timeout SECS] [-y]`` -- compile and execute
+* ``run QUERY.sql [-o OUT] [--timeout SECS] [-y]`` -- compile and execute
   ffmpeg as a subprocess (guardrail #6: argv list, no shell, timeout
   enforced, stderr captured and surfaced on failure). ``run`` always
   probes -- the files must exist to execute, so there is no ``--no-probe``
-  escape hatch here.
+  escape hatch here. Output path: ``-o`` if given, else the query's sink
+  path, else a usage error (exit 2) -- unlike ``compile``, ``run`` never
+  falls back to a placeholder path.
 * ``prompt`` -- print the portable LLM system prompt (plan 012) to stdout;
   takes no arguments and never touches the filesystem.
 
@@ -83,7 +89,12 @@ def _build_parser() -> argparse.ArgumentParser:
     compile_p.add_argument(
         "--graph-only", action="store_true", help="print only the filter_complex string"
     )
-    compile_p.add_argument("-o", "--output", default=_DEFAULT_OUT, help="output path placeholder")
+    compile_p.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="output path (default: the query's sink path, else out.mp4)",
+    )
     compile_p.add_argument(
         "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
     )
@@ -105,7 +116,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_p = subparsers.add_parser("run", help="compile and execute ffmpeg")
     run_p.add_argument("query", help="path to a .sql file, or - for stdin")
-    run_p.add_argument("-o", "--output", required=True, help="output file path")
+    run_p.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="output file path (default: the query's sink path)",
+    )
     run_p.add_argument(
         "--timeout", type=float, default=_DEFAULT_TIMEOUT, help="ffmpeg timeout in seconds"
     )
@@ -146,6 +162,15 @@ def _check_output_dir(out_path: str) -> str | None:
     return None
 
 
+def _resolve_out_path(cli_output: str | None, graph: Graph, *, default: str | None) -> str | None:
+    """Output path precedence (RFC-002, plan 027): ``-o`` > sink path > `default`."""
+    if cli_output is not None:
+        return cli_output
+    if graph.sink is not None:
+        return graph.sink.path
+    return default
+
+
 # ---------------------------------------------------------------------------
 # subcommands
 # ---------------------------------------------------------------------------
@@ -167,7 +192,8 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         print(emitted.filter_complex)
         return 0
 
-    ffmpeg_args = build_ffmpeg_args(emitted, args.output)
+    out_path = _resolve_out_path(args.output, graph, default=_DEFAULT_OUT)
+    ffmpeg_args = build_ffmpeg_args(emitted, out_path)
     print(shlex.join(ffmpeg_args))
     return 0
 
@@ -216,7 +242,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
         _print_error(err)
         return 1
 
-    dir_error = _check_output_dir(args.output)
+    out_path = _resolve_out_path(args.output, graph, default=None)
+    if out_path is None:
+        print(
+            "error: no output path given: pass -o, or use COPY ... TO in the query",
+            file=sys.stderr,
+        )
+        return 2
+
+    dir_error = _check_output_dir(out_path)
     if dir_error is not None:
         print(dir_error, file=sys.stderr)
         return 1
@@ -225,7 +259,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print("error: ffmpeg not found on PATH", file=sys.stderr)
         return 1
 
-    ffmpeg_args = build_ffmpeg_args(emitted, args.output)
+    ffmpeg_args = build_ffmpeg_args(emitted, out_path)
     if args.overwrite:
         ffmpeg_args.insert(1, "-y")
 

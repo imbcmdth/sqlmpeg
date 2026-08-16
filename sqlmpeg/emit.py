@@ -80,7 +80,8 @@ import re
 from dataclasses import dataclass
 
 from .errors import ErrorCode, SqlmpegError
-from .ir import FrameRef, Graph, Node, Output, StreamType, is_src, src_parts
+from .ir import FrameRef, Graph, Node, Output, Sink, StreamType, is_src, src_parts
+from .sink import SINK_OPTIONS, SinkOptionSpec
 
 OUTPUT_LABEL_PREFIX = "out"
 """Filtered outputs are labelled ``out0``, ``out1``, ... (without brackets)."""
@@ -122,6 +123,7 @@ class Emitted:
     inputs: list[str]  # file paths in -i order
     filter_complex: str  # "" when every output is a passthrough
     maps: list[OutputMap]  # one per Graph.outputs entry, same order
+    sink: Sink | None = None  # copied from Graph.sink (RFC-002, plan 027)
 
 
 def emit(g: Graph) -> Emitted:
@@ -149,30 +151,107 @@ def emit(g: Graph) -> Emitted:
         inputs=list(g.input_paths),
         filter_complex=filter_complex,
         maps=maps,
+        sink=_copy_sink(g.sink),
     )
 
 
-def build_ffmpeg_args(e: Emitted, out_path: str) -> list[str]:
-    """Full ffmpeg argv for `e`, writing to `out_path`.
+def _copy_sink(sink: Sink | None) -> Sink | None:
+    if sink is None:
+        return None
+    return Sink(path=sink.path, options=dict(sink.options))
+
+
+def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
+    """Full ffmpeg argv for `e`, writing to the resolved output path.
+
+    Path precedence: `out_path` if given, else `e.sink.path` if `e.sink` is
+    set, else ``ValueError("no output path given and the query has no
+    sink")``. This is a CLI/programmer contract, not something user SQL can
+    trigger -- the CLI always resolves a concrete path (its own fallback, or
+    the sink's, or usage-errors out) before calling this.
 
     The SELECT list is authoritative: exactly one ``-map`` per
     :class:`OutputMap`, in order, with ``-c:<i> copy`` for passthrough streams
     and ``-metadata:s:<i> k=v`` (keys sorted) for provenance metadata. v0's
     implicit ``-map 0:a? -c:a copy`` tail is gone. ``-filter_complex`` is
     omitted when the graph is pure passthrough.
+
+    Sink option rendering (RFC-002, plan 027): after the -map/-metadata
+    block, `e.sink.options` render in insertion order purely from
+    ``sqlmpeg.sink.SINK_OPTIONS`` table data -- no option-specific logic
+    here. Per-stream specs (``per_stream=True``) render ``f"{flag}:{i}"``
+    for every output index `i` whose type matches the spec's scope;
+    container specs (``per_stream=False``) render ``flag`` once, regardless
+    of output types. A bool value of False is never rendered (e.g.
+    ``faststart false`` emits nothing).
+
+    Copy suppression: if the sink sets a codec option (``flag == "-c"``)
+    scoped to video, video passthrough outputs drop their ``-c:<i> copy``
+    (the explicit codec re-encodes them instead); same for audio.
     """
+    if out_path is not None:
+        path = out_path
+    elif e.sink is not None:
+        path = e.sink.path
+    else:
+        raise ValueError("no output path given and the query has no sink")
+
+    copy_suppressed_scopes = _copy_suppressed_scopes(e.sink)
+
     args = ["ffmpeg"]
-    for path in e.inputs:
-        args += ["-i", path]
+    for input_path in e.inputs:
+        args += ["-i", input_path]
     if e.filter_complex:
         args += ["-filter_complex", e.filter_complex]
     for index, mapping in enumerate(e.maps):
         args += ["-map", mapping.target]
-        if mapping.copy:
+        if mapping.copy and mapping.type not in copy_suppressed_scopes:
             args += [f"-c:{index}", "copy"]
         for key in sorted(mapping.metadata):
             args += [f"-metadata:s:{index}", f"{key}={mapping.metadata[key]}"]
-    args.append(out_path)
+    args += _render_sink_options(e)
+    args.append(path)
+    return args
+
+
+# ---------------------------------------------------------------------------
+# sink option rendering (RFC-002, plan 027)
+# ---------------------------------------------------------------------------
+
+
+def _copy_suppressed_scopes(sink: Sink | None) -> set[str]:
+    """Stream scopes ("video"/"audio") for which the sink sets an explicit codec."""
+    if sink is None:
+        return set()
+    return {SINK_OPTIONS[name].scope for name in sink.options if SINK_OPTIONS[name].flag == "-c"}
+
+
+def _render_option_value(spec: SinkOptionSpec, value: object) -> str | None:
+    """Render one option's value per its spec, or None to omit it entirely.
+
+    A bool value of False is always omitted (e.g. plain ``faststart false``);
+    every other value renders via ``spec.value_template.format(v=value)``.
+    """
+    if spec.type == "bool" and value is not True:
+        return None
+    return spec.value_template.format(v=value)
+
+
+def _render_sink_options(e: Emitted) -> list[str]:
+    if e.sink is None:
+        return []
+    args: list[str] = []
+    for name, value in e.sink.options.items():
+        spec = SINK_OPTIONS[name]
+        rendered = _render_option_value(spec, value)
+        if rendered is None:
+            continue
+        if spec.per_stream:
+            for index, mapping in enumerate(e.maps):
+                if mapping.type == spec.scope:
+                    args += [f"{spec.flag}:{index}", rendered]
+        else:
+            args += [spec.flag, rendered]
     return args
 
 

@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from sqlmpeg import cli
-from sqlmpeg.ir import Graph
+from sqlmpeg.ir import Graph, Output, Sink
 
 VALID_QUERY = "SELECT scale(a.frame, 0.5) FROM input('x.mp4') a"
 BAD_QUERY = "SELECT nope(a.frame) FROM input('x.mp4') a"
@@ -22,6 +22,23 @@ def _write_sql(tmp_path: Path, text: str, name: str = "query.sql") -> str:
     path = tmp_path / name
     path.write_text(text, encoding="utf-8")
     return str(path)
+
+
+def _sinked_graph(path: str, options: dict[str, object] | None = None) -> Graph:
+    """A hand-built, already-sinked Graph.
+
+    ``compile_sql`` cannot yet produce a ``Graph`` with a sink -- COPY ... TO
+    parsing/lowering is plan 026, being written concurrently with this file.
+    Sink-path-resolution tests below monkeypatch ``cli.compile_sql`` to
+    return this instead of compiling real SQL.
+    """
+    return Graph(
+        input_paths=["x.mp4"],
+        sources={"a": 0},
+        nodes={},
+        outputs=[Output(ref="src:a:v:0", type="video", name=None, metadata={})],
+        sink=Sink(path=path, options=dict(options or {})),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +107,30 @@ def test_compile_no_probe(tmp_path: Path, capsys: pytest.CaptureFixture[str]) ->
     out = capsys.readouterr().out
     assert code == 0
     assert "-filter_complex" in out
+
+
+def test_compile_uses_sink_path_when_no_dash_o(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    query = _write_sql(tmp_path, VALID_QUERY)
+    monkeypatch.setattr(cli, "compile_sql", lambda text, probe=True: _sinked_graph("sink.mkv"))
+    code = cli.main(["compile", query])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "sink.mkv" in out
+    assert "out.mp4" not in out
+
+
+def test_compile_dash_o_overrides_sink_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    query = _write_sql(tmp_path, VALID_QUERY)
+    monkeypatch.setattr(cli, "compile_sql", lambda text, probe=True: _sinked_graph("sink.mkv"))
+    code = cli.main(["compile", query, "-o", "override.mp4"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "override.mp4" in out
+    assert "sink.mkv" not in out
 
 
 def test_compile_no_probe_skips_probing(
@@ -229,6 +270,47 @@ def test_run_bad_query_never_checks_ffmpeg(
     captured = capsys.readouterr()
     assert code == 1
     assert "error:" in captured.err
+
+
+def test_run_uses_sink_path_when_no_dash_o(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """compile_sql is monkeypatched -- see `_sinked_graph`'s docstring."""
+    query = _write_sql(tmp_path, VALID_QUERY)
+    monkeypatch.setattr(cli, "compile_sql", lambda text: _sinked_graph("sink.mkv"))
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+
+    code = cli.main(["run", query])
+    captured = capsys.readouterr()
+    # Reaching the ffmpeg-not-found check (rather than the exit-2 usage error
+    # below) proves -o was resolved from the sink path and execution proceeded.
+    assert code == 1
+    assert "ffmpeg" in captured.err
+    assert "not found" in captured.err
+
+
+def test_run_dash_o_overrides_sink_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    query = _write_sql(tmp_path, VALID_QUERY)
+    out_path = str(tmp_path / "override.mp4")
+    monkeypatch.setattr(cli, "compile_sql", lambda text: _sinked_graph("sink.mkv"))
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+
+    code = cli.main(["run", query, "-o", out_path])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "not found" in captured.err
+
+
+def test_run_no_output_and_no_sink_is_usage_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    query = _write_sql(tmp_path, VALID_QUERY)
+    code = cli.main(["run", query])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "no output path" in captured.err
 
 
 def test_run_missing_output_directory(
