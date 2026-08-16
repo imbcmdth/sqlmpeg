@@ -1,6 +1,8 @@
-# RFC-004 — SELECT *, subtitle & timed-metadata streams (draft)
+# RFC-004 — SELECT *, subtitle & timed-metadata streams, input-level seeking
+(draft)
 
-Status: draft · 2026-08-15 · Delivers RFC-001's V1b plus two new stream types.
+Status: draft · 2026-08-15 (input-seek amendment accepted same day) · Delivers
+RFC-001's V1b plus two new stream types plus the WHERE-trim reimplementation.
 Sequencing: lands AFTER the RFC-003 waves (plans 031-032) — both rewrite parts
 of lower.py, so they serialize.
 
@@ -34,11 +36,50 @@ ever `-map`'d. Therefore:
   (legal ffmpeg), unlike filtergraph pads.
 - Emit consume-once check: exempt subtitle/data src refs for the same reason.
   They never get labels or enter filter_complex.
-- WHERE t BETWEEN on an alias whose subtitle/data stream is selected ->
-  UNSUPPORTED_SQL ("captions cannot be trimmed in v1; the trim filters are
-  video/audio only") — silently un-trimmed captions on a trimmed video would
-  desync, so reject loudly. (v2 idea: -ss/-to input seeking could trim all
-  types coherently; out of scope.)
+- WHERE t BETWEEN on an INPUT alias trims subtitle/data streams coherently
+  via input-level seeking (see below) — no rejection needed. The rejection
+  survives only for WHERE on a CTE whose columns include subtitle/data refs
+  (a CTE trim is a filtergraph trim, which cannot touch them).
+
+## Input-level seeking is the primary trim (amendment, accepted 2026-08-15)
+
+`WHERE <alias>.t BETWEEN a AND b` on an INPUT alias no longer splices
+trim/setpts filter nodes; it lowers to input options on that alias's `-i`:
+
+    ffmpeg -ss <a> -to <b> -i <path> ...
+
+Why this is sound and better:
+- Aliases are globally unique and each owns its own -i slot, so every alias
+  has AT MOST ONE time window in the whole query — per-alias seeking maps
+  1:1 onto per-input flags. (This was the objection that originally deferred
+  the idea; it dissolves under our own input model.)
+- Trims ALL stream types of that input coherently — video, audio, subtitle,
+  data — which is what makes RFC-004's caption story whole.
+- Faster (demuxer seek, no decode-and-discard) and smaller graphs (the
+  trim+setpts / atrim+asetpts pairs disappear). Input -ss rebases timestamps
+  to zero, which is exactly what setpts=PTS-STARTPTS did.
+- NEW capability: trimmed passthrough. `SELECT a.video[1] ... WHERE a.t
+  BETWEEN 5 AND 60` can now stream-copy (previously the trim filter forced a
+  re-encode).
+
+Accuracy contract (document loudly, exec-test both):
+- Streams that are DECODED (anything filtered/re-encoded): frame-accurate —
+  modern ffmpeg decodes from the prior keyframe and discards up to the seek
+  point.
+- Streams that are STREAM-COPIED: the cut snaps to the previous keyframe —
+  may start up to a GOP early. This is inherent to copying; the docs say so
+  and the fixture-based exec tests use tolerances accordingly. (A future
+  `strict` knob could force re-encode for exactness; not in this RFC.)
+
+Filter-level trim SURVIVES for one case: WHERE on a CTE name (a CTE output is
+a filtergraph pad, not an -i) — video/audio only, captions rejected, exactly
+the v0.3 behavior.
+
+IR: `Graph.input_trims: dict[str, tuple[float, float]]` (alias -> (start,
+end)); `to_dict` emits the key only when non-empty (golden-compat pattern,
+same as sink). Emit renders `-ss <start> -to <end>` immediately before the
+owning alias's `-i`. Golden 030-trim-where and friends regen to the new
+shape (trim nodes gone, input_trims present).
 
 ## SELECT * (and alias.*)
 
