@@ -147,6 +147,14 @@ an INTERNAL error.
   ``ffmpeg.format(...)`` arrive with their arguments intact. Everything else
   about such a call is a bare tier-2 call's, verbatim; the node it builds
   carries the FILTER's name, so nothing downstream knows the namespace exists.
+* Three ``->N`` filters are callable through that namespace despite the pad
+  fence, because their output COUNT is fixed by an option: ``channelsplit``,
+  ``acrossover`` and ``extractplanes`` (RFC-006, :data:`ARRAY_RETURNING`).
+  Each lowers to ONE node with N output pads and RETURNS an array — the first
+  call that does — so its result splats into a SELECT list, subscripts out of
+  a CTE column and broadcasts elementwise like any other array. The table is
+  consulted before the registry's verdict, since the registry has no entry to
+  give; every other fenced name keeps its ``UNKNOWN_FUNCTION``.
 * A tier-1 call may ALSO carry trailing named arguments, validated against the
   matched overload's ``named_target`` options (``blur`` -> ``gblur``) and
   merged into the single node its expansion produced, after the
@@ -373,6 +381,229 @@ _NO_TIMELINE_HINT = (
 # Longest option/constant list a hint or message renders before it stops
 # counting (xfade's `transition` alone has 59 constants).
 _MAX_LISTED = 12
+
+
+# ---------------------------------------------------------------------------
+# array-RETURNING filters (RFC-006, plan 047)
+# ---------------------------------------------------------------------------
+#
+# Three ffmpeg filters take ONE input pad and produce a number of output pads
+# that is fixed, statically, by one of their options. The registry's v1 pad
+# fence excludes all three (their `-filters` spec is `A->N` / `V->N`, and `N`
+# is excluded wholesale), so `Registry.get` says None for them and they are
+# not callable as tier-2 filters. This table is what re-admits exactly those
+# three, and it lives here rather than in the registry because the count rule
+# is a property of the OPTION SEMANTICS, which nothing ffmpeg prints exposes:
+# the registry keeps saying `A->N`, and lowering keeps the arithmetic.
+#
+# Re-admitted through the `ffmpeg.<filter>(...)` namespace only (RFC-006:
+# "Remains namespace-only"). A bare `channelsplit(...)` stays UNKNOWN_FUNCTION,
+# exactly as every other fenced name does -- the namespace is where a call
+# that needs a special shape is spelled.
+#
+# The result is an ARRAY value: `Node(outputs=[element]*N)` plus one `_Stream`
+# per pad, `is_array=True` even when N == 1 (a one-element array still splats,
+# subscripts through a CTE column, and broadcasts). Its pads are ordinary pads
+# -- consume-once, so a pad read by two sinks gets an `asplit` from the split
+# pass like any other.
+
+
+@dataclass(frozen=True)
+class _BadCount:
+    """A count rule's rejection: which option said what, and what was expected."""
+
+    option: str
+    value: str
+    expected: str
+    hint: str
+
+
+@dataclass(frozen=True)
+class _ArrayFilter:
+    """One array-returning filter: its pads, and how an option fixes its count."""
+
+    name: str
+    input: StreamType  # its single input pad
+    element: StreamType  # what every one of its output pads carries
+    count: Callable[[dict[str, object]], int | _BadCount]
+
+
+# `ffmpeg -layouts` (7.1), "Standard channel layouts": name -> how many
+# channels its decomposition lists. Data, verbatim -- the whole table ffmpeg
+# printed, not a curated subset of it, so the only layouts a query can be
+# rejected for are the ones this ffmpeg would reject too.
+_CHANNEL_LAYOUTS: dict[str, int] = {
+    "mono": 1,
+    "stereo": 2,
+    "2.1": 3,
+    "3.0": 3,
+    "3.0(back)": 3,
+    "4.0": 4,
+    "quad": 4,
+    "quad(side)": 4,
+    "3.1": 4,
+    "5.0": 5,
+    "5.0(side)": 5,
+    "4.1": 5,
+    "5.1": 6,
+    "5.1(side)": 6,
+    "6.0": 6,
+    "6.0(front)": 6,
+    "3.1.2": 6,
+    "hexagonal": 6,
+    "6.1": 7,
+    "6.1(back)": 7,
+    "6.1(front)": 7,
+    "7.0": 7,
+    "7.0(front)": 7,
+    "7.1": 8,
+    "7.1(wide)": 8,
+    "7.1(wide-side)": 8,
+    "5.1.2": 8,
+    "octagonal": 8,
+    "cube": 8,
+    "5.1.4": 10,
+    "7.1.2": 10,
+    "7.1.4": 12,
+    "7.2.3": 12,
+    "9.1.4": 14,
+    "hexadecagonal": 16,
+    "downmix": 2,
+    "22.2": 24,
+}
+
+# `ffmpeg -layouts` (7.1), "Individual channels": the names a custom layout is
+# composed of with `+` (`FL+FR`, `FC+LFE`), which ffmpeg accepts anywhere a
+# standard layout name is accepted.
+_CHANNEL_NAMES: frozenset[str] = frozenset(
+    {
+        "FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC", "BC", "SL", "SR",
+        "TC", "TFL", "TFC", "TFR", "TBL", "TBC", "TBR", "DL", "DR", "WL", "WR",
+        "SDL", "SDR", "LFE2", "TSL", "TSR", "BFC", "BFL", "BFR", "SSL", "SSR",
+        "TTL", "TTR",
+    }
+)
+
+_LAYOUT_HINT = (
+    "a channel layout is one of ffmpeg's standard names (see `ffmpeg -layouts`) "
+    "or a '+'-joined list of channel names, e.g. 'stereo', '5.1', 'FL+FR'"
+)
+_SPLIT_HINT = (
+    "acrossover splits at a list of positive frequencies separated by spaces or "
+    "'|', e.g. split => '500' (2 bands) or split => '500|3000' (3 bands)"
+)
+_PLANES_HINT = (
+    "planes names the planes to extract, e.g. planes => 'y'; your ffmpeg types "
+    "it as an enum, so only ONE plane per call is accepted here"
+)
+
+
+def _option_text(value: object) -> str:
+    """A validated option value as the text ffmpeg will be handed."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _channel_count(text: str) -> int | None:
+    """How many channels a layout spelling describes, or None if unrecognized."""
+    standard = _CHANNEL_LAYOUTS.get(text)
+    if standard is not None:
+        return standard
+    parts = text.split("+")
+    if parts and all(part in _CHANNEL_NAMES for part in parts):
+        return len(parts)
+    return None
+
+
+def _channelsplit_count(args: dict[str, object]) -> int | _BadCount:
+    """One output pad per channel channelsplit is asked to extract.
+
+    `channels` (default "all") wins when it is set to anything else: it is
+    itself a layout spelling naming the SUBSET to split out, so
+    `channels => 'FL'` is one pad however wide `channel_layout` is. Verified
+    against ffmpeg 7.1 -- a graph that labels more pads than the filter has is
+    a hard "More output link labels specified ... than it has outputs" error,
+    so the count has to follow both options, not just the documented one.
+    """
+    channels = _option_text(args.get("channels", "all"))
+    if channels != "all":
+        count = _channel_count(channels)
+        if count is None:
+            return _BadCount("channels", channels, "a channel layout", _LAYOUT_HINT)
+        return count
+    layout = _option_text(args.get("channel_layout", "stereo"))
+    count = _channel_count(layout)
+    if count is None:
+        return _BadCount(
+            "channel_layout",
+            layout,
+            f"one of {_listed(_CHANNEL_LAYOUTS)}",
+            _LAYOUT_HINT,
+        )
+    return count
+
+
+def _acrossover_count(args: dict[str, object]) -> int | _BadCount:
+    """One band per split frequency, plus the band below the lowest one."""
+    split = _option_text(args.get("split", "500"))
+    parts = split.replace("|", " ").split()
+    ok = bool(parts)
+    for part in parts:
+        try:
+            frequency = float(part)
+        except ValueError:
+            ok = False
+            break
+        if not frequency > 0:
+            ok = False
+            break
+    if not ok:
+        return _BadCount("split", split, "a list of positive frequencies", _SPLIT_HINT)
+    return len(parts) + 1
+
+
+def _extractplanes_count(args: dict[str, object]) -> int | _BadCount:
+    """One output pad per requested plane.
+
+    ffmpeg's own option is a `flags` set (`y+u+v`), but the registry types an
+    option that lists constants as an enum, so `_option_value` accepts exactly
+    one of them and a `+`-joined value is FILTER_OPTION_TYPE before this rule
+    ever runs. The `+` arithmetic is written out anyway: it is what the option
+    means, and it is what a later plan widening flags handling will need.
+    """
+    planes = _option_text(args.get("planes", "r"))
+    parts = planes.split("+")
+    if not parts or not all(parts):
+        return _BadCount("planes", planes, "one or more plane names", _PLANES_HINT)
+    return len(parts)
+
+
+ARRAY_RETURNING: dict[str, _ArrayFilter] = {
+    "channelsplit": _ArrayFilter(
+        name="channelsplit",
+        input="audio",
+        element="audio",
+        count=_channelsplit_count,
+    ),
+    "acrossover": _ArrayFilter(
+        name="acrossover",
+        input="audio",
+        element="audio",
+        count=_acrossover_count,
+    ),
+    "extractplanes": _ArrayFilter(
+        name="extractplanes",
+        input="video",
+        element="video",
+        count=_extractplanes_count,
+    ),
+}
+
+_ARRAY_INPUT_HINT = (
+    "an array-returning filter takes exactly one stream, because its own result "
+    "is the array; subscript the argument, e.g. a.audio[1]"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -2102,7 +2333,18 @@ class _Lowerer:
         positional from the pad signature, every option named, and no registry
         (no ffmpeg, or ``--portable``) means the name is simply UNKNOWN, the
         same rejection a bare tier-2 name gets there.
+
+        :data:`ARRAY_RETURNING` is consulted BEFORE the registry's verdict
+        (RFC-006, plan 047): its three names are fenced OUT of the registry by
+        their ``->N`` pad spec, so asking `get` about them first would answer
+        "unknown" and the table would never be reached. Every other fenced name
+        keeps exactly today's rejection.
         """
+        options = self._array_options(name)
+        if options is not None:
+            return self._lower_array_call(
+                node, ARRAY_RETURNING[name], options, call, env, select
+            )
         dynamic = self.registry.get(name) if self.registry is not None else None
         if dynamic is None:
             raise _error(
@@ -2318,6 +2560,122 @@ class _Lowerer:
             positions=list(range(len(expected))),
             returns=output,
             build=build,
+        )
+
+    # -- array-returning filters (RFC-006, plan 047) -----------------------
+
+    def _array_options(self, name: str) -> dict[str, FilterOption] | None:
+        """`name`'s option table if it is a callable array-returning filter.
+
+        Three questions, one answer, because they have the same shape: is the
+        name in :data:`ARRAY_RETURNING`, is there a registry at all (no ffmpeg
+        or ``--portable`` turns the whole namespace off, this table included),
+        and does THIS ffmpeg actually have the filter. The last one is why the
+        options are fetched even for a call with no named arguments: a fenced
+        name is in no registry table, so its option block is the only evidence
+        this build has it (see ``Registry.fenced_options``). None means "not
+        callable", and the caller falls through to the ordinary namespaced
+        rejection, hint and all.
+        """
+        if name not in ARRAY_RETURNING or self.registry is None:
+            return None
+        return self.registry.fenced_options(name)
+
+    def _lower_array_call(
+        self,
+        node: exp.Expr,
+        spec: _ArrayFilter,
+        options: dict[str, FilterOption],
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Value:
+        """One node with N output pads, returned as an N-element array value.
+
+        The pad COUNT comes from the table's count rule, run over the validated
+        named arguments — so the option's own type, range and constant checks
+        have already happened, and a value that is well-typed but not a count
+        this filter could produce (``channel_layout => 'nonsense'``) is the
+        rule's own ``FILTER_OPTION_TYPE``, anchored on that argument.
+
+        Provenance is a 1:N fan: the single input stream's source is threaded
+        to every element (not ``_agreed_source``, which answers the opposite
+        question), so splitting a ``language=eng`` track gives N eng channels.
+        """
+        kinds = [self._classify(arg, env, select) for arg in call.args]
+        self._reject_passthrough_args(call.display, kinds, call, node)
+        if kinds != [spec.input]:
+            shown = call.display
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{shown}() is an ffmpeg filter: it expects {shown}({spec.input}), "
+                f"got {shown}({', '.join(kinds)})",
+                node,
+                fallback=select,
+                hint=f"only stream inputs are positional for a dynamic filter; pass "
+                f"options by name, e.g. {shown}({spec.input}, <option> => <value>)",
+            )
+        args = self._check_named_args(
+            spec.name,
+            options,
+            call.named,
+            node,
+            owner=call.display,
+            occupied=set(),
+            timeline=False,
+        )
+        count = spec.count(args)
+        if isinstance(count, _BadCount):
+            raise self._bad_count(spec, count, call, node, select)
+
+        value = self._lower_expr(call.args[0], env, select)
+        if value.is_array:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() returns an array, so it cannot also broadcast "
+                f"over one: {_sql_text(call.args[0])} is "
+                f"{_stream_count(len(value.streams))}",
+                call.args[0],
+                fallback=node,
+                hint=_ARRAY_INPUT_HINT,
+            )
+        stream = value.streams[0]
+        node_id = self.ctx.node(
+            spec.name, dict(args), [stream.ref], [spec.element] * count
+        )
+        return _array(
+            spec.element,
+            [
+                _Stream(ref=f"{node_id}:{pad}", type=spec.element, source=stream.source)
+                for pad in range(count)
+            ],
+        )
+
+    def _bad_count(
+        self,
+        spec: _ArrayFilter,
+        bad: _BadCount,
+        call: _Call,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> SqlmpegError:
+        """A count rule's rejection, anchored on the argument that caused it.
+
+        The offending option is normally one the query wrote, and that is the
+        token worth pointing at; a rule can only reject a DEFAULT if the table
+        itself is wrong, so falling back to the call keeps that case anchored
+        rather than unanchored.
+        """
+        written = next((arg for arg in call.named if arg.name == bad.option), None)
+        anchor = written.value if written is not None else node
+        return _error(
+            ErrorCode.FILTER_OPTION_TYPE,
+            f"option '{bad.option}' of filter '{spec.name}' decides how many "
+            f"streams the call returns, so it must be {bad.expected}, "
+            f"got {bad.value!r}",
+            anchor,
+            fallback=select,
+            hint=bad.hint,
         )
 
     # -- shared call machinery --------------------------------------------
@@ -2651,6 +3009,11 @@ class _Lowerer:
             spec = None if call.namespaced else FUNCTIONS.get(name)
             if spec is not None:
                 return self._stdlib_returns(spec, call, env, select)
+            # An array-returning call is classified by its ELEMENT type, which
+            # is what makes it a legal argument: `volume(ffmpeg.channelsplit(
+            # a.audio[1]), 0.5)` broadcasts over the channels.
+            if call.namespaced and self._array_options(name) is not None:
+                return ARRAY_RETURNING[name].element
             dynamic = self.registry.get(name) if self.registry is not None else None
             if dynamic is None:
                 raise _error(

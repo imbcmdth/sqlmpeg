@@ -2523,9 +2523,12 @@ Filters:
   | = Source or sink filter
  .S. acrossover        A->N       Split audio into per-bands streams.
  ... aecho             A->A       Add echoing to the audio.
+ ... amerge            N->A       Merge two or more audio streams into a single multi-channel stream.
+ ... channelsplit      A->N       Split audio into per-channel streams.
  ..C crop              V->V       Crop the input video.
  T.C feedback          VV->VV     Apply feedback video filter.
  TSC deband            V->V       Debands video.
+ ... extractplanes     V->N       Extract planes as grayscale frames.
  TSC gblur             V->V       Apply Gaussian Blur filter.
  ..C scale             V->V       Scale the input video size and/or convert the image format.
  ... split             V->N       Pass on the input to N video outputs.
@@ -2620,6 +2623,40 @@ xfade AVOptions:
    duration          <duration>   ..FV....... set cross fade duration (default 1)
    offset            <duration>   ..FV....... set cross fade start relative to first input stream (default 0)
    expr              <string>     ..FV....... set expression for custom transition
+
+""",
+    # -- array-returning filters (RFC-006, plan 047). All three are `->N` and
+    # so are FENCED out of the registry's tables; their option blocks are
+    # still reachable through `Registry.fenced_options`, which is what makes
+    # them callable through the namespace. Real ffmpeg 7.1 captures.
+    "channelsplit": """\
+channelsplit AVOptions:
+   channel_layout    <channel_layout> ..F.A...... Input channel layout. (default "stereo")
+   channels          <string>     ..F.A...... Channels to extract. (default "all")
+
+""",
+    "acrossover": """\
+acrossover AVOptions:
+   split             <string>     ..F.A...... set split frequencies (default "500")
+   order             <int>        ..F.A...... set filter order (from 0 to 9) (default 4th)
+     2nd             0            ..F.A...... 2nd order (12 dB/8ve)
+     4th             1            ..F.A...... 4th order (24 dB/8ve)
+     6th             2            ..F.A...... 6th order (36 dB/8ve)
+     8th             3            ..F.A...... 8th order (48 dB/8ve)
+   level             <float>      ..F.A...... set input gain (from 0 to 1) (default 1)
+   gain              <string>     ..F.A...... set output bands gain (default "1.f")
+
+""",
+    "extractplanes": """\
+extractplanes AVOptions:
+   planes            <flags>      ..FV....... set planes (default r)
+     y                            ..FV....... set luma plane
+     u                            ..FV....... set u plane
+     v                            ..FV....... set v plane
+     r                            ..FV....... set red plane
+     g                            ..FV....... set green plane
+     b                            ..FV....... set blue plane
+     a                            ..FV....... set alpha plane
 
 """,
     # -- generated sources (RFC-005 SS1, plan 042). Same lazy `-help` path a
@@ -2776,7 +2813,11 @@ def test_two_pad_dynamic_filter_lowers_both_inputs(_registry: Registry) -> None:
 def test_excluded_filters_are_not_callable(_registry: Registry) -> None:
     """The v1 scope fence lives in the registry: dynamic pads (acrossover),
     multiple outputs (feedback) and sources (testsrc) are all in the fixture's
-    -filters output but excluded, so lowering never sees them at all."""
+    -filters output but excluded, so lowering never sees them at all.
+
+    `acrossover` is array-RETURNING (plan 047) and callable as
+    `ffmpeg.acrossover(...)`, but that table is namespace-only: the BARE name
+    resolves exactly as it always did, which is not at all."""
     for sql in (
         "SELECT acrossover(a.audio[1]) FROM input('x.mp4') a",
         "SELECT feedback(a.frame, a.frame) FROM input('x.mp4') a",
@@ -3638,8 +3679,11 @@ def test_a_namespaced_did_you_mean_never_reaches_into_the_stdlib(
 
 
 def test_the_scope_fence_applies_to_the_namespace_too(_registry: Registry) -> None:
+    """Plan 047 re-admits three `->N` names through this namespace, and only
+    those three: `amerge` is dynamic-pad in exactly the same way and stays
+    fenced, as do multi-output, source and `split`-shaped names."""
     for sql in (
-        "SELECT ffmpeg.acrossover(a.audio[1]) FROM input('x.mp4') a",
+        "SELECT ffmpeg.amerge(a.audio[1]) FROM input('x.mp4') a",
         "SELECT ffmpeg.feedback(a.frame, a.frame) FROM input('x.mp4') a",
         "SELECT ffmpeg.testsrc(a.frame) FROM input('x.mp4') a",
         "SELECT ffmpeg.split(a.frame) FROM input('x.mp4') a",
@@ -3713,6 +3757,353 @@ def test_an_unrelated_qualified_call_is_still_rejected() -> None:
     sqlmpeg knows how to read."""
     err = _reject_lower("SELECT foo.gblur(a.frame) FROM input('x.mp4') a", {})
     assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+# ---------------------------------------------------------------------------
+# RFC-006 (plan 047): array-RETURNING filters
+# ---------------------------------------------------------------------------
+#
+# `channelsplit`, `acrossover` and `extractplanes` are `->N` filters, fenced
+# out of the registry's tables, re-admitted through the `ffmpeg.` namespace by
+# `lower.ARRAY_RETURNING` -- one node with N output pads, returned as an
+# N-element ARRAY. The fixture registry has all three `-help` blocks (and
+# `amerge`, which has none, so it stays fenced).
+
+
+def test_channelsplit_defaults_to_the_stereo_layouts_two_pads(_registry: Registry) -> None:
+    g = _dyn("SELECT ffmpeg.channelsplit(a.audio[1]) FROM input('x.mp4') a", _registry)
+    node = g.nodes["n1"]
+    assert node.filter == "channelsplit"
+    assert node.args == {}
+    assert node.inputs == ["src:a:a:0"]
+    assert node.outputs == ["audio", "audio"]
+    assert _outputs(g) == [("n1:0", "audio", None), ("n1:1", "audio", None)]
+
+
+@pytest.mark.parametrize(
+    ("layout", "count"),
+    [("mono", 1), ("stereo", 2), ("2.1", 3), ("quad", 4), ("5.1", 6), ("7.1", 8)],
+)
+def test_channelsplit_counts_the_channels_of_its_layout(
+    _registry: Registry, layout: str, count: int
+) -> None:
+    g = _dyn(
+        f"SELECT ffmpeg.channelsplit(a.audio[1], channel_layout => '{layout}') "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].outputs == ["audio"] * count
+    assert len(g.outputs) == count
+
+
+def test_a_one_channel_split_is_still_an_array(_registry: Registry) -> None:
+    """`is_array` is not `len(streams) != 1`: mono channelsplit returns an
+    array of one, so it still subscripts (and would still splat)."""
+    g = _dyn(
+        "WITH s AS (SELECT ffmpeg.channelsplit(a.audio[1], channel_layout => 'mono') "
+        "AS ch FROM input('x.mp4') a) SELECT s.ch[1] FROM s",
+        _registry,
+    )
+    assert g.nodes["n1"].outputs == ["audio"]
+    assert _outputs(g) == [("n1:0", "audio", None)]
+
+
+def test_a_custom_channel_layout_counts_its_channel_names(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT ffmpeg.channelsplit(a.audio[1], channel_layout => 'FL+FR+LFE') "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].outputs == ["audio"] * 3
+
+
+def test_channels_narrows_the_split_to_a_subset(_registry: Registry) -> None:
+    """ffmpeg's `channels` option is the count that WINS: it names the subset
+    to extract, so the pad count follows it, not the (wider) layout."""
+    g = _dyn(
+        "SELECT ffmpeg.channelsplit(a.audio[1], channel_layout => '5.1', "
+        "channels => 'FL+FR') FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].args == {"channel_layout": "5.1", "channels": "FL+FR"}
+    assert g.nodes["n1"].outputs == ["audio", "audio"]
+
+
+def test_channels_all_falls_back_to_the_layout(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT ffmpeg.channelsplit(a.audio[1], channel_layout => '5.1', "
+        "channels => 'all') FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].outputs == ["audio"] * 6
+
+
+def test_an_unknown_channel_layout_is_a_typed_rejection(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT ffmpeg.channelsplit(a.audio[1], channel_layout => 'nonsense') "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "decides how many streams the call returns" in err.message
+    # The layout table is longer than a message lists before it starts
+    # counting (`_MAX_LISTED`), which is the same rule an enum option's
+    # constants get.
+    assert "one of mono, stereo, 2.1" in err.message and "more)" in err.message
+    assert err.hint is not None and "ffmpeg -layouts" in err.hint and "5.1" in err.hint
+
+
+def test_a_bad_layout_anchors_on_the_option_that_caused_it(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT ffmpeg.channelsplit(\n  a.audio[1],\n  channel_layout => 'nope'\n) "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.line == 3
+
+
+def test_acrossover_returns_one_more_band_than_it_splits(_registry: Registry) -> None:
+    g = _dyn("SELECT ffmpeg.acrossover(a.audio[1]) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].outputs == ["audio", "audio"]  # default split '500'
+
+
+@pytest.mark.parametrize("split", ["500|3000", "500 3000", "500||3000"])
+def test_acrossover_takes_either_list_separator(_registry: Registry, split: str) -> None:
+    """Spaces and `|` both separate, and a repeated separator is one
+    separator -- measured against ffmpeg 7.1, which counts the same bands for
+    all three spellings (a TRAILING separator likewise yields no extra band)."""
+    g = _dyn(
+        f"SELECT ffmpeg.acrossover(a.audio[1], split => '{split}') FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].outputs == ["audio"] * 3
+
+
+def test_a_single_numeric_split_is_two_bands(_registry: Registry) -> None:
+    """A `<string>` option also takes a bare number (RFC-003), so the count
+    rule reads the rendered text either way."""
+    g = _dyn(
+        "SELECT ffmpeg.acrossover(a.audio[1], split => 800) FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].args == {"split": 800}
+    assert g.nodes["n1"].outputs == ["audio", "audio"]
+
+
+@pytest.mark.parametrize("split", ["zzz", "", "-500", "0", "500|zzz"])
+def test_a_malformed_split_list_is_a_typed_rejection(
+    _registry: Registry, split: str
+) -> None:
+    err = _reject_dyn(
+        f"SELECT ffmpeg.acrossover(a.audio[1], split => '{split}') FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "positive frequencies" in err.message
+
+
+def test_acrossovers_other_options_validate_normally(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT ffmpeg.acrossover(a.audio[1], order => '6th', level => 0.5) "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].args == {"order": "6th", "level": 0.5}
+    err = _reject_dyn(
+        "SELECT ffmpeg.acrossover(a.audio[1], order => 'ninth') FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "named constants" in err.message
+
+
+def test_extractplanes_returns_one_video_pad_per_plane(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT ffmpeg.extractplanes(a.video[1], planes => 'y') FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].filter == "extractplanes"
+    assert g.nodes["n1"].outputs == ["video"]
+    assert _outputs(g) == [("n1:0", "video", None)]
+
+
+def test_extractplanes_defaults_to_its_one_plane(_registry: Registry) -> None:
+    """ffmpeg 7.1 prints `(default r)` for `planes`, which is one plane."""
+    g = _dyn("SELECT ffmpeg.extractplanes(a.video[1]) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].args == {}
+    assert g.nodes["n1"].outputs == ["video"]
+
+
+def test_a_multi_plane_value_is_rejected_before_the_count_rule(
+    _registry: Registry,
+) -> None:
+    """The registry types an option that lists constants as an ENUM, so
+    ffmpeg's own `y+u` flags spelling is FILTER_OPTION_TYPE from the ordinary
+    constant check -- the count rule's `+` arithmetic is unreachable until a
+    later plan teaches the registry about flags sets."""
+    err = _reject_dyn(
+        "SELECT ffmpeg.extractplanes(a.video[1], planes => 'y+u') FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "named constants" in err.message
+
+
+def test_an_array_call_splats_into_the_select_list(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT a.video[1], ffmpeg.channelsplit(a.audio[1]) FROM input('x.mp4') a",
+        _registry,
+    )
+    assert _outputs(g) == [
+        ("src:a:v:0", "video", None),
+        ("n1:0", "audio", None),
+        ("n1:1", "audio", None),
+    ]
+
+
+def test_an_array_call_subscripts_through_a_cte(_registry: Registry) -> None:
+    g = _dyn(
+        "WITH s AS (SELECT ffmpeg.channelsplit(a.audio[1]) AS ch FROM input('x.mp4') a) "
+        "SELECT s.ch[2] FROM s",
+        _registry,
+    )
+    assert _outputs(g) == [("n1:1", "audio", None)]
+
+
+def test_an_array_call_is_bounds_checked_statically(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "WITH s AS (SELECT ffmpeg.channelsplit(a.audio[1]) AS ch FROM input('x.mp4') a) "
+        "SELECT s.ch[3] FROM s",
+        _registry,
+    )
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "has 2 streams" in err.message
+
+
+def test_a_per_element_op_broadcasts_over_an_array_call(_registry: Registry) -> None:
+    """The headline shape: one channelsplit, one volume per channel."""
+    g = _dyn(
+        "SELECT volume(ffmpeg.channelsplit(a.audio[1]), 0.5) FROM input('x.mp4') a",
+        _registry,
+    )
+    assert _filters(g) == ["channelsplit", "volume", "volume"]
+    assert g.nodes["n2"].inputs == ["n1:0"]
+    assert g.nodes["n3"].inputs == ["n1:1"]
+
+
+def test_an_array_call_threads_its_sources_provenance_to_every_element(
+    _registry: Registry,
+) -> None:
+    """1:N fan: every channel of an eng track is an eng channel (this is NOT
+    `_agreed_source`, which answers the N:1 question)."""
+    g = _dyn(
+        "SELECT ffmpeg.channelsplit(a.audio[2]) FROM input('x.mp4') a",
+        _registry,
+        {"a": _probe_result(per_audio_tags=[{"language": "eng"}, {"language": "fra"}])},
+    )
+    assert [o.metadata for o in g.outputs] == [{"language": "fra"}, {"language": "fra"}]
+
+
+def test_two_readers_of_one_array_pad_get_an_asplit(_registry: Registry) -> None:
+    """channelsplit pads are ordinary pads -- consume-once like any other."""
+    g = insert_splits(
+        _dyn(
+            "WITH s AS (SELECT ffmpeg.channelsplit(a.audio[1]) AS ch "
+            "FROM input('x.mp4') a) SELECT s.ch[1], volume(s.ch[1], 0.5) FROM s",
+            _registry,
+        )
+    )
+    asplit = next(node for node in g.nodes.values() if node.filter == "asplit")
+    assert asplit.inputs == ["n1:0"]
+    assert asplit.args == {"n": 2}
+
+
+def test_an_array_call_cannot_also_broadcast_over_an_array(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT ffmpeg.channelsplit(a.audio) FROM input('x.mp4') a",
+        _registry,
+        {"a": _probe_result(per_audio_tags=[{}, {}])},
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "returns an array, so it cannot also broadcast over one" in err.message
+    assert err.hint is not None and "a.audio[1]" in err.hint
+
+
+def test_an_array_call_checks_its_input_pad_type(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT ffmpeg.channelsplit(a.frame) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "expects ffmpeg.channelsplit(audio), got ffmpeg.channelsplit(video)" in err.message
+
+
+def test_an_array_call_takes_only_its_pad_positionally(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT ffmpeg.channelsplit(a.audio[1], 2) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "got ffmpeg.channelsplit(audio, num)" in err.message
+
+
+def test_an_array_call_rejects_an_unknown_option(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT ffmpeg.channelsplit(a.audio[1], zzz => 1) FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+    assert err.hint is not None and "channel_layout" in err.hint
+
+
+def test_an_array_filter_has_no_timeline_support(_registry: Registry) -> None:
+    """None of the three is T-flagged in `ffmpeg -filters`, so `enable` is
+    rejected the ordinary way rather than silently accepted."""
+    err = _reject_dyn(
+        "SELECT ffmpeg.channelsplit(a.audio[1], enable => 'gte(t,1)') "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+    assert "does not flag 'channelsplit' as supporting timeline editing" in err.message
+
+
+def test_an_array_filter_this_ffmpeg_lacks_is_an_unknown_function(
+    _registry: Registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The table says what SHAPE the call has, never that the filter exists:
+    a build whose `-help filter=channelsplit` says nothing does not have it,
+    and the namespace answers exactly as it does for any other unknown name."""
+    monkeypatch.delitem(_HELP_FIXTURES, "channelsplit")
+    err = _reject_dyn(
+        "SELECT ffmpeg.channelsplit(a.audio[1]) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None and "variable pad count" in err.hint
+
+
+def test_an_array_call_needs_a_registry() -> None:
+    err = _reject_dyn("SELECT ffmpeg.channelsplit(a.audio[1]) FROM input('x.mp4') a", None)
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None and "ffmpeg was not found on PATH" in err.hint
+
+
+def test_portable_turns_the_array_table_off_too() -> None:
+    err = _reject_dyn(
+        "SELECT ffmpeg.channelsplit(a.audio[1]) FROM input('x.mp4') a",
+        None,
+        portable=True,
+    )
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None and "--portable" in err.hint
+
+
+def test_an_array_call_emits_one_label_per_pad(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT volume(ffmpeg.channelsplit(a.audio[1]), 2) FROM input('x.mp4') a",
+        _registry,
+    )
+    assert emit(insert_splits(g)).filter_complex == (
+        "[0:a:0]channelsplit[n10][n11];[n10]volume=volume=2[out0];[n11]volume=volume=2[out1]"
+    )
 
 
 # ---------------------------------------------------------------------------

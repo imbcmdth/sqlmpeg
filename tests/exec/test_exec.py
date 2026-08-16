@@ -36,6 +36,9 @@ _TESTSRC = _FIXTURES_DIR / "testsrc.mp4"
 _FRAME_PNG = _FIXTURES_DIR / "frame.png"
 _AV2 = _FIXTURES_DIR / "av2.mp4"
 _AV3 = _FIXTURES_DIR / "av3.mp4"
+# Plan 047: the one fixture with a genuinely 2-CHANNEL audio track (440 Hz
+# left, 880 Hz right), which is what channelsplit needs to split.
+_STEREO = _FIXTURES_DIR / "stereo.mp4"
 # RFC-004 caption fixtures: avs.mkv is video + audio + an srt track tagged
 # language=eng; subs.en.vtt is a standalone 3-cue WebVTT file (no tags).
 _AVS = _FIXTURES_DIR / "avs.mkv"
@@ -134,7 +137,7 @@ def _ffprobe_streams(path: Path) -> list[dict[str, object]]:
         "-v",
         "error",
         "-show_entries",
-        "stream=index,codec_type,codec_name",
+        "stream=index,codec_type,codec_name,channels",
         "-show_entries",
         "stream_tags=language",
         "-of",
@@ -1424,3 +1427,120 @@ def test_two_sinks_may_stream_copy_the_same_audio_track(tmp_path: Path) -> None:
         streams = _ffprobe_streams(path)
         assert [s["codec_type"] for s in streams] == ["audio"]
         assert streams[0]["codec_name"] == "aac"  # copied, not re-encoded
+
+
+# ---------------------------------------------------------------------------
+# RFC-006 (plan 047): array-RETURNING filters, against real ffmpeg
+# ---------------------------------------------------------------------------
+#
+# `ffmpeg.channelsplit(...)` and friends are `->N` filters the registry fences
+# out; lowering re-admits them from its own table and returns an ARRAY, so the
+# result splats, subscripts and broadcasts. These run the real thing: the pad
+# count the table computed has to be exactly the pad count ffmpeg builds, or
+# the graph does not link at all ("More output link labels specified for
+# filter 'channelsplit' than it has outputs").
+
+
+def test_channelsplit_writes_one_mono_stream_per_channel(tmp_path: Path) -> None:
+    """The splat: a 2-channel track becomes two 1-channel output streams."""
+    _require_fixture(_STEREO)
+    out_path = tmp_path / "channels.mka"
+    query = (
+        f"COPY (SELECT ffmpeg.channelsplit(a.audio[1]) FROM input('{_sql_path(_STEREO)}') a)\n"
+        f"TO '{_sql_path(out_path)}';"
+    )
+
+    emitted = emit(compile_sql(query))
+    assert "channelsplit" in emitted.filter_complex
+    assert len(emitted.groups[0].maps) == 2
+
+    _run_sink_query(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["audio", "audio"]
+    assert [s["channels"] for s in streams] == [1, 1]
+
+
+def test_the_channelsplit_round_trip_mixes_the_channels_back_down(
+    tmp_path: Path,
+) -> None:
+    """split -> a volume per channel -> amix back into one stream.
+
+    The wave's headline shape, and the one that exercises every piece at once:
+    one node with two pads, a broadcast subscript out of a CTE column, two
+    ordinary tier-1 calls, and a join back. `amix` of two mono streams is one
+    mono stream (it keeps its first input's layout, which channelsplit made
+    `FL`), so the output is written as WAV -- aac refuses a 1-channel `FL`
+    layout, which is an ffmpeg encoder rule, not a graph problem.
+    """
+    _require_fixture(_STEREO)
+    out_path = tmp_path / "remixed.wav"
+    query = (
+        "CREATE VIEW split AS\n"
+        f"  SELECT ffmpeg.channelsplit(a.audio[1]) AS ch FROM input('{_sql_path(_STEREO)}') a;\n"
+        "COPY (SELECT amix(volume(s.ch[1], 0.5), volume(s.ch[2], 2.0)) FROM split s)\n"
+        f"TO '{_sql_path(out_path)}';"
+    )
+
+    emitted = emit(compile_sql(query))
+    assert emitted.filter_complex == (
+        "[0:a:0]channelsplit[n10][n11];"
+        "[n10]volume=volume=0.5[n2];"
+        "[n11]volume=volume=2.0[n3];"
+        "[n2][n3]amix=inputs=2[out0]"
+    )
+
+    _run_sink_query(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["audio"]
+    assert streams[0]["channels"] == 1
+    assert _ffprobe_duration(out_path) == pytest.approx(2.0, abs=0.2)
+
+
+def test_acrossover_writes_one_stream_per_band(tmp_path: Path) -> None:
+    """Two split frequencies, three bands -- the count rule's arithmetic run
+    against the filter that has to agree with it."""
+    _require_fixture(_STEREO)
+    out_path = tmp_path / "bands.mka"
+    query = (
+        "COPY (SELECT ffmpeg.acrossover(a.audio[1], split => '500|3000')\n"
+        f"      FROM input('{_sql_path(_STEREO)}') a)\n"
+        f"TO '{_sql_path(out_path)}';"
+    )
+
+    emitted = emit(compile_sql(query))
+    assert "acrossover=split=500|3000" in emitted.filter_complex
+
+    _run_sink_query(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["audio", "audio", "audio"]
+    assert [s["channels"] for s in streams] == [2, 2, 2]  # bands, not channels
+
+
+def test_extractplanes_extracts_the_luma_plane_as_grey(tmp_path: Path) -> None:
+    """`planes => 'y'` is a one-element array, and what comes out is grey.
+
+    One plane per call is all the option surface allows today: the registry
+    types `planes` as an enum (it lists constants), so ffmpeg's own `y+u`
+    flags spelling is rejected before the count rule sees it.
+    """
+    _require_fixture(_TESTSRC)
+    out_path = tmp_path / "luma.mp4"
+    query = (
+        "SELECT ffmpeg.extractplanes(a.video[1], planes => 'y') "
+        f"FROM input('{_sql_path(_TESTSRC)}') a"
+    )
+
+    _compile_and_run(query, out_path)
+
+    assert [s["codec_type"] for s in _ffprobe_streams(out_path)] == ["video"]
+    frame = tmp_path / "luma.png"
+    _extract_frame(out_path, 1.0, frame)
+    with Image.open(frame) as image:
+        data = image.convert("RGB").tobytes()
+    pixels = [data[i : i + 3] for i in range(0, len(data), 3)]
+    # A luma plane rendered as video is grey: every pixel's channels agree,
+    # give or take the yuv420p round trip's chroma rounding.
+    assert max(max(p) - min(p) for p in pixels) <= 8

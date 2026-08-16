@@ -659,10 +659,11 @@ class Registry:
     """Lazily-loaded view of the installed ffmpeg's filter set.
 
     `-filters` is parsed at most once per process, on first call to any of
-    `available()`, `get()`, `names()`, `get_source()`, `source_names()`, or
-    `options()`. Per-filter `-help filter=X` is parsed at most once per
-    filter (regular OR source), on first call to `options(name)` for that
-    filter -- never for all filters upfront. NEVER raises.
+    `available()`, `get()`, `names()`, `get_source()`, `source_names()`,
+    `options()` or `fenced_options()`. Per-filter `-help filter=X` is parsed
+    at most once per filter (regular OR source), on first call to
+    `options(name)` / `fenced_options(name)` for that filter -- never for all
+    filters upfront. NEVER raises.
     """
 
     def __init__(self) -> None:
@@ -754,6 +755,40 @@ class Registry:
         if self._ffmpeg is None:
             return {}
         opts = _parse_filter_help(self._ffmpeg, name)
+        self._options[name] = opts
+        if self._version_line is not None:
+            _write_disk_cache(self._version_line, self._filters, self._sources, self._options)
+        return opts
+
+    def fenced_options(self, name: str) -> dict[str, FilterOption] | None:
+        """`-help filter=<name>` options for a name the v1 pad fence EXCLUDED.
+
+        `options()` answers only for names that SURVIVED the fence -- they are
+        the keys of `_filters`/`_sources`, and an excluded name is in neither
+        table, so it reads as unknown there. The array-RETURNING filters
+        (`channelsplit`, `acrossover`, `extractplanes` -- all `->N`) are
+        excluded from those tables yet callable through the table lowering
+        keeps of them (RFC-006), and this is the one door they get: same lazy,
+        memoized, permissive `-help` path, no pad information implied.
+
+        None means "this ffmpeg cannot tell me about that filter": no ffmpeg,
+        or `-help filter=<name>` printed no option block at all -- which is
+        what an ffmpeg build WITHOUT the filter prints (`Unknown filter 'x'.`,
+        exit 0, no "AVOptions:" line, verified against ffmpeg 7.1). Every name
+        this accessor exists for has a non-empty option table in a build that
+        has it, so lowering reads None as "not in this build" and rejects the
+        call as an unknown function. That inference is the accessor's contract,
+        not a general one: it does not hold for a filter with no options.
+        """
+        self._ensure_loaded()
+        cached = self._options.get(name)
+        if cached is not None:
+            return cached
+        if self._ffmpeg is None:
+            return None
+        opts = _parse_filter_help(self._ffmpeg, name)
+        if not opts:
+            return None
         self._options[name] = opts
         if self._version_line is not None:
             _write_disk_cache(self._version_line, self._filters, self._sources, self._options)

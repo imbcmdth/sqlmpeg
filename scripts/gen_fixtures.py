@@ -10,7 +10,8 @@ one audio track), and ``av2.mp4`` / ``av3.mp4`` (video + TWO audio tracks
 tagged ``language=eng`` / ``language=fra``), which is what the broadcasting
 tests expand over. av2 and av3 differ only in their sine frequencies, so a
 ``UNION ALL`` of the two concatenates two distinguishable multi-language
-sources whose language tags agree track for track.
+sources whose language tags agree track for track. ``stereo.mp4`` adds the
+one thing none of those have: a genuinely 2-CHANNEL audio track (plan 047).
 
 Idempotent: a fixture whose output file already exists is skipped, so this
 is safe to run repeatedly, including once per CI job right before the exec
@@ -46,6 +47,7 @@ _SOURCES: dict[str, str] = {
 _AV_NAME = "av.mp4"
 _AV2_NAME = "av2.mp4"
 _AV3_NAME = "av3.mp4"
+_STEREO_NAME = "stereo.mp4"
 _SUBS_NAME = "subs.en.vtt"
 _AVS_NAME = "avs.mkv"
 _FRAME_PNG_NAME = "frame.png"
@@ -141,6 +143,32 @@ def _generate_av3() -> None:
     )
 
 
+def _generate_stereo() -> None:
+    """testsrc2 video + ONE two-channel audio track: 440 Hz left, 880 Hz right.
+
+    The channelsplit fixture (plan 047). Every other audio fixture here is
+    mono -- ``sine`` is a single-channel source, and two sine INPUTS are two
+    mono TRACKS, not two channels of one -- so the split had nothing to split.
+    ``join`` is what makes one 2-channel track out of them, inside a single
+    lavfi graph: ``sine[l]; sine[r]; [l][r]join=inputs=2:channel_layout=stereo``.
+    Verified with ``ffprobe``: one audio stream, ``channels=2``,
+    ``channel_layout=stereo``, and the two channels carry different tones, so
+    a per-channel filter's effect is audible (and measurable) per side.
+    """
+    _run(
+        FIXTURES_DIR / _STEREO_NAME,
+        [
+            "-f", "lavfi", "-i", f"testsrc2=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
+            "-f", "lavfi", "-i",
+            f"sine=frequency=440:duration={_DURATION}[l];"
+            f"sine=frequency=880:duration={_DURATION}[r];"
+            "[l][r]join=inputs=2:channel_layout=stereo",
+            "-pix_fmt", "yuv420p",
+            "-shortest",
+        ],
+    )
+
+
 def _generate_subs_vtt() -> Path:
     """A tiny, valid WEBVTT file (3 cues over ~2s) -- plain text, no ffmpeg needed."""
     out_path = FIXTURES_DIR / _SUBS_NAME
@@ -202,6 +230,7 @@ def main() -> int:
     _generate_av()
     _generate_av2()
     _generate_av3()
+    _generate_stereo()
     subs_path = _generate_subs_vtt()
     _generate_avs(subs_path)
     _generate_frame_png()
