@@ -107,18 +107,24 @@
       ]
     }
   ],
-  "outputs": [
+  "sinks": [
     {
-      "ref": "n4",
-      "type": "video",
-      "name": "frame",
-      "metadata": {}
-    },
-    {
-      "ref": "n7",
-      "type": "audio",
-      "name": "sound",
-      "metadata": {}
+      "outputs": [
+        {
+          "ref": "n4",
+          "type": "video",
+          "name": "frame",
+          "metadata": {}
+        },
+        {
+          "ref": "n7",
+          "type": "audio",
+          "name": "sound",
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
     }
   ]
 }

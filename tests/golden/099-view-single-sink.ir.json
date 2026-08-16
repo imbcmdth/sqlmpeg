@@ -47,25 +47,27 @@
       ]
     }
   ],
-  "outputs": [
+  "sinks": [
     {
-      "ref": "n3",
-      "type": "video",
-      "name": null,
-      "metadata": {}
-    },
-    {
-      "ref": "n2",
-      "type": "audio",
-      "name": null,
-      "metadata": {}
+      "outputs": [
+        {
+          "ref": "n3",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        },
+        {
+          "ref": "n2",
+          "type": "audio",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": "720.mp4",
+      "options": {
+        "video_codec": "libx264",
+        "crf": 20
+      }
     }
-  ],
-  "sink": {
-    "path": "720.mp4",
-    "options": {
-      "video_codec": "libx264",
-      "crf": 20
-    }
-  }
+  ]
 }

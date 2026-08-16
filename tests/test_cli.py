@@ -13,12 +13,13 @@ stdin) where file-reading behavior is the point.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from sqlmpeg import cli
-from sqlmpeg.ir import Graph, Output, Sink
+from sqlmpeg.ir import Graph, Output, SinkUnit
 
 VALID_QUERY = "SELECT scale(a.frame, 0.5) FROM input('x.mp4') a"
 BAD_QUERY = "SELECT nope(a.frame) FROM input('x.mp4') a"
@@ -38,12 +39,27 @@ def _sinked_graph(path: str, options: dict[str, object] | None = None) -> Graph:
     Sink-path-resolution tests below monkeypatch ``cli.compile_sql`` to
     return this instead of compiling real SQL.
     """
+    return _multi_sink_graph((path, dict(options or {})))
+
+
+def _multi_sink_graph(*sinks: tuple[str, dict[str, object]]) -> Graph:
+    """One passthrough output per COPY, all reading the same input stream.
+
+    RFC-006's cross-group passthrough shape, hand-built: two groups may map
+    the same source stream without a split (see `sqlmpeg.split._exempt_refs`).
+    """
     return Graph(
         input_paths=["x.mp4"],
         sources={"a": 0},
         nodes={},
-        outputs=[Output(ref="src:a:v:0", type="video", name=None, metadata={})],
-        sink=Sink(path=path, options=dict(options or {})),
+        sinks=[
+            SinkUnit(
+                outputs=[Output(ref="src:a:v:0", type="video", name=None, metadata={})],
+                path=path,
+                options=dict(options),
+            )
+            for path, options in sinks
+        ],
     )
 
 
@@ -144,6 +160,66 @@ def test_compile_dash_o_overrides_sink_path(
     assert code == 0
     assert "override.mp4" in out
     assert "sink.mkv" not in out
+
+
+def test_compile_prints_every_sink_path_of_a_script(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """RFC-006: one ffmpeg command, one output file per COPY."""
+    monkeypatch.setattr(
+        cli,
+        "compile_sql",
+        lambda text, probe=True, portable=False: _multi_sink_graph(
+            ("720.mp4", {}), ("360.mp4", {})
+        ),
+    )
+    code = cli.main(["compile", VALID_QUERY])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert out.count("ffmpeg") == 1
+    assert "720.mp4" in out
+    assert "360.mp4" in out
+
+
+def test_compile_dash_o_against_a_multi_sink_script_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "compile_sql",
+        lambda text, probe=True, portable=False: _multi_sink_graph(
+            ("720.mp4", {}), ("360.mp4", {})
+        ),
+    )
+    code = cli.main(["compile", VALID_QUERY, "-o", "override.mp4"])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "-o takes one path" in captured.err
+    assert "'720.mp4', '360.mp4'" in captured.err
+    assert captured.out == ""
+
+
+def test_compile_graph_only_still_works_for_a_multi_sink_script(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--graph-only prints the filtergraph, which has no paths in it at all."""
+    monkeypatch.setattr(
+        cli,
+        "compile_sql",
+        lambda text, probe=True, portable=False: _multi_sink_graph(
+            ("720.mp4", {}), ("360.mp4", {})
+        ),
+    )
+    code = cli.main(["compile", "--graph-only", VALID_QUERY, "-o", "override.mp4"])
+    assert code == 0
+    assert capsys.readouterr().out == "\n"  # pure passthrough graph
+
+
+def test_explain_shows_the_sinks_list(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["explain", "--no-probe", VALID_QUERY])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert [unit["path"] for unit in payload["sinks"]] == [None]
 
 
 def test_compile_no_probe_skips_probing(
@@ -523,6 +599,46 @@ def test_run_no_output_and_no_sink_is_usage_error(capsys: pytest.CaptureFixture[
     captured = capsys.readouterr()
     assert code == 2
     assert "no output path" in captured.err
+
+
+def test_run_dash_o_against_a_multi_sink_script_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        cli, "compile_sql", lambda text: _multi_sink_graph(("720.mp4", {}), ("360.mp4", {}))
+    )
+    code = cli.main(["run", VALID_QUERY, "-o", "override.mp4"])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "-o takes one path" in captured.err
+
+
+def test_run_of_a_multi_sink_script_reaches_the_ffmpeg_check(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every COPY's path is the query's own, so `run` needs no -o at all."""
+    monkeypatch.setattr(
+        cli, "compile_sql", lambda text: _multi_sink_graph(("720.mp4", {}), ("360.mp4", {}))
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    code = cli.main(["run", VALID_QUERY])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "not found" in captured.err
+
+
+def test_run_checks_every_sinks_output_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = str(tmp_path / "does_not_exist" / "360.mp4")
+    monkeypatch.setattr(
+        cli, "compile_sql", lambda text: _multi_sink_graph(("720.mp4", {}), (missing, {}))
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    code = cli.main(["run", VALID_QUERY])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "does not exist" in captured.err
 
 
 def test_run_missing_output_directory(

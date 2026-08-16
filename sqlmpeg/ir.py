@@ -43,8 +43,8 @@ v1.
 
 Subtitle / data refs are PASSTHROUGH-ONLY (RFC-004): ffmpeg filtergraphs
 carry only video/audio, so a `"src:<alias>:s:<k>"` or `"src:<alias>:d:<k>"`
-ref may only ever appear as a `Graph.outputs` entry (a bare `-map`), never as
-a `Node.inputs` entry and never produced by a `Node.outputs` entry. This
+ref may only ever appear as a `SinkUnit.outputs` entry (a bare `-map`), never
+as a `Node.inputs` entry and never produced by a `Node.outputs` entry. This
 module does not enforce that constraint -- it is a property of well-formed
 IR that later passes (parser/lower in wave 2, split/emit exemptions in wave
 3) are responsible for upholding and checking.
@@ -185,29 +185,53 @@ class Output:
 
 
 @dataclass
-class Sink:
-    """One `COPY (query) TO 'path' WITH (options)` destination (RFC-002).
+class SinkUnit:
+    """One output FILE: its stream list, its destination and its options.
 
-    ``options`` is insertion-ordered and its values are already normalized
-    (validated against `sqlmpeg.sink.SINK_OPTIONS` by lower -- plan 026).
+    RFC-006 replaced ``Graph.outputs`` + ``Graph.sink`` with
+    ``Graph.sinks: list[SinkUnit]`` -- one unit per ``COPY (query) TO 'path'
+    WITH (options)`` of a script, in script order. A unit is exactly what
+    ffmpeg calls an output FILE:
+
+    * ``outputs`` is that COPY's top-level SELECT list, in ``-map`` order.
+      Output STREAM indices are per-file in ffmpeg, so ``-c:<i>`` and
+      ``-metadata:s:<i>`` are indexed within this list, not across the
+      command (emit's ``OutputGroup``).
+    * ``path`` is None only for the bare-SELECT case -- a query with no COPY
+      at all names no destination, so the caller (the CLI's ``-o``, or a
+      placeholder) supplies one. ``options`` is empty then too.
+    * ``options`` is insertion-ordered and its values are already normalized
+      (validated against `sqlmpeg.sink.SINK_OPTIONS` by lower -- plan 026).
+
+    Filtergraph LABELS are graph-scoped, not file-scoped: a single
+    ``-filter_complex`` serves every unit, so emit keeps ``out<i>`` unique
+    across the whole graph (see :attr:`Graph.outputs`).
     """
 
-    path: str
-    options: dict[str, object]
+    outputs: list[Output] = field(default_factory=list)
+    path: str | None = None
+    options: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "path": self.path,
+            "outputs": [output.to_dict() for output in self.outputs],
+            "path": self.path,  # explicit null for the bare-SELECT case
             "options": dict(self.options),
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, object]) -> Sink:
+    def from_dict(cls, d: dict[str, object]) -> SinkUnit:
+        raw_outputs = d["outputs"]
         raw_path = d["path"]
         raw_options = d["options"]
-        assert isinstance(raw_path, str)
+        assert isinstance(raw_outputs, list)
+        assert raw_path is None or isinstance(raw_path, str)
         assert isinstance(raw_options, dict)
-        return cls(path=raw_path, options=dict(raw_options))
+        outputs: list[Output] = []
+        for raw_output in raw_outputs:
+            assert isinstance(raw_output, dict)
+            outputs.append(Output.from_dict(raw_output))
+        return cls(outputs=outputs, path=raw_path, options=dict(raw_options))
 
 
 @dataclass
@@ -215,13 +239,16 @@ class Graph:
     input_paths: list[str]  # -i order; index is the ffmpeg input index
     sources: dict[str, int]  # alias -> index into input_paths
     nodes: dict[str, Node] = field(default_factory=dict)  # insertion-ordered
-    outputs: list[Output] = field(default_factory=list)  # order = -map order
-    sink: Sink | None = None  # COPY ... TO ... WITH (...); None for bare SELECT
+    # RFC-006: one unit per output FILE, in script order. A bare SELECT and a
+    # single COPY are both exactly one unit (path None / the COPY's path); a
+    # script is one per COPY, and they share this graph's nodes -- a view read
+    # by three COPYs is lowered ONCE and fanned out by the split pass.
+    sinks: list[SinkUnit] = field(default_factory=list)
     # RFC-004 input-seek amendment: alias -> (start, end) seconds. Emit (wave
     # 3) renders "-ss <start> -to <end>" immediately before that alias's -i,
     # trimming every stream type of that input coherently. Empty by default;
-    # to_dict emits the "input_trims" key only when non-empty (same
-    # golden-compat pattern as "sink" above). Plan 039 (open-ended windows):
+    # to_dict emits the "input_trims" key only when non-empty. Plan 039
+    # (open-ended windows):
     # either bound may be None -- a missing start omits "-ss", a missing end
     # omits "-to" -- but not both (a WHERE clause always supplies at least
     # one bound; see parser._time_bounds).
@@ -232,22 +259,33 @@ class Graph:
     # alias-keyed map into a per-`-i` list, same as `input_trims`, and renders
     # each input's options immediately before its own `-i` (before any
     # `-ss`/`-to` from `input_trims`). Empty by default; to_dict emits the
-    # "input_options" key only when non-empty (same golden-compat pattern as
-    # "sink"/"input_trims" above).
+    # "input_options" key only when non-empty (same pattern as "input_trims").
     input_options: dict[str, dict[str, object]] = field(default_factory=dict)
+
+    @property
+    def outputs(self) -> list[Output]:
+        """Every unit's outputs concatenated, in sink order (read-only).
+
+        The graph-wide output list: this is the UNION the split pass and
+        emit's consume-once check count over, because a filtergraph pad
+        feeding two different output files is still consumed twice. It is
+        derived, not stored -- an Output belongs to exactly one
+        :class:`SinkUnit`, and its index HERE is only an ffmpeg output stream
+        index when the graph has a single unit (ffmpeg restarts output stream
+        numbering per file). Emit uses it for the graph-scoped ``out<i>``
+        labels, which are unique across the whole command.
+        """
+        return [output for unit in self.sinks for output in unit.outputs]
 
     def to_dict(self) -> dict[str, object]:
         d: dict[str, object] = {
             "inputs": list(self.input_paths),
             "sources": dict(self.sources),
             "nodes": [node.to_dict() for node in self.nodes.values()],
-            "outputs": [output.to_dict() for output in self.outputs],
+            "sinks": [unit.to_dict() for unit in self.sinks],
         }
-        # "sink", "input_trims" and "input_options" are emitted ONLY when
-        # present/non-empty, so every existing golden .ir.json stays
-        # byte-identical -- these changes are additive.
-        if self.sink is not None:
-            d["sink"] = self.sink.to_dict()
+        # "input_trims" and "input_options" are emitted ONLY when non-empty,
+        # so a graph that uses neither keeps the smaller shape.
         if self.input_trims:
             d["input_trims"] = {
                 alias: [start, end] for alias, (start, end) in self.input_trims.items()
@@ -263,11 +301,11 @@ class Graph:
         raw_inputs = d["inputs"]
         raw_sources = d["sources"]
         raw_nodes = d["nodes"]
-        raw_outputs = d["outputs"]
+        raw_sinks = d["sinks"]
         assert isinstance(raw_inputs, list)
         assert isinstance(raw_sources, dict)
         assert isinstance(raw_nodes, list)
-        assert isinstance(raw_outputs, list)
+        assert isinstance(raw_sinks, list)
 
         nodes: dict[str, Node] = {}
         for raw_node in raw_nodes:
@@ -275,16 +313,10 @@ class Graph:
             node = Node.from_dict(raw_node)
             nodes[node.id] = node
 
-        outputs: list[Output] = []
-        for raw_output in raw_outputs:
-            assert isinstance(raw_output, dict)
-            outputs.append(Output.from_dict(raw_output))
-
-        raw_sink = d.get("sink")
-        sink: Sink | None = None
-        if raw_sink is not None:
+        sinks: list[SinkUnit] = []
+        for raw_sink in raw_sinks:
             assert isinstance(raw_sink, dict)
-            sink = Sink.from_dict(raw_sink)
+            sinks.append(SinkUnit.from_dict(raw_sink))
 
         raw_input_trims = d.get("input_trims")
         input_trims: dict[str, tuple[float | None, float | None]] = {}
@@ -310,8 +342,7 @@ class Graph:
             input_paths=[str(p) for p in raw_inputs],
             sources={str(k): int(v) for k, v in raw_sources.items()},
             nodes=nodes,
-            outputs=outputs,
-            sink=sink,
+            sinks=sinks,
             input_trims=input_trims,
             input_options=input_options,
         )

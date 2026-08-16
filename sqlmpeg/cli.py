@@ -11,10 +11,14 @@ Subcommands:
   Windows -- it is documentation output, not something meant to be pasted
   into cmd.exe), or just the ``-filter_complex`` string with
   ``--graph-only``. Output path resolution (RFC-002, plan 027): ``-o`` if
-  given, else the query's ``COPY ... TO`` sink path if it has one, else the
-  ``out.mp4`` placeholder (today's default).
+  given, else the query's ``COPY ... TO`` sink paths if it has any, else the
+  ``out.mp4`` placeholder (today's default). A multi-COPY script (RFC-006)
+  compiles to ONE ffmpeg command with one output file per COPY, so ``-o`` --
+  which names a single file -- is a usage error (exit 2) against it, naming
+  the paths the script found.
 * ``explain SQL [-f FILE] [--no-probe] [--portable]`` -- dump the IR graph
-  as JSON (the sink, if any, is part of that JSON already).
+  as JSON (the sinks, with their paths and options, are part of that JSON
+  already).
 * ``validate SQL [-f FILE] [--json] [--no-probe] [--portable]`` -- exit 0
   silent on success; on error, exit 1 with either a one-line human message
   or ``err.to_dict()`` JSON.
@@ -24,8 +28,10 @@ Subcommands:
   probes -- the files must exist to execute, so there is no ``--no-probe``
   escape hatch here; it has no ``--portable`` either, since it needs an
   installed ffmpeg to execute against regardless. Output path: ``-o`` if
-  given, else the query's sink path, else a usage error (exit 2) -- unlike
-  ``compile``, ``run`` never falls back to a placeholder path.
+  given, else the query's sink paths, else a usage error (exit 2) -- unlike
+  ``compile``, ``run`` never falls back to a placeholder path. A multi-COPY
+  script runs as the single ffmpeg command it compiles to, writing every
+  COPY's file; ``-o`` against one is the same usage error ``compile`` gives.
 * ``prompt [--dynamic]`` -- print the portable LLM system prompt (plan 012)
   to stdout; takes no other arguments and never touches the filesystem.
   ``--dynamic`` (plan 032, RFC-003) appends an "Installed filters" section
@@ -266,13 +272,32 @@ def _check_output_dir(out_path: str) -> str | None:
     return None
 
 
-def _resolve_out_path(cli_output: str | None, graph: Graph, *, default: str | None) -> str | None:
-    """Output path precedence (RFC-002, plan 027): ``-o`` > sink path > `default`."""
-    if cli_output is not None:
-        return cli_output
-    if graph.sink is not None:
-        return graph.sink.path
-    return default
+def _reject_output_override(cli_output: str | None, graph: Graph) -> str | None:
+    """``-o`` names ONE file, so it is illegal against a multi-sink script.
+
+    RFC-006: a script's COPYs each carry their own destination, and one ``-o``
+    cannot stand in for several — it would silently write every group over the
+    same file. Returns the stderr message (usage error, exit 2), or None.
+    """
+    if cli_output is None or len(graph.sinks) <= 1:
+        return None
+    paths = ", ".join(repr(unit.path) for unit in graph.sinks)
+    return (
+        f"error: -o takes one path, but this script writes {len(graph.sinks)} "
+        f"files ({paths}); drop -o and let each COPY write its own"
+    )
+
+
+def _needs_out_path(graph: Graph) -> bool:
+    """True if some sink names no destination — i.e. the bare-SELECT case."""
+    return any(unit.path is None for unit in graph.sinks)
+
+
+def _output_paths(out_path: str | None, graph: Graph) -> list[str]:
+    """Every file this command will write, for the directory-existence check."""
+    if out_path is not None:
+        return [out_path]
+    return [unit.path for unit in graph.sinks if unit.path is not None]
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +321,16 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         print(emitted.filter_complex)
         return 0
 
-    out_path = _resolve_out_path(args.output, graph, default=_DEFAULT_OUT)
+    override_error = _reject_output_override(args.output, graph)
+    if override_error is not None:
+        print(override_error, file=sys.stderr)
+        return 2
+
+    # `-o` if given; else each COPY's own path (build_ffmpeg_args reads them
+    # off the groups), with the placeholder standing in for a bare SELECT.
+    out_path = args.output
+    if out_path is None and _needs_out_path(graph):
+        out_path = _DEFAULT_OUT
     ffmpeg_args = build_ffmpeg_args(emitted, out_path)
     print(shlex.join(ffmpeg_args))
     return 0
@@ -350,18 +384,24 @@ def _cmd_run(args: argparse.Namespace) -> int:
         _print_error(err, source=args.query)
         return 1
 
-    out_path = _resolve_out_path(args.output, graph, default=None)
-    if out_path is None:
+    override_error = _reject_output_override(args.output, graph)
+    if override_error is not None:
+        print(override_error, file=sys.stderr)
+        return 2
+
+    out_path = args.output
+    if out_path is None and _needs_out_path(graph):
         print(
             "error: no output path given: pass -o, or use COPY ... TO in the query",
             file=sys.stderr,
         )
         return 2
 
-    dir_error = _check_output_dir(out_path)
-    if dir_error is not None:
-        print(dir_error, file=sys.stderr)
-        return 1
+    for path in _output_paths(out_path, graph):
+        dir_error = _check_output_dir(path)
+        if dir_error is not None:
+            print(dir_error, file=sys.stderr)
+            return 1
 
     if shutil.which("ffmpeg") is None:
         print("error: ffmpeg not found on PATH", file=sys.stderr)

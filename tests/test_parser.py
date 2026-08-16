@@ -1012,7 +1012,6 @@ def test_alias_colliding_with_cte_name() -> None:
         "WITH RECURSIVE c AS (SELECT a.frame FROM input('x') a) SELECT c.frame FROM c",
         "WITH c AS (WITH d AS (SELECT a.frame FROM input('x') a) SELECT d.frame FROM d) "
         "SELECT c.frame FROM c",
-        "WITH c AS (SELECT a.frame FROM input('x') a) SELECT z.frame FROM c z",
         "SELECT a.frame FROM input('x') a(c)",
         "SELECT frame FROM input('x') a",
         "SELECT a.frame FROM sch.tbl a",
@@ -1519,12 +1518,59 @@ def test_a_bad_view_body_is_rejected_like_any_other_query() -> None:
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
 
 
-def test_a_view_may_not_be_aliased_in_from() -> None:
-    """Same rule a CTE has had all along -- reference it by its own name."""
-    err = _reject(
+def test_a_view_may_be_aliased_in_from() -> None:
+    """RFC-006 relaxed it: `FROM master m` binds a BRANCH-LOCAL name."""
+    res = _resolve(
         f"CREATE VIEW v AS {_VIEW_BODY};\nCOPY (SELECT m.f FROM v m) TO 'out.mp4';"
     )
+    assert list(res.views) == ["v"]
+    assert [sink.path for sink in res.sinks] == ["out.mp4"]
+
+
+def test_two_sinks_may_reuse_the_same_view_alias() -> None:
+    """The alias is branch-local, so it is not in the flat namespace at all."""
+    res = _resolve(
+        f"CREATE VIEW v AS {_VIEW_BODY};\n"
+        "COPY (SELECT m.f FROM v m) TO 'a.mp4';\n"
+        "COPY (SELECT m.f FROM v m) TO 'b.mp4';"
+    )
+    assert [sink.path for sink in res.sinks] == ["a.mp4", "b.mp4"]
+
+
+def test_a_view_alias_may_not_shadow_a_flat_namespace_name() -> None:
+    err = _reject(
+        f"CREATE VIEW v AS {_VIEW_BODY};\n"
+        "COPY (SELECT a.f FROM v a, input('y.mp4') a) TO 'out.mp4';"
+    )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "duplicate name 'a'" in err.message
+
+
+def test_a_view_alias_may_not_be_the_filter_namespace() -> None:
+    err = _reject(
+        f"CREATE VIEW v AS {_VIEW_BODY};\n"
+        "COPY (SELECT ffmpeg.f FROM v ffmpeg) TO 'out.mp4';"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "reserved" in err.message
+
+
+def test_a_cte_may_be_aliased_too() -> None:
+    """The relaxation is on the binding, not on how it was defined."""
+    res = _resolve(
+        "WITH c AS (SELECT a.frame FROM input('x') a) SELECT z.frame FROM c z"
+    )
+    assert list(res.ctes) == ["c"]
+
+
+def test_an_aliased_name_may_not_collide_with_another_from_entry() -> None:
+    err = _reject(
+        "WITH c AS (SELECT a.frame FROM input('x') a), "
+        "d AS (SELECT b.frame FROM input('y') b) "
+        "SELECT z.frame FROM c z, d z"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "duplicate name 'z'" in err.message
 
 
 # ---------------------------------------------------------------------------

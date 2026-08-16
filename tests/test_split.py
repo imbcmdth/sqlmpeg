@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlmpeg.ir import Graph, Node, Output, StreamType
+from sqlmpeg.ir import Graph, Node, Output, SinkUnit, StreamType
 from sqlmpeg.split import insert_splits
 
 
@@ -31,7 +31,7 @@ def _no_fanout_graph() -> Graph:
         inputs=["src:a:v:0", "n1"],
         outputs=["video"],
     )
-    g.outputs = [_out("n2")]
+    g.sinks = [SinkUnit(outputs=[_out("n2")])]
     return g
 
 
@@ -54,7 +54,7 @@ def _node_fanout_graph() -> Graph:
         inputs=["n1", "n2"],
         outputs=["video"],
     )
-    g.outputs = [_out("n3")]
+    g.sinks = [SinkUnit(outputs=[_out("n3")])]
     return g
 
 
@@ -67,7 +67,7 @@ def _audio_fanout_graph() -> Graph:
     g.nodes["n1"] = Node(id="n1", filter="highpass", args={}, inputs=["n0"], outputs=["audio"])
     g.nodes["n2"] = Node(id="n2", filter="lowpass", args={}, inputs=["n0"], outputs=["audio"])
     g.nodes["n3"] = Node(id="n3", filter="amix", args={}, inputs=["n1", "n2"], outputs=["audio"])
-    g.outputs = [_out("n3", "audio")]
+    g.sinks = [SinkUnit(outputs=[_out("n3", "audio")])]
     return g
 
 
@@ -80,7 +80,7 @@ def _src_fanout_graph() -> Graph:
     g.nodes["n3"] = Node(
         id="n3", filter="merge3", args={}, inputs=["n0", "n1", "n2"], outputs=["video"]
     )
-    g.outputs = [_out("n3")]
+    g.sinks = [SinkUnit(outputs=[_out("n3")])]
     return g
 
 
@@ -89,7 +89,7 @@ def _output_edge_fanout_graph() -> Graph:
     g = Graph(input_paths=["a.mp4"], sources={"a": 0})
     g.nodes["n0"] = Node(id="n0", filter="f0", args={}, inputs=["src:a:v:0"], outputs=["video"])
     g.nodes["n1"] = Node(id="n1", filter="f1", args={}, inputs=["n0"], outputs=["video"])
-    g.outputs = [_out("n0")]
+    g.sinks = [SinkUnit(outputs=[_out("n0")])]
     return g
 
 
@@ -108,7 +108,7 @@ def _mixed_video_audio_graph() -> Graph:
     g.nodes["a1"] = Node(id="a1", filter="highpass", args={}, inputs=["a0"], outputs=["audio"])
     g.nodes["a2"] = Node(id="a2", filter="lowpass", args={}, inputs=["a0"], outputs=["audio"])
     g.nodes["a3"] = Node(id="a3", filter="amix", args={}, inputs=["a1", "a2"], outputs=["audio"])
-    g.outputs = [_out("v3", "video"), _out("a3", "audio")]
+    g.sinks = [SinkUnit(outputs=[_out("v3", "video"), _out("a3", "audio")])]
     return g
 
 
@@ -117,7 +117,7 @@ def _multi_output_graph() -> Graph:
     g = Graph(input_paths=["a.mp4"], sources={"a": 0})
     g.nodes["n0"] = Node(id="n0", filter="scale", args={}, inputs=["src:a:v:0"], outputs=["video"])
     g.nodes["n1"] = Node(id="n1", filter="hflip", args={}, inputs=["n0"], outputs=["video"])
-    g.outputs = [_out("n0", name="orig"), _out("n0", name="dup")]
+    g.sinks = [SinkUnit(outputs=[_out("n0", name="orig"), _out("n0", name="dup")])]
     return g
 
 
@@ -299,9 +299,13 @@ def test_idempotent_on_multi_output_graph() -> None:
 def _duplicate_subtitle_graph() -> Graph:
     """One subtitle src ref named by TWO Outputs (legal per RFC-004)."""
     g = Graph(input_paths=["a.mkv"], sources={"a": 0})
-    g.outputs = [
-        _out("src:a:s:0", "subtitle", name="caps"),
-        _out("src:a:s:0", "subtitle", name="caps_again"),
+    g.sinks = [
+        SinkUnit(
+            outputs=[
+                _out("src:a:s:0", "subtitle", name="caps"),
+                _out("src:a:s:0", "subtitle", name="caps_again"),
+            ]
+        )
     ]
     return g
 
@@ -317,7 +321,7 @@ def test_duplicate_subtitle_ref_is_not_split() -> None:
 
 def test_duplicate_data_ref_is_not_split() -> None:
     g = Graph(input_paths=["a.mkv"], sources={"a": 0})
-    g.outputs = [_out("src:a:d:0", "data"), _out("src:a:d:0", "data")]
+    g.sinks = [SinkUnit(outputs=[_out("src:a:d:0", "data"), _out("src:a:d:0", "data")])]
     out = insert_splits(g)
     assert out.nodes == {}
     assert [o.ref for o in out.outputs] == ["src:a:d:0", "src:a:d:0"]
@@ -332,11 +336,15 @@ def test_subtitle_exemption_does_not_disturb_a_video_fanout_in_the_same_graph() 
     g.nodes["n1"] = Node(
         id="n1", filter="vflip", args={}, inputs=["src:a:v:0"], outputs=["video"]
     )
-    g.outputs = [
-        _out("n0"),
-        _out("n1"),
-        _out("src:a:s:0", "subtitle"),
-        _out("src:a:s:0", "subtitle"),
+    g.sinks = [
+        SinkUnit(
+            outputs=[
+                _out("n0"),
+                _out("n1"),
+                _out("src:a:s:0", "subtitle"),
+                _out("src:a:s:0", "subtitle"),
+            ]
+        )
     ]
     out = insert_splits(g)
     assert out.nodes["src_a_v_0_split"].outputs == ["video", "video"]
@@ -350,6 +358,98 @@ def test_idempotent_on_duplicate_subtitle_refs() -> None:
     once = insert_splits(g)
     twice = insert_splits(once)
     assert once.to_dict() == twice.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# RFC-006: several sinks, and the cross-GROUP passthrough exemption (plan 046)
+# ---------------------------------------------------------------------------
+
+
+def _two_sink_passthrough_graph() -> Graph:
+    """The same audio src ref bare-mapped by TWO output files."""
+    g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    g.sinks = [
+        SinkUnit(outputs=[_out("src:a:a:0", "audio")], path="one.m4a"),
+        SinkUnit(outputs=[_out("src:a:a:0", "audio")], path="two.m4a"),
+    ]
+    return g
+
+
+def test_a_source_stream_mapped_once_per_file_is_not_split() -> None:
+    """Repeating `-map 0:a:0` in a second output FILE is legal ffmpeg, and it
+    keeps both files stream-copying the track."""
+    out = insert_splits(_two_sink_passthrough_graph())
+    assert out.nodes == {}
+    assert [unit.outputs[0].ref for unit in out.sinks] == ["src:a:a:0", "src:a:a:0"]
+
+
+def test_the_cross_group_exemption_is_idempotent() -> None:
+    once = insert_splits(_two_sink_passthrough_graph())
+    assert once.to_dict() == insert_splits(once).to_dict()
+
+
+def test_a_source_stream_mapped_twice_in_ONE_file_is_still_split() -> None:
+    """Within a single output the exemption does not apply: that is the
+    ordinary fan-out the pass has always split."""
+    g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    g.sinks = [
+        SinkUnit(
+            outputs=[_out("src:a:a:0", "audio"), _out("src:a:a:0", "audio")],
+            path="one.m4a",
+        )
+    ]
+    out = insert_splits(g)
+    assert out.nodes["src_a_a_0_split"].outputs == ["audio", "audio"]
+    assert [o.ref for o in out.outputs] == ["src_a_a_0_split:0", "src_a_a_0_split:1"]
+
+
+def test_a_source_stream_a_filter_also_reads_is_still_split() -> None:
+    """One group filters it, another bare-maps it: no exemption, it is a pad."""
+    g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    g.nodes["n0"] = Node(
+        id="n0", filter="volume", args={}, inputs=["src:a:a:0"], outputs=["audio"]
+    )
+    g.sinks = [
+        SinkUnit(outputs=[_out("n0", "audio")], path="one.m4a"),
+        SinkUnit(outputs=[_out("src:a:a:0", "audio")], path="two.m4a"),
+    ]
+    out = insert_splits(g)
+    assert out.nodes["src_a_a_0_split"].outputs == ["audio", "audio"]
+    assert out.nodes["n0"].inputs == ["src_a_a_0_split:0"]
+    assert out.sinks[1].outputs[0].ref == "src_a_a_0_split:1"
+
+
+def test_one_node_pad_read_by_two_sinks_is_split() -> None:
+    """A real filtergraph pad is consume-once across FILES too."""
+    g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    g.nodes["n0"] = Node(
+        id="n0", filter="scale", args={}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    g.sinks = [
+        SinkUnit(outputs=[_out("n0")], path="one.mp4"),
+        SinkUnit(outputs=[_out("n0")], path="two.mp4"),
+    ]
+    out = insert_splits(g)
+    assert out.nodes["n0_split"].outputs == ["video", "video"]
+    assert [unit.outputs[0].ref for unit in out.sinks] == ["n0_split:0", "n0_split:1"]
+
+
+def test_sink_paths_and_options_survive_the_split_pass() -> None:
+    g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    g.nodes["n0"] = Node(
+        id="n0", filter="scale", args={}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    g.sinks = [
+        SinkUnit(outputs=[_out("n0")], path="one.mp4", options={"crf": 20}),
+        SinkUnit(outputs=[_out("n0")], path="two.mp4", options={"crf": 30}),
+    ]
+    out = insert_splits(g)
+    assert [(unit.path, unit.options) for unit in out.sinks] == [
+        ("one.mp4", {"crf": 20}),
+        ("two.mp4", {"crf": 30}),
+    ]
+    out.sinks[0].options["crf"] = 99  # purity: copied, not shared
+    assert g.sinks[0].options == {"crf": 20}
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +532,7 @@ def test_a_zero_input_node_fans_out_through_an_ordinary_split() -> None:
     g.nodes["n2"] = Node(
         id="n2", filter="hflip", args={}, inputs=["n1"], outputs=["video"]
     )
-    g.outputs = [_out("n2"), _out("n1")]
+    g.sinks = [SinkUnit(outputs=[_out("n2"), _out("n1")])]
 
     out = insert_splits(g)
 

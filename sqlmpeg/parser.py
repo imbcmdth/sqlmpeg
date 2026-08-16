@@ -32,7 +32,10 @@ Notes for downstream passes (lower):
   for the VERIFIED sqlglot shapes. A view is to STATEMENTS what a CTE is to
   branches, so it is stored as one: ``Resolved.ctes`` is the flat, ordered
   binding table (views AND CTEs, in definition order) that lower walks, and
-  ``Resolved.views`` names the subset that came from a ``CREATE VIEW``.
+  ``Resolved.views`` names the subset that came from a ``CREATE VIEW``. A
+  binding may be ALIASED in FROM (``FROM master m``, plan 046): the alias is
+  branch-local — two branches, or two COPYs, may both spell it ``m`` — but it
+  may not shadow the flat namespace (:meth:`_Resolver._local_alias`).
 * Named function arguments (``gblur(a.frame, sigma => 5)``, RFC-003) are native
   Postgres syntax: sqlglot parses each into an ``exp.Kwarg(this=Var(name),
   expression=<value>)`` inside the call's ``expressions`` list. The resolver only
@@ -644,8 +647,9 @@ class Resolved:
     select: QueryExpr
     """The query being compiled, CTEs still attached; ``exp.Union`` for UNION ALL.
 
-    For a script this is ``sinks[0].query``: lowering is single-sink until
-    plan 046, which retires this field in favour of walking ``sinks``.
+    For anything with a COPY this MIRRORS ``sinks[0].query``; lower reads it
+    only for the bare-SELECT case (no COPY at all), and walks ``sinks``
+    otherwise. Retiring the field is parser cleanup, not this wave's.
     """
 
     input_paths: list[str]
@@ -670,10 +674,9 @@ class Resolved:
     sinks: list[RawSink] = field(default_factory=list)
     """One entry per ``COPY``, in script order; EMPTY for a bare SELECT.
 
-    RFC-006 replaced the single ``sink`` field with this list so the parser
-    contract is already multi-sink. Resolve accepts any number; ``lower``
-    TEMPORARILY rejects more than one until plan 046 builds the multi-sink
-    core.
+    RFC-006 replaced the single ``sink`` field with this list. Resolve accepts
+    any number and lower turns each into one ``ir.SinkUnit`` -- one output
+    FILE of the single ffmpeg command the script compiles to (plan 046).
     """
 
     views: dict[str, QueryExpr] = field(default_factory=dict)
@@ -1642,14 +1645,6 @@ class _Resolver:
             return
         if isinstance(inner, exp.Identifier):
             name = _ident_name(inner)
-            if alias_node is not None:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"aliasing CTE '{name}' is not supported",
-                    alias_node,
-                    fallback=table,
-                    hint="reference the CTE by its own name",
-                )
             if name not in visible:
                 raise _error(
                     ErrorCode.UNKNOWN_ALIAS,
@@ -1658,25 +1653,54 @@ class _Resolver:
                     fallback=table,
                     hint=self._known_hint(visible),
                 )
-            if name in scope:
+            # Feeds the unused-VIEW check (RFC-006). CTE names land here too;
+            # only views are required to be read.
+            self.used.add(name)
+            local = self._local_alias(name, alias_node, table)
+            if local in scope:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"duplicate name '{name}'",
-                    inner,
+                    f"duplicate name '{local}'",
+                    alias_node if alias_node is not None else inner,
                     fallback=table,
                     hint="a name can appear only once per FROM clause; to consume "
                     "it twice, reference <name>.frame twice — reuse is automatic",
                 )
-            # Feeds the unused-VIEW check (RFC-006). CTE names land here too;
-            # only views are required to be read.
-            self.used.add(name)
-            scope[name] = "cte"
+            scope[local] = "cte"
             return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             "only input('path') and CTE names are allowed in FROM",
             table,
         )
+
+    def _local_alias(
+        self, name: str, alias_node: exp.Expr | None, table: exp.Table
+    ) -> str:
+        """The name a view/CTE is read under in THIS branch (RFC-006).
+
+        ``FROM master`` reads it under its own name; ``FROM master m`` binds
+        ``m``, and that binding is BRANCH-LOCAL — nothing else about a branch
+        escapes it either, so two branches (or two COPYs of one script) may
+        both spell it ``m``, and the alias is not recorded in the flat
+        namespace. What it may NOT do is SHADOW that namespace: an alias that
+        collides with a view, a CTE, an input alias, a generated source or
+        the ``ffmpeg`` namespace would make one name mean two things inside a
+        single FROM clause. :meth:`_reserve` is exactly that check, and it
+        records nothing, so it is the whole rule here.
+        """
+        if alias_node is None:
+            return name
+        if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"malformed alias for '{name}'",
+                alias_node,
+                fallback=table,
+            )
+        local = _ident_name(alias_node.this)
+        self._reserve(local, alias_node.this)
+        return local
 
     def _add_input(
         self,

@@ -48,11 +48,18 @@ What lowering does, in order:
 
 * CTE bodies lower first, in definition order, into the *same* graph. A CTE
   records a list of ``(name, type, ref)`` columns — its SELECT list — and
-  ``FROM <cte>`` later exposes those columns by their ``AS`` names.
+  ``FROM <cte>`` later exposes those columns by their ``AS`` names. A script's
+  VIEWS are CTEs here (RFC-006): ``Resolved.ctes`` holds both, so the whole
+  binding table is lowered exactly ONCE no matter how many COPYs read it.
+* Then one :class:`~sqlmpeg.ir.SinkUnit` per ``COPY``, in script order, each
+  from that COPY's own query (RFC-006) — or, for a bare SELECT, a single unit
+  with ``path=None``. Every unit shares this graph's nodes, so a view read by
+  three COPYs is decoded and filtered once and fanned out by the split pass.
 * Inside a branch, ``FROM`` builds a typed environment: an ``input()`` alias
   exposes per-type stream access (``a.video[1]`` -> ``"src:a:v:0"``; SQL
   subscripts are 1-based, IR indices 0-based), a CTE alias exposes its
-  recorded columns, and a ``ffmpeg.<source>(...)`` alias exposes exactly one
+  recorded columns (under its own name, or under a branch-local alias:
+  ``FROM master m``), and a ``ffmpeg.<source>(...)`` alias exposes exactly one
   statically-typed stream (see below).
 * ``<alias>.frame`` is sugar for ``<alias>.video[1]`` (v0 compat). A single
   unnamed video column of a CTE is likewise reachable as ``<cte>.frame``.
@@ -246,7 +253,7 @@ from sqlglot import exp
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import validate_option as validate_input_option
-from sqlmpeg.ir import FrameRef, Graph, Node, Output, Sink, StreamType
+from sqlmpeg.ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType
 from sqlmpeg.parser import (
     FILTER_NAMESPACE,
     RawSink,
@@ -886,35 +893,40 @@ class _Lowerer:
     # -- entry point ------------------------------------------------------
 
     def run(self) -> Graph:
+        """Lower every CTE/view once, then one :class:`SinkUnit` per COPY.
+
+        The bindings come first and are shared: ``res.ctes`` holds a script's
+        views AND every COPY's own ``WITH``, in written order (RFC-006), and
+        each is lowered into THIS graph exactly once. A view read by three
+        COPYs therefore mints its nodes once and hands the same refs to all
+        three — the fan-out is the split pass's ordinary business, which is
+        the whole point of the ABR ladder compiling to one ffmpeg command.
+
+        ``res.select`` / ``res.branches`` are read for the BARE-SELECT case
+        only (a query with no COPY at all, which is the one unit whose path
+        is None). When there are sinks they are just a mirror of ``sinks[0]``
+        and walking them again would lower the first group twice.
+        """
         for name, body in self.res.ctes.items():
             self.cte_columns[name] = tuple(
                 self._lower_query(union_branches(body), body)
             )
-        columns = self._lower_query(self.res.branches, self.res.select)
-        # The SELECT list IS the output stream list, and an array column is
-        # several streams, so it splats into consecutive Outputs. Every element
-        # of an aliased array column keeps that alias VERBATIM (no ordinal
-        # suffix): the alias names the column, not the stream, and ffmpeg
-        # metadata naming is plan 022's business.
-        self.graph.outputs = [
-            Output(
-                ref=stream.ref,
-                type=stream.type,
-                name=column.name,
-                metadata=_provenance(stream),
-            )
-            for column in columns
-            for stream in column.value.streams
-        ]
         if self.res.sinks:
-            self.graph.sink = self._lower_sink(self.res.sinks[0])
+            self.graph.sinks = [self._lower_sink(raw) for raw in self.res.sinks]
+        else:
+            columns = self._lower_query(self.res.branches, self.res.select)
+            self.graph.sinks = [SinkUnit(outputs=_outputs(columns))]
         self.graph.input_options = self._lower_input_options()
         return self.graph
 
-    # -- the COPY sink (RFC-002) -------------------------------------------
+    # -- the COPY sink (RFC-002, RFC-006) ----------------------------------
 
-    def _lower_sink(self, raw: RawSink) -> Sink:
-        """Validate the COPY options against the table and normalize them.
+    def _lower_sink(self, raw: RawSink) -> SinkUnit:
+        """One COPY: its own query lowered, its options validated.
+
+        Each COPY carries a whole query of its own (``RawSink.query`` /
+        ``.branches``, already validated by resolve), so a sink unit is that
+        query's SELECT list plus the destination it names.
 
         Anchoring, VERIFIED against sqlglot 30.17: the option NAME (an
         ``exp.Var``) carries no token position, and neither does a ``Boolean``
@@ -922,13 +934,14 @@ class _Lowerer:
         node to the value node to the path literal — which at least keeps
         every rejection on (or just above) the ``WITH`` block.
         """
+        columns = self._lower_query(list(raw.branches), raw.query)
         options: dict[str, object] = {}
         for option in raw.options:
             line, col = _pos(option.name_node, option.value, raw.path_node)
             options[option.name] = validate_sink_option(
                 option.name, _sink_value(option.value), line=line, col=col
             )
-        return Sink(path=raw.path, options=options)
+        return SinkUnit(outputs=_outputs(columns), path=raw.path, options=options)
 
     # -- input() named options (RFC-005 SS4, plan 041) ---------------------
 
@@ -1276,7 +1289,16 @@ class _Lowerer:
                     fallback=table,
                     hint=self._known_hint(),
                 )
-            env.bindings[name] = _CteBinding(name=name, columns=columns)
+            # RFC-006: `FROM master m` binds the view/CTE under a BRANCH-LOCAL
+            # name (resolve checked it shadows nothing in the flat namespace).
+            # The binding records the local name, so `m.v` resolves and every
+            # message about it reads back as the user wrote it; the columns —
+            # and therefore the graph refs — are the same objects either way,
+            # which is what makes the shared subgraph shared.
+            local = name
+            if isinstance(alias_node, exp.TableAlias) and alias_node.this is not None:
+                local = _fold(alias_node.this)
+            env.bindings[local] = _CteBinding(name=local, columns=columns)
             return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -2716,6 +2738,27 @@ def _agreed_source(segments: list[_Stream]) -> StreamMeta | None:
     return segments[0].source
 
 
+def _outputs(columns: list[_Column]) -> list[Output]:
+    """One :class:`~sqlmpeg.ir.Output` per stream a SELECT list carries.
+
+    The SELECT list IS the output stream list, and an array column is several
+    streams, so it splats into consecutive Outputs. Every element of an
+    aliased array column keeps that alias VERBATIM (no ordinal suffix): the
+    alias names the column, not the stream, and ffmpeg metadata naming is
+    plan 022's business.
+    """
+    return [
+        Output(
+            ref=stream.ref,
+            type=stream.type,
+            name=column.name,
+            metadata=_provenance(stream),
+        )
+        for column in columns
+        for stream in column.value.streams
+    ]
+
+
 def _flatten(columns: list[_Column]) -> list[_Column]:
     """One column per stream: arrays are gone, every column is a scalar.
 
@@ -3035,39 +3078,6 @@ def _match_variant(
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# TEMPORARY (plan 045, RFC-006 wave 1) — DELETE THIS WHOLE SECTION IN PLAN 046
-# ---------------------------------------------------------------------------
-#
-# The parser contract is already multi-sink (`Resolved.sinks`, one entry per
-# COPY, each carrying its own validated query), but the IR is not: `Graph` has
-# one `sink` and one `outputs` list, which plan 046 replaces with
-# `Graph.sinks: list[SinkUnit]`. Until it does, a script that resolves cleanly
-# with more than one COPY is rejected HERE — after resolve, so the parser tests
-# can assert the resolution is clean — rather than silently compiling only the
-# first sink. Views are NOT affected: a script with views and exactly one COPY
-# compiles end to end, because a view lowers as a CTE bound before everything.
-#
-# To delete: drop `_reject_multiple_sinks` and its call in `lower()`, and the
-# tests marked `TEMPORARY (plan 045)` in tests/test_lower.py.
-
-
-def _reject_multiple_sinks(res: Resolved) -> None:
-    if len(res.sinks) < 2:
-        return
-    second = res.sinks[1]
-    line, col = _pos(second.path_node)
-    paths = ", ".join(repr(sink.path) for sink in res.sinks)
-    raise SqlmpegError(
-        ErrorCode.UNSUPPORTED_SQL,
-        f"a script writes exactly one file for now, got {len(res.sinks)} "
-        f"({paths}); multiple sinks land in the next wave",
-        line=line,
-        col=col,
-        hint="keep one COPY per script",
-    )
-
-
 def lower(
     res: Resolved,
     probes: dict[str, ProbeResult | None],
@@ -3094,7 +3104,6 @@ def lower(
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
-    _reject_multiple_sinks(res)
     try:
         return _Lowerer(res, probes, registry, portable).run()
     except SqlmpegError:

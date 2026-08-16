@@ -21,12 +21,18 @@
       ]
     }
   ],
-  "outputs": [
+  "sinks": [
     {
-      "ref": "n1",
-      "type": "video",
-      "name": null,
-      "metadata": {}
+      "outputs": [
+        {
+          "ref": "n1",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
     }
   ],
   "input_trims": {

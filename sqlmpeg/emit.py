@@ -15,14 +15,27 @@ FrameRef grammar consumed here (authoritative source: ``ir.py``)::
     "src:<alias>:d:<k>"  -> same for data; rendered as "<index>:d:<k>"
 
 Subtitle and data refs (RFC-004) are passthrough-only: they only ever appear
-as ``Graph.outputs`` entries and are only ever rendered as bare ``-map``
-targets, never as filtergraph labels. Repeating one is legal ffmpeg, so they
-are exempt from the consume-once check (:func:`_check_fanout`).
+as sink-unit outputs and are only ever rendered as bare ``-map`` targets,
+never as filtergraph labels. Repeating one is legal ffmpeg, so they are exempt
+from the consume-once check (:func:`_check_fanout`).
 
-Outputs and passthrough
+Output groups (RFC-006)
 -----------------------
-``Graph.outputs`` is the output stream list: one ``Output`` per top-level
-SELECT column, in ``-map`` order. Each one becomes an :class:`OutputMap`:
+``Graph.sinks`` is one :class:`~sqlmpeg.ir.SinkUnit` per output FILE, and
+:attr:`Emitted.groups` mirrors it one-for-one. The whole command is a single
+ffmpeg invocation: the inputs are rendered once, the ``-filter_complex`` once,
+and then each group contributes its own ``-map`` block, per-stream options,
+sink options and path, in that order — ffmpeg's own native multi-output form.
+
+Two scopes matter here and they are NOT the same:
+
+* output STREAM indices restart at 0 in every output file, so ``-c:<i>`` and
+  ``-metadata:s:<i>`` are indexed within a group;
+* filtergraph LABELS are graph-scoped — one filter_complex serves the whole
+  command — so ``out<i>`` is indexed over ``Graph.outputs``, the union of
+  every group's outputs, and stays unique across the command.
+
+Each ``Output`` becomes an :class:`OutputMap`:
 
 * **passthrough** -- ``Output.ref`` is a source ref with zero node consumers.
   The stream never enters the filtergraph: the map target is the bare ffmpeg
@@ -133,7 +146,7 @@ from dataclasses import dataclass, field
 
 from .errors import ErrorCode, SqlmpegError
 from .inputs import INPUT_OPTIONS, InputOptionSpec
-from .ir import FrameRef, Graph, Node, Output, Sink, StreamType, is_src, src_parts
+from .ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType, is_src, src_parts
 from .sink import SINK_OPTIONS, SinkOptionSpec
 
 OUTPUT_LABEL_PREFIX = "out"
@@ -181,11 +194,28 @@ class OutputMap:
 
 
 @dataclass
+class OutputGroup:
+    """One output FILE of the command: its maps, its path, its options.
+
+    Mirrors one :class:`~sqlmpeg.ir.SinkUnit` (RFC-006). `maps` is that
+    file's ``-map`` list in SELECT order, and its INDEX is the ffmpeg output
+    stream index — per file, because ffmpeg restarts output stream numbering
+    at every output — so ``-c:<i>``/``-metadata:s:<i>`` are computed from it
+    and from nothing wider. `path` is None only for a bare-SELECT graph,
+    where the caller supplies the destination (`build_ffmpeg_args`'s
+    ``out_path``). `options` are the validated ``WITH (...)`` sink options.
+    """
+
+    maps: list[OutputMap]
+    path: str | None = None
+    options: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass
 class Emitted:
     inputs: list[str]  # file paths in -i order
     filter_complex: str  # "" when every output is a passthrough
-    maps: list[OutputMap]  # one per Graph.outputs entry, same order
-    sink: Sink | None = None  # copied from Graph.sink (RFC-002, plan 027)
+    groups: list[OutputGroup]  # one per Graph.sinks entry, same order
     # RFC-004 input-seek amendment: entry `i` is the (start, end) window of the
     # `-i` at index `i`, or None if that input is not seeked. Plan 039: either
     # half of a present window may itself be None (open-ended). :func:`emit`
@@ -198,6 +228,17 @@ class Emitted:
     # none. Parallel to `inputs`, same convention as `input_trims`.
     input_options: list[dict[str, object]] = field(default_factory=list)
 
+    @property
+    def maps(self) -> list[OutputMap]:
+        """Every group's maps concatenated, in command order (read-only).
+
+        A convenience view of the whole command's ``-map`` list. Its index is
+        an ffmpeg output STREAM index only when there is exactly one group:
+        ffmpeg numbers output streams per FILE, which is why
+        ``build_ffmpeg_args`` walks ``groups`` and never this.
+        """
+        return [mapping for group in self.groups for mapping in group.maps]
+
 
 def emit(g: Graph) -> Emitted:
     """Render `g` as an ffmpeg filtergraph plus its output map list.
@@ -205,35 +246,37 @@ def emit(g: Graph) -> Emitted:
     Raises ``SqlmpegError(INTERNAL)`` if the graph is malformed: a cycle or
     non-topological node ordering, a dangling FrameRef, no outputs, or a pad
     with more than one consumer (which means the split pass did not run --
-    an ``Output`` counts as a consumer, so a pad feeding both a node and an
-    output, or two outputs naming the same pad, is a split-pass bug).
+    an ``Output`` counts as a consumer, in whichever group it sits, so a pad
+    feeding both a node and an output, or two outputs naming the same pad, is
+    a split-pass bug).
     """
     _verify_topological(g)
 
     nodes = list(g.nodes.values())
     pads = {node.id: _out_pad_count(node) for node in nodes}
-    _check_fanout(nodes, g.outputs)
+    _check_fanout(nodes, g)
     labels = _assign_labels(nodes, pads, g.outputs)
 
     chains = _build_chains(nodes, pads)
     filter_complex = ";".join(_render_chain(chain, g, pads, labels) for chain in chains)
 
-    maps = [_output_map(g, output, labels) for output in g.outputs]
+    groups = [_output_group(g, unit, labels) for unit in g.sinks]
 
     return Emitted(
         inputs=list(g.input_paths),
         filter_complex=filter_complex,
-        maps=maps,
-        sink=_copy_sink(g.sink),
+        groups=groups,
         input_trims=_input_windows(g),
         input_options=_input_option_list(g),
     )
 
 
-def _copy_sink(sink: Sink | None) -> Sink | None:
-    if sink is None:
-        return None
-    return Sink(path=sink.path, options=dict(sink.options))
+def _output_group(g: Graph, unit: SinkUnit, labels: dict[str, str]) -> OutputGroup:
+    return OutputGroup(
+        maps=[_output_map(g, output, labels) for output in unit.outputs],
+        path=unit.path,
+        options=dict(unit.options),
+    )
 
 
 def _input_windows(g: Graph) -> list[tuple[float | None, float | None] | None]:
@@ -289,19 +332,25 @@ def _input_option_list(g: Graph) -> list[dict[str, object]]:
 
 
 def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
-    """Full ffmpeg argv for `e`, writing to the resolved output path.
+    """Full ffmpeg argv for `e`: one invocation, one output file per group.
 
-    Path precedence: `out_path` if given, else `e.sink.path` if `e.sink` is
-    set, else ``ValueError("no output path given and the query has no
-    sink")``. This is a CLI/programmer contract, not something user SQL can
-    trigger -- the CLI always resolves a concrete path (its own fallback, or
-    the sink's, or usage-errors out) before calling this.
+    Path precedence per group: `out_path` if given, else that group's own
+    path, else ``ValueError("no output path given and the query has no
+    sink")``. `out_path` OVERRIDES, so it is legal only when `e` has exactly
+    one group — overriding several files with one path would silently write
+    them on top of each other — and a multi-group `e` with `out_path` set is
+    ``ValueError``. This is a CLI/programmer contract, not something user SQL
+    can trigger: the CLI rejects ``-o`` against a multi-sink script itself
+    (usage error, exit 2) before calling this.
 
     The SELECT list is authoritative: exactly one ``-map`` per
     :class:`OutputMap`, in order, with ``-c:<i> copy`` for passthrough streams
-    and ``-metadata:s:<i> k=v`` (keys sorted) for provenance metadata. v0's
+    and ``-metadata:s:<i> k=v`` (keys sorted) for provenance metadata. Those
+    ``<i>`` are PER GROUP — ffmpeg restarts output stream numbering at each
+    output file — so group 2's first map is ``-c:0``, not ``-c:<n>``. v0's
     implicit ``-map 0:a? -c:a copy`` tail is gone. ``-filter_complex`` is
-    omitted when the graph is pure passthrough.
+    rendered once for the whole command, and omitted when the graph is pure
+    passthrough.
 
     Per-``-i`` flags come first, in a fixed order (verified against real
     ffmpeg -- see the module docstring's "Input options" section): an input
@@ -313,30 +362,30 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     `input_options`/`input_trims` lists simply leave the remaining inputs
     plain, so a hand-built :class:`Emitted` needs neither at all.
 
-    Sink option rendering (RFC-002, plan 027): after the -map/-metadata
-    block, `e.sink.options` render in insertion order purely from
-    ``sqlmpeg.sink.SINK_OPTIONS`` table data -- no option-specific logic
-    here. Per-stream specs (``per_stream=True``) render ``f"{flag}:{i}"``
-    for every output index `i` whose type matches the spec's scope;
-    container specs (``per_stream=False``) render ``flag`` once, regardless
-    of output types. A bool value of False is never rendered (e.g.
+    Sink option rendering (RFC-002, plan 027): after each group's
+    -map/-metadata block, that group's own options render in insertion order
+    purely from ``sqlmpeg.sink.SINK_OPTIONS`` table data -- no option-specific
+    logic here. Per-stream specs (``per_stream=True``) render ``f"{flag}:{i}"``
+    for every output index `i` of THAT GROUP whose type matches the spec's
+    scope; container specs (``per_stream=False``) render ``flag`` once,
+    regardless of output types. A bool value of False is never rendered (e.g.
     ``faststart false`` emits nothing).
 
-    Copy suppression: if the sink sets a codec option (``flag == "-c"``)
-    scoped to video, video passthrough outputs drop their ``-c:<i> copy``
-    (the explicit codec re-encodes them instead); same for audio and — since
-    the rule reads the option table's ``scope`` rather than naming types —
-    for ``subtitle_codec`` (RFC-004: webvtt -> mov_text on a passthrough
-    subtitle output).
+    Copy suppression: if a group's options set a codec option (``flag ==
+    "-c"``) scoped to video, that group's video passthrough outputs drop their
+    ``-c:<i> copy`` (the explicit codec re-encodes them instead); same for
+    audio and — since the rule reads the option table's ``scope`` rather than
+    naming types — for ``subtitle_codec`` (RFC-004: webvtt -> mov_text on a
+    passthrough subtitle output). Suppression is per group, so one file may
+    re-encode a stream another file copies.
     """
-    if out_path is not None:
-        path = out_path
-    elif e.sink is not None:
-        path = e.sink.path
-    else:
+    if not e.groups:
         raise ValueError("no output path given and the query has no sink")
-
-    copy_suppressed_scopes = _copy_suppressed_scopes(e.sink)
+    if out_path is not None and len(e.groups) > 1:
+        raise ValueError(
+            f"out_path overrides a single output file, but this command writes "
+            f"{len(e.groups)}"
+        )
 
     args = ["ffmpeg"]
     for index, input_path in enumerate(e.inputs):
@@ -352,14 +401,20 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
         args += ["-i", input_path]
     if e.filter_complex:
         args += ["-filter_complex", e.filter_complex]
-    for index, mapping in enumerate(e.maps):
-        args += ["-map", mapping.target]
-        if mapping.copy and mapping.type not in copy_suppressed_scopes:
-            args += [f"-c:{index}", "copy"]
-        for key in sorted(mapping.metadata):
-            args += [f"-metadata:s:{index}", f"{key}={mapping.metadata[key]}"]
-    args += _render_sink_options(e)
-    args.append(path)
+    for group in e.groups:
+        path = out_path if out_path is not None else group.path
+        if path is None:
+            raise ValueError("no output path given and the query has no sink")
+        copy_suppressed_scopes = _copy_suppressed_scopes(group.options)
+        # Output stream indices restart at 0 in every output file.
+        for index, mapping in enumerate(group.maps):
+            args += ["-map", mapping.target]
+            if mapping.copy and mapping.type not in copy_suppressed_scopes:
+                args += [f"-c:{index}", "copy"]
+            for key in sorted(mapping.metadata):
+                args += [f"-metadata:s:{index}", f"{key}={mapping.metadata[key]}"]
+        args += _render_sink_options(group)
+        args.append(path)
     return args
 
 
@@ -400,11 +455,9 @@ def _render_input_options(options: dict[str, object]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _copy_suppressed_scopes(sink: Sink | None) -> set[str]:
-    """Stream scopes ("video"/"audio") for which the sink sets an explicit codec."""
-    if sink is None:
-        return set()
-    return {SINK_OPTIONS[name].scope for name in sink.options if SINK_OPTIONS[name].flag == "-c"}
+def _copy_suppressed_scopes(options: dict[str, object]) -> set[str]:
+    """Stream scopes ("video"/"audio") for which a group sets an explicit codec."""
+    return {SINK_OPTIONS[name].scope for name in options if SINK_OPTIONS[name].flag == "-c"}
 
 
 def _render_option_value(spec: SinkOptionSpec, value: object) -> str | None:
@@ -418,17 +471,16 @@ def _render_option_value(spec: SinkOptionSpec, value: object) -> str | None:
     return spec.value_template.format(v=value)
 
 
-def _render_sink_options(e: Emitted) -> list[str]:
-    if e.sink is None:
-        return []
+def _render_sink_options(group: OutputGroup) -> list[str]:
     args: list[str] = []
-    for name, value in e.sink.options.items():
+    for name, value in group.options.items():
         spec = SINK_OPTIONS[name]
         rendered = _render_option_value(spec, value)
         if rendered is None:
             continue
         if spec.per_stream:
-            for index, mapping in enumerate(e.maps):
+            # Per-FILE stream indices, same as the -c/-metadata block above.
+            for index, mapping in enumerate(group.maps):
                 if mapping.type == spec.scope:
                     args += [f"{spec.flag}:{index}", rendered]
         else:
@@ -580,18 +632,31 @@ def _check_ref(g: Graph, ref: FrameRef, defined: set[str], where: str) -> None:
         raise _internal(f"{where} references pad {pad} of {node_id!r}, which has fewer outputs")
 
 
-def _check_fanout(nodes: list[Node], outputs: list[Output]) -> None:
+def _check_fanout(nodes: list[Node], g: Graph) -> None:
     """Every pad has at most one consumer, except the ones that are not pads.
 
-    RFC-004: a subtitle/data source ref never enters the filtergraph — it is
-    rendered as a bare ``-map <idx>:s:<k>``, and repeating one is legal ffmpeg
-    (``SELECT f.subtitle[1], f.subtitle[1]`` writes the same track twice).
-    There is no split filter for such a stream, so the split pass leaves it
-    alone and the consume-once rule does not apply to it.
+    Two exemptions, both about refs that are bare ``-map``s rather than
+    filtergraph pads — and both mirrored in the split pass, which is what
+    leaves them fanned out on purpose:
+
+    * RFC-004: a subtitle/data source ref never enters the filtergraph, and
+      repeating one is legal ffmpeg (``SELECT f.subtitle[1], f.subtitle[1]``
+      writes the same track twice). There is no split filter for such a
+      stream at all.
+    * RFC-006: a video/audio SOURCE ref that no node consumes and that each
+      output FILE maps at most once. Two output groups bare-mapping the same
+      input stream is a repeated ``-map``, which is equally legal, and it is
+      what lets both files stream-copy that track. A repeat within ONE group,
+      or any pad a filter also consumes, is still a split-pass bug.
+
+    Real filtergraph pads (``"<node-id>[:<pad>]"``) are consume-once in every
+    direction, including across groups: two sinks reading one view's pad must
+    have been split.
     """
-    counts = _count_consumers(nodes, outputs)
+    counts = _count_consumers(nodes, g.outputs)
+    exempt = _exempt_refs(g)
     for slot, count in counts.items():
-        if count > 1 and not _is_passthrough_only(slot):
+        if count > 1 and slot not in exempt:
             raise _internal(
                 f"pad {slot!r} has {count} consumers; ffmpeg pads are consume-once "
                 "(the split pass must run before emit)"
@@ -608,8 +673,34 @@ def _is_passthrough_only(ref: FrameRef) -> bool:
         return False
 
 
+def _exempt_refs(g: Graph) -> set[FrameRef]:
+    """Source refs allowed to keep more than one consumer (see `_check_fanout`).
+
+    Deliberately the same rule ``sqlmpeg.split._exempt_refs`` applies, stated
+    independently: emit never imports the split pass, it CHECKS its output.
+    """
+    exempt: set[FrameRef] = set()
+    filtered: set[FrameRef] = {
+        ref for node in g.nodes.values() for ref in node.inputs if is_src(ref)
+    }
+    for unit in g.sinks:
+        seen: dict[FrameRef, int] = {}
+        for output in unit.outputs:
+            if is_src(output.ref):
+                seen[output.ref] = seen.get(output.ref, 0) + 1
+        for ref, count in seen.items():
+            if _is_passthrough_only(ref):
+                exempt.add(ref)
+            elif count == 1 and ref not in filtered:
+                exempt.add(ref)
+            else:
+                exempt.discard(ref)
+                filtered.add(ref)
+    return exempt
+
+
 def _count_consumers(nodes: list[Node], outputs: list[Output]) -> dict[str, int]:
-    """Count consumers per pad. A ``Graph.outputs`` entry is a consumer too."""
+    """Count consumers per pad. Every sink unit's Output is a consumer too."""
     counts: dict[str, int] = {}
     for node in nodes:
         for ref in node.inputs:

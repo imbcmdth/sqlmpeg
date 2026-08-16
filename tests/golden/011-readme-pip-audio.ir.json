@@ -94,18 +94,24 @@
       ]
     }
   ],
-  "outputs": [
+  "sinks": [
     {
-      "ref": "n3",
-      "type": "video",
-      "name": null,
-      "metadata": {}
-    },
-    {
-      "ref": "n6",
-      "type": "audio",
-      "name": null,
-      "metadata": {}
+      "outputs": [
+        {
+          "ref": "n3",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        },
+        {
+          "ref": "n6",
+          "type": "audio",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
     }
   ]
 }

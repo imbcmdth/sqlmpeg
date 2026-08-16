@@ -3,7 +3,14 @@ from __future__ import annotations
 import pytest
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import Graph, Node, Output, Sink, is_src, src_alias, src_parts
+from sqlmpeg.ir import Graph, Node, Output, SinkUnit, is_src, src_alias, src_parts
+
+
+def _serialized_sinks(d: dict[str, object]) -> list[dict[str, object]]:
+    """``Graph.to_dict()["sinks"]``, narrowed for the type checker."""
+    sinks = d["sinks"]
+    assert isinstance(sinks, list)
+    return sinks
 
 
 def _build_graph() -> Graph:
@@ -29,14 +36,18 @@ def _build_graph() -> Graph:
         inputs=["src:a:v:0", "n1"],
         outputs=["video"],
     )
-    g.outputs = [
-        Output(ref="n2", type="video", name=None, metadata={}),
-        Output(
-            ref="src:a:a:0",
-            type="audio",
-            name="eng_audio",
-            metadata={"language": "eng"},
-        ),
+    g.sinks = [
+        SinkUnit(
+            outputs=[
+                Output(ref="n2", type="video", name=None, metadata={}),
+                Output(
+                    ref="src:a:a:0",
+                    type="audio",
+                    name="eng_audio",
+                    metadata={"language": "eng"},
+                ),
+            ]
+        )
     ]
     return g
 
@@ -62,7 +73,14 @@ def test_graph_to_dict_shape() -> None:
         assert set(n.keys()) == {"id", "filter", "args", "inputs", "outputs"}
     assert nodes[0]["outputs"] == ["video"]
 
-    outputs = d["outputs"]
+    sinks = d["sinks"]
+    assert isinstance(sinks, list)
+    assert len(sinks) == 1
+    assert set(sinks[0].keys()) == {"outputs", "path", "options"}
+    assert sinks[0]["path"] is None
+    assert sinks[0]["options"] == {}
+
+    outputs = sinks[0]["outputs"]
     assert isinstance(outputs, list)
     assert len(outputs) == 2
     for o in outputs:
@@ -81,10 +99,24 @@ def test_graph_to_dict_shape() -> None:
     }
 
 
-def test_graph_outputs_default_empty() -> None:
+def test_graph_sinks_default_empty() -> None:
     g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    assert g.sinks == []
     assert g.outputs == []
-    assert g.to_dict()["outputs"] == []
+    assert g.to_dict()["sinks"] == []
+
+
+def test_graph_outputs_is_the_union_across_sinks() -> None:
+    """RFC-006: the derived output list is what consume-once counts over."""
+    g = _build_graph()
+    g.sinks.append(
+        SinkUnit(
+            outputs=[Output(ref="n1", type="video", name=None, metadata={})],
+            path="second.mp4",
+            options={"crf": 30},
+        )
+    )
+    assert [o.ref for o in g.outputs] == ["n2", "src:a:a:0", "n1"]
 
 
 def test_node_outputs_multi_pad() -> None:
@@ -193,49 +225,59 @@ def test_sink_error_codes_exist() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sink (plan 025)
+# SinkUnit (plan 025 sink options; plan 046 multi-sink shape)
 # ---------------------------------------------------------------------------
 
 
-def test_sink_round_trip() -> None:
-    s = Sink(
+def test_sink_unit_round_trip() -> None:
+    unit = SinkUnit(
+        outputs=[Output(ref="n2", type="video", name=None, metadata={})],
         path="out.mkv",
         options={"video_codec": "libx264", "crf": 20, "faststart": True},
     )
-    d = s.to_dict()
-    s2 = Sink.from_dict(d)
-    assert s2 == s
+    d = unit.to_dict()
+    assert SinkUnit.from_dict(d) == unit
     assert d == {
+        "outputs": [{"ref": "n2", "type": "video", "name": None, "metadata": {}}],
         "path": "out.mkv",
         "options": {"video_codec": "libx264", "crf": 20, "faststart": True},
     }
 
 
-def test_graph_without_sink_to_dict_has_no_sink_key() -> None:
+def test_bare_select_sink_unit_emits_an_explicit_null_path() -> None:
     g = _build_graph()
-    assert g.sink is None
-    d = g.to_dict()
-    assert "sink" not in d
+    unit = _serialized_sinks(g.to_dict())[0]
+    assert unit["path"] is None
+    assert "path" in unit
 
 
-def test_graph_with_sink_round_trip() -> None:
+def test_graph_with_sink_paths_round_trips() -> None:
     g = _build_graph()
-    g.sink = Sink(path="out.mp4", options={"video_codec": "libx264"})
+    g.sinks[0].path = "out.mp4"
+    g.sinks[0].options = {"video_codec": "libx264"}
     d1 = g.to_dict()
-    assert "sink" in d1
-    assert d1["sink"] == {"path": "out.mp4", "options": {"video_codec": "libx264"}}
+    assert _serialized_sinks(d1)[0]["path"] == "out.mp4"
+    assert _serialized_sinks(d1)[0]["options"] == {"video_codec": "libx264"}
     g2 = Graph.from_dict(d1)
-    assert g2.sink == g.sink
-    d2 = g2.to_dict()
-    assert d1 == d2
+    assert g2.sinks == g.sinks
+    assert g2.to_dict() == d1
 
 
-def test_graph_from_dict_tolerates_missing_sink_key() -> None:
+def test_graph_with_several_sinks_round_trips() -> None:
     g = _build_graph()
-    d = g.to_dict()
-    assert "sink" not in d
-    g2 = Graph.from_dict(d)
-    assert g2.sink is None
+    g.sinks.append(
+        SinkUnit(
+            outputs=[Output(ref="n1", type="video", name=None, metadata={})],
+            path="720.mp4",
+            options={"crf": 26},
+        )
+    )
+    g.sinks[0].path = "1080.mp4"
+    d1 = g.to_dict()
+    assert [unit["path"] for unit in _serialized_sinks(d1)] == ["1080.mp4", "720.mp4"]
+    g2 = Graph.from_dict(d1)
+    assert g2.sinks == g.sinks
+    assert g2.to_dict() == d1
 
 
 # ---------------------------------------------------------------------------
@@ -396,15 +438,15 @@ def test_graph_from_dict_tolerates_missing_input_options_key() -> None:
     assert g2.input_options == {}
 
 
-def test_graph_input_options_are_independent_of_sink_and_input_trims() -> None:
-    """The three "additive, omit-when-empty" fields do not interfere."""
+def test_graph_input_options_are_independent_of_sinks_and_input_trims() -> None:
+    """The two "additive, omit-when-empty" fields do not interfere."""
     g = _build_graph()
     g.input_options = {"a": {"itsoffset": -1.5}}
     g.input_trims = {"a": (0.0, 2.0)}
     d = g.to_dict()
     assert d["input_options"] == {"a": {"itsoffset": -1.5}}
     assert d["input_trims"] == {"a": [0.0, 2.0]}
-    assert "sink" not in d
+    assert _serialized_sinks(d)[0]["path"] is None
     g2 = Graph.from_dict(d)
     assert g2.input_options == g.input_options
     assert g2.input_trims == g.input_trims

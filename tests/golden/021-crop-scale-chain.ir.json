@@ -37,12 +37,18 @@
       ]
     }
   ],
-  "outputs": [
+  "sinks": [
     {
-      "ref": "n2",
-      "type": "video",
-      "name": null,
-      "metadata": {}
+      "outputs": [
+        {
+          "ref": "n2",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
     }
   ]
 }

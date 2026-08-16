@@ -17,9 +17,16 @@ from pathlib import Path
 
 import pytest
 
-from sqlmpeg.emit import Emitted, OutputMap, _escape_value, build_ffmpeg_args, emit
+from sqlmpeg.emit import (
+    Emitted,
+    OutputGroup,
+    OutputMap,
+    _escape_value,
+    build_ffmpeg_args,
+    emit,
+)
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import Graph, Node, Output, Sink, StreamType
+from sqlmpeg.ir import Graph, Node, Output, SinkUnit, StreamType
 
 
 def _node(
@@ -48,22 +55,38 @@ def _out(
     return Output(ref=ref, type=type, name=name, metadata=dict(metadata or {}))
 
 
+def _sink(path: str, options: dict[str, object] | None = None) -> SinkUnit:
+    """A destination with no outputs yet -- `_graph` fills them in."""
+    return SinkUnit(outputs=[], path=path, options=dict(options or {}))
+
+
 def _graph(
     nodes: list[Node],
     outputs: list[Output],
     *,
     input_paths: list[str] | None = None,
     sources: dict[str, int] | None = None,
-    sink: Sink | None = None,
+    sink: SinkUnit | None = None,
+    sinks: list[SinkUnit] | None = None,
     input_trims: dict[str, tuple[float | None, float | None]] | None = None,
     input_options: dict[str, dict[str, object]] | None = None,
 ) -> Graph:
+    """A ONE-sink graph carrying `outputs` (`sink` names its destination).
+
+    `sinks` is the multi-sink escape hatch (RFC-006): pass whole
+    :class:`SinkUnit`s, each with its own outputs, and `outputs` is ignored.
+    """
+    if sinks is not None:
+        units = list(sinks)
+    elif sink is not None:
+        units = [SinkUnit(outputs=list(outputs), path=sink.path, options=dict(sink.options))]
+    else:
+        units = [SinkUnit(outputs=list(outputs))]
     return Graph(
         input_paths=list(input_paths or ["a.mp4"]),
         sources=dict(sources or {"a": 0}),
         nodes={n.id: n for n in nodes},
-        outputs=list(outputs),
-        sink=sink,
+        sinks=units,
         input_trims=dict(input_trims or {}),
         input_options={k: dict(v) for k, v in (input_options or {}).items()},
     )
@@ -418,7 +441,10 @@ def test_labels_are_sanitized() -> None:
 def _source_graph(nodes: list[Node], outputs: list[Output]) -> Graph:
     """A graph with NO inputs at all -- `_graph`'s defaults would add one."""
     return Graph(
-        input_paths=[], sources={}, nodes={n.id: n for n in nodes}, outputs=list(outputs)
+        input_paths=[],
+        sources={},
+        nodes={n.id: n for n in nodes},
+        sinks=[SinkUnit(outputs=list(outputs))],
     )
 
 
@@ -796,7 +822,11 @@ def test_build_ffmpeg_args_single_input() -> None:
     e = Emitted(
         inputs=["a.mp4"],
         filter_complex="[0:v:0]hflip[out0]",
-        maps=[OutputMap(target="[out0]", type="video", copy=False, metadata={})],
+        groups=[
+            OutputGroup(
+                maps=[OutputMap(target="[out0]", type="video", copy=False, metadata={})]
+            )
+        ],
     )
     assert build_ffmpeg_args(e, "/tmp/o.mkv") == [
         "ffmpeg",
@@ -861,12 +891,20 @@ def test_build_ffmpeg_args_sorts_metadata_keys() -> None:
     e = Emitted(
         inputs=["a.mp4"],
         filter_complex="",
-        maps=[
-            OutputMap(
-                target="0:a:0",
-                type="audio",
-                copy=True,
-                metadata={"title": "Commentary", "language": "fra", "artist": "x"},
+        groups=[
+            OutputGroup(
+                maps=[
+                    OutputMap(
+                        target="0:a:0",
+                        type="audio",
+                        copy=True,
+                        metadata={
+                            "title": "Commentary",
+                            "language": "fra",
+                            "artist": "x",
+                        },
+                    )
+                ]
             )
         ],
     )
@@ -891,12 +929,16 @@ def test_build_ffmpeg_args_metadata_values_are_passed_raw() -> None:
     e = Emitted(
         inputs=["a.mp4"],
         filter_complex="",
-        maps=[
-            OutputMap(
-                target="0:a:0",
-                type="audio",
-                copy=True,
-                metadata={"title": "12:30, take 'one'"},
+        groups=[
+            OutputGroup(
+                maps=[
+                    OutputMap(
+                        target="0:a:0",
+                        type="audio",
+                        copy=True,
+                        metadata={"title": "12:30, take 'one'"},
+                    )
+                ]
             )
         ],
     )
@@ -904,27 +946,29 @@ def test_build_ffmpeg_args_metadata_values_are_passed_raw() -> None:
 
 
 # ---------------------------------------------------------------------------
-# sink (RFC-002, plan 027) -- Graphs are hand-built with sink=Sink(...) here;
-# compile_sql cannot yet produce a sinked Graph while plan 026 is in flight.
+# sink (RFC-002, plan 027) -- Graphs are hand-built with sink=_sink(...) here,
+# which plan 046 turned into one `SinkUnit` / one `Emitted.groups` entry.
 # ---------------------------------------------------------------------------
 
 
-def test_emitted_sink_defaults_to_none() -> None:
+def test_emitted_group_path_defaults_to_none() -> None:
     g = _graph([], [_out("src:a:v:0")])
     e = emit(g)
-    assert e.sink is None
+    assert len(e.groups) == 1
+    assert e.groups[0].path is None
+    assert e.groups[0].options == {}
 
 
-def test_emit_copies_graph_sink() -> None:
-    """`emit` copies `g.sink`, not aliases it -- mutating one must not affect the other."""
-    sink = Sink(path="out.mkv", options={"video_codec": "libx264"})
+def test_emit_copies_sink_options() -> None:
+    """`emit` copies each unit's options, not aliases them."""
+    sink = _sink(path="out.mkv", options={"video_codec": "libx264"})
     g = _graph([], [_out("src:a:v:0")], sink=sink)
     e = emit(g)
-    assert e.sink == sink
-    assert e.sink is not sink
-    assert e.sink is not None
-    e.sink.options["video_codec"] = "mangled"
-    assert sink.options["video_codec"] == "libx264"
+    assert e.groups[0].path == "out.mkv"
+    assert e.groups[0].options == sink.options
+    assert e.groups[0].options is not sink.options
+    e.groups[0].options["video_codec"] = "mangled"
+    assert g.sinks[0].options["video_codec"] == "libx264"
 
 
 def test_build_ffmpeg_args_without_out_path_or_sink_raises() -> None:
@@ -935,14 +979,14 @@ def test_build_ffmpeg_args_without_out_path_or_sink_raises() -> None:
 
 
 def test_build_ffmpeg_args_uses_sink_path_when_no_out_path() -> None:
-    sink = Sink(path="sink.mkv", options={})
+    sink = _sink(path="sink.mkv", options={})
     g = _graph([], [_out("src:a:v:0")], sink=sink)
     e = emit(g)
     assert build_ffmpeg_args(e)[-1] == "sink.mkv"
 
 
 def test_build_ffmpeg_args_out_path_overrides_sink_path() -> None:
-    sink = Sink(path="sink.mkv", options={})
+    sink = _sink(path="sink.mkv", options={})
     g = _graph([], [_out("src:a:v:0")], sink=sink)
     e = emit(g)
     assert build_ffmpeg_args(e, "override.mp4")[-1] == "override.mp4"
@@ -961,7 +1005,7 @@ def test_build_ffmpeg_args_no_sink_graph_unchanged_byte_for_byte() -> None:
         sources={"a": 0, "b": 1},
     )
     e = emit(g)
-    assert e.sink is None
+    assert e.groups[0].path is None
     assert build_ffmpeg_args(e, "out.mp4") == [
         "ffmpeg",
         "-i",
@@ -978,7 +1022,7 @@ def test_build_ffmpeg_args_no_sink_graph_unchanged_byte_for_byte() -> None:
 
 
 def test_sink_video_codec_and_crf_render_per_video_output() -> None:
-    sink = Sink(path="out.mp4", options={"video_codec": "libx264", "crf": 20})
+    sink = _sink(path="out.mp4", options={"video_codec": "libx264", "crf": 20})
     g = _graph(
         [
             _node("n1", "hflip", {}, ["src:a:v:0"]),
@@ -1009,7 +1053,7 @@ def test_sink_video_codec_and_crf_render_per_video_output() -> None:
 
 
 def test_sink_audio_bitrate_renders_per_audio_output() -> None:
-    sink = Sink(path="out.mp4", options={"audio_bitrate": "192k"})
+    sink = _sink(path="out.mp4", options={"audio_bitrate": "192k"})
     g = _graph(
         [
             _node("n1", "volume", {"volume": 1}, ["src:a:a:0"], ["audio"]),
@@ -1034,7 +1078,7 @@ def test_sink_audio_bitrate_renders_per_audio_output() -> None:
 
 
 def test_sink_format_and_faststart_render_once_at_container_level() -> None:
-    sink = Sink(path="out.mp4", options={"format": "mp4", "faststart": True})
+    sink = _sink(path="out.mp4", options={"format": "mp4", "faststart": True})
     g = _graph([], [_out("src:a:v:0")], sink=sink)
     e = emit(g)
     args = build_ffmpeg_args(e)
@@ -1052,7 +1096,7 @@ def test_sink_format_and_faststart_render_once_at_container_level() -> None:
 
 
 def test_sink_faststart_false_omits_movflags_entirely() -> None:
-    sink = Sink(path="out.mp4", options={"faststart": False})
+    sink = _sink(path="out.mp4", options={"faststart": False})
     g = _graph([], [_out("src:a:v:0")], sink=sink)
     e = emit(g)
     args = build_ffmpeg_args(e)
@@ -1062,7 +1106,7 @@ def test_sink_faststart_false_omits_movflags_entirely() -> None:
 
 def test_sink_options_render_in_insertion_order_not_table_order() -> None:
     """SINK_OPTIONS lists video_codec before crf; Sink.options insertion order wins."""
-    sink = Sink(path="out.mp4", options={"crf": 20, "video_codec": "libx264"})
+    sink = _sink(path="out.mp4", options={"crf": 20, "video_codec": "libx264"})
     g = _graph([_node("n1", "hflip", {}, ["src:a:v:0"])], [_out("n1")], sink=sink)
     e = emit(g)
     args = build_ffmpeg_args(e)
@@ -1079,7 +1123,7 @@ def test_sink_options_render_in_insertion_order_not_table_order() -> None:
 
 def test_sink_audio_codec_suppresses_passthrough_copy_for_audio_only() -> None:
     """passthrough audio + audio_codec set -> no -c:<i> copy, codec rendered instead."""
-    sink = Sink(path="out.mp4", options={"audio_codec": "aac"})
+    sink = _sink(path="out.mp4", options={"audio_codec": "aac"})
     g = _graph(
         [_node("n1", "hflip", {}, ["src:a:v:0"])],
         [_out("n1"), _out("src:a:a:0", "audio")],
@@ -1100,7 +1144,7 @@ def test_sink_audio_codec_suppresses_passthrough_copy_for_audio_only() -> None:
 
 def test_sink_video_codec_suppresses_only_video_passthrough_copy() -> None:
     """A video-scoped codec option leaves an untouched audio passthrough's copy alone."""
-    sink = Sink(path="out.mp4", options={"video_codec": "libx264"})
+    sink = _sink(path="out.mp4", options={"video_codec": "libx264"})
     g = _graph([], [_out("src:a:v:0"), _out("src:a:a:0", "audio")], sink=sink)
     e = emit(g)
     args = build_ffmpeg_args(e)
@@ -1186,7 +1230,7 @@ def test_subtitle_output_keeps_its_language_metadata() -> None:
 
 
 def test_sink_subtitle_codec_renders_per_subtitle_output() -> None:
-    sink = Sink(path="out.mp4", options={"subtitle_codec": "mov_text"})
+    sink = _sink(path="out.mp4", options={"subtitle_codec": "mov_text"})
     g = _graph(
         [],
         [_out("src:a:v:0"), _out("src:a:a:0", "audio"), _out("src:a:s:0", "subtitle")],
@@ -1215,7 +1259,7 @@ def test_sink_subtitle_codec_renders_per_subtitle_output() -> None:
 
 
 def test_sink_subtitle_codec_leaves_video_and_audio_copies_alone() -> None:
-    sink = Sink(path="out.mkv", options={"subtitle_codec": "srt"})
+    sink = _sink(path="out.mkv", options={"subtitle_codec": "srt"})
     g = _graph(
         [],
         [_out("src:a:a:0", "audio"), _out("src:a:s:0", "subtitle")],
@@ -1228,7 +1272,7 @@ def test_sink_subtitle_codec_leaves_video_and_audio_copies_alone() -> None:
 
 
 def test_sink_video_codec_does_not_suppress_a_subtitle_copy() -> None:
-    sink = Sink(path="out.mkv", options={"video_codec": "libx264"})
+    sink = _sink(path="out.mkv", options={"video_codec": "libx264"})
     g = _graph(
         [],
         [_out("src:a:v:0"), _out("src:a:s:0", "subtitle")],
@@ -1247,6 +1291,201 @@ def test_sink_video_codec_does_not_suppress_a_subtitle_copy() -> None:
         "libx264",
         "out.mkv",
     ]
+
+
+# ---------------------------------------------------------------------------
+# RFC-006 output groups (plan 046): one ffmpeg command, one file per sink
+# ---------------------------------------------------------------------------
+
+
+def _ladder_graph() -> Graph:
+    """Two scaled video renditions off one split, plus an audio-only file."""
+    return _graph(
+        [
+            _node("n1", "split", {"n": 2}, ["src:a:v:0"], ["video", "video"]),
+            _node("n2", "scale", {"w": 1280, "h": -2}, ["n1:0"]),
+            _node("n3", "scale", {"w": 640, "h": -2}, ["n1:1"]),
+        ],
+        [],
+        sinks=[
+            SinkUnit(
+                outputs=[_out("n2"), _out("src:a:a:0", "audio")],
+                path="720.mp4",
+                options={"video_codec": "libx264", "crf": 21},
+            ),
+            SinkUnit(
+                outputs=[_out("n3"), _out("src:a:a:0", "audio")],
+                path="360.mp4",
+                options={"crf": 26},
+            ),
+        ],
+    )
+
+
+def test_groups_mirror_the_graphs_sinks() -> None:
+    e = emit(_ladder_graph())
+    assert [group.path for group in e.groups] == ["720.mp4", "360.mp4"]
+    assert [len(group.maps) for group in e.groups] == [2, 2]
+    assert [group.options for group in e.groups] == [
+        {"video_codec": "libx264", "crf": 21},
+        {"crf": 26},
+    ]
+
+
+def test_output_labels_stay_unique_across_the_whole_command() -> None:
+    """Labels are graph-scoped: out<i> is indexed over the OUTPUT UNION."""
+    e = emit(_ladder_graph())
+    assert [m.target for group in e.groups for m in group.maps] == [
+        "[out0]",
+        "0:a:0",
+        "[out2]",
+        "0:a:0",
+    ]
+    assert "[out2]" in e.filter_complex
+
+
+def test_maps_is_the_concatenation_of_every_group() -> None:
+    e = emit(_ladder_graph())
+    assert e.maps == e.groups[0].maps + e.groups[1].maps
+
+
+def test_stream_indices_restart_in_every_output_file() -> None:
+    """ffmpeg numbers output streams per FILE, so -c:<i> restarts at 0."""
+    args = build_ffmpeg_args(emit(_ladder_graph()))
+    assert args[args.index("-map") :] == [
+        "-map",
+        "[out0]",
+        "-map",
+        "0:a:0",
+        "-c:1",
+        "copy",
+        "-c:0",
+        "libx264",
+        "-crf:0",
+        "21",
+        "720.mp4",
+        # group 2 starts over at 0 -- its audio passthrough is -c:1 again,
+        # not -c:3, and its own crf applies to ITS video index.
+        "-map",
+        "[out2]",
+        "-map",
+        "0:a:0",
+        "-c:1",
+        "copy",
+        "-crf:0",
+        "26",
+        "360.mp4",
+    ]
+
+
+def test_metadata_indices_are_per_group_too() -> None:
+    g = _graph(
+        [_node("n1", "hflip", {}, ["src:a:v:0"])],
+        [],
+        sinks=[
+            SinkUnit(outputs=[_out("n1")], path="one.mp4"),
+            SinkUnit(
+                outputs=[
+                    _out("src:a:v:1"),
+                    _out("src:a:a:0", "audio", metadata={"language": "fra"}),
+                ],
+                path="two.mkv",
+            ),
+        ],
+    )
+    args = build_ffmpeg_args(emit(g))
+    # The tag rides group 2's SECOND stream, which is index 1 of that file.
+    assert "-metadata:s:1" in args
+    assert args[args.index("-metadata:s:1") + 1] == "language=fra"
+    assert "-metadata:s:2" not in args
+
+
+def test_copy_suppression_is_per_group() -> None:
+    """One file may re-encode the stream the other copies."""
+    g = _graph(
+        [],
+        [],
+        sinks=[
+            SinkUnit(outputs=[_out("src:a:a:0", "audio")], path="copy.m4a"),
+            SinkUnit(
+                outputs=[_out("src:a:a:0", "audio")],
+                path="encoded.m4a",
+                options={"audio_codec": "aac"},
+            ),
+        ],
+    )
+    args = build_ffmpeg_args(emit(g))
+    assert args == [
+        "ffmpeg",
+        "-i",
+        "a.mp4",
+        "-map",
+        "0:a:0",
+        "-c:0",
+        "copy",
+        "copy.m4a",
+        "-map",
+        "0:a:0",
+        "-c:0",
+        "aac",
+        "encoded.m4a",
+    ]
+
+
+def test_two_groups_may_bare_map_the_same_source_stream() -> None:
+    """RFC-006's cross-group exemption: a repeated -map is not a fan-out bug."""
+    g = _graph(
+        [],
+        [],
+        sinks=[
+            SinkUnit(outputs=[_out("src:a:a:0", "audio")], path="one.m4a"),
+            SinkUnit(outputs=[_out("src:a:a:0", "audio")], path="two.m4a"),
+        ],
+    )
+    e = emit(g)  # no INTERNAL: the pad is a bare -map, not a filtergraph pad
+    assert [group.maps[0].target for group in e.groups] == ["0:a:0", "0:a:0"]
+
+
+def test_one_group_mapping_a_source_stream_twice_is_still_a_fanout_bug() -> None:
+    g = _graph(
+        [],
+        [_out("src:a:a:0", "audio"), _out("src:a:a:0", "audio")],
+        sink=_sink(path="one.m4a"),
+    )
+    err = _assert_internal(g)
+    assert "consume-once" in err.message
+
+
+def test_one_node_pad_read_by_two_groups_is_still_a_fanout_bug() -> None:
+    g = _graph(
+        [_node("n1", "hflip", {}, ["src:a:v:0"])],
+        [],
+        sinks=[
+            SinkUnit(outputs=[_out("n1")], path="one.mp4"),
+            SinkUnit(outputs=[_out("n1")], path="two.mp4"),
+        ],
+    )
+    err = _assert_internal(g)
+    assert "consume-once" in err.message
+
+
+def test_out_path_may_not_override_a_multi_group_command() -> None:
+    e = emit(_ladder_graph())
+    with pytest.raises(ValueError, match="writes 2"):
+        build_ffmpeg_args(e, "override.mp4")
+
+
+def test_a_group_without_a_path_and_without_out_path_raises() -> None:
+    g = _graph(
+        [],
+        [],
+        sinks=[
+            SinkUnit(outputs=[_out("src:a:v:0")], path="one.mp4"),
+            SinkUnit(outputs=[_out("src:a:a:0", "audio")]),
+        ],
+    )
+    with pytest.raises(ValueError, match="no output path"):
+        build_ffmpeg_args(emit(g))
 
 
 # ---------------------------------------------------------------------------
@@ -1325,7 +1564,11 @@ def test_a_hand_built_emitted_needs_no_input_trims() -> None:
     e = Emitted(
         inputs=["a.mp4"],
         filter_complex="",
-        maps=[OutputMap(target="0:v:0", type="video", copy=True, metadata={})],
+        groups=[
+            OutputGroup(
+                maps=[OutputMap(target="0:v:0", type="video", copy=True, metadata={})]
+            )
+        ],
     )
     assert build_ffmpeg_args(e, "out.mp4")[:3] == ["ffmpeg", "-i", "a.mp4"]
 
@@ -1514,7 +1757,11 @@ def test_a_hand_built_emitted_needs_no_input_options() -> None:
     e = Emitted(
         inputs=["a.mp4"],
         filter_complex="",
-        maps=[OutputMap(target="0:v:0", type="video", copy=True, metadata={})],
+        groups=[
+            OutputGroup(
+                maps=[OutputMap(target="0:v:0", type="video", copy=True, metadata={})]
+            )
+        ],
     )
     assert build_ffmpeg_args(e, "out.mp4")[:3] == ["ffmpeg", "-i", "a.mp4"]
 

@@ -65,12 +65,18 @@
       ]
     }
   ],
-  "outputs": [
+  "sinks": [
     {
-      "ref": "n3",
-      "type": "video",
-      "name": null,
-      "metadata": {}
+      "outputs": [
+        {
+          "ref": "n3",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
     }
   ]
 }

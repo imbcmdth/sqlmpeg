@@ -108,6 +108,13 @@ def _lower(sql: str, probes: dict[str, ProbeResult | None] | None = None) -> Gra
     return lower(resolve(parse(sql)), probes or {})
 
 
+def _serialized_sinks(d: dict[str, object]) -> list[dict[str, object]]:
+    """``Graph.to_dict()["sinks"]``, narrowed for the type checker."""
+    sinks = d["sinks"]
+    assert isinstance(sinks, list)
+    return sinks
+
+
 def _reject(sql: str) -> SqlmpegError:
     with pytest.raises(SqlmpegError) as excinfo:
         compile_sql(sql)
@@ -363,15 +370,17 @@ def test_readme_encoding_wraps_the_flagship_query_in_a_sink(_fixtures: None) -> 
     graph untouched -- same shape as `test_sink_does_not_change_the_graph_shape`."""
     plain = compile_sql(_readme_flagship_sql()).to_dict()
     wrapped = compile_sql(_readme_encoding_sql()).to_dict()
-    assert wrapped.pop("sink") == {
-        "path": "pip.mkv",
-        "options": {
-            "video_codec": "libx264",
-            "crf": 20,
-            "audio_codec": "aac",
-            "audio_bitrate": "192k",
-        },
+    unit = _serialized_sinks(wrapped)[0]
+    assert unit["path"] == "pip.mkv"
+    assert unit["options"] == {
+        "video_codec": "libx264",
+        "crf": 20,
+        "audio_codec": "aac",
+        "audio_bitrate": "192k",
     }
+    # The destination is the ONLY difference: same nodes, same outputs.
+    unit["path"] = None
+    unit["options"] = {}
     assert wrapped == plain
 
 
@@ -2262,15 +2271,17 @@ def _sink_of(options: str) -> dict[str, object]:
     """The lowered sink of `SINK_QUERY` wrapped in a COPY with `options`."""
     with_clause = f" WITH ({options})" if options else ""
     g = _lower(f"COPY ({SINK_QUERY}) TO 'out.mkv'{with_clause}")
-    assert g.sink is not None
-    assert g.sink.path == "out.mkv"
-    return g.sink.options
+    assert len(g.sinks) == 1
+    assert g.sinks[0].path == "out.mkv"
+    return g.sinks[0].options
 
 
-def test_bare_select_has_no_sink() -> None:
+def test_bare_select_lowers_to_one_pathless_sink() -> None:
     g = _lower(SINK_QUERY)
-    assert g.sink is None
-    assert "sink" not in g.to_dict()
+    assert len(g.sinks) == 1
+    assert g.sinks[0].path is None
+    assert g.sinks[0].options == {}
+    assert _serialized_sinks(g.to_dict())[0]["path"] is None
 
 
 def test_copy_lowers_to_a_sink() -> None:
@@ -2311,9 +2322,12 @@ def test_sink_survives_the_split_pass_and_serializes() -> None:
     )
     # the projection is used twice, so the split pass rebuilt the graph
     assert "split" in _filters(g)
-    assert g.to_dict()["sink"] == {
-        "path": "out.mp4",
-        "options": {"video_codec": "libx264", "crf": 18, "faststart": True},
+    unit = _serialized_sinks(g.to_dict())[0]
+    assert unit["path"] == "out.mp4"
+    assert unit["options"] == {
+        "video_codec": "libx264",
+        "crf": 18,
+        "faststart": True,
     }
     assert Graph.from_dict(g.to_dict()).to_dict() == g.to_dict()
 
@@ -2376,7 +2390,11 @@ def test_sink_does_not_change_the_graph_shape() -> None:
     """Wrapping a query in a COPY adds a sink and touches nothing else."""
     plain = compile_sql(SINK_QUERY).to_dict()
     wrapped = compile_sql(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH (crf 20)").to_dict()
-    assert wrapped.pop("sink") == {"path": "out.mkv", "options": {"crf": 20}}
+    unit = _serialized_sinks(wrapped)[0]
+    assert unit["path"] == "out.mkv"
+    assert unit["options"] == {"crf": 20}
+    unit["path"] = None
+    unit["options"] = {}
     assert wrapped == plain
 
 
@@ -4609,9 +4627,9 @@ def test_a_view_lowers_into_the_same_ir_a_cte_would() -> None:
 
 def test_a_view_script_keeps_its_sink() -> None:
     g = compile_sql(_VIEW_SCRIPT, probe=False)
-    assert g.sink is not None
-    assert g.sink.path == "out.mp4"
-    assert g.sink.options == {"crf": 20}
+    assert len(g.sinks) == 1
+    assert g.sinks[0].path == "out.mp4"
+    assert g.sinks[0].options == {"crf": 20}
 
 
 def test_a_view_script_compiles_to_one_ffmpeg_command() -> None:
@@ -4660,10 +4678,7 @@ def test_a_view_column_error_still_names_the_view() -> None:
     assert err.line == 2
 
 
-# --- TEMPORARY (plan 045): the multi-sink rejection ------------------------
-#
-# Delete these three tests together with `lower._reject_multiple_sinks` when
-# plan 046 lands `Graph.sinks`.
+# --- multiple sinks (RFC-006 wave 2, plan 046) -----------------------------
 
 _TWO_SINKS = (
     "CREATE VIEW m AS SELECT a.frame AS v FROM input('film.mkv') a;\n"
@@ -4672,21 +4687,59 @@ _TWO_SINKS = (
 )
 
 
-def test_more_than_one_copy_is_rejected_for_now() -> None:
-    err = _reject(_TWO_SINKS)
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "multiple sinks land in the next wave" in err.message
-    assert "'720.mp4', '360.mp4'" in err.message
+def test_each_copy_becomes_its_own_sink_unit() -> None:
+    g = compile_sql(_TWO_SINKS, probe=False)
+    assert [unit.path for unit in g.sinks] == ["720.mp4", "360.mp4"]
+    assert [len(unit.outputs) for unit in g.sinks] == [1, 1]
 
 
-def test_the_multi_sink_rejection_is_anchored_on_the_second_copy() -> None:
-    assert _reject(_TWO_SINKS).line == 3
-
-
-def test_the_multi_sink_rejection_fires_after_a_clean_resolve() -> None:
-    """The parser contract is already multi-sink; only the IR is not."""
+def test_the_parser_and_the_ir_agree_on_the_sink_list() -> None:
     res = resolve(parse(_TWO_SINKS))
     assert [sink.path for sink in res.sinks] == ["720.mp4", "360.mp4"]
+    assert [unit.path for unit in compile_sql(_TWO_SINKS, probe=False).sinks] == [
+        "720.mp4",
+        "360.mp4",
+    ]
+
+
+_LADDER_SCRIPT = (
+    "CREATE VIEW master AS\n"
+    "  SELECT blur(a.video[1], 2) AS v, volume(a.audio[1], 0.9) AS a\n"
+    "  FROM input('film.mkv') a;\n"
+    "COPY (SELECT scale(m.v, 1280, -2), m.a FROM master m) TO '720.mp4';\n"
+    "COPY (SELECT scale(m.v, 640, -2), m.a FROM master m) TO '360.mp4';\n"
+    "COPY (SELECT m.a FROM master m) TO 'audio.m4a';"
+)
+
+
+def test_the_shared_view_is_lowered_once_and_split_across_the_sinks() -> None:
+    """The ladder's load-bearing property: the master view lowers ONCE.
+
+    Three COPYs read `master`. Its two filters (`gblur`, `volume`) must appear
+    exactly once each; what fans them out is the split pass, one `split` for
+    the two video readers and one `asplit` for the three audio ones.
+    """
+    g = compile_sql(_LADDER_SCRIPT, probe=False)
+    filters = [node.filter for node in g.nodes.values()]
+    assert filters.count("gblur") == 1
+    assert filters.count("volume") == 1
+    assert filters.count("scale") == 2
+    assert filters.count("split") == 1
+    assert filters.count("asplit") == 1
+    assert g.input_paths == ["film.mkv"]  # one -i: decode once
+    assert [unit.path for unit in g.sinks] == ["720.mp4", "360.mp4", "audio.m4a"]
+    assert [len(unit.outputs) for unit in g.sinks] == [2, 2, 1]
+
+
+def test_the_shared_views_split_pads_are_handed_out_in_sink_order() -> None:
+    g = compile_sql(_LADDER_SCRIPT, probe=False)
+    asplit = next(node for node in g.nodes.values() if node.filter == "asplit")
+    assert asplit.args == {"n": 3}
+    assert [unit.outputs[-1].ref for unit in g.sinks] == [
+        f"{asplit.id}:0",
+        f"{asplit.id}:1",
+        f"{asplit.id}:2",
+    ]
 
 
 @pytest.mark.exec

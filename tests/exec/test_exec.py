@@ -1332,3 +1332,95 @@ def test_every_expr_slot_maps_to_a_string_typed_ffmpeg_option() -> None:
     assert {(f, p) for f, p, _ in checked} == _EXPR_SLOT_CENSUS
     # The one pair whose names differ -- and the reason the mapping is derived.
     assert ("text", "size", "fontsize") in checked
+
+
+# ---------------------------------------------------------------------------
+# RFC-006 (plan 046): a script with several COPYs is ONE ffmpeg command
+# ---------------------------------------------------------------------------
+
+
+def test_the_abr_ladder_writes_three_files_from_one_invocation(tmp_path: Path) -> None:
+    """The wave's headline: a view over av2, three COPYs, one ffmpeg run.
+
+    `master` decodes and normalizes once; two COPYs scale it to their own
+    rendition and take its audio, and a third takes the audio alone. The
+    command has exactly one `-i` and one `-filter_complex`, and the three
+    output files come out of the single invocation with the dimensions each
+    COPY asked for -- the audio-only one with no video stream at all.
+    """
+    _require_fixture(_AV2)
+    ladder = tmp_path / "480.mp4"
+    small = tmp_path / "240.mp4"
+    audio = tmp_path / "audio.m4a"
+    query = (
+        "CREATE VIEW master AS\n"
+        "  SELECT a.video[1] AS v, volume(a.audio[1], 0.9) AS a\n"
+        f"  FROM input('{_sql_path(_AV2)}') a;\n"
+        "COPY (SELECT scale(m.v, 160, -2), m.a FROM master m)\n"
+        f"TO '{_sql_path(ladder)}' WITH (video_codec 'libx264', crf 30, audio_codec 'aac');\n"
+        "COPY (SELECT scale(m.v, 80, -2), m.a FROM master m)\n"
+        f"TO '{_sql_path(small)}' WITH (video_codec 'libx264', crf 32, audio_codec 'aac');\n"
+        "COPY (SELECT m.a FROM master m)\n"
+        f"TO '{_sql_path(audio)}' WITH (audio_codec 'aac', audio_bitrate '64k');"
+    )
+
+    graph = compile_sql(query)
+    emitted = emit(graph)
+    args = build_ffmpeg_args(emitted)
+
+    assert args.count("-i") == 1  # ONE decode
+    assert args.count("-filter_complex") == 1
+    assert len(emitted.groups) == 3
+    assert args[-1] == str(audio.resolve().as_posix())
+
+    args.insert(1, "-y")
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, f"{args}\n{result.stderr}"
+
+    for path in (ladder, small, audio):
+        assert path.exists(), path
+
+    assert _ffprobe_video_stream(ladder)["width"] == 160
+    assert _ffprobe_video_stream(ladder)["height"] == 120
+    assert _ffprobe_video_stream(small)["width"] == 80
+    assert _ffprobe_video_stream(small)["height"] == 60
+    assert [s["codec_type"] for s in _ffprobe_streams(ladder)] == ["video", "audio"]
+    assert [s["codec_type"] for s in _ffprobe_streams(small)] == ["video", "audio"]
+    assert [s["codec_type"] for s in _ffprobe_streams(audio)] == ["audio"]
+
+
+def test_two_sinks_may_stream_copy_the_same_audio_track(tmp_path: Path) -> None:
+    """The cross-GROUP passthrough exemption, against real ffmpeg.
+
+    Both COPYs bare-map `0:a:0`. There is no `asplit` and no filtergraph at
+    all: each file gets `-map 0:a:0 -c:0 copy`, which is a repeated `-map`,
+    and ffmpeg writes both.
+    """
+    _require_fixture(_AV2)
+    first = tmp_path / "one.m4a"
+    second = tmp_path / "two.m4a"
+    query = (
+        f"CREATE VIEW track AS SELECT a.audio[1] AS a FROM input('{_sql_path(_AV2)}') a;\n"
+        f"COPY (SELECT t.a FROM track t) TO '{_sql_path(first)}';\n"
+        f"COPY (SELECT t.a FROM track t) TO '{_sql_path(second)}';"
+    )
+
+    graph = compile_sql(query)
+    emitted = emit(graph)
+    assert graph.nodes == {}
+    assert emitted.filter_complex == ""
+    assert [group.maps[0].target for group in emitted.groups] == ["0:a:0", "0:a:0"]
+
+    args = build_ffmpeg_args(emitted)
+    args.insert(1, "-y")
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, f"{args}\n{result.stderr}"
+
+    for path in (first, second):
+        streams = _ffprobe_streams(path)
+        assert [s["codec_type"] for s in streams] == ["audio"]
+        assert streams[0]["codec_name"] == "aac"  # copied, not re-encoded

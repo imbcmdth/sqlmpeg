@@ -21,18 +21,24 @@
       ]
     }
   ],
-  "outputs": [
+  "sinks": [
     {
-      "ref": "n1",
-      "type": "video",
-      "name": null,
-      "metadata": {}
-    },
-    {
-      "ref": "src:a:a:0",
-      "type": "audio",
-      "name": null,
-      "metadata": {}
+      "outputs": [
+        {
+          "ref": "n1",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        },
+        {
+          "ref": "src:a:a:0",
+          "type": "audio",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
     }
   ]
 }

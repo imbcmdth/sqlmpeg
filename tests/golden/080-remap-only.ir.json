@@ -6,18 +6,24 @@
     "a": 0
   },
   "nodes": [],
-  "outputs": [
+  "sinks": [
     {
-      "ref": "src:a:v:0",
-      "type": "video",
-      "name": null,
-      "metadata": {}
-    },
-    {
-      "ref": "src:a:a:1",
-      "type": "audio",
-      "name": null,
-      "metadata": {}
+      "outputs": [
+        {
+          "ref": "src:a:v:0",
+          "type": "video",
+          "name": null,
+          "metadata": {}
+        },
+        {
+          "ref": "src:a:a:1",
+          "type": "audio",
+          "name": null,
+          "metadata": {}
+        }
+      ],
+      "path": null,
+      "options": {}
     }
   ]
 }
