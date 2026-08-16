@@ -196,14 +196,47 @@ _DIALECT_TAIL = """\
 - `WITH name AS (SELECT ...)`, multiple CTEs comma-separated. A CTE body is a
   `SELECT` or a `UNION ALL` of `SELECT`s; each column of its SELECT list
   becomes a named CTE column (name it with `AS`).
-- Reference a CTE by its bare name in `FROM`: `FROM pip`. Never alias it
-  (`FROM pip p` is rejected) and never wrap it in `input()`.
+- Reference a CTE by its bare name in `FROM` (`FROM pip`), or give it an
+  alias (`FROM pip p`) -- never wrap it in `input()` either way. The alias is
+  BRANCH-LOCAL (two branches, or two COPYs in a script, may each spell it the
+  same way) and may not shadow another alias/CTE/view name already in scope.
 - A CTE sees only the CTEs defined BEFORE it. No forward references, no
   `RECURSIVE`, no `WITH` nested inside a CTE body, no CTE column lists.
 - A name may appear at most once in a single `FROM` clause. To consume the
   same stream twice in one expression, just write `c.frame` (or
   `c.<name>`) twice -- the compiler inserts the `split`/`asplit` for you.
   Reuse is automatic; never duplicate the CTE.
+
+### Scripts, views and multiple outputs
+- A query is normally one statement: a bare `SELECT`, or one wrapped in
+  `COPY (<query>) TO '<path>' WITH (<options>)` (see Output below). It may
+  also be a SCRIPT -- zero or more `CREATE VIEW <name> AS <query>;`
+  statements, EVERY one of them before the first `COPY`, followed by one or
+  more `COPY (<query>) TO '<path>' WITH (<options>);` statements. A script
+  still compiles to ONE ffmpeg command, with one output group per `COPY`.
+- `CREATE VIEW <name> AS <query>` is to STATEMENTS what a CTE is to
+  branches: a named, shared subgraph, built once and split across every
+  later view or `COPY` that reads it. Its columns are its SELECT's `AS`
+  names (same rule as a CTE column), its body is a full query and may carry
+  its own `WITH`, and it may reference an earlier view (no forward
+  references, same as a CTE). View, CTE and alias names all share ONE flat
+  namespace for the WHOLE script, not just one statement.
+- Reference a view exactly like a CTE -- bare name, or aliased in `FROM`
+  (`FROM master m`, branch-local, may not shadow).
+- Rejected, typed: `CREATE OR REPLACE VIEW`, `CREATE TEMP`/`TEMPORARY VIEW`,
+  `CREATE MATERIALIZED VIEW`, `CREATE VIEW IF NOT EXISTS`, a view column
+  list, a `CREATE VIEW` after the first `COPY`, any statement in a script
+  that is neither `CREATE VIEW` nor `COPY` (a bare `SELECT` included --
+  only `COPY` carries a destination, so wrap it), a script with zero `COPY`
+  statements, and a view nothing ever reads (a typo guard, anchored on its
+  `CREATE VIEW`).
+- A single bare `SELECT`, or a single `COPY`, behaves exactly as it always
+  has -- nothing above applies until the query text has more than one
+  statement.
+- `-o` on the CLI names ONE path, so it is legal only when the query has
+  exactly one sink (a bare `SELECT` with no `COPY`, or a script with exactly
+  one `COPY`); against more than one sink it is a usage error naming the
+  sinks the script found.
 
 ### Time selection
 - The supported predicates are `WHERE <alias>.t BETWEEN <start> AND <end>`,
@@ -339,6 +372,18 @@ _DIALECT_TAIL = """\
   output are NOT callable under either spelling. Neither is a zero-input
   filter: `ffmpeg.testsrc(...)` is a generated SOURCE and belongs in `FROM`
   (see Dialect > Sources), never in the SELECT list.
+- Three of those otherwise-excluded filters ARE callable, through the
+  namespace ONLY, because their pad count is fixed by one of their own
+  options rather than genuinely variable: `ffmpeg.channelsplit(audio)` (one
+  stream per channel of `channel_layout`, or the narrower `channels`
+  subset), `ffmpeg.acrossover(audio)` (one band per `split` frequency, plus
+  one), and `ffmpeg.extractplanes(video)` (one per requested plane). Each
+  RETURNS AN ARRAY, exactly like an input's bare `<alias>.audio`: splat it
+  into the SELECT list, subscript one element through a CTE column
+  (`s.ch[2]`), or broadcast a call over every element. The bare name still
+  resolves nowhere -- only the namespaced spelling reaches these three. A
+  count-deciding option whose value is well-typed but not a count ffmpeg
+  could actually produce is `FILTER_OPTION_TYPE`, naming that option.
 - This is machine-dependent, and it is the only part of the dialect that is:
   the stdlib above compiles anywhere, while a query naming a filter (or a
   named option) only compiles where that ffmpeg has it. Prefer a stdlib
@@ -427,10 +472,11 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   `UNION` without `ALL`.
 - Outside the dialect: subqueries anywhere (use a CTE), explicit `JOIN ...
   ON` / `USING`, casts (`::` or `CAST`), arithmetic or any non-literal in an
-  argument, unqualified columns, schema-qualified tables, aliasing a CTE,
-  `WITH RECURSIVE`, nested `WITH`, CTE column lists, table functions other than
-  `input()`, any statement that is not a `SELECT`, more than one statement, a
-  zero/negative/computed array subscript.
+  argument, unqualified columns, schema-qualified tables, an alias that
+  shadows another alias/CTE/view name already in scope, `WITH RECURSIVE`,
+  nested `WITH`, CTE column lists, table functions other than `input()`, a
+  statement that is neither a `SELECT` nor (in a script) `CREATE VIEW` /
+  `COPY`, a zero/negative/computed array subscript.
 - Any name that is neither a function listed below nor a filter the installed
   ffmpeg provides (see "Beyond the stdlib"), including transitions between
   concatenated branches, motion tracking, subtitle/data-stream filtering, and
@@ -561,6 +607,19 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
         "  SELECT a.video[1], a.audio[1], s.subtitle[1]\n"
         "  FROM input('clip.mp4') a, input('subs.en.vtt') s\n"
         ") TO 'out.mp4' WITH (subtitle_codec 'mov_text')",
+    ),
+    (
+        "Encode film.mkv to a 720p and a 360p mp4 plus a standalone AAC "
+        "audio file, decoding and filtering the source only once.",
+        "CREATE VIEW master AS\n"
+        "  SELECT scale(f.video[1], 1920, -2) AS v, volume(f.audio[1], 0.9) AS a\n"
+        "  FROM input('film.mkv') f;\n"
+        "COPY (SELECT scale(m.v, 1280, -2) AS v, m.a FROM master m)\n"
+        "TO '720.mp4' WITH (video_codec 'libx264', crf 21, audio_codec 'aac');\n"
+        "COPY (SELECT scale(m.v, 640, -2) AS v, m.a FROM master m)\n"
+        "TO '360.mp4' WITH (video_codec 'libx264', crf 26, audio_codec 'aac');\n"
+        "COPY (SELECT m.a FROM master m)\n"
+        "TO 'audio.m4a' WITH (audio_codec 'aac', audio_bitrate '128k')",
     ),
 )
 

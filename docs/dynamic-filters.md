@@ -71,9 +71,28 @@ The expression's vocabulary is `t` (timestamp in seconds), `n` (frame number) an
 Not everything ffmpeg reports is callable:
 
 - Only filters with a static pad signature and exactly one output make the cut: `V->V`, `A->A`, `AA->A`, `VV->V`, and friends. Variable pad counts (`N`: `split`, `concat`), multiple outputs (`scale2ref`, `feedback`), and sources/sinks (`|`: `testsrc`, `anullsink`) are excluded, and calling one gets an `UNSUPPORTED_SQL` naming the limitation rather than a partial guess.
-- **Three fenced filters are callable after all**, because their output count is not really variable: it is fixed, statically, by one of their options. `ffmpeg.channelsplit(...)` (one stream per channel of `channel_layout`, or of the narrower `channels` subset), `ffmpeg.acrossover(...)` (one band per `split` frequency, plus one) and `ffmpeg.extractplanes(...)` (one per requested plane) each return an **array** of streams — the first calls that do — so the result splats into a SELECT list, subscripts out of a CTE column (`s.ch[2]`), and broadcasts a per-element call over every element. They are reachable through the `ffmpeg.` namespace only; the bare names stay unknown. A layout or split list that is well-typed but not a count ffmpeg could produce is `FILTER_OPTION_TYPE`, naming the option that decides the count. Every other `->N` filter (`amerge`, `join`, `concat`, `split`) is fenced exactly as before.
+- **Three fenced filters are callable after all**, because their output count is not really variable: it is fixed, statically, by one of their options. `ffmpeg.channelsplit(...)` (one stream per channel of `channel_layout`, or of the narrower `channels` subset), `ffmpeg.acrossover(...)` (one band per `split` frequency, plus one) and `ffmpeg.extractplanes(...)` (one per requested plane) each return an **array** of streams — the first calls that do — so the result splats into a SELECT list, subscripts out of a CTE column (`s.ch[2]`), and broadcasts a per-element call over every element. They are reachable through the `ffmpeg.` namespace only; the bare names stay unknown. A layout or split list that is well-typed but not a count ffmpeg could produce is `FILTER_OPTION_TYPE`, naming the option that decides the count. Every other `->N` filter (`amerge`, `join`, `concat`, `split`) is fenced exactly as before. None of the three is `T`-flagged for timeline support in `ffmpeg -filters` either, so `enable` on any of them is rejected the ordinary way (`UNKNOWN_FILTER_OPTION`), not silently accepted.
 - Options typed `binary` or `dictionary` have no representation in the dialect; setting one is `FILTER_OPTION_TYPE`. The filter's other options still work.
 - ffmpeg's runtime filter commands (`sendcmd`, `zmq`) are out of scope entirely.
+
+### Array-returning filters, worked
+
+Split a stereo track into its two channels, gain each one separately, and mix them back into one — the shape all three array-returning filters exist for:
+
+```sql
+WITH ch AS (
+  SELECT ffmpeg.channelsplit(a.audio[1]) AS lr FROM input('stereo.mp4') a
+)
+SELECT amix(volume(ch.lr[1], 0.5), volume(ch.lr[2], 2.0))
+FROM ch
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i stereo.mp4 -filter_complex '[0:a:0]channelsplit[n10][n11];[n10]volume=volume=0.5[n2];[n11]volume=volume=2.0[n3];[n2][n3]amix=inputs=2[out0]' -map '[out0]' out.mp4
+```
+
+One `channelsplit` node makes both pads at once — `channel_layout` defaults to `'stereo'`, so two, without probing the file at all — and `ch.lr[1]`/`ch.lr[2]` subscript them out of the CTE column exactly like any other array column. `acrossover` and `extractplanes` work the same way, sized off `split` and `planes` respectively instead of `channel_layout`.
 
 ## The introspection cache
 

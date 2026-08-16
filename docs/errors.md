@@ -149,6 +149,12 @@ Three caption rejections land here too, all consequences of one measured fact: f
 - a `WHERE` window on a CTE whose columns include a subtitle/data column. A CTE trim is a filtergraph trim (`trim`/`atrim`), and a filtergraph cannot carry captions at all, so this rejects unconditionally, selected or not;
 - a subtitle/data column inside a `UNION ALL` branch. `concat` has video and audio pads, full stop.
 
+Three script rejections (RFC-006: `CREATE VIEW name AS <query>;`* followed by `COPY ...;`+, see [the README](../README.md#views-and-multiple-outputs)) land here too, all typo/shape guards rather than anything semantic:
+
+- a view nobody ever reads, anchored on its `CREATE VIEW` (captured example below) -- a script's whole point is that its views feed later views or COPYs, so one that feeds nothing is almost always a misspelled name somewhere else;
+- a bare `SELECT` sitting among other statements. Only `COPY` carries a destination, so a lone `SELECT` in a multi-statement script has nowhere to send its streams -- wrap it in `COPY (<query>) TO '<path>'`;
+- a `CREATE VIEW` written after the first `COPY`. Every view must precede every `COPY`, so the whole script can resolve names left-to-right in one pass.
+
 **Fires when:** (one example among many) the query selects a subtitle stream that sits inside its own alias's `WHERE` time window.
 
 **Example query** (`tests/fixtures/avs.mkv` has one subtitle stream):
@@ -163,6 +169,19 @@ WHERE a.t BETWEEN 1 AND 2
 
 ```json
 {"line": 1, "col": 8, "code": "UNSUPPORTED_SQL", "message": "'WHERE a.t' cannot trim a selected subtitle stream: ffmpeg does not retime caption packets under an input seek, so they would play out of sync with the trimmed video", "hint": "trim the video/audio without selecting the subtitle/data columns, or select them in a query without a WHERE time range; to caption a trimmed clip, join an external subtitle file whose cues are timed for the cut"}
+```
+
+**Example query** (a script: the view is defined but nothing reads it):
+
+```sql
+CREATE VIEW unused AS SELECT a.frame AS v FROM input('x.mp4') a;
+COPY (SELECT b.frame FROM input('x.mp4') b) TO 'out.mp4';
+```
+
+**Error JSON:**
+
+```json
+{"line": 1, "col": 13, "code": "UNSUPPORTED_SQL", "message": "view 'unused' is never used", "hint": "every view must be read by a later view or COPY; check the spelling of the name in its FROM clauses"}
 ```
 
 ## STREAM_NOT_FOUND

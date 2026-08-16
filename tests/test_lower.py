@@ -357,8 +357,13 @@ def test_readme_flagship_command_is_the_real_compilation(_fixtures: None) -> Non
 
 def _readme_encoding_sql() -> str:
     """The Encoding section's ```sql block: the flagship verbatim inside a
-    COPY ... TO ... WITH (...), re-pointed at the real fixtures the same way."""
-    sql = _readme_block("COPY (")
+    COPY ... TO ... WITH (...), re-pointed at the real fixtures the same way.
+
+    Needled on 'pip.mkv' (its TO destination), not the more obvious 'COPY (':
+    the Views and multiple outputs section's ladder script also opens with
+    COPY ( now, which would make that needle match two blocks.
+    """
+    sql = _readme_block("pip.mkv")
     for shown, fixture in _FLAGSHIP_README_PATHS.items():
         sql = sql.replace(shown, (FIXTURES_DIR / fixture).as_posix())
     return sql
@@ -400,6 +405,37 @@ def test_readme_encoding_command_is_the_real_compilation(_fixtures: None) -> Non
 
 
 # ---------------------------------------------------------------------------
+# the README "Views and multiple outputs" example (RFC-006, plan 048)
+# ---------------------------------------------------------------------------
+#
+# Explicit subscripts only (`f.video[1]`, `f.audio[1]`), so this compiles
+# fully symbolically -- no fixture substitution, no probe, no registry. Pinned
+# offline like `_readme_overlay_expr_sql`, not exec-marked.
+
+
+def _readme_ladder_sql() -> str:
+    """The ABR-ladder script, verbatim -- 'film.mkv' need not exist."""
+    return _readme_block("CREATE VIEW master")
+
+
+def test_readme_ladder_example_compiles() -> None:
+    g = compile_sql(_readme_ladder_sql(), probe=False)
+    assert [unit.path for unit in g.sinks] == ["720.mp4", "360.mp4", "audio.m4a"]
+    filters = [node.filter for node in g.nodes.values()]
+    assert filters.count("scale") == 3  # master's own + one per video COPY
+    assert filters.count("volume") == 1  # built once, split across all 3 COPYs
+    assert g.input_paths == ["film.mkv"]  # one -i: decoded once
+
+
+def test_readme_ladder_example_command_is_the_real_compilation() -> None:
+    """The command shown under "Views and multiple outputs" is what sqlmpeg
+    actually prints for that script -- no fixture path to substitute back,
+    since the query names no file sqlmpeg can (or needs to) read."""
+    args = build_ffmpeg_args(emit(compile_sql(_readme_ladder_sql(), probe=False)), None)
+    assert shlex.join(args) in _readme_text()
+
+
+# ---------------------------------------------------------------------------
 # the README "Any ffmpeg filter" example (plan 032, RFC-003)
 # ---------------------------------------------------------------------------
 
@@ -434,6 +470,42 @@ def test_readme_dynamic_filter_command_is_the_real_compilation(_fixtures: None) 
     args = build_ffmpeg_args(emit(compile_sql(_readme_dynamic_sql())), "out.mp4")
     shown = shlex.join(args)
     for name, fixture in _DYNAMIC_README_PATHS.items():
+        shown = shown.replace((FIXTURES_DIR / fixture).as_posix(), name)
+    assert shown in _readme_text(), shown
+
+
+# ---------------------------------------------------------------------------
+# the README "Any ffmpeg filter" channelsplit round trip (RFC-006, plan 048)
+# ---------------------------------------------------------------------------
+#
+# ffmpeg.channelsplit(...) is a tier-2, array-returning call: it needs the
+# real installed ffmpeg's registry the same way the unsharp example above
+# does, so this is exec-pinned rather than offline like the ladder above it.
+
+_CHANNELSPLIT_README_PATHS = {"stereo.mp4": "stereo.mp4"}
+
+
+def _readme_channelsplit_sql() -> str:
+    """The round-trip one-liner -- the shown name IS the real fixture's name
+    already, so the substitution below is a same-name round trip, kept for
+    symmetry with every other README fixture-mapping helper."""
+    sql = _readme_block("channelsplit")
+    for shown, fixture in _CHANNELSPLIT_README_PATHS.items():
+        sql = sql.replace(shown, (FIXTURES_DIR / fixture).as_posix())
+    return sql
+
+
+@pytest.mark.exec
+def test_readme_channelsplit_example_compiles(_fixtures: None) -> None:
+    g = compile_sql(_readme_channelsplit_sql())
+    assert _filters(g) == ["channelsplit", "volume", "volume", "amix"]
+
+
+@pytest.mark.exec
+def test_readme_channelsplit_example_command_is_the_real_compilation(_fixtures: None) -> None:
+    args = build_ffmpeg_args(emit(compile_sql(_readme_channelsplit_sql())), "out.mp4")
+    shown = shlex.join(args)
+    for name, fixture in _CHANNELSPLIT_README_PATHS.items():
         shown = shown.replace((FIXTURES_DIR / fixture).as_posix(), name)
     assert shown in _readme_text(), shown
 

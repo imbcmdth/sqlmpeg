@@ -2,7 +2,7 @@
 
 SQL in, ffmpeg command out. You write a `SELECT` statement, sqlmpeg compiles it into a `-filter_complex` invocation, and ffmpeg does the actual pixel-pushing. This tool never decodes a single frame: it's a compiler, and ffmpeg is the executor.
 
-**Status: v0.8.0, not yet on PyPI. Works on my machine (and the CI machine).**
+**Status: v0.9.0, not yet on PyPI. Works on my machine (and the CI machine).**
 
 Why does this exist? The ffmpeg engine is a marvel. The filtergraph syntax is the hard part: hand-labeled pads that must each be consumed exactly once, positional arguments in surprising orders (`crop` takes `w:h:x:y`, when everyone thinks in `x,y,w,h`), and quoting rules deep enough that the official docs include a worked escaping example. SQL, meanwhile, has been describing dataflow DAGs for fifty years, and it's the language every developer (and every LLM) already speaks. This project connects the two.
 
@@ -67,6 +67,32 @@ ffmpeg -i episode1.mkv -i episode2.mkv -filter_complex '[0:v:0][0:a:0][0:a:1][1:
 
 This example is my favorite, because it shows why SQL is such a natural fit. SQL requires `UNION ALL` branches to agree on column count, type, and order. That happens to be, verbatim, ffmpeg's concat segment contract: n segments, each contributing its videos then its audios, interleaved in exactly the right order - which is genuinely tricky to get right by hand. Two three-track episodes would give you `a=3` without anyone counting pads. And the language tags survive the concat, because every segment agrees on them.
 
+## Views and multiple outputs
+
+A `CREATE VIEW name AS <query>;` followed by one or more `COPY (...) TO '<path>' WITH (...);` is a script - the ABR-ladder shape, one decode feeding several encodes. It still compiles to ONE ffmpeg invocation, one output group per COPY:
+
+```sql
+CREATE VIEW master AS
+  SELECT scale(f.video[1], 1920, -2) AS v, volume(f.audio[1], 0.9) AS a
+  FROM input('film.mkv') f;
+
+COPY (SELECT scale(m.v, 1280, -2) AS v, m.a FROM master m)
+TO '720.mp4' WITH (video_codec 'libx264', crf 21, audio_codec 'aac');
+
+COPY (SELECT scale(m.v, 640, -2) AS v, m.a FROM master m)
+TO '360.mp4' WITH (video_codec 'libx264', crf 26, audio_codec 'aac');
+
+COPY (SELECT m.a FROM master m)
+TO 'audio.m4a' WITH (audio_codec 'aac', audio_bitrate '128k')
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i film.mkv -filter_complex '[0:v:0]scale=w=1920:h=-2[n1];[0:a:0]volume=volume=0.9[n2];[n1]split=2[n1_split0][n1_split1];[n1_split0]scale=w=1280:h=-2[out0];[n1_split1]scale=w=640:h=-2[out2];[n2]asplit=3[out1][out3][out4]' -map '[out0]' -map '[out1]' -c:0 libx264 -crf:0 21 -c:1 aac 720.mp4 -map '[out2]' -map '[out3]' -c:0 libx264 -crf:0 26 -c:1 aac 360.mp4 -map '[out4]' -c:0 aac -b:0 128k audio.m4a
+```
+
+A view is to statements what a CTE is to branches: `master` decodes and filters `film.mkv` exactly once - `scale` and `volume` each appear a single time in the graph above - and the split pass hands out however many pads its readers need (`split=2` for the two video consumers, `asplit=3` for the three audio ones). Alias it in `FROM` (`FROM master m`) exactly like a CTE; view, CTE and alias names share one flat, script-wide namespace, and a view that nothing ever reads is a typo, rejected outright. `-o` on the CLI only makes sense with one destination - against a script with more than one COPY it's a usage error naming the sinks it found, so give each COPY its own path instead.
+
 ## Any ffmpeg filter
 
 The stdlib is a few dozen functions with hand-picked, portable signatures: degrees instead of radians, seconds instead of milliseconds, arguments in the order a person would guess. But your installed ffmpeg ships somewhere north of 450 filters, and sqlmpeg exposes every one of them. It asks the binary what it has (`ffmpeg -filters`, then `-help filter=<name>` per filter, cached), then type-checks your calls against the answer: stream inputs positional, options by name.
@@ -82,6 +108,23 @@ ffmpeg -i clip.mp4 -filter_complex '[0:v:0]unsharp=luma_msize_x=7:luma_amount=1.
 ```
 
 This is machine-dependent on purpose: the query compiles where an `unsharp` filter exists and nowhere else, and the option names, types, ranges, and enum constants are all validated against what your binary actually reports. Named options also reach through stdlib calls to the underlying filter's full option set (`blur(a.frame, 5, planes => 1)` sets `gblur`'s `planes`, which no table anywhere lists). Every filter is additionally callable as `ffmpeg.<name>(...)`, a spelling that resolves in the filter set alone - which is how you reach the raw filter behind a stdlib name, and the eleven filters whose names Postgres itself parses specially (`ffmpeg.trim`, `ffmpeg.format`, `ffmpeg.overlay`, ...). When a query needs to travel, `--portable` compiles it against the stdlib alone and tells you exactly what a machine with no ffmpeg would think of it. Details live in [docs/dynamic-filters.md](docs/dynamic-filters.md).
+
+A few of those ~450 filters return more than one stream. `channelsplit`, `acrossover` and `extractplanes` are `->N` filters everywhere else, but sqlmpeg admits them anyway because their pad count is fixed by one of their own options, so the call returns an array - splat it, subscript it, or broadcast a function over it, exactly like an input's bare `.audio`. Split a stereo track into its two channels, gain each one separately, and mix them back into one:
+
+```sql
+WITH ch AS (
+  SELECT ffmpeg.channelsplit(a.audio[1]) AS lr FROM input('stereo.mp4') a
+)
+SELECT amix(volume(ch.lr[1], 0.5), volume(ch.lr[2], 2.0))
+FROM ch
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i stereo.mp4 -filter_complex '[0:a:0]channelsplit[n10][n11];[n10]volume=volume=0.5[n2];[n11]volume=volume=2.0[n3];[n2][n3]amix=inputs=2[out0]' -map '[out0]' out.mp4
+```
+
+One `channelsplit` node makes two pads - `channel_layout` defaults to `'stereo'`, so two, without touching the file - and `ch.lr[1]`/`ch.lr[2]` subscript them out of the CTE column like any other array; `amix` folds the two regained channels back into one stream. Only the namespaced spelling reaches it - `channelsplit` bare is unknown, same as every other multi-output filter.
 
 ## Generated sources
 
