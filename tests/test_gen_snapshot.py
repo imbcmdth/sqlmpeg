@@ -1,0 +1,343 @@
+"""Tests for scripts/gen_snapshot.py and sqlmpeg.registry.load_reference()
+(plan 050, RFC-007 "Offline compile: the reference snapshot replaces
+--portable").
+
+Split like tests/test_registry.py: monkeypatched / no-subprocess tests are
+unmarked so the default suite (`pytest`, `-m "not exec"`) stays offline;
+tests that shell out to a real ffmpeg (regenerating the snapshot, or
+comparing it against a freshly-introspected live Registry) are marked
+`@pytest.mark.exec`.
+"""
+
+from __future__ import annotations
+
+import importlib.resources
+import importlib.util
+import json
+import subprocess
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+
+from sqlmpeg import registry as registry_mod
+from sqlmpeg.registry import Registry, clear_cache, load_reference
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_GEN_SNAPSHOT_PATH = _REPO_ROOT / "scripts" / "gen_snapshot.py"
+_SNAPSHOT_PATH = _REPO_ROOT / "sqlmpeg" / "reference_registry.json"
+
+
+def _load_gen_snapshot() -> ModuleType:
+    """Load scripts/gen_snapshot.py as a module without scripts/ being a package."""
+    spec = importlib.util.spec_from_file_location("gen_snapshot", _GEN_SNAPSHOT_PATH)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def _forced_registry(tmp_path_factory: pytest.TempPathFactory) -> Registry:
+    """A single force-loaded `Registry` (`build_registry()`), built ONCE for
+    the whole module against a dedicated, session-local cache dir.
+
+    `build_registry()` does a full `-help filter=X` pass over every included
+    name (~500), which costs tens of seconds cold. Sharing one already-built
+    `Registry` object across every `render()`-based test below (`render()`
+    takes an injectable `registry=` for exactly this reason) means that cost
+    is paid once for the module, not once per test -- and never touches the
+    real `~/.cache/sqlmpeg` (a dedicated tmp dir, isolated via
+    `pytest.MonkeyPatch.context()`, which reverts on exit).
+    """
+    cache_dir = tmp_path_factory.mktemp("gen_snapshot_cache")
+    gen_snapshot = _load_gen_snapshot()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(registry_mod, "_cache_dir", lambda: cache_dir)
+        clear_cache()
+        registry = gen_snapshot.build_registry()
+    clear_cache()  # reset the process-wide load() singleton pointer only
+    return registry
+
+
+# ---------------------------------------------------------------------------
+# committed file is up to date / deterministic (requires real ffmpeg)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.exec
+def test_snapshot_is_up_to_date(_forced_registry: Registry) -> None:
+    """Regenerating with the committed file's own `generated` stamp reproduces
+    it byte-for-byte -- the file is generated, not hand-written."""
+    gen_snapshot = _load_gen_snapshot()
+    with _SNAPSHOT_PATH.open(encoding="utf-8", newline="") as fh:
+        committed = fh.read()
+    stamp = json.loads(committed)["generated"]
+    regenerated = gen_snapshot.render(stamp, registry=_forced_registry)
+    assert regenerated == committed, (
+        "sqlmpeg/reference_registry.json is stale -- run "
+        "`python scripts/gen_snapshot.py --stamp <value>` to regenerate"
+    )
+
+
+@pytest.mark.exec
+def test_generation_is_deterministic_across_two_runs(_forced_registry: Registry) -> None:
+    gen_snapshot = _load_gen_snapshot()
+    first = gen_snapshot.render("2026-01-01", registry=_forced_registry)
+    second = gen_snapshot.render("2026-01-01", registry=_forced_registry)
+    assert first == second
+
+
+@pytest.mark.exec
+def test_generation_is_deterministic_across_two_independent_builds(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Two SEPARATE `build_registry()` calls -- independent `Registry` objects,
+    independent `-filters`/`-help` subprocess sequences, sharing only a
+    (dedicated tmp) disk cache dir once the first warms it -- produce
+    byte-identical JSON. A stronger check than calling `render()` twice on
+    the SAME already-built object (trivially pure given `sort_keys=True`).
+    Does not touch the real `~/.cache/sqlmpeg` or the committed snapshot
+    file -- `render()` returns text, `main()`/the CLI is what writes."""
+    cache_dir = tmp_path_factory.mktemp("gen_snapshot_cache_determinism")
+    gen_snapshot = _load_gen_snapshot()
+    texts: list[str] = []
+    for _ in range(2):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(registry_mod, "_cache_dir", lambda: cache_dir)
+            clear_cache()
+            registry = gen_snapshot.build_registry()
+            texts.append(gen_snapshot.render("2026-01-01", registry=registry))
+    clear_cache()
+    assert texts[0] == texts[1]
+
+
+@pytest.mark.exec
+def test_generation_output_is_lf_only(_forced_registry: Registry) -> None:
+    gen_snapshot = _load_gen_snapshot()
+    text = gen_snapshot.render("2026-01-01", registry=_forced_registry)
+    assert "\r" not in text
+
+
+@pytest.mark.exec
+def test_build_registry_raises_without_ffmpeg(monkeypatch: pytest.MonkeyPatch) -> None:
+    gen_snapshot = _load_gen_snapshot()
+    monkeypatch.setattr(registry_mod.shutil, "which", lambda name: None)
+    with pytest.raises(RuntimeError):
+        gen_snapshot.build_registry()
+
+
+# ---------------------------------------------------------------------------
+# round-trip: load_reference() answers exactly what a live Registry did,
+# for a spot-check set (requires real ffmpeg to build the live side)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.exec
+def test_round_trip_matches_live_registry_spot_check() -> None:
+    live = registry_mod.load()
+    assert live.available() is True  # force _ensure_loaded() before anything else
+    ref = load_reference()
+
+    assert ref.source == "reference"
+    assert ref.snapshot_of is not None and ref.snapshot_of.startswith("ffmpeg version")
+    assert ref.generated is not None
+
+    # gblur options (numeric, range, default, timeline).
+    assert ref.options("gblur") == live.options("gblur")
+    gblur_live = live.get("gblur")
+    gblur_ref = ref.get("gblur")
+    assert gblur_live is not None and gblur_ref is not None
+    assert gblur_ref.timeline is True
+    assert gblur_ref == gblur_live
+
+    # xfade enum constants.
+    assert ref.options("xfade") == live.options("xfade")
+
+    # testsrc source.
+    assert ref.get_source("testsrc") == live.get_source("testsrc")
+    assert ref.options("testsrc") == live.options("testsrc")
+
+    # timeline flags (pinned against the same real names test_registry.py uses).
+    for name, expected in (("gblur", True), ("drawbox", True), ("overlay", True), ("null", False)):
+        r = ref.get(name)
+        v = live.get(name)
+        assert r is not None and v is not None
+        assert r.timeline == expected
+        assert v.timeline == expected
+
+    # fenced array-returning trio.
+    for name in ("channelsplit", "acrossover", "extractplanes"):
+        assert ref.fenced_options(name) == live.fenced_options(name)
+        assert ref.get(name) is None  # still excluded from the filters table
+        assert live.get(name) is None
+
+    # names()/source_names() are the same sets.
+    assert set(ref.names()) == set(live.names())
+    assert set(ref.source_names()) == set(live.source_names())
+
+
+# ---------------------------------------------------------------------------
+# wheel-data presence
+# ---------------------------------------------------------------------------
+
+
+def test_reference_json_findable_via_importlib_resources() -> None:
+    """importlib.resources finds the package-data file from the installed
+    (here: editable, `pip install -e .`) sqlmpeg package."""
+    text = importlib.resources.files("sqlmpeg").joinpath("reference_registry.json").read_text(
+        encoding="utf-8"
+    )
+    data = json.loads(text)
+    assert data["format_version"] == 2
+    assert isinstance(data["filters"], dict) and len(data["filters"]) > 300
+    assert isinstance(data["sources"], dict) and len(data["sources"]) > 20
+    assert isinstance(data["options"], dict) and len(data["options"]) > 300
+
+
+# ---------------------------------------------------------------------------
+# load_reference(): zero subprocess calls, ever -- with or without ffmpeg
+# ---------------------------------------------------------------------------
+
+
+def test_load_reference_never_spawns_a_subprocess_with_no_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+
+    def fake_which(name: str) -> str | None:
+        calls.append(("which", name))
+        return None
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(("run", args, kwargs))
+        raise AssertionError("subprocess.run must never be called by load_reference()")
+
+    monkeypatch.setattr(registry_mod.shutil, "which", fake_which)
+    monkeypatch.setattr(registry_mod.subprocess, "run", fake_run)
+
+    ref = load_reference()
+    assert ref.source == "reference"
+    assert ref.available() is True
+    assert ref.get("gblur") is not None
+    assert ref.options("gblur") is not None
+    assert ref.get_source("testsrc") is not None
+    assert ref.options("testsrc") is not None
+    assert ref.fenced_options("channelsplit") is not None
+    assert len(ref.names()) > 300
+    assert len(ref.source_names()) > 20
+
+    assert calls == [], f"expected zero subprocess/which calls, got {len(calls)}: {calls}"
+
+
+def test_load_reference_never_spawns_a_subprocess_with_ffmpeg_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same proof, but with a (faked) ffmpeg ON PATH -- the reference
+    Registry must not shell out even when it COULD."""
+    calls: list[object] = []
+
+    def fake_which(name: str) -> str | None:
+        calls.append(("which", name))
+        return "C:/fake/ffmpeg.exe"
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(("run", args, kwargs))
+        raise AssertionError("subprocess.run must never be called by load_reference()")
+
+    monkeypatch.setattr(registry_mod.shutil, "which", fake_which)
+    monkeypatch.setattr(registry_mod.subprocess, "run", fake_run)
+
+    ref = load_reference()
+    assert ref.available() is True
+    assert ref.get("gblur") is not None
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# markers: source / snapshot_of / generated
+# ---------------------------------------------------------------------------
+
+
+def test_default_registry_source_is_live() -> None:
+    assert Registry().source == "live"
+    assert Registry().snapshot_of is None
+    assert Registry().generated is None
+
+
+def test_load_reference_source_and_stamps_are_set() -> None:
+    ref = load_reference()
+    assert ref.source == "reference"
+    assert ref.snapshot_of is not None and ref.snapshot_of.startswith("ffmpeg version")
+    assert ref.generated is not None
+
+
+# ---------------------------------------------------------------------------
+# permissive degradation (NEVER raises, even for a broken snapshot)
+# ---------------------------------------------------------------------------
+
+
+def test_load_reference_missing_resource_degrades_permissively(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _BrokenFiles:
+        def joinpath(self, name: str) -> _BrokenFiles:
+            return self
+
+        def read_text(self, encoding: str) -> str:
+            raise FileNotFoundError("no such resource")
+
+    monkeypatch.setattr(registry_mod.importlib.resources, "files", lambda pkg: _BrokenFiles())
+    ref = load_reference()
+    assert ref.source == "reference"
+    assert ref.available() is False
+    assert ref.get("gblur") is None
+    assert ref.names() == []
+
+
+def test_load_reference_corrupt_json_degrades_permissively(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _GarbageFiles:
+        def joinpath(self, name: str) -> _GarbageFiles:
+            return self
+
+        def read_text(self, encoding: str) -> str:
+            return "{not valid json"
+
+    monkeypatch.setattr(registry_mod.importlib.resources, "files", lambda pkg: _GarbageFiles())
+    ref = load_reference()
+    assert ref.available() is False
+
+
+def test_load_reference_wrong_format_version_degrades_permissively(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _StaleFiles:
+        def joinpath(self, name: str) -> _StaleFiles:
+            return self
+
+        def read_text(self, encoding: str) -> str:
+            return json.dumps({"format_version": 999, "filters": {}, "sources": {}, "options": {}})
+
+    monkeypatch.setattr(registry_mod.importlib.resources, "files", lambda pkg: _StaleFiles())
+    ref = load_reference()
+    assert ref.available() is False
+
+
+def test_load_reference_bad_shape_degrades_permissively(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _BadShapeFiles:
+        def joinpath(self, name: str) -> _BadShapeFiles:
+            return self
+
+        def read_text(self, encoding: str) -> str:
+            return json.dumps(
+                {"format_version": 2, "filters": "not-a-dict", "sources": {}, "options": {}}
+            )
+
+    monkeypatch.setattr(registry_mod.importlib.resources, "files", lambda pkg: _BadShapeFiles())
+    ref = load_reference()
+    assert ref.available() is False

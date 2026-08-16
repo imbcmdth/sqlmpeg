@@ -150,6 +150,7 @@ build:
 from __future__ import annotations
 
 import hashlib
+import importlib.resources
 import json
 import os
 import re
@@ -571,37 +572,32 @@ def _decode_options(raw: object) -> dict[str, dict[str, FilterOption]]:
     return result
 
 
-def _read_disk_cache(version_line: str) -> _DiskCache | None:
-    path = _cache_path(version_line)
-    try:
-        raw_text = path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        data = json.loads(raw_text)
-        if not isinstance(data, dict):
-            return None
-        if data.get("format_version") != _CACHE_FORMAT_VERSION:
-            # Missing entirely (pre-040 cache) or a future/older version --
-            # either way, rebuild rather than guess at a payload shape.
-            return None
-        if data.get("version_line") != version_line:
-            return None
-        filters = _decode_filters(data["filters"])
-        sources = _decode_sources(data["sources"])
-        options = _decode_options(data["options"])
-        return _DiskCache(filters=filters, sources=sources, options=options)
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return None
+def _decode_payload(data: dict[str, object]) -> _DiskCache:
+    """Shared shape decode for both the disk cache AND the reference snapshot.
+
+    Raises (KeyError, TypeError, ValueError) on any malformed shape -- both
+    callers (`_read_disk_cache`, `load_reference`) catch those and degrade
+    permissively rather than propagate, per this module's NEVER-raises
+    contract. Does not look at `format_version`/`version_line` itself --
+    each caller's own freshness rule differs (the disk cache pins BOTH to
+    the live binary; the reference snapshot only checks `format_version`,
+    since it deliberately outlives any one binary).
+    """
+    filters = _decode_filters(data["filters"])
+    sources = _decode_sources(data["sources"])
+    options = _decode_options(data["options"])
+    return _DiskCache(filters=filters, sources=sources, options=options)
 
 
-def _write_disk_cache(
+def _encode_payload(
     version_line: str,
     filters: dict[str, DynamicFilter],
     sources: dict[str, SourceFilter],
     options: dict[str, dict[str, FilterOption]],
-) -> None:
-    data: dict[str, object] = {
+) -> dict[str, object]:
+    """The disk-cache-shaped payload dict, JSON-ready, shared by the disk
+    cache writer and `Registry.to_snapshot_payload()` (`scripts/gen_snapshot.py`)."""
+    return {
         "format_version": _CACHE_FORMAT_VERSION,
         "version_line": version_line,
         "filters": {
@@ -633,6 +629,36 @@ def _write_disk_cache(
             for filter_name, opts in options.items()
         },
     }
+
+
+def _read_disk_cache(version_line: str) -> _DiskCache | None:
+    path = _cache_path(version_line)
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw_text)
+        if not isinstance(data, dict):
+            return None
+        if data.get("format_version") != _CACHE_FORMAT_VERSION:
+            # Missing entirely (pre-040 cache) or a future/older version --
+            # either way, rebuild rather than guess at a payload shape.
+            return None
+        if data.get("version_line") != version_line:
+            return None
+        return _decode_payload(data)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _write_disk_cache(
+    version_line: str,
+    filters: dict[str, DynamicFilter],
+    sources: dict[str, SourceFilter],
+    options: dict[str, dict[str, FilterOption]],
+) -> None:
+    data = _encode_payload(version_line, filters, sources, options)
     # Cache is purely an optimization -- any filesystem failure is silently
     # swallowed, never raised.
     try:
@@ -664,6 +690,15 @@ class Registry:
     at most once per filter (regular OR source), on first call to
     `options(name)` / `fenced_options(name)` for that filter -- never for all
     filters upfront. NEVER raises.
+
+    `source` marks how this instance got its data: `"live"` (default, via
+    `load()`/bare `Registry()` -- introspects the ffmpeg on PATH, lazily) or
+    `"reference"` (via `load_reference()` -- fully populated up front from
+    the vendored snapshot, no subprocess ever). `snapshot_of` (the snapshot
+    ffmpeg's `-version` first line) and `generated` (the `--stamp` value
+    `scripts/gen_snapshot.py` was run with) are set only on a `"reference"`
+    instance; both stay `None` for `"live"`. RFC-007 wave 2 (plan 051) reads
+    `source` to choose live-vs-snapshot and to annotate `explain` output.
     """
 
     def __init__(self) -> None:
@@ -673,6 +708,9 @@ class Registry:
         self._filters: dict[str, DynamicFilter] = {}
         self._sources: dict[str, SourceFilter] = {}
         self._options: dict[str, dict[str, FilterOption]] = {}
+        self.source: Literal["live", "reference"] = "live"
+        self.snapshot_of: str | None = None
+        self.generated: str | None = None
 
     def _ensure_loaded(self) -> None:
         if self._loaded:
@@ -794,6 +832,22 @@ class Registry:
             _write_disk_cache(self._version_line, self._filters, self._sources, self._options)
         return opts
 
+    def to_snapshot_payload(self) -> dict[str, object] | None:
+        """This Registry's CURRENT state as a disk-cache-shaped JSON payload.
+
+        `None` if `-filters`/`-version` never succeeded (no version line to
+        stamp the payload with). Does NOT force anything to load first --
+        `options()`/`fenced_options()` are exactly as lazy as ever, so a
+        payload taken from a `Registry` nobody has queried yet has an empty
+        `options` table. `scripts/gen_snapshot.py` (the only intended
+        caller) force-loads every name's options before calling this, which
+        is what makes the payload it writes fully self-contained.
+        """
+        self._ensure_loaded()
+        if self._version_line is None:
+            return None
+        return _encode_payload(self._version_line, self._filters, self._sources, self._options)
+
 
 _registry: Registry | None = None
 
@@ -804,6 +858,60 @@ def load() -> Registry:
     if _registry is None:
         _registry = Registry()
     return _registry
+
+
+_REFERENCE_RESOURCE = "reference_registry.json"
+
+
+def load_reference() -> Registry:
+    """Build a fully-populated `Registry` from the vendored reference snapshot.
+
+    Reads `sqlmpeg/reference_registry.json` (package data, via
+    `importlib.resources`) -- the parsed `-filters`/`-help` data
+    `scripts/gen_snapshot.py` captured ahead of time from a real ffmpeg,
+    wrapped with `snapshot_of` (that ffmpeg's `-version` first line) and
+    `generated` (the `--stamp` the script was run with). Every in-fence
+    filter's and source's options, plus the array-returning trio's
+    `fenced_options()`, are already in the payload -- so unlike `load()`,
+    `_ensure_loaded()` never runs (`_loaded` is set `True` up front) and
+    NO subprocess is ever spawned by the returned instance, on any
+    platform, with or without ffmpeg on PATH.
+
+    Returns a FRESH `Registry` every call (unlike `load()`'s process-wide
+    singleton) -- callers that want memoization do it themselves (plan 051).
+
+    NEVER raises: a missing or malformed snapshot (should not happen for a
+    correctly built package, but this module's contract holds regardless)
+    degrades to an empty, unavailable `Registry` with `source ==
+    "reference"` -- exactly like a live `Registry` with no ffmpeg on PATH.
+    """
+    registry = Registry()
+    registry.source = "reference"
+    registry._loaded = True  # never let _ensure_loaded touch which()/subprocess
+    try:
+        raw_text = (
+            importlib.resources.files("sqlmpeg")
+            .joinpath(_REFERENCE_RESOURCE)
+            .read_text(encoding="utf-8")
+        )
+        data = json.loads(raw_text)
+        if not isinstance(data, dict):
+            return registry
+        if data.get("format_version") != _CACHE_FORMAT_VERSION:
+            return registry
+        disk = _decode_payload(data)
+        version_line = _require_optional_str(data.get("version_line"))
+        snapshot_of = _require_optional_str(data.get("snapshot_of"))
+        generated = _require_optional_str(data.get("generated"))
+    except (OSError, ModuleNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return registry
+    registry._filters = disk.filters
+    registry._sources = disk.sources
+    registry._options = disk.options
+    registry._version_line = version_line
+    registry.snapshot_of = snapshot_of
+    registry.generated = generated
+    return registry
 
 
 def clear_cache() -> None:

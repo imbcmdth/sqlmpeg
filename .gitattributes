@@ -1,3 +1,8 @@
 # Docs are written with LF by generators/tests that assert byte-identity or
 # LF-only content: never CRLF-smudge them on checkout.
 docs/** text eol=lf
+
+# The reference registry snapshot (plan 050) is a generated, committed
+# package-data file whose regeneration test asserts byte-identity -- same
+# LF-only contract as docs/**, but it lives under sqlmpeg/ instead.
+sqlmpeg/*.json text eol=lf

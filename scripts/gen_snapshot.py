@@ -1,0 +1,149 @@
+"""Generate ``sqlmpeg/reference_registry.json`` from the ffmpeg on PATH.
+
+RFC-007 "Offline compile" (plan 050): the reference snapshot is the vendored,
+committed replacement for the deleted ``--portable`` flag. It ships as
+package data and lets ``sqlmpeg.registry.load_reference()`` build a fully
+populated :class:`~sqlmpeg.registry.Registry` with NO ffmpeg on PATH and NO
+subprocess call, ever -- the same parsed ``-filters``/``-help`` shapes the
+live disk cache uses, just captured ahead of time and shipped in the wheel.
+
+Unlike ``sqlmpeg.registry.load()``, which parses ``-help filter=X`` lazily
+per filter on first reference, this script force-loads EVERY name's
+options up front:
+
+  - every in-fence filter's options (``Registry.options()`` over
+    ``Registry.names()``)
+  - every source's options (``Registry.options()`` over
+    ``Registry.source_names()``)
+  - the array-returning trio's options (``Registry.fenced_options()`` --
+    ``channelsplit``/``acrossover``/``extractplanes`` are excluded from the
+    filters/sources tables by the v1 pad fence, so ``options()`` cannot
+    reach them; ``fenced_options()`` is the only door, see
+    ``sqlmpeg/lower.py``'s ``ARRAY_RETURNING``)
+  - the eleven "collision census" names (``Registry.fenced_options()`` too
+    -- they are ordinary in-fence filters already covered by the
+    ``options()`` pass above, so this adds no new data, but it exercises
+    ``fenced_options()``'s cache-hit branch against a well-known name set;
+    see docs/dynamic-filters.md "The collision census" and
+    tests/test_lower.py's ``_KNOWN_COLLISIONS``)
+
+Output is deterministic given the same ffmpeg binary and ``--stamp`` value:
+JSON keys are sorted (``sort_keys=True``), the only wall-clock-ish value is
+whatever ``--stamp`` the caller passes (never ``datetime.now()``), and the
+file is written LF-only (``sqlmpeg/*.json`` is pinned in .gitattributes) so
+regenerating on any platform reproduces byte-identical output.
+
+Usage::
+
+    python scripts/gen_snapshot.py --stamp 2026-08-16
+
+The generated file is COMMITTED (it is package data, not a build artifact)
+-- rerun this after any ffmpeg upgrade this project pins against, or after
+any change to ``sqlmpeg/registry.py``'s parsing rules that would change the
+captured shapes. ``tests/test_gen_snapshot.py`` asserts (under
+``@pytest.mark.exec``, since it requires the real binary) that regenerating
+with the committed file's own ``generated`` stamp reproduces it exactly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from sqlmpeg.lower import ARRAY_RETURNING
+from sqlmpeg.registry import Registry
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_OUTPUT_PATH = _REPO_ROOT / "sqlmpeg" / "reference_registry.json"
+
+# The eleven names docs/dynamic-filters.md "The collision census" and
+# tests/test_lower.py's `_KNOWN_COLLISIONS` document as colliding with
+# Postgres/stdlib grammar under a bare call -- kept as a small literal copy
+# here (not imported from the test module) since this is generation-time
+# coverage, not a correctness dependency: every name below is an ordinary
+# in-fence filter already force-loaded via `options()`, so a stale copy
+# only under- or over-exercises `fenced_options()`, it cannot desync the
+# snapshot's actual content.
+_CENSUS_NAMES = (
+    "copy",
+    "corr",
+    "format",
+    "median",
+    "normalize",
+    "null",
+    "overlay",
+    "pad",
+    "random",
+    "reverse",
+    "trim",
+)
+
+
+def build_registry() -> Registry:
+    """A live `Registry`, force-loaded: every reachable name's options present.
+
+    Raises `RuntimeError` if no ffmpeg is on PATH -- there is nothing to
+    snapshot. (This is the one place in the whole project a `Registry`
+    failure is NOT swallowed permissively: `sqlmpeg/registry.py`'s
+    NEVER-raises contract is about compiling sqlmpeg queries without a
+    working ffmpeg, not about generating this file, which has no reason to
+    run without one.)
+    """
+    registry = Registry()
+    if not registry.available():
+        raise RuntimeError(
+            "no ffmpeg on PATH -- scripts/gen_snapshot.py needs a real ffmpeg to "
+            "introspect (this is a generation-time tool, not a compile-time one)"
+        )
+    for name in registry.names():
+        registry.options(name)
+    for name in registry.source_names():
+        registry.options(name)
+    for name in ARRAY_RETURNING:
+        registry.fenced_options(name)
+    for name in _CENSUS_NAMES:
+        registry.fenced_options(name)
+    return registry
+
+
+def render(stamp: str, registry: Registry | None = None) -> str:
+    """The snapshot file's exact text: sorted keys, 2-space indent, LF, trailing newline.
+
+    `registry` is injectable for tests that want to force-load a specific
+    (e.g. monkeypatched) `Registry` rather than the real ffmpeg on PATH;
+    omitted, a fresh one is built and force-loaded via `build_registry()`.
+    """
+    if registry is None:
+        registry = build_registry()
+    payload = registry.to_snapshot_payload()
+    if payload is None:
+        raise RuntimeError(
+            "registry has no version line after build_registry() succeeded -- unreachable"
+        )
+    payload = dict(payload)
+    payload["snapshot_of"] = payload["version_line"]
+    payload["generated"] = stamp
+    return json.dumps(payload, sort_keys=True, indent=2) + "\n"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate sqlmpeg/reference_registry.json from the ffmpeg on PATH."
+    )
+    parser.add_argument(
+        "--stamp",
+        required=True,
+        help="deterministic 'generated' value stamped into the snapshot "
+        "(e.g. an ISO date) -- never wall-clock time, so regeneration with "
+        "the same stamp is byte-identical",
+    )
+    args = parser.parse_args()
+    text = render(args.stamp)
+    with open(_OUTPUT_PATH, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    print(f"wrote {_OUTPUT_PATH} ({len(text)} bytes)")
+
+
+if __name__ == "__main__":
+    main()
