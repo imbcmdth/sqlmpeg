@@ -221,8 +221,11 @@ class Graph:
     # 3) renders "-ss <start> -to <end>" immediately before that alias's -i,
     # trimming every stream type of that input coherently. Empty by default;
     # to_dict emits the "input_trims" key only when non-empty (same
-    # golden-compat pattern as "sink" above).
-    input_trims: dict[str, tuple[float, float]] = field(default_factory=dict)
+    # golden-compat pattern as "sink" above). Plan 039 (open-ended windows):
+    # either bound may be None -- a missing start omits "-ss", a missing end
+    # omits "-to" -- but not both (a WHERE clause always supplies at least
+    # one bound; see parser._time_bounds).
+    input_trims: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         d: dict[str, object] = {
@@ -239,7 +242,7 @@ class Graph:
         if self.input_trims:
             d["input_trims"] = {
                 alias: [start, end] for alias, (start, end) in self.input_trims.items()
-            }
+            }  # None bounds render as JSON null, same as any other field
         return d
 
     @classmethod
@@ -271,13 +274,16 @@ class Graph:
             sink = Sink.from_dict(raw_sink)
 
         raw_input_trims = d.get("input_trims")
-        input_trims: dict[str, tuple[float, float]] = {}
+        input_trims: dict[str, tuple[float | None, float | None]] = {}
         if raw_input_trims is not None:
             assert isinstance(raw_input_trims, dict)
             for alias, bounds in raw_input_trims.items():
                 assert isinstance(bounds, list)
                 start, end = bounds
-                input_trims[str(alias)] = (float(start), float(end))
+                input_trims[str(alias)] = (
+                    float(start) if start is not None else None,
+                    float(end) if end is not None else None,
+                )
 
         return cls(
             input_paths=[str(p) for p in raw_inputs],

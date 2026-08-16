@@ -139,8 +139,12 @@ _INDEX_OFFSET = 1
 _DIGITS_RE = re.compile(r"[0-9]+\Z")
 
 _WHERE_HINT = (
-    "the only supported WHERE form is <alias>.t BETWEEN <start> AND <end>, "
+    "the only supported WHERE forms are <alias>.t BETWEEN <start> AND <end>, "
+    "<alias>.t >= <start>, or <alias>.t <= <end> (either operand order), "
     "optionally joined with AND"
+)
+_STRICT_HINT = (
+    "use >= / <=: seeks are time-based, a strict bound has no frame-level meaning"
 )
 _ALIAS_HINT = "add an alias, e.g. FROM input('clip.mp4') a"
 _SUBSCRIPT_HINT = (
@@ -303,6 +307,83 @@ def kwarg_name(kwarg: exp.Kwarg) -> str:
     if not isinstance(left, exp.Expr):
         return ""
     return str(left.name)
+
+
+# ---------------------------------------------------------------------------
+# time predicates: WHERE <alias>.t ... (plan 039, open-ended windows)
+# ---------------------------------------------------------------------------
+
+
+def _time_bounds(
+    conjunct: exp.Expr,
+) -> tuple[exp.Column, exp.Expr | None, exp.Expr | None, bool] | None:
+    """Parse one WHERE conjunct as a time-range predicate, or None if it isn't one.
+
+    Returns ``(column, low, high, strict)``:
+
+    * ``exp.Between`` (non-symmetric, column on the left) gives both bounds.
+    * ``exp.GTE`` / ``exp.LTE`` give ONE bound each, in EITHER operand order:
+      ``a.t >= 120`` and ``120 <= a.t`` are the exact same predicate (lower
+      bound 120), not an approximation of each other. VERIFIED under sqlglot
+      30.17 ``read="postgres"``: sqlglot does NOT normalize operand order at
+      parse time -- ``120 <= a.t`` parses to
+      ``LTE(this=Literal(120), expression=Column(a.t))`` verbatim, so both
+      shapes are handled explicitly here rather than relying on a canonical
+      form. The mapping: for ``LTE``/``LT`` (`this OP expression`, `this` no
+      greater than `expression`), a `Column` on the left is an upper bound
+      and a `Column` on the right is a mirrored lower bound; for
+      ``GTE``/``GT`` it is the reverse.
+    * ``exp.GT`` / ``exp.LT`` match the same shapes but come back with
+      `strict` True, so the caller can reject them with a dedicated hint
+      instead of the generic "unsupported predicate" one (guardrail #3:
+      reject a strict bound, never approximate it as its closed neighbor).
+
+    None for anything else a caller should fall back to a generic rejection
+    for: a symmetric BETWEEN, a non-column BETWEEN subject (e.g. ``* BETWEEN
+    1 AND 2``), an inequality with no column operand, ``=``, etc.
+    """
+    if isinstance(conjunct, exp.Between):
+        if conjunct.args.get("symmetric"):
+            return None
+        column = conjunct.this
+        if not isinstance(column, exp.Column):
+            return None
+        low = conjunct.args.get("low")
+        high = conjunct.args.get("high")
+        return (
+            column,
+            low if isinstance(low, exp.Expr) else None,
+            high if isinstance(high, exp.Expr) else None,
+            False,
+        )
+    if isinstance(conjunct, exp.GTE | exp.GT | exp.LTE | exp.LT):
+        strict = isinstance(conjunct, exp.GT | exp.LT)
+        is_lte = isinstance(conjunct, exp.LTE | exp.LT)
+        this = conjunct.this
+        expression = conjunct.args.get("expression")
+        if isinstance(this, exp.Column) and isinstance(expression, exp.Expr):
+            # <alias>.t <= X (upper) / <alias>.t >= X (lower), strict variants
+            return (this, None, expression, strict) if is_lte else (this, expression, None, strict)
+        if isinstance(expression, exp.Column) and isinstance(this, exp.Expr):
+            # X <= <alias>.t (lower, mirrored) / X >= <alias>.t (upper, mirrored)
+            return (expression, this, None, strict) if is_lte else (expression, None, this, strict)
+        return None
+    return None
+
+
+def _literal_seconds(node: exp.Literal) -> float | None:
+    """Best-effort python float of a time-bound literal, or None if malformed.
+
+    None (never raises) on purpose: an unparseable literal that still slips
+    past sqlglot's own tokenizer (e.g. ``1e``) is a real rejection, but not
+    this function's -- ``lower._number`` raises the typed one when it
+    converts the same literal, so this only skips the (optional) empty-window
+    check rather than pre-empting that error with a worse message.
+    """
+    try:
+        return float(str(node.this))
+    except (TypeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1176,9 +1257,16 @@ class _Resolver:
         conjuncts: list[exp.Expr] = []
         self._flatten_and(where.this, conjuncts, select)
 
-        seen: set[str] = set()
+        # alias -> {"low": <literal>, "high": <literal>}, accumulated across
+        # every conjunct so a second bound of the same kind for one alias is
+        # rejected (mirrors the old one-BETWEEN rule) whether it repeats
+        # within one BETWEEN, across two inequalities, or a BETWEEN plus an
+        # inequality -- and so the closed pair, once both are known, can be
+        # checked for an empty window.
+        bounds: dict[str, dict[str, exp.Literal]] = {}
         for conjunct in conjuncts:
-            if not isinstance(conjunct, exp.Between) or conjunct.args.get("symmetric"):
+            parsed = _time_bounds(conjunct)
+            if parsed is None:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     "unsupported WHERE predicate",
@@ -1186,14 +1274,14 @@ class _Resolver:
                     fallback=where,
                     hint=_WHERE_HINT,
                 )
-            column = conjunct.this
-            if not isinstance(column, exp.Column):
+            column, low, high, strict = parsed
+            if strict:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    "unsupported WHERE predicate",
+                    "strict inequalities are not supported",
                     conjunct,
                     fallback=where,
-                    hint=_WHERE_HINT,
+                    hint=_STRICT_HINT,
                 )
             table_node = column.args.get("table")
             if table_node is None:
@@ -1222,25 +1310,47 @@ class _Resolver:
                     fallback=where,
                     hint=_WHERE_HINT,
                 )
-            for key in ("low", "high"):
-                bound = conjunct.args.get(key)
+            alias_bounds = bounds.setdefault(alias, {})
+            for kind, bound in (("low", low), ("high", high)):
+                if bound is None:
+                    continue
                 if not (isinstance(bound, exp.Literal) and not bound.is_string):
                     raise _error(
                         ErrorCode.UNSUPPORTED_SQL,
-                        "BETWEEN bounds must be numeric literals (seconds)",
-                        bound if isinstance(bound, exp.Expr) else conjunct,
+                        "time bounds must be numeric literals (seconds)",
+                        bound,
                         fallback=where,
                         hint=_WHERE_HINT,
                     )
-            if alias in seen:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"more than one time range for alias '{alias}'",
-                    column,
-                    fallback=where,
-                    hint="use a single BETWEEN per alias",
-                )
-            seen.add(alias)
+                if kind in alias_bounds:
+                    bound_name = "lower" if kind == "low" else "upper"
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"more than one {bound_name} bound for alias '{alias}'",
+                        column,
+                        fallback=where,
+                        hint="each alias may set at most one lower and one "
+                        "upper time bound",
+                    )
+                alias_bounds[kind] = bound
+
+        for alias, alias_bounds in bounds.items():
+            low_literal = alias_bounds.get("low")
+            high_literal = alias_bounds.get("high")
+            if low_literal is None or high_literal is None:
+                continue
+            start = _literal_seconds(low_literal)
+            end = _literal_seconds(high_literal)
+            if start is None or end is None or start < end:
+                continue
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"empty time window for alias '{alias}': start "
+                f"({low_literal.this}) is not before end ({high_literal.this})",
+                high_literal,
+                fallback=where,
+                hint="the start bound must be strictly before the end bound",
+            )
 
     def _flatten_and(
         self, node: exp.Expr | None, out: list[exp.Expr], select: exp.Select

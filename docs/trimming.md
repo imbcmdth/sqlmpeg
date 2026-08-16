@@ -13,9 +13,33 @@ $ sqlmpeg compile --no-probe "SELECT a.video[1] FROM input('clip.mp4') a WHERE a
 ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -c:0 copy out.mp4
 ```
 
-Earlier versions spliced `trim`/`atrim` filter nodes into the graph for every `WHERE`. The seek is better on every axis we could measure. Every alias owns exactly one `-i` and can carry at most one time window in the whole query, so the per-alias window maps 1:1 onto ffmpeg's per-input `-ss`/`-to`. The seek trims and rebases every stream of that input at once (video, audio, subtitle, data, selected or not), the demuxer skips the front of the file instead of decoding it just to throw it away, the graph shrinks, and a column nothing else filters gets to stay a plain `-c:0 copy` instead of being forced through an encoder just because it has a start time.
+Earlier versions spliced `trim`/`atrim` filter nodes into the graph for every `WHERE`. The seek is better on every axis we could measure. Every alias owns exactly one `-i` and can carry at most one time window in the whole query (one lower bound, one upper bound, from any combination of the forms below), so the per-alias window maps 1:1 onto ffmpeg's per-input `-ss`/`-to`. The seek trims and rebases every stream of that input at once (video, audio, subtitle, data, selected or not), the demuxer skips the front of the file instead of decoding it just to throw it away, the graph shrinks, and a column nothing else filters gets to stay a plain `-c:0 copy` instead of being forced through an encoder just because it has a start time.
 
 A `WHERE` window on a CTE name still works the old way, because it has to: a CTE's output is a filtergraph pad, not an `-i`, so its window lowers to `trim`+`setpts` (or `atrim`+`asetpts`), spliced lazily and shared across every consumer. Video and audio only, down that path.
+
+## Open-ended windows
+
+A bound may be missing on either end. `<alias>.t >= <start>` seeks to `<start>` and reads to the end of the file (no `-to` at all); `<alias>.t <= <end>` reads from the start and stops at `<end>` (no `-ss`). Either operand order is accepted and means the same thing -- `<alias>.t >= 120` and `120 <= <alias>.t` are the exact same predicate, not an approximation of each other:
+
+```sql
+SELECT a.video[1]
+FROM input('clip.mp4') a
+WHERE a.t >= 120
+```
+
+```
+$ sqlmpeg compile --no-probe "SELECT a.video[1] FROM input('clip.mp4') a WHERE a.t >= 120"
+ffmpeg -ss 120 -i clip.mp4 -map 0:v:0 -c:0 copy out.mp4
+```
+
+This is what kills the old `BETWEEN 120 AND 3600`-style placeholder for "to the end of the file" -- a wart the ad-splice pattern used to need (see the README): a UNION ALL branch that used to end with a made-up, hopefully-large-enough upper bound now just writes `WHERE g.t >= 120` and means it exactly. The same works the other way for `<=`, and the two forms combine to build a closed window one bound at a time: `WHERE a.t >= 1 AND a.t <= 2` means exactly what `WHERE a.t BETWEEN 1 AND 2` means, merged into one seek.
+
+Two things stay firmly rejected:
+
+- **Strict `<` / `>`.** Seeks are time-based, and a strict bound has no frame-level meaning at that granularity -- `WHERE a.t > 120` is `UNSUPPORTED_SQL` with a hint pointing at `>=`/`<=`.
+- **An empty window.** If both bounds end up present (from one `BETWEEN`, or from merging a `>=` and a `<=`) and the start is not strictly before the end, that is a compile-time `UNSUPPORTED_SQL` ("empty time window"), not an ffmpeg runtime surprise. A second bound of the same kind for one alias -- two lower bounds, or a `BETWEEN` overlapping a later `>=` -- is rejected the same way a second `BETWEEN` on the same alias always was: at most one lower and one upper bound per alias, however they were spelled.
+
+On a CTE, an open window works the same way: `trim`/`atrim` only gets the args it actually has (`trim=start=3` with no `end=`, or vice versa), plus the usual `setpts`/`asetpts` rebase.
 
 ## Accuracy: decoded vs. stream-copied
 
@@ -60,6 +84,8 @@ The seek covers every stream of the alias, subtitle and data streams included, w
 | transcoded (video/audio re-encoded) | 0.000 / 0.700 / 1.400, still the original spacing, not shifted by the seek |
 
 So the video now starts at what used to be 0.5s, and a caption written for the 0.723s moment still fires at ~0.7s of the new timeline, half a second before the moment it captions. Every cue, off by exactly your seek offset, for the whole clip. The cue from before the window even survives the trim and shows up in the output anyway.
+
+The rejection below keys on whether the alias has ANY window recorded at all, not on its shape -- a tail-only `WHERE a.t >= 1` desyncs captions exactly as a closed `BETWEEN` does (there is still a nonzero seek offset), so it is rejected the same way.
 
 sqlmpeg will not compile that. Trimming an alias and selecting its subtitle/data column in the same query is a typed rejection, not a deliverable with a latent sync bug:
 

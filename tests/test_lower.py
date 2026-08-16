@@ -1094,6 +1094,53 @@ def test_the_seek_covers_the_whole_input_selected_or_not() -> None:
 
 
 # ---------------------------------------------------------------------------
+# open-ended input windows (plan 039): >= / <=, either operand order, merging
+# ---------------------------------------------------------------------------
+
+
+def test_tail_only_where_seeks_with_no_upper_bound() -> None:
+    g = _lower("SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 5")
+    assert g.input_trims == {"a": (5, None)}
+    emitted = emit(g)
+    assert emitted.input_trims == [(5, None)]
+    assert build_ffmpeg_args(emitted, "out.mp4")[:4] == ["ffmpeg", "-ss", "5", "-i"]
+
+
+def test_head_only_where_seeks_with_no_lower_bound() -> None:
+    g = _lower("SELECT a.frame FROM input('x.mp4') a WHERE a.t <= 60")
+    assert g.input_trims == {"a": (None, 60)}
+    emitted = emit(g)
+    assert emitted.input_trims == [(None, 60)]
+    assert build_ffmpeg_args(emitted, "out.mp4")[:4] == ["ffmpeg", "-to", "60", "-i"]
+
+
+def test_flipped_operand_order_produces_the_same_window() -> None:
+    """``120 <= a.t`` is the mirror of ``a.t >= 120`` -- exact, not approximate."""
+    g_unflipped = _lower("SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 120")
+    g_flipped = _lower("SELECT a.frame FROM input('x.mp4') a WHERE 120 <= a.t")
+    assert g_unflipped.input_trims == g_flipped.input_trims == {"a": (120, None)}
+
+
+def test_gte_and_lte_merge_into_the_same_window_as_between() -> None:
+    g_inequalities = _lower("SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 1 AND a.t <= 2")
+    g_between = _lower("SELECT a.frame FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2")
+    assert g_inequalities.input_trims == g_between.input_trims == {"a": (1, 2)}
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 5 AND a.t <= 2",
+        "SELECT a.frame FROM input('x.mp4') a WHERE a.t BETWEEN 5 AND 2",
+    ],
+)
+def test_empty_time_window_is_rejected(sql: str) -> None:
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "empty time window" in err.message
+
+
+# ---------------------------------------------------------------------------
 # CTEs
 # ---------------------------------------------------------------------------
 
@@ -1221,7 +1268,28 @@ def test_where_trims_a_cte_column_by_its_type() -> None:
     )
     assert _filters(g) == ["atrim", "asetpts"]
     assert g.nodes["n1"].inputs == ["src:a:a:0"]
+    assert g.nodes["n1"].args == {"start": 1, "end": 2}
     assert g.input_trims == {}  # nothing is seeked: the -i is untouched
+
+
+def test_cte_open_lower_trim_node_carries_only_start() -> None:
+    """Plan 039: a CTE trim with only one bound omits the other's arg entirely."""
+    g = _lower(
+        "WITH c AS (SELECT hflip(a.frame) AS pic FROM input('x.mp4') a) "
+        "SELECT c.pic FROM c WHERE c.t >= 3"
+    )
+    assert _filters(g) == ["hflip", "trim", "setpts"]
+    assert g.nodes["n2"].filter == "trim"
+    assert g.nodes["n2"].args == {"start": 3}
+
+
+def test_cte_open_upper_trim_node_carries_only_end() -> None:
+    g = _lower(
+        "WITH c AS (SELECT a.audio[1] AS snd FROM input('x.mp4') a) "
+        "SELECT c.snd FROM c WHERE c.t <= 4"
+    )
+    assert _filters(g) == ["atrim", "asetpts"]
+    assert g.nodes["n1"].args == {"end": 4}
 
 
 def test_a_where_inside_a_cte_body_still_seeks_the_input() -> None:
@@ -1747,6 +1815,18 @@ def test_where_over_a_consumed_subtitle_stream_is_rejected() -> None:
     would desync by the seek amount. Rejected rather than shipped broken."""
     err = _reject_lower(
         "SELECT a.subtitle[1] FROM input('x.mkv') a WHERE a.t BETWEEN 1 AND 2",
+        {"a": _layout_probe("vas")},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "out of sync" in err.message
+
+
+def test_where_over_a_consumed_subtitle_stream_is_rejected_for_an_open_window() -> None:
+    """Plan 039: the desync rejection keys on `graph.input_trims` membership,
+    so an open-ended window (`t >= x`, no upper bound at all) triggers it just
+    as a closed BETWEEN does -- there is no window shape that is safe."""
+    err = _reject_lower(
+        "SELECT a.subtitle[1] FROM input('x.mkv') a WHERE a.t >= 1",
         {"a": _layout_probe("vas")},
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL

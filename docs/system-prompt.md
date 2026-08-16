@@ -110,22 +110,35 @@ statement is not. `--` and `/* */` comments are allowed.
   Reuse is automatic; never duplicate the CTE.
 
 ### Time selection
-- The ONLY predicate is `WHERE <alias>.t BETWEEN <start> AND <end>`, in
-  seconds. Both bounds are plain numeric literals.
-- One `BETWEEN` per alias per `SELECT`. Join different aliases with `AND`:
-  `WHERE a.t BETWEEN 0 AND 5 AND b.t BETWEEN 2 AND 7`.
-- No `OR`, no `NOT BETWEEN`, no `<`/`>`/`=`, no expressions as bounds, no
-  second range for the same alias.
-- On an `input()` alias, the window becomes an INPUT seek (`-ss <start> -to
-  <end>` immediately before that alias's own `-i`), not a filter: it trims
-  AND rebases to t=0 every stream of that input, selected or not -- video,
-  audio, subtitle, data alike -- so a column nothing else filters can stay a
-  plain stream copy instead of forcing a re-encode. A DECODED stream
-  (anything filtered/re-encoded) trims frame-accurate; a STREAM-COPIED one
-  snaps back to the preceding keyframe and may start up to one GOP early.
+- The supported predicates are `WHERE <alias>.t BETWEEN <start> AND <end>`,
+  `<alias>.t >= <start>` (open-ended, no upper bound), and `<alias>.t <= <end>`
+  (open-ended, no lower bound), all in seconds. Bounds are plain numeric
+  literals. Either operand order works -- `<alias>.t >= 120` and
+  `120 <= <alias>.t` are the exact same predicate, not an approximation.
+- At most one lower bound and one upper bound per alias per `SELECT`, from any
+  combination of the forms above -- `t >= 1 AND t <= 2` means exactly what
+  `t BETWEEN 1 AND 2` means. Join different aliases with `AND`:
+  `WHERE a.t BETWEEN 0 AND 5 AND b.t >= 2`. A second bound of the same kind
+  for one alias (two lower bounds, a BETWEEN plus an overlapping `>=`, ...) is
+  rejected, same as writing `BETWEEN` twice.
+- No `OR`, no `NOT BETWEEN`, no strict `<`/`>` (seeks are time-based, and a
+  strict bound has no frame-level meaning -- use `>=`/`<=`), no `=`, no
+  expressions as bounds. A window with both bounds present where the start is
+  not strictly before the end is a compile-time `UNSUPPORTED_SQL`, not an
+  ffmpeg runtime error.
+- On an `input()` alias, the window becomes an INPUT seek (`-ss <start>`
+  and/or `-to <end>` immediately before that alias's own `-i`, whichever
+  bounds are present), not a filter: it trims AND rebases to t=0 every stream
+  of that input, selected or not -- video, audio, subtitle, data alike -- so
+  a column nothing else filters can stay a plain stream copy instead of
+  forcing a re-encode. A DECODED stream (anything filtered/re-encoded) trims
+  frame-accurate; a STREAM-COPIED one snaps back to the preceding keyframe and
+  may start up to one GOP early. An open-ended window with no `-to` reads to
+  EOF, same as giving ffmpeg no end time at all.
 - On a CTE name, the window is still a filtergraph trim (`trim`+`setpts` /
-  `atrim`+`asetpts`), because a CTE's output is a filtergraph pad, not an
-  input -- video/audio only, same as before RFC-004.
+  `atrim`+`asetpts`, with only the present bound(s) as filter args), because a
+  CTE's output is a filtergraph pad, not an input -- video/audio only, same as
+  before RFC-004.
 - Caption caveat: ffmpeg does not retime subtitle/data packets under an
   input seek, so a track that is both inside its own alias's WHERE window
   AND selected in the same query would play out of sync with the rebased
@@ -406,6 +419,14 @@ FROM input('clip.mp4') a
 WHERE a.t BETWEEN 5 AND 12.5
 ```
 
+Drop everything before the 90 second mark in clip.mp4; keep the rest.
+
+```sql
+SELECT a.frame
+FROM input('clip.mp4') a
+WHERE a.t >= 90
+```
+
 Put a half-size copy of the scoreboard (the 600x200 box at 1200,50) in the top-left corner of game.mp4, and mix its audio under the main feed's at 65/35.
 
 ```sql
@@ -536,9 +557,9 @@ not in the dialect.
 - `UNKNOWN_ALIAS` -- The qualifier before the dot is not in this SELECT's FROM. Add `input('path') <alias>` or the CTE name to that FROM clause; `hint` lists what is in scope. Names do not cross UNION ALL branches, and a CTE is in scope only in the branches whose FROM names it.
 - `UDF_ARG_TYPE` -- Wrong arity or wrong argument kind. Count the arguments against one signature in `message` and fix the mismatched slot: `video` needs `<alias>.video[k]`, `<alias>.frame`, or a nested video-returning call; `audio` needs `<alias>.audio[k]` or a nested audio-returning call; `num` needs a bare number; `str` needs a single-quoted literal. `video`/`audio` in the got-list where the other was expected usually means you mixed up video and audio; a stream kind where `num` was expected usually means you passed a stream or `<alias>.t` instead of a number. A got-list that is EMPTY (`trim(), got trim()`) for a call you did pass arguments to means Postgres claimed the name: rewrite it as `ffmpeg.<name>(...)`.
 - `SINGLE_OUTPUT_ONLY` -- Reserved; sqlmpeg never raises this code -- a multi-column SELECT is ordinary usage, one column per output stream. If you see it anyway, treat it as INTERNAL: re-emit the simplest form of the query.
-- `NO_STREAMING_EQUIVALENT` -- Delete the clause named in `message`; there is no filtergraph form for it. If you used it to pick a time range, use `WHERE <alias>.t BETWEEN a AND b`. If you used it to pick one branch, just write that branch.
+- `NO_STREAMING_EQUIVALENT` -- Delete the clause named in `message`; there is no filtergraph form for it. If you used it to pick a time range, use `WHERE <alias>.t BETWEEN a AND b`, `<alias>.t >= a`, or `<alias>.t <= b`. If you used it to pick one branch, just write that branch.
 - `CONCAT_MISMATCH` -- UNION ALL branches disagree. `message` says how: if it names stream types, column counts, or order, make every branch select the same columns, the same types, in the same order (a splatted array counts one column per element, so array lengths must match too); if it is a resolution/frame-rate mismatch, wrap each branch's video column in `scale(<expr>, w, h)` with the same w and h everywhere.
-- `UNSUPPORTED_SQL` -- The construct is outside the dialect. Read `hint` -- it names the replacement: a CTE instead of a subquery, a comma instead of `JOIN ... ON`, a bare CTE name instead of an aliased one, one BETWEEN per alias, `<alias>.video`/`<alias>.audio` instead of `*` or an unqualified column, a positive integer literal subscript instead of zero, a negative number, or a computed index.
+- `UNSUPPORTED_SQL` -- The construct is outside the dialect. Read `hint` -- it names the replacement: a CTE instead of a subquery, a comma instead of `JOIN ... ON`, a bare CTE name instead of an aliased one, one lower and one upper time bound per alias, `<alias>.video`/`<alias>.audio` instead of `*` or an unqualified column, a positive integer literal subscript instead of zero, a negative number, or a computed index.
 - `STREAM_NOT_FOUND` -- The subscript is out of range for the actual stream count named in `message` (from the probed file, or a CTE array column's recorded length). Subscripts are 1-based -- lower the number into range, or select a different alias/column/element.
 - `INPUT_NOT_FOUND` -- A bare array (`<alias>.video` / `<alias>.audio` with no subscript, splatted or handed to a function) needs to read the file to know how many streams it has, and this input cannot be read (missing path, a URL, or `--no-probe`). Subscript one specific stream instead -- `hint` names one -- or point at a path you know is readable.
 - `BROADCAST_MISMATCH` -- Two array arguments to the same call have different lengths (both named in `message`) and cannot zip elementwise. Subscript one of them down to a single stream, e.g. `<alias>.audio[1]`, so it broadcasts as a scalar instead, or make both arrays the same length.

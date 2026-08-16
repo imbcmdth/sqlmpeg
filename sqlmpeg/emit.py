@@ -40,15 +40,18 @@ in that case.
 
 Input seeking (RFC-004 amendment)
 ---------------------------------
-``Graph.input_trims`` maps an alias to a ``(start, end)`` window. Since an
-alias owns exactly one ``-i`` slot, emit resolves it against ``Graph.sources``
-into :attr:`Emitted.input_trims`, a list parallel to :attr:`Emitted.inputs`,
-and ``build_ffmpeg_args`` renders ``-ss <start> -to <end>`` immediately BEFORE
-the owning ``-i`` — an input option, so the demuxer seeks and every stream of
-that input is cut coherently, subtitle and data streams included. Both bounds
-are on the input's own timeline. A seeked input can still be stream-copied (a
-window no longer forces a filter node into the graph), and then the cut snaps
-back to the preceding keyframe; a decoded stream is frame-accurate.
+``Graph.input_trims`` maps an alias to a ``(start, end)`` window, either bound
+possibly ``None`` (plan 039: an open-ended ``WHERE <alias>.t >= x`` or
+``<alias>.t <= y``). Since an alias owns exactly one ``-i`` slot, emit resolves
+it against ``Graph.sources`` into :attr:`Emitted.input_trims`, a list parallel
+to :attr:`Emitted.inputs`, and ``build_ffmpeg_args`` renders ``-ss <start>``
+and/or ``-to <end>`` immediately BEFORE the owning ``-i`` — an input option, so
+the demuxer seeks and every stream of that input is cut coherently, subtitle
+and data streams included — omitting whichever half is ``None`` (a tail-only
+window has no ``-to`` at all, so ffmpeg reads to EOF). Both bounds are on the
+input's own timeline. A seeked input can still be stream-copied (a window no
+longer forces a filter node into the graph), and then the cut snaps back to
+the preceding keyframe; a decoded stream is frame-accurate.
 
 Pad label scheme
 ----------------
@@ -153,11 +156,12 @@ class Emitted:
     maps: list[OutputMap]  # one per Graph.outputs entry, same order
     sink: Sink | None = None  # copied from Graph.sink (RFC-002, plan 027)
     # RFC-004 input-seek amendment: entry `i` is the (start, end) window of the
-    # `-i` at index `i`, or None if that input is not seeked. :func:`emit`
+    # `-i` at index `i`, or None if that input is not seeked. Plan 039: either
+    # half of a present window may itself be None (open-ended). :func:`emit`
     # always fills this in parallel with `inputs` (all None when the graph has
     # no `input_trims`); the empty default is for hand-built Emitted objects and
     # means the same thing -- no input is seeked.
-    input_trims: list[tuple[float, float] | None] = field(default_factory=list)
+    input_trims: list[tuple[float | None, float | None] | None] = field(default_factory=list)
 
 
 def emit(g: Graph) -> Emitted:
@@ -196,14 +200,14 @@ def _copy_sink(sink: Sink | None) -> Sink | None:
     return Sink(path=sink.path, options=dict(sink.options))
 
 
-def _input_windows(g: Graph) -> list[tuple[float, float] | None]:
+def _input_windows(g: Graph) -> list[tuple[float | None, float | None] | None]:
     """``g.input_trims`` (alias-keyed) resolved into a per-``-i`` list.
 
     An alias owns exactly one input slot (``g.sources``), so a window on an
     alias is a window on that ``-i``. The result is parallel to
     ``g.input_paths``: entry `i` is that input's ``(start, end)``, or None.
     """
-    windows: list[tuple[float, float] | None] = [None] * len(g.input_paths)
+    windows: list[tuple[float | None, float | None] | None] = [None] * len(g.input_paths)
     for alias, window in g.input_trims.items():
         index = g.sources.get(alias)
         if index is None:
@@ -238,8 +242,9 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     omitted when the graph is pure passthrough.
 
     Input options come first: an input carrying a window in `e.input_trims`
-    gets ``-ss <start> -to <end>`` immediately before its own ``-i`` (RFC-004's
-    input seek). A short or empty `input_trims` list simply leaves the
+    gets ``-ss <start>`` and/or ``-to <end>`` immediately before its own
+    ``-i`` (RFC-004's input seek; plan 039 lets either half be absent for an
+    open-ended window). A short or empty `input_trims` list simply leaves the
     remaining inputs unseeked, so a hand-built :class:`Emitted` needs no
     windows at all.
 
@@ -272,7 +277,11 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     for index, input_path in enumerate(e.inputs):
         window = e.input_trims[index] if index < len(e.input_trims) else None
         if window is not None:
-            args += ["-ss", _render_number(window[0]), "-to", _render_number(window[1])]
+            start, end = window
+            if start is not None:
+                args += ["-ss", _render_number(start)]
+            if end is not None:
+                args += ["-to", _render_number(end)]
         args += ["-i", input_path]
     if e.filter_complex:
         args += ["-filter_complex", e.filter_complex]

@@ -217,6 +217,7 @@ from sqlmpeg.parser import (
     RawSink,
     Resolved,
     _pos,
+    _time_bounds,
     kwarg_name,
     star_qualifier,
     subscript_index,
@@ -264,7 +265,10 @@ _EXPR_KIND = "expr"
 _PROVENANCE_KEYS = ("language", "title")
 _UNDEFINED_LANGUAGE = "und"
 
-_TIME_HINT = "<alias>.t is only usable as WHERE <alias>.t BETWEEN <start> AND <end>"
+_TIME_HINT = (
+    "<alias>.t is only usable as WHERE <alias>.t BETWEEN <start> AND <end>, "
+    "<alias>.t >= <start>, or <alias>.t <= <end>"
+)
 _ARG_HINT = "arguments are stream expressions or literals, in the order shown"
 _STREAM_HINT = "a SELECT column must be a stream, e.g. a.video[1] or scale(a.frame, 0.5)"
 _SUBSCRIPT_HINT = "stream subscripts are 1-based: a.video[1] is the first video stream"
@@ -666,7 +670,10 @@ class _Env:
     # CTE name -> its WHERE window. CTE-ONLY: an INPUT alias's window is a
     # property of its `-i`, not of this branch, so `_collect_trims` records it
     # in `Graph.input_trims` instead and no filter trim is ever spliced for it.
-    trims: dict[str, tuple[int | float, int | float]] = field(default_factory=dict)
+    # Plan 039: either half may be None (open-ended window).
+    trims: dict[str, tuple[int | float | None, int | float | None]] = field(
+        default_factory=dict
+    )
     # base stream ref -> its trimmed ref, so one filter trim is shared by every
     # consumer of that stream inside this branch (CTE-only, as above).
     trimmed: dict[FrameRef, FrameRef] = field(default_factory=dict)
@@ -1110,14 +1117,25 @@ class _Lowerer:
         the BRANCH (``_Env.trims``) and the ``trim``/``atrim`` pair is spliced
         lazily by :meth:`_access`, the first time a stream of that CTE is
         consumed.
+
+        Plan 039 (open-ended windows): a conjunct may supply only a lower
+        bound (``<alias>.t >= x``) or only an upper one (``<alias>.t <= y``),
+        via :func:`sqlmpeg.parser._time_bounds`, which also normalizes the
+        mirrored operand order (``x <= <alias>.t`` etc.) and flags a strict
+        ``>``/``<`` so it is rejected here too. Two conjuncts for the same
+        alias MERGE into one window (``t >= 1 AND t <= 2`` behaves exactly
+        like ``t BETWEEN 1 AND 2``) — resolve already rejected a second bound
+        of the same kind, so this only ever fills in the other half. Every
+        check below duplicates one resolve already made (defensive re-check,
+        as elsewhere in this pass).
         """
         where = select.args.get("where")
         if not isinstance(where, exp.Where):
             return
+        windows: dict[str, tuple[int | float | None, int | float | None]] = {}
         for conjunct in _flatten_and(where.this):
-            if not isinstance(conjunct, exp.Between) or not isinstance(
-                conjunct.this, exp.Column
-            ):
+            parsed = _time_bounds(conjunct)
+            if parsed is None:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     "unsupported WHERE predicate",
@@ -1125,7 +1143,15 @@ class _Lowerer:
                     fallback=where,
                     hint=_TIME_HINT,
                 )
-            column = conjunct.this
+            column, low, high, strict = parsed
+            if strict:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "strict inequalities are not supported",
+                    conjunct,
+                    fallback=where,
+                    hint=_TIME_HINT,
+                )
             table_node = column.args.get("table")
             if table_node is None:
                 raise _error(
@@ -1153,20 +1179,23 @@ class _Lowerer:
                     fallback=where,
                     hint=self._known_hint(),
                 )
-            low = conjunct.args.get("low")
-            high = conjunct.args.get("high")
-            if not isinstance(low, exp.Expr) or not isinstance(high, exp.Expr):
+            start, end = windows.get(alias, (None, None))
+            if low is not None:
+                start = _number(low, ErrorCode.UNSUPPORTED_SQL)
+            if high is not None:
+                end = _number(high, ErrorCode.UNSUPPORTED_SQL)
+            windows[alias] = (start, end)
+
+        for alias, window in windows.items():
+            start, end = window
+            if start is not None and end is not None and start >= end:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    "BETWEEN needs both bounds",
-                    conjunct,
-                    fallback=where,
-                    hint=_TIME_HINT,
+                    f"empty time window for alias '{alias}': start ({start}) "
+                    f"is not before end ({end})",
+                    fallback=select,
+                    hint="the start bound must be strictly before the end bound",
                 )
-            window = (
-                _number(low, ErrorCode.UNSUPPORTED_SQL),
-                _number(high, ErrorCode.UNSUPPORTED_SQL),
-            )
             if isinstance(env.bindings[alias], _InputBinding):
                 self.graph.input_trims[alias] = window
             else:
@@ -1233,24 +1262,33 @@ class _Lowerer:
         )
 
     def _trim(
-        self, env: _Env, window: tuple[int | float, int | float], stream: _Stream
+        self,
+        env: _Env,
+        window: tuple[int | float | None, int | float | None],
+        stream: _Stream,
     ) -> _Stream:
-        """The trimmed counterpart of one stream; a trim is spliced once per stream."""
+        """The trimmed counterpart of one stream; a trim is spliced once per stream.
+
+        Plan 039: `window` may have either half absent (open-ended), so the
+        ``trim``/``atrim`` node only gets the args it actually has --
+        ``start=X``, ``end=Y``, or both, same as today.
+        """
         cached = env.trimmed.get(stream.ref)
         if cached is not None:
             return _Stream(ref=cached, type=stream.type, source=stream.source)
         start, end = window
+        args: dict[str, object] = {}
+        if start is not None:
+            args["start"] = start
+        if end is not None:
+            args["end"] = end
         if stream.type == "video":
-            trimmed = self.ctx.node(
-                "trim", {"start": start, "end": end}, [stream.ref], ["video"]
-            )
+            trimmed = self.ctx.node("trim", args, [stream.ref], ["video"])
             rebased = self.ctx.node(
                 "setpts", {"expr": "PTS-STARTPTS"}, [trimmed], ["video"]
             )
         else:
-            trimmed = self.ctx.node(
-                "atrim", {"start": start, "end": end}, [stream.ref], ["audio"]
-            )
+            trimmed = self.ctx.node("atrim", args, [stream.ref], ["audio"])
             rebased = self.ctx.node(
                 "asetpts", {"expr": "PTS-STARTPTS"}, [trimmed], ["audio"]
             )

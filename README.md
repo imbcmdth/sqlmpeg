@@ -2,7 +2,7 @@
 
 SQL in, ffmpeg command out. You write a `SELECT` statement, sqlmpeg compiles it into a `-filter_complex` invocation, and ffmpeg does the actual pixel-pushing. This tool never decodes a single frame: it's a compiler, and ffmpeg is the executor.
 
-**Status: v0.6.0, not yet on PyPI. Works on my machine (and the CI machine).**
+**Status: v0.7.0, not yet on PyPI. Works on my machine (and the CI machine).**
 
 Why does this exist? The ffmpeg engine is a marvel. The filtergraph syntax is the hard part: hand-labeled pads that must each be consumed exactly once, positional arguments in surprising orders (`crop` takes `w:h:x:y`, when everyone thinks in `x,y,w,h`), and quoting rules deep enough that the official docs include a worked escaping example. SQL, meanwhile, has been describing dataflow DAGs for fifty years, and it's the language every developer (and every LLM) already speaks. This project connects the two.
 
@@ -128,7 +128,7 @@ ffmpeg -i tests/fixtures/avs.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 
 
 ## Trims
 
-`WHERE <alias>.t BETWEEN <start> AND <end>` on an input alias becomes an input seek (`-ss <start> -to <end>` in front of that alias's own `-i`), not a filtergraph node. The demuxer skips the front of the file instead of decoding and discarding it, and a trimmed column nothing else touches gets to stay a stream copy:
+`WHERE <alias>.t BETWEEN <start> AND <end>` on an input alias becomes an input seek (`-ss <start> -to <end>` in front of that alias's own `-i`), not a filtergraph node -- and either bound alone (`<alias>.t >= <start>` or `<alias>.t <= <end>`) works too, for an open-ended window with no made-up placeholder end. The demuxer skips the front of the file instead of decoding and discarding it, and a trimmed column nothing else touches gets to stay a stream copy:
 
 ```sql
 SELECT a.video[1], a.audio[1]

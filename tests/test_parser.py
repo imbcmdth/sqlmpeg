@@ -190,6 +190,107 @@ def test_where_conjunction_per_alias_is_accepted() -> None:
     assert res.sources == {"a": 0, "b": 1}
 
 
+# ---------------------------------------------------------------------------
+# resolve — open-ended time windows (plan 039)
+# ---------------------------------------------------------------------------
+
+
+def test_where_gte_open_lower_bound_is_accepted() -> None:
+    res = _resolve("SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 5")
+    assert res.sources == {"a": 0}
+
+
+def test_where_lte_open_upper_bound_is_accepted() -> None:
+    res = _resolve("SELECT a.frame FROM input('x.mp4') a WHERE a.t <= 60")
+    assert res.sources == {"a": 0}
+
+
+def test_where_flipped_gte_operand_order_is_accepted() -> None:
+    """``120 <= a.t`` is the exact mirror of ``a.t >= 120``, same lower bound.
+
+    VERIFIED (sqlglot 30.17, read="postgres"): operand order is NOT
+    normalized at parse time, so this exercises the mirrored branch of
+    ``parser._time_bounds`` for real, not the same code path as the
+    unflipped form.
+    """
+    res = _resolve("SELECT a.frame FROM input('x.mp4') a WHERE 120 <= a.t")
+    assert res.sources == {"a": 0}
+
+
+def test_where_flipped_lte_operand_order_is_accepted() -> None:
+    """``60 >= a.t`` is the exact mirror of ``a.t <= 60``, same upper bound."""
+    res = _resolve("SELECT a.frame FROM input('x.mp4') a WHERE 60 >= a.t")
+    assert res.sources == {"a": 0}
+
+
+def test_where_gte_and_lte_merge_into_one_window() -> None:
+    """``t >= 1 AND t <= 2`` is accepted exactly like ``t BETWEEN 1 AND 2``."""
+    res = _resolve("SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 1 AND a.t <= 2")
+    assert res.sources == {"a": 0}
+
+
+def test_where_open_bound_mixes_with_between_on_another_alias() -> None:
+    sql = (
+        "SELECT overlay(a.frame, b.frame, 0, 0) FROM input('x.mp4') a, input('y.mp4') b "
+        "WHERE a.t >= 1 AND b.t BETWEEN 0 AND 5"
+    )
+    res = _resolve(sql)
+    assert res.sources == {"a": 0, "b": 1}
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a.frame FROM input('x.mp4') a WHERE a.t > 5",
+        "SELECT a.frame FROM input('x.mp4') a WHERE 5 < a.t",
+        "SELECT a.frame FROM input('x.mp4') a WHERE a.t < 60",
+        "SELECT a.frame FROM input('x.mp4') a WHERE 60 > a.t",
+    ],
+)
+def test_strict_inequality_is_rejected_with_dedicated_hint(sql: str) -> None:
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.hint is not None
+    assert "use >= / <=" in err.hint
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 1 AND a.t >= 2",
+        "SELECT a.frame FROM input('x.mp4') a WHERE a.t <= 1 AND a.t <= 2",
+        "SELECT a.frame FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2 AND a.t >= 3",
+        "SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 1 AND a.t BETWEEN 2 AND 3",
+    ],
+)
+def test_a_second_bound_of_the_same_kind_is_rejected(sql: str) -> None:
+    """Mirrors the old one-BETWEEN rule: at most one lower and one upper bound
+    per alias, whichever forms supplied them."""
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.hint is not None
+
+
+def test_non_literal_inequality_bound_is_rejected() -> None:
+    sql = "SELECT a.frame FROM input('x.mp4') a, input('y.mp4') b WHERE a.t >= b.t"
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 5 AND a.t <= 2",
+        "SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 5 AND a.t <= 5",
+        "SELECT a.frame FROM input('x.mp4') a WHERE a.t BETWEEN 5 AND 2",
+    ],
+)
+def test_empty_time_window_is_rejected_at_compile_time(sql: str) -> None:
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.hint is not None
+
+
 def test_alias_case_is_folded_like_postgres() -> None:
     res = _resolve("SELECT A.frame FROM input('x.mp4') A WHERE a.t BETWEEN 1 AND 2")
     assert res.sources == {"a": 0}

@@ -331,3 +331,28 @@ def test_graph_from_dict_tolerates_missing_input_trims_key() -> None:
     assert "input_trims" not in d
     g2 = Graph.from_dict(d)
     assert g2.input_trims == {}
+
+
+# ---------------------------------------------------------------------------
+# Graph.input_trims open-ended windows (plan 039)
+# ---------------------------------------------------------------------------
+
+
+def test_graph_input_trims_open_upper_round_trips_as_json_null() -> None:
+    g = _build_graph()
+    g.input_trims = {"a": (5.0, None)}
+    d = g.to_dict()
+    assert d["input_trims"] == {"a": [5.0, None]}
+    g2 = Graph.from_dict(d)
+    assert g2.input_trims == {"a": (5.0, None)}
+    assert g2.to_dict() == d
+
+
+def test_graph_input_trims_open_lower_round_trips_as_json_null() -> None:
+    g = _build_graph()
+    g.input_trims = {"a": (None, 60.0)}
+    d = g.to_dict()
+    assert d["input_trims"] == {"a": [None, 60.0]}
+    g2 = Graph.from_dict(d)
+    assert g2.input_trims == {"a": (None, 60.0)}
+    assert g2.to_dict() == d

@@ -278,6 +278,60 @@ def test_a_trimmed_passthrough_is_stream_copied_within_keyframe_tolerance(
     assert duration <= source_duration + _DURATION_SLACK
 
 
+# ---------------------------------------------------------------------------
+# plan 039: open-ended windows -- WHERE <alias>.t >= x / <= y, no BETWEEN
+# ---------------------------------------------------------------------------
+
+
+def test_tail_only_input_seek_is_frame_accurate_when_the_stream_is_re_encoded(
+    tmp_path: Path,
+) -> None:
+    """`t >= 1` on the 2.000s fixture, decoded path: no upper bound at all --
+    ffmpeg reads to EOF -- so the output is exactly the tail, 2.0 - 1.0 = 1.0s."""
+    _require_fixture(_TESTSRC)
+    out_path = tmp_path / "tail-reencoded.mp4"
+    query = f"SELECT hflip(a.frame) FROM input('{_sql_path(_TESTSRC)}') a WHERE a.t >= 1"
+
+    emitted = emit(compile_sql(query))
+    args = build_ffmpeg_args(emitted, str(out_path))
+    assert args[:4] == ["ffmpeg", "-ss", "1", "-i"]
+    assert "-to" not in args
+
+    _compile_and_run(query, out_path)
+
+    source_duration = _ffprobe_duration(_TESTSRC)
+    assert _ffprobe_duration(out_path) == pytest.approx(
+        source_duration - 1.0, abs=_DURATION_SLACK
+    )
+
+
+def test_tail_only_input_seek_is_stream_copied_within_keyframe_tolerance(
+    tmp_path: Path,
+) -> None:
+    """The passthrough half: no `-to` means ffmpeg reads to EOF regardless, so
+    a stream-copied tail trim's duration ranges from the requested tail up to
+    the whole input -- same keyframe-snap contract a closed window has (see
+    the measured keyframe layout above testsrc.mp4 has one keyframe, at t=0,
+    so a copy can only snap all the way back to the start)."""
+    _require_fixture(_TESTSRC)
+    out_path = tmp_path / "tail-copied.mp4"
+    query = f"SELECT a.video[1] FROM input('{_sql_path(_TESTSRC)}') a WHERE a.t >= 1"
+
+    emitted = emit(compile_sql(query))
+    assert emitted.filter_complex == ""
+    assert emitted.input_trims == [(1, None)]
+    args = build_ffmpeg_args(emitted, str(out_path))
+    assert args[:4] == ["ffmpeg", "-ss", "1", "-i"]
+    assert "-to" not in args
+
+    _compile_and_run(query, out_path)
+
+    source_duration = _ffprobe_duration(_TESTSRC)
+    duration = _ffprobe_duration(out_path)
+    assert duration >= source_duration - 1.0 - _DURATION_SLACK
+    assert duration <= source_duration + _DURATION_SLACK
+
+
 def test_a_trimmed_captioned_input_still_remuxes_video_and_audio(tmp_path: Path) -> None:
     """A WHERE over a captioned input is fine as long as the captions are not
     selected (they are seeked but unmapped). Selecting them under a trim is
@@ -763,3 +817,61 @@ def test_the_same_subtitle_track_may_be_mapped_twice(tmp_path: Path) -> None:
     streams = _ffprobe_streams(out_path)
     assert [s["codec_type"] for s in streams] == ["video", "subtitle", "subtitle"]
     assert [s["tags"]["language"] for s in streams[1:]] == ["eng", "eng"]
+
+
+# ---------------------------------------------------------------------------
+# plan 039: the ad-splice pattern, without the `BETWEEN x AND 3600` placeholder
+# ---------------------------------------------------------------------------
+
+
+def test_ad_splice_tail_trim_needs_no_between_placeholder(tmp_path: Path) -> None:
+    """Splice an ad into the middle of a clip by cutting the base into a head
+    and a tail, with the tail reaching to the end of the file. Before plan 039
+    that meant a `BETWEEN x AND 3600`-style placeholder to fake "to the end";
+    `g.t >= 1` says it directly, with no upper bound at all.
+
+    Three UNION ALL branches over the 2s av2/av3 fixtures: a 1s head of av2, all
+    of av3 as the ad, and a 1s tail of av2 (`g.t >= 1`, BETWEEN-free). Every
+    branch feeds the `concat` filter, so every trim is DECODED end to end
+    (frame-accurate, not stream-copy-and-snap), and the run is head + ad + tail.
+    """
+    _require_fixture(_AV2)
+    _require_fixture(_AV3)
+    av2_path = _sql_path(_AV2)
+    av3_path = _sql_path(_AV3)
+    out_path = tmp_path / "ad-splice.mp4"
+    query = (
+        f"SELECT a.frame FROM input('{av2_path}') a WHERE a.t BETWEEN 0 AND 1 "
+        "UNION ALL "
+        f"SELECT b.frame FROM input('{av3_path}') b "
+        "UNION ALL "
+        f"SELECT g.frame FROM input('{av2_path}') g WHERE g.t >= 1"
+    )
+
+    graph = compile_sql(query)
+    assert graph.input_trims == {"a": (0, 1), "g": (1, None)}
+    assert [node.filter for node in graph.nodes.values()] == ["concat"]
+
+    emitted = emit(graph)
+    args = build_ffmpeg_args(emitted, str(out_path))
+    assert args[:13] == [
+        "ffmpeg",
+        "-ss",
+        "0",
+        "-to",
+        "1",
+        "-i",
+        av2_path,
+        "-i",
+        av3_path,
+        "-ss",
+        "1",
+        "-i",
+        av2_path,
+    ]
+    assert args.count("-to") == 1  # only the head branch has an upper bound
+
+    _compile_and_run(query, out_path)
+
+    expected_duration = 1.0 + _ffprobe_duration(_AV3) + (_ffprobe_duration(_AV2) - 1.0)
+    assert _ffprobe_duration(out_path) == pytest.approx(expected_duration, abs=0.3)

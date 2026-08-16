@@ -55,7 +55,7 @@ def _graph(
     input_paths: list[str] | None = None,
     sources: dict[str, int] | None = None,
     sink: Sink | None = None,
-    input_trims: dict[str, tuple[float, float]] | None = None,
+    input_trims: dict[str, tuple[float | None, float | None]] | None = None,
 ) -> Graph:
     return Graph(
         input_paths=list(input_paths or ["a.mp4"]),
@@ -1219,6 +1219,66 @@ def test_a_hand_built_emitted_needs_no_input_trims() -> None:
         maps=[OutputMap(target="0:v:0", type="video", copy=True, metadata={})],
     )
     assert build_ffmpeg_args(e, "out.mp4")[:3] == ["ffmpeg", "-i", "a.mp4"]
+
+
+# ---------------------------------------------------------------------------
+# open-ended windows (plan 039): either half of a window may be None
+# ---------------------------------------------------------------------------
+
+
+def test_tail_only_window_renders_ss_with_no_to() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_trims={"a": (5, None)})
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args == [
+        "ffmpeg",
+        "-ss",
+        "5",
+        "-i",
+        "a.mp4",
+        "-map",
+        "0:v:0",
+        "-c:0",
+        "copy",
+        "out.mp4",
+    ]
+    assert "-to" not in args
+
+
+def test_head_only_window_renders_to_with_no_ss() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_trims={"a": (None, 60)})
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args == [
+        "ffmpeg",
+        "-to",
+        "60",
+        "-i",
+        "a.mp4",
+        "-map",
+        "0:v:0",
+        "-c:0",
+        "copy",
+        "out.mp4",
+    ]
+    assert "-ss" not in args
+
+
+def test_open_window_still_resolves_alias_to_input_position() -> None:
+    g = _graph(
+        [],
+        [_out("src:b:v:0")],
+        input_paths=["a.mp4", "b.mp4"],
+        sources={"a": 0, "b": 1},
+        input_trims={"b": (None, 8)},
+    )
+    assert emit(g).input_trims == [None, (None, 8)]
+
+
+def test_open_window_still_stream_copies() -> None:
+    """Same as a closed window: no bound forces a filter node into the graph."""
+    g = _graph([], [_out("src:a:v:0")], input_trims={"a": (5, None)})
+    e = emit(g)
+    assert e.filter_complex == ""
+    assert e.maps[0].copy is True
 
 
 def test_input_trim_on_an_unknown_alias_is_internal_error() -> None:

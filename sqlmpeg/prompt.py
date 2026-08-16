@@ -163,22 +163,35 @@ statement is not. `--` and `/* */` comments are allowed.
   Reuse is automatic; never duplicate the CTE.
 
 ### Time selection
-- The ONLY predicate is `WHERE <alias>.t BETWEEN <start> AND <end>`, in
-  seconds. Both bounds are plain numeric literals.
-- One `BETWEEN` per alias per `SELECT`. Join different aliases with `AND`:
-  `WHERE a.t BETWEEN 0 AND 5 AND b.t BETWEEN 2 AND 7`.
-- No `OR`, no `NOT BETWEEN`, no `<`/`>`/`=`, no expressions as bounds, no
-  second range for the same alias.
-- On an `input()` alias, the window becomes an INPUT seek (`-ss <start> -to
-  <end>` immediately before that alias's own `-i`), not a filter: it trims
-  AND rebases to t=0 every stream of that input, selected or not -- video,
-  audio, subtitle, data alike -- so a column nothing else filters can stay a
-  plain stream copy instead of forcing a re-encode. A DECODED stream
-  (anything filtered/re-encoded) trims frame-accurate; a STREAM-COPIED one
-  snaps back to the preceding keyframe and may start up to one GOP early.
+- The supported predicates are `WHERE <alias>.t BETWEEN <start> AND <end>`,
+  `<alias>.t >= <start>` (open-ended, no upper bound), and `<alias>.t <= <end>`
+  (open-ended, no lower bound), all in seconds. Bounds are plain numeric
+  literals. Either operand order works -- `<alias>.t >= 120` and
+  `120 <= <alias>.t` are the exact same predicate, not an approximation.
+- At most one lower bound and one upper bound per alias per `SELECT`, from any
+  combination of the forms above -- `t >= 1 AND t <= 2` means exactly what
+  `t BETWEEN 1 AND 2` means. Join different aliases with `AND`:
+  `WHERE a.t BETWEEN 0 AND 5 AND b.t >= 2`. A second bound of the same kind
+  for one alias (two lower bounds, a BETWEEN plus an overlapping `>=`, ...) is
+  rejected, same as writing `BETWEEN` twice.
+- No `OR`, no `NOT BETWEEN`, no strict `<`/`>` (seeks are time-based, and a
+  strict bound has no frame-level meaning -- use `>=`/`<=`), no `=`, no
+  expressions as bounds. A window with both bounds present where the start is
+  not strictly before the end is a compile-time `UNSUPPORTED_SQL`, not an
+  ffmpeg runtime error.
+- On an `input()` alias, the window becomes an INPUT seek (`-ss <start>`
+  and/or `-to <end>` immediately before that alias's own `-i`, whichever
+  bounds are present), not a filter: it trims AND rebases to t=0 every stream
+  of that input, selected or not -- video, audio, subtitle, data alike -- so
+  a column nothing else filters can stay a plain stream copy instead of
+  forcing a re-encode. A DECODED stream (anything filtered/re-encoded) trims
+  frame-accurate; a STREAM-COPIED one snaps back to the preceding keyframe and
+  may start up to one GOP early. An open-ended window with no `-to` reads to
+  EOF, same as giving ffmpeg no end time at all.
 - On a CTE name, the window is still a filtergraph trim (`trim`+`setpts` /
-  `atrim`+`asetpts`), because a CTE's output is a filtergraph pad, not an
-  input -- video/audio only, same as before RFC-004.
+  `atrim`+`asetpts`, with only the present bound(s) as filter args), because a
+  CTE's output is a filtergraph pad, not an input -- video/audio only, same as
+  before RFC-004.
 - Caption caveat: ffmpeg does not retime subtitle/data packets under an
   input seek, so a track that is both inside its own alias's WHERE window
   AND selected in the same query would play out of sync with the rebased
@@ -411,6 +424,10 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
         "SELECT a.frame\nFROM input('clip.mp4') a\nWHERE a.t BETWEEN 5 AND 12.5",
     ),
     (
+        "Drop everything before the 90 second mark in clip.mp4; keep the rest.",
+        "SELECT a.frame\nFROM input('clip.mp4') a\nWHERE a.t >= 90",
+    ),
+    (
         "Put a half-size copy of the scoreboard (the 600x200 box at 1200,50) "
         "in the top-left corner of game.mp4, and mix its audio under the main "
         "feed's at 65/35.",
@@ -613,8 +630,8 @@ _REPAIR: dict[ErrorCode, str] = {
     ErrorCode.NO_STREAMING_EQUIVALENT: (
         "Delete the clause named in `message`; there is no filtergraph form for "
         "it. If you used it to pick a time range, use "
-        "`WHERE <alias>.t BETWEEN a AND b`. If you used it to pick one branch, "
-        "just write that branch."
+        "`WHERE <alias>.t BETWEEN a AND b`, `<alias>.t >= a`, or `<alias>.t <= "
+        "b`. If you used it to pick one branch, just write that branch."
     ),
     ErrorCode.CONCAT_MISMATCH: (
         "UNION ALL branches disagree. `message` says how: if it names stream "
@@ -646,9 +663,10 @@ _REPAIR: dict[ErrorCode, str] = {
     ErrorCode.UNSUPPORTED_SQL: (
         "The construct is outside the dialect. Read `hint` -- it names the "
         "replacement: a CTE instead of a subquery, a comma instead of "
-        "`JOIN ... ON`, a bare CTE name instead of an aliased one, one BETWEEN "
-        "per alias, `<alias>.video`/`<alias>.audio` instead of `*` or an "
-        "unqualified column, a positive integer literal subscript instead of "
+        "`JOIN ... ON`, a bare CTE name instead of an aliased one, one lower "
+        "and one upper time bound per alias, `<alias>.video`/`<alias>.audio` "
+        "instead of `*` or an unqualified column, a positive integer literal "
+        "subscript instead of "
         "zero, a negative number, or a computed index."
     ),
     ErrorCode.UNKNOWN_SINK_OPTION: (
