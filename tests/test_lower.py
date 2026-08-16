@@ -429,6 +429,83 @@ def test_readme_dynamic_filter_command_is_the_real_compilation(_fixtures: None) 
     assert shown in _readme_text(), shown
 
 
+# ---------------------------------------------------------------------------
+# the README "Generated sources" example (plan 044, RFC-005 SS1)
+# ---------------------------------------------------------------------------
+
+
+def _readme_sine_sql() -> str:
+    """A generated source names no file at all -- nothing to re-point at a
+    fixture, so this is exactly the ```sql block README.md shows."""
+    return _readme_block("ffmpeg.sine")
+
+
+@pytest.mark.exec
+def test_readme_sine_source_compiles() -> None:
+    """A zero-input filter node: no ``-i``, one ``audio`` output."""
+    g = compile_sql(_readme_sine_sql())
+    assert _filters(g) == ["sine"]
+    assert g.nodes["n1"].args == {"frequency": 440, "duration": 1}
+    assert _outputs(g) == [("n1", "audio", None)]
+
+
+@pytest.mark.exec
+def test_readme_sine_source_command_is_the_real_compilation() -> None:
+    """The command shown under "Generated sources" is what sqlmpeg actually
+    prints for that query -- no fixture path to substitute back, since the
+    query names no file at all."""
+    args = build_ffmpeg_args(emit(compile_sql(_readme_sine_sql())), "out.mp4")
+    assert shlex.join(args) in _readme_text()
+
+
+# ---------------------------------------------------------------------------
+# the README "Enable, and expressions" examples (plan 044, RFC-005 SS2/SS3)
+# ---------------------------------------------------------------------------
+
+
+def _readme_enable_sql() -> str:
+    """`enable`'s timeline (T-flag) check needs the real installed ffmpeg,
+    same as any other named argument -- the block names no real file."""
+    return _readme_block("enable => 'between")
+
+
+@pytest.mark.exec
+def test_readme_enable_example_compiles() -> None:
+    g = compile_sql(_readme_enable_sql())
+    assert _filters(g) == ["gblur"]
+    assert g.nodes["n1"].args == {"sigma": 12, "enable": "between(t,0.5,1.5)"}
+
+
+@pytest.mark.exec
+def test_readme_enable_example_command_is_the_real_compilation() -> None:
+    """The command shown under "Enable, and expressions" for the windowed
+    blur is what sqlmpeg actually prints for that query."""
+    args = build_ffmpeg_args(emit(compile_sql(_readme_enable_sql())), "out.mp4")
+    assert shlex.join(args) in _readme_text()
+
+
+def _readme_overlay_expr_sql() -> str:
+    """`expr` slots need neither probe nor registry -- pure stdlib, so this
+    example pins offline, unlike its two neighbors above."""
+    return _readme_block("(W-w)/2")
+
+
+def test_readme_overlay_expr_example_compiles() -> None:
+    g = compile_sql(_readme_overlay_expr_sql(), probe=False)
+    assert _filters(g) == ["overlay"]
+    assert g.nodes["n1"].args == {"x": "(W-w)/2", "y": "(H-h)/2"}
+
+
+def test_readme_overlay_expr_example_command_is_the_real_compilation() -> None:
+    """The command shown under "Enable, and expressions" for the centered
+    overlay is what sqlmpeg actually prints for that query, byte-identical
+    because ``--no-probe`` makes the compile fully symbolic."""
+    args = build_ffmpeg_args(
+        emit(compile_sql(_readme_overlay_expr_sql(), probe=False)), "out.mp4"
+    )
+    assert shlex.join(args) in _readme_text()
+
+
 def test_readme_flagship_scale_factor_is_not_a_decimal() -> None:
     """``Literal.to_py()`` yields Decimal for 0.5; the IR must carry float."""
     g = _lower("SELECT scale(a.frame, 0.5, 0.25) FROM input('x.mp4') a")

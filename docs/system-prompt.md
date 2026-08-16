@@ -236,10 +236,10 @@ statement is not. `--` and `/* */` comments are allowed.
   The expression is over `t` (seconds), `n` (frame number) or `pos`, and its
   content is checked by ffmpeg at run time. Only filters your ffmpeg flags
   with timeline support take it -- `gblur`, `drawbox`, `drawtext`, `overlay`,
-  `eq` do; `scale`, `pad`, `fps`, `xfade` do not, and asking is
-  `UNKNOWN_FILTER_OPTION` saying so. It is never valid on a generated source
-  (there is no upstream frame to switch), and, like every named argument, it
-  needs the installed ffmpeg.
+  `eq` do; `scale`, `pad`, `fps`, `xfade` do not, and asking anyway is
+  `UNKNOWN_FILTER_OPTION`, worded to say so. It is never valid on a generated
+  source (there is no upstream frame to switch), and, like every named
+  argument, it needs the installed ffmpeg.
 - A call that expands to more than one ffmpeg filter takes no named arguments
   at all, because there is no single filter to set them on: `blur_regions`,
   and `delay` on a VIDEO stream. `delay` on an AUDIO stream is one filter and

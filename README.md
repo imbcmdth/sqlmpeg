@@ -2,7 +2,7 @@
 
 SQL in, ffmpeg command out. You write a `SELECT` statement, sqlmpeg compiles it into a `-filter_complex` invocation, and ffmpeg does the actual pixel-pushing. This tool never decodes a single frame: it's a compiler, and ffmpeg is the executor.
 
-**Status: v0.7.0, not yet on PyPI. Works on my machine (and the CI machine).**
+**Status: v0.8.0, not yet on PyPI. Works on my machine (and the CI machine).**
 
 Why does this exist? The ffmpeg engine is a marvel. The filtergraph syntax is the hard part: hand-labeled pads that must each be consumed exactly once, positional arguments in surprising orders (`crop` takes `w:h:x:y`, when everyone thinks in `x,y,w,h`), and quoting rules deep enough that the official docs include a worked escaping example. SQL, meanwhile, has been describing dataflow DAGs for fifty years, and it's the language every developer (and every LLM) already speaks. This project connects the two.
 
@@ -83,6 +83,21 @@ ffmpeg -i clip.mp4 -filter_complex '[0:v:0]unsharp=luma_msize_x=7:luma_amount=1.
 
 This is machine-dependent on purpose: the query compiles where an `unsharp` filter exists and nowhere else, and the option names, types, ranges, and enum constants are all validated against what your binary actually reports. Named options also reach through stdlib calls to the underlying filter's full option set (`blur(a.frame, 5, planes => 1)` sets `gblur`'s `planes`, which no table anywhere lists). Every filter is additionally callable as `ffmpeg.<name>(...)`, a spelling that resolves in the filter set alone - which is how you reach the raw filter behind a stdlib name, and the eleven filters whose names Postgres itself parses specially (`ffmpeg.trim`, `ffmpeg.format`, `ffmpeg.overlay`, ...). When a query needs to travel, `--portable` compiles it against the stdlib alone and tells you exactly what a machine with no ffmpeg would think of it. Details live in [docs/dynamic-filters.md](docs/dynamic-filters.md).
 
+## Generated sources
+
+Some ffmpeg filters make a stream instead of transforming one - test patterns, color fields, tones, silence. sqlmpeg exposes them in `FROM`, under the same `ffmpeg.` namespace and mandatory alias `input()` uses, so writing one down is a table function, not a special form:
+
+```sql
+SELECT s.audio[1] FROM ffmpeg.sine(frequency => 440, duration => 1) s
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -filter_complex 'sine=frequency=440:duration=1[out0]' -map '[out0]' out.mp4
+```
+
+That's a complete, valid ffmpeg command with no `-i` in it anywhere - there is no file, so there is nothing to demux. A generated source is legal everywhere an `input()` alias is: comma-joined with real files, inside a CTE, in a `UNION ALL` branch. The last is the actual point of the feature - `concat` demands every segment share the same pad shape, so a generated video segment can pick up a matching silent audio track (`ffmpeg.anullsrc(duration => ...)`) instead of a hand-made file kept on disk just to line the shapes up. The full rules, including what a source alias like `s` above exposes, are in [docs/dynamic-filters.md](docs/dynamic-filters.md).
+
 ## Streams are columns
 
 Every input exposes four array-typed pseudo-columns: `<alias>.video`, `<alias>.audio`, `<alias>.subtitle`, and `<alias>.data`. Subscripts are 1-based, matching Postgres array semantics (`<alias>.frame` is sugar for `<alias>.video[1]`). `input('path')` also takes trailing named options - `input('logo.png', loop => true, framerate => 15)` loops a still image into a video stream at 15fps - for the handful of ffmpeg per-input flags (`loop`, `stream_loop`, `framerate`, `itsoffset`, `hwaccel`) that only make sense before the demuxer opens the file. The rule everything else falls out of: **the SELECT list is the output stream list.** One column, one output stream, in `-map` order. Nothing rides along implicitly. If you didn't select the audio, the output has no audio - and that's a feature, because it means your output's stream layout is exactly the SELECT list you can read at the top of the query.
@@ -142,6 +157,36 @@ ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy out.mp
 ```
 
 Accuracy is the classic trade. A decoded stream trims frame-accurate; a stream-copied one snaps back to the previous keyframe, because a copied stream can only begin at a keyframe. One caveat we measured the hard way: the seek covers every stream of the input, captions included, but ffmpeg does not retime caption packets under an input seek. Rather than hand you subtitles that drift by exactly your seek offset, sqlmpeg rejects a query that trims an alias and also selects its captions. Trim without the captions, or join a subtitle file already timed for the cut (next section). The measured numbers, including an important caveat about mkv's self-reported durations, are in [docs/trimming.md](docs/trimming.md).
+
+## Enable, and expressions
+
+Two more named arguments, both aimed at the same everyday gap: telling ffmpeg something about *when* or *where* inside the frame, without reshaping the query around it. `enable => '<expr>'` turns a filter on and off as the stream plays - no trim, no branch, no concat - on any filter your ffmpeg flags as timeline-capable:
+
+```sql
+SELECT blur(a.frame, 12, enable => 'between(t,0.5,1.5)')
+FROM input('clip.mp4') a
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i clip.mp4 -filter_complex '[0:v:0]gblur=sigma=12:enable=between(t\,0.5\,1.5)[out0]' -map '[out0]' out.mp4
+```
+
+That blurs exactly one second in the middle of the clip and leaves the rest of it sharp.
+
+A handful of stdlib slots - `overlay`'s x/y, `crop`'s x/y/w/h, and a few others - take an ffmpeg expression string in place of a bare number, evaluated per frame against the real frame sizes:
+
+```sql
+SELECT overlay(f.frame, logo.frame, '(W-w)/2', '(H-h)/2')
+FROM input('film.mp4') f, input('watermark.png') logo
+```
+
+```
+$ sqlmpeg compile --no-probe "SELECT overlay(f.frame, logo.frame, '(W-w)/2', '(H-h)/2') FROM input('film.mp4') f, input('watermark.png') logo"
+ffmpeg -i film.mp4 -i watermark.png -filter_complex '[0:v:0][1:v:0]overlay=x=(W-w)/2:y=(H-h)/2[out0]' -map '[out0]' out.mp4
+```
+
+Whatever size `film.mp4` and `watermark.png` turn out to be, the centering math runs inside ffmpeg at playback time - sqlmpeg never has to know it, and the query compiles the same with no file to probe at all. Both features, including which filters and slots accept them, are documented in full in [docs/dynamic-filters.md](docs/dynamic-filters.md).
 
 ## Captions and data streams
 

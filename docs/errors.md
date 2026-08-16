@@ -294,6 +294,17 @@ The anchor lands on the option's VALUE: sqlglot records no token position on the
 
 Machine-dependence is the entire point of this code: a query using it compiles only where that ffmpeg does. See `UNSUPPORTED_SQL` for what happens when there is no ffmpeg to check against at all.
 
+**Also fires for `enable`:** `enable` is never a real option of any filter (it is framework-level, see [docs/dynamic-filters.md](dynamic-filters.md)), so the validator special-cases the name instead of looking it up — but it names this same code, worded to say so, when the target filter isn't one your ffmpeg flags as timeline-capable (the `T` column of `ffmpeg -filters`):
+
+```sql
+SELECT scale(a.frame, 640, 360, enable => 'gt(t,1)')
+FROM input('x.mp4') a
+```
+
+```json
+{"line": 1, "col": 43, "code": "UNKNOWN_FILTER_OPTION", "message": "filter 'scale' has no option 'enable': your ffmpeg does not flag 'scale' as supporting timeline editing", "hint": "enable is only accepted by filters your ffmpeg flags with timeline support (the T column of `ffmpeg -filters`: gblur has it, scale does not); drop it, or express the timing with a WHERE window over the input"}
+```
+
 ## FILTER_OPTION_TYPE
 
 **Meaning:** A named argument's value doesn't match the option's introspected type, declared range, or set of named constants.
@@ -314,6 +325,19 @@ FROM input('x.mp4') a
 ```
 
 Enum options quote their constant name (`transition => 'wipeleft'`), and the message lists the constants, truncated with a count when there are many (`xfade`'s `transition` alone has 59). Anchoring matches `UNKNOWN_FILTER_OPTION`: the value, not the name.
+
+**Also fires for `enable`:** on a filter that does accept it, `enable`'s value must still be a single-quoted string (an ffmpeg timeline expression) — anything else is this code, not `UNKNOWN_FILTER_OPTION`, since the name itself was fine:
+
+```sql
+SELECT blur(a.frame, 5, enable => 5)
+FROM input('x.mp4') a
+```
+
+```json
+{"line": 1, "col": 35, "code": "FILTER_OPTION_TYPE", "message": "option 'enable' of filter 'gblur' expects an ffmpeg timeline expression, got 5", "hint": "enable takes a single-quoted ffmpeg timeline expression over t (seconds), n (frame number) or pos, e.g. enable => 'between(t,2,5)'"}
+```
+
+The expression's own *content* is never checked here (or anywhere at compile time) — see [docs/dynamic-filters.md](dynamic-filters.md). A stdlib `expr`-kind parameter (`overlay`'s x/y, `crop`'s x/y/w/h, and others — see [docs/stdlib.md](stdlib.md)) is a different mechanism: it is positional, not a named argument, so a bad value there is `UDF_ARG_TYPE`, never this code.
 
 ## UNKNOWN_INPUT_OPTION
 
