@@ -404,6 +404,113 @@ def test_labels_are_sanitized() -> None:
 
 
 # ---------------------------------------------------------------------------
+# zero-input (generated source) nodes -- RFC-005 SS1, plan 042
+# ---------------------------------------------------------------------------
+#
+# `FROM ffmpeg.testsrc(duration => 2) t` lowers to a node with `inputs=[]`.
+# Nothing in this pass needed changing for it (verified, not assumed): a chain
+# head with no inputs renders no input labels, `_extends` refuses to
+# comma-append a node that does not take exactly one input (so a source always
+# STARTS a chain), and `_verify_topological` / `_check_fanout` have nothing to
+# say about an empty input list. These tests pin that.
+
+
+def _source_graph(nodes: list[Node], outputs: list[Output]) -> Graph:
+    """A graph with NO inputs at all -- `_graph`'s defaults would add one."""
+    return Graph(
+        input_paths=[], sources={}, nodes={n.id: n for n in nodes}, outputs=list(outputs)
+    )
+
+
+def test_a_zero_input_node_renders_as_a_chain_head_with_no_input_labels() -> None:
+    g = _source_graph([_node("n1", "testsrc", {"duration": 2}, [])], [_out("n1")])
+    assert emit(g).filter_complex == "testsrc=duration=2[out0]"
+
+
+def test_a_graph_of_only_sources_needs_no_input_at_all() -> None:
+    """No `-i` anywhere: the whole command is a filtergraph and its maps."""
+    g = _source_graph(
+        [
+            _node("n1", "testsrc", {"duration": 2}, []),
+            _node("n2", "anullsrc", {"duration": 2}, [], ["audio"]),
+        ],
+        [_out("n1"), _out("n2", "audio")],
+    )
+    e = emit(g)
+    assert e.filter_complex == "testsrc=duration=2[out0];anullsrc=duration=2[out1]"
+    assert build_ffmpeg_args(e, "out.mp4") == [
+        "ffmpeg",
+        "-filter_complex",
+        "testsrc=duration=2[out0];anullsrc=duration=2[out1]",
+        "-map",
+        "[out0]",
+        "-map",
+        "[out1]",
+        "out.mp4",
+    ]
+
+
+def test_a_zero_input_node_merges_into_a_chain_with_what_follows_it() -> None:
+    g = _source_graph(
+        [
+            _node("n1", "sine", {"frequency": 440}, [], ["audio"]),
+            _node("n2", "volume", {"volume": 0.5}, ["n1"], ["audio"]),
+        ],
+        [_out("n2", "audio")],
+    )
+    assert emit(g).filter_complex == "sine=frequency=440,volume=volume=0.5[out0]"
+
+
+def test_a_zero_input_node_never_extends_the_previous_chain() -> None:
+    """A source takes no inputs, so it can never be the comma-continuation of
+    anything -- it always starts its own chain."""
+    g = _graph(
+        [
+            _node("n1", "hflip", {}, ["src:a:v:0"]),
+            _node("n2", "testsrc", {"duration": 1}, []),
+        ],
+        [_out("n1"), _out("n2")],
+    )
+    assert emit(g).filter_complex == "[0:v:0]hflip[out0];testsrc=duration=1[out1]"
+
+
+def test_a_split_of_a_zero_input_node_chains_off_it() -> None:
+    g = _source_graph(
+        [
+            _node("n1", "testsrc", {"duration": 2}, []),
+            _node("n1_split", "split", {"n": 2}, ["n1"], ["video", "video"]),
+            _node("n2", "hflip", {}, ["n1_split:0"]),
+        ],
+        [_out("n2"), _out("n1_split:1")],
+    )
+    assert emit(g).filter_complex == (
+        "testsrc=duration=2,split=2[n1_split0][out1];[n1_split0]hflip[out0]"
+    )
+
+
+def test_zero_input_nodes_feed_concat_alongside_real_inputs() -> None:
+    """The silent-audio-for-concat shape (RFC-005 SS1's headline)."""
+    g = _graph(
+        [
+            _node("n1", "testsrc2", {"duration": 1}, []),
+            _node("n2", "anullsrc", {"duration": 1}, [], ["audio"]),
+            _node(
+                "n3",
+                "concat",
+                {"n": 2, "v": 1, "a": 1},
+                ["src:a:v:0", "src:a:a:0", "n1", "n2"],
+                ["video", "audio"],
+            ),
+        ],
+        [_out("n3:0"), _out("n3:1", "audio")],
+    )
+    assert emit(g).filter_complex == (
+        "testsrc2=duration=1[n1];anullsrc=duration=1[n2];"
+        "[0:v:0][0:a:0][n1][n2]concat=n=2:v=1:a=1[out0][out1]"
+    )
+
+
+# ---------------------------------------------------------------------------
 # argument rendering
 # ---------------------------------------------------------------------------
 

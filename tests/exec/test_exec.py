@@ -924,3 +924,111 @@ def test_looped_png_title_card_composites_onto_testsrc(tmp_path: Path) -> None:
     _compile_and_run(query, out_path)
 
     assert _ffprobe_duration(out_path) == pytest.approx(2.0, abs=0.2)
+
+
+# ---------------------------------------------------------------------------
+# plan 042: FROM ffmpeg.<source>(...) -- RFC-005 SS1
+# ---------------------------------------------------------------------------
+
+
+def test_silent_audio_lets_a_generated_segment_concat_with_a_real_clip(
+    tmp_path: Path,
+) -> None:
+    """THE headline of RFC-005 SS1.
+
+    ffmpeg's `concat` needs every segment to have the same pad shape, so a
+    generated video segment cannot join a clip that has audio -- unless
+    something supplies the missing track. `ffmpeg.anullsrc(duration => 1)` is
+    that something, and it costs one zero-input filter node rather than a
+    silent .wav on disk.
+
+    Both generators are `-i`-less: the whole command reads ONE input file, and
+    `testsrc2`/`anullsrc` are chain heads inside `-filter_complex`. The result
+    is av2 (2s, video + audio) followed by a 1s generated segment.
+    """
+    _require_fixture(_AV2)
+    out_path = tmp_path / "silent-concat.mp4"
+    query = (
+        f"SELECT f.video[1], f.audio[1] FROM input('{_sql_path(_AV2)}') f "
+        "UNION ALL "
+        "SELECT t.video[1], s.audio[1] "
+        "FROM ffmpeg.testsrc2(duration => 1, size => '320x240', rate => 15) t, "
+        "ffmpeg.anullsrc(duration => 1) s"
+    )
+
+    graph = compile_sql(query)
+    # A source takes no input index: one -i for the one real file.
+    assert graph.input_paths == [_sql_path(_AV2)]
+    assert graph.sources == {"f": 0}
+    assert [node.filter for node in graph.nodes.values()] == [
+        "testsrc2",
+        "anullsrc",
+        "concat",
+    ]
+    assert graph.nodes["n1"].inputs == []
+    assert graph.nodes["n2"].inputs == []
+
+    emitted = emit(graph)
+    args = build_ffmpeg_args(emitted, str(out_path))
+    assert args.count("-i") == 1
+    assert emitted.filter_complex.startswith(
+        "testsrc2=duration=1:size=320x240:rate=15[n1];anullsrc=duration=1[n2];"
+    )
+
+    _compile_and_run(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["video", "audio"]
+    expected = _ffprobe_duration(_AV2) + 1.0
+    assert _ffprobe_duration(out_path) == pytest.approx(expected, abs=0.3)
+
+
+def test_a_color_matte_composites_under_a_padded_clip(tmp_path: Path) -> None:
+    """A generated colour matte as the base of a composite: `ffmpeg.color`
+    makes a 640x480 backdrop out of nothing, and testsrc.mp4 (320x240) is
+    overlaid centred on it. Without sources this needs a PNG on disk."""
+    _require_fixture(_TESTSRC)
+    out_path = tmp_path / "matte.mp4"
+    query = (
+        "SELECT overlay(m.frame, v.frame, 160, 120) "
+        "FROM ffmpeg.color(color => 'navy', size => '640x480', rate => 15, "
+        "duration => 2) m, "
+        f"input('{_sql_path(_TESTSRC)}') v"
+    )
+
+    graph = compile_sql(query)
+    assert graph.nodes["n1"].filter == "color"
+    assert graph.nodes["n1"].inputs == []
+    assert graph.nodes["n1"].args == {
+        "color": "navy",
+        "size": "640x480",
+        "rate": 15,
+        "duration": 2,
+    }
+
+    _compile_and_run(query, out_path)
+
+    stream = _ffprobe_video_stream(out_path)
+    assert stream["width"] == 640
+    assert stream["height"] == 480
+
+
+def test_a_sine_tone_is_a_whole_query_with_no_input_file(tmp_path: Path) -> None:
+    """No `-i` at all: the entire command is a filtergraph and one `-map`."""
+    out_path = tmp_path / "tone.m4a"
+    query = "SELECT s.audio[1] FROM ffmpeg.sine(frequency => 440, duration => 1) s"
+
+    graph = compile_sql(query)
+    assert graph.input_paths == []
+    assert graph.sources == {}
+
+    emitted = emit(graph)
+    args = build_ffmpeg_args(emitted, str(out_path))
+    assert "-i" not in args
+    assert emitted.filter_complex == "sine=frequency=440:duration=1[out0]"
+
+    _compile_and_run(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["audio"]
+    assert _ffprobe_duration(out_path) == pytest.approx(1.0, abs=0.2)

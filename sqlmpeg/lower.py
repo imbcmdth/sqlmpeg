@@ -52,7 +52,8 @@ What lowering does, in order:
 * Inside a branch, ``FROM`` builds a typed environment: an ``input()`` alias
   exposes per-type stream access (``a.video[1]`` -> ``"src:a:v:0"``; SQL
   subscripts are 1-based, IR indices 0-based), a CTE alias exposes its
-  recorded columns.
+  recorded columns, and a ``ffmpeg.<source>(...)`` alias exposes exactly one
+  statically-typed stream (see below).
 * ``<alias>.frame`` is sugar for ``<alias>.video[1]`` (v0 compat). A single
   unnamed video column of a CTE is likewise reachable as ``<cte>.frame``.
 * ``WHERE <alias>.t BETWEEN x AND y`` records a per-alias time range, and where
@@ -81,6 +82,39 @@ What lowering does, in order:
   ``stdlib.FUNCTIONS[name].variants`` (kinds are ``video``/``audio``/``num``/
   ``str``) and then delegates node creation to the spec's ``expand``
   (guardrail #4: no per-function lowering logic lives here).
+
+Generated sources: ``FROM ffmpeg.<source>(...) a`` (RFC-005 §1)
+--------------------------------------------------------------
+A source alias is the third kind of binding (:class:`_SourceBinding`), and
+it is the tier-2 surface in TABLE position: the name resolves through
+``Registry.get_source`` alone (never the stdlib, never ``get``), and its
+options through the same ``Registry.options`` path a call's named arguments
+take, with the same two codes.
+
+What makes it different from an ``input()`` alias is that there is no FILE:
+
+* no ``-i``, so no input index — a source appears in neither
+  ``Graph.input_paths`` nor ``Graph.sources``, and ``compile_sql`` never
+  probes it (it probes ``Resolved.sources``, which a source alias is not in);
+* it lowers to a ZERO-INPUT node, ``Node(filter=<source>, args=<options>,
+  inputs=[], outputs=[<type>])``, minted lazily on first column access and
+  memoized on the binding, so fan-out is the split pass's ordinary business
+  and never a second generator;
+* one output pad means one stream of one statically-known type, so every
+  column rule is answered without a probe: ``a.frame``/``a.video[1]`` on a
+  video source, ``a.audio[1]`` on an audio one, a bare ``a.video``/``a.audio``
+  that is an array of LENGTH 1, ``a.*`` = that one column, and
+  ``STREAM_NOT_FOUND`` (naming the source and what it produces) for the other
+  type or any subscript but ``[1]``;
+* ``WHERE a.t`` is rejected: nothing was read, so there is no timeline to
+  seek — a source's length is its own ``duration =>`` option;
+* provenance is always empty, for the same reason (nothing probed).
+
+Everything else is ordinary. A source is legal in a CTE body and in a UNION
+ALL branch — silent-audio-for-concat, ``SELECT t.video[1], s.audio[1] FROM
+ffmpeg.testsrc2(...) t, ffmpeg.anullsrc(...) s`` as the second branch of a
+concat, is the motivating case — and the node it builds is one split, emit
+and the goldens cannot tell apart from any other.
 
 Two function tiers (RFC-003)
 ----------------------------
@@ -216,6 +250,7 @@ from sqlmpeg.ir import FrameRef, Graph, Node, Output, Sink, StreamType
 from sqlmpeg.parser import (
     FILTER_NAMESPACE,
     RawSink,
+    RawSource,
     Resolved,
     _pos,
     _time_bounds,
@@ -226,7 +261,7 @@ from sqlmpeg.parser import (
 )
 from sqlmpeg.parser import _ident_name as _fold
 from sqlmpeg.probe import ProbeResult, StreamMeta
-from sqlmpeg.registry import DynamicFilter, FilterOption, Registry
+from sqlmpeg.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from sqlmpeg.sink import validate_option as validate_sink_option
 from sqlmpeg.stdlib import FUNCTIONS, ExpandCtx, FuncSpec, Param, VariantImpl, signatures
 
@@ -292,6 +327,10 @@ _PORTABLE_HINT = (
 _PASSTHROUGH_HINT = (
     "subtitle and data streams can only be selected (and copied), never filtered; "
     "drop them from the call and select them as their own column"
+)
+_SOURCE_DURATION_HINT = (
+    "a generated source has no timeline to seek into; give it a length with "
+    "its own option instead, e.g. ffmpeg.anullsrc(duration => 30) s"
 )
 _CAPTION_TRIM_HINT = (
     "trim the video/audio without selecting the subtitle/data columns, or select "
@@ -680,7 +719,43 @@ class _CteBinding:
     columns: tuple[_Column, ...]
 
 
-_Binding = _InputBinding | _CteBinding
+@dataclass
+class _SourceBinding:
+    """``FROM ffmpeg.<source>(...) a`` — exposes ONE statically-typed stream.
+
+    RFC-005 §1. Everything about the stream is known before any projection
+    lowers: the registry's :class:`~sqlmpeg.registry.SourceFilter` says which
+    type the source's single output pad carries, so ``a.video[1]`` /
+    ``a.frame`` (video sources), ``a.audio[1]`` (audio ones), the bare array
+    ``a.video`` (length 1, statically), and ``a.*`` are all answered without
+    a probe — there is no file to probe, and no ``-i``: the source is a
+    ZERO-INPUT filter node.
+
+    `options` is already validated against the source's introspected option
+    table (the exact same ``Registry.options`` path a tier-2 call's named
+    arguments take), because that happens when the FROM clause binds, not
+    when a column is read.
+
+    Mutable on purpose: `ref` memoizes the node, which is minted lazily on
+    the FIRST column access and shared by every later one. Fan-out beyond
+    that is the split pass's job, exactly as for any other node, so
+    ``SELECT a.frame, hflip(a.frame) FROM ffmpeg.testsrc(...) a`` is one
+    ``testsrc`` plus a ``split``, never two generators.
+    """
+
+    alias: str
+    name: str  # the ffmpeg source filter's name, e.g. "testsrc"
+    output: StreamType
+    options: dict[str, object]
+    ref: FrameRef | None = None
+
+    @property
+    def display(self) -> str:
+        """The source as the user spelled it, for error messages."""
+        return f"{FILTER_NAMESPACE}.{self.name}"
+
+
+_Binding = _InputBinding | _CteBinding | _SourceBinding
 
 
 @dataclass
@@ -1009,6 +1084,12 @@ class _Lowerer:
         for binding in bindings:
             if isinstance(binding, _InputBinding):
                 columns += self._star_input(binding.alias, anchor, env, select)
+            elif isinstance(binding, _SourceBinding):
+                # A source has exactly one stream, so its star is that one
+                # column -- statically, like everything else about it.
+                columns.append(
+                    _Column(name=None, value=_scalar(self._source_stream_of(binding)))
+                )
             else:
                 columns += self._star_cte(binding, anchor, env, select)
         return columns
@@ -1107,6 +1188,12 @@ class _Lowerer:
             )
         inner = table.this
         alias_node = table.args.get("alias")
+        db = table.args.get("db")
+        if isinstance(db, exp.Expr) and _fold(db) == FILTER_NAMESPACE:
+            # `FROM ffmpeg.<source>(...) alias` (RFC-005 §1): resolve already
+            # shape-checked it and parked the record in `res.source_filters`.
+            self._add_source(table, alias_node, env, select)
+            return
         if isinstance(inner, exp.Anonymous):
             if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
                 raise _error(
@@ -1144,8 +1231,152 @@ class _Lowerer:
         )
 
     def _known_hint(self) -> str:
-        known = sorted(set(self.cte_columns) | set(self.graph.sources))
+        known = sorted(
+            set(self.cte_columns) | set(self.graph.sources) | set(self.res.source_filters)
+        )
         return f"known names: {', '.join(known)}" if known else "no aliases are in scope"
+
+    # -- FROM ffmpeg.<source>(...) (RFC-005 §1, plan 042) ------------------
+
+    def _add_source(
+        self,
+        table: exp.Table,
+        alias_node: exp.Expr | None,
+        env: _Env,
+        select: exp.Select,
+    ) -> None:
+        """Bind one generated-source alias, options validated, no node yet.
+
+        Resolution and option validation happen HERE, when the FROM clause
+        binds, rather than at first column access: a source's options are
+        checked against the installed ffmpeg exactly like a tier-2 call's
+        named arguments, and that check is a property of the query, not of
+        how many times a column of it is read. The NODE is what is deferred
+        (:meth:`_source_stream_of`) — an alias no projection ever mentions
+        contributes no filter, which is the one respect in which a source
+        alias differs from an ``input()`` one (that always gets its ``-i``).
+        """
+        if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{FILTER_NAMESPACE}.<source>() requires an alias",
+                table,
+                fallback=select,
+                hint=f"add an alias, e.g. FROM {FILTER_NAMESPACE}.testsrc"
+                "(duration => 2) t",
+            )
+        alias = _fold(alias_node.this)
+        raw = self.res.source_filters.get(alias)
+        if raw is None:  # defensive: resolve records every source alias
+            raise _error(
+                ErrorCode.UNKNOWN_ALIAS,
+                f"unknown alias '{alias}'",
+                alias_node,
+                fallback=table,
+                hint=self._known_hint(),
+            )
+        source = self._source_filter(raw, select)
+        named = [_NamedArg(name=option.name, value=option.value) for option in raw.options]
+        options = (
+            self._filter_options(raw.name, raw.call_node, select) if named else {}
+        )
+        args = self._check_named_args(
+            raw.name,
+            options,
+            named,
+            raw.call_node,
+            owner=f"{FILTER_NAMESPACE}.{raw.name}",
+            occupied=set(),
+        )
+        env.bindings[alias] = _SourceBinding(
+            alias=alias, name=raw.name, output=source.output, options=args
+        )
+
+    def _source_filter(self, raw: RawSource, select: exp.Select) -> SourceFilter:
+        """The registry's entry for ``ffmpeg.<name>`` in FROM position, or a rejection.
+
+        Three ways this fails, in the order they are told apart:
+
+        * the name is a REGULAR filter of this ffmpeg (``ffmpeg.gblur``) — it
+          has input pads, so it is a call, not a table: UNSUPPORTED_SQL saying
+          so, the one fenced case that is positively identifiable;
+        * there is no registry at all (no ffmpeg, or ``--portable``) — the
+          standard tier-2 unavailability wording, same as a namespaced CALL's;
+        * the name is unknown to both tables — UNKNOWN_FUNCTION with a
+          did-you-mean over ``source_names()``. Sources the v1 scope fence
+          excluded (``avsynctest``'s ``|->AV``, ``movie``/``amovie``'s
+          ``|->N``) are NOT retained by the registry at all, so they are
+          indistinguishable from a typo here and land on the same rejection —
+          which is why its fallback hint states the fence explicitly rather
+          than only listing near-misses.
+        """
+        registry = self.registry
+        source = registry.get_source(raw.name) if registry is not None else None
+        if source is not None:
+            return source
+        if registry is not None and registry.get(raw.name) is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{FILTER_NAMESPACE}.{raw.name} is an ffmpeg filter, not a source: "
+                "it takes stream inputs, so it cannot stand in FROM",
+                raw.call_node,
+                fallback=select,
+                hint=f"call it over a stream instead, e.g. SELECT "
+                f"{FILTER_NAMESPACE}.{raw.name}(a.frame) FROM input('clip.mp4') a",
+            )
+        raise _error(
+            ErrorCode.UNKNOWN_FUNCTION,
+            f"unknown generated source {FILTER_NAMESPACE}.{raw.name}()",
+            raw.call_node,
+            fallback=select,
+            hint=self._unknown_source_hint(raw.name),
+        )
+
+    def _unknown_source_hint(self, name: str) -> str:
+        """Did-you-mean over ``source_names()``, then why the set might be missing.
+
+        Mirrors :meth:`_namespaced_function_hint` branch for branch — the
+        namespace is the same one, and a source is unavailable for exactly the
+        same reasons a namespaced call is — but suggests only SOURCES, since
+        a regular filter would not be usable in FROM either way.
+        """
+        registry = self.registry
+        if registry is not None and registry.available():
+            matches = difflib.get_close_matches(
+                name, sorted(registry.source_names()), n=1, cutoff=0.6
+            )
+            if matches:
+                return f"did you mean {FILTER_NAMESPACE}.{matches[0]}()?"
+            return (
+                f"FROM {FILTER_NAMESPACE}.<source>(...) takes a zero-input filter of "
+                "your installed ffmpeg, and this is not one of them; sources with "
+                "more than one output pad (avsynctest) or a variable pad count "
+                "(movie, amovie) are not usable"
+            )
+        if self.portable:
+            return (
+                f"--portable turns the whole {FILTER_NAMESPACE}.<source> namespace "
+                "off; read a real file with input('path'), or compile without "
+                "--portable"
+            )
+        return (
+            f"FROM {FILTER_NAMESPACE}.<source>(...) generates a stream with your "
+            "installed ffmpeg; ffmpeg was not found on PATH"
+        )
+
+    def _source_stream_of(self, binding: _SourceBinding) -> _Stream:
+        """The source's one stream, minting its node on first use only.
+
+        The node is ``Node(filter=<source>, args=<validated options>,
+        inputs=[], outputs=[<type>])`` — a chain head with no input labels
+        (emit renders it as ``testsrc=duration=2[out0]``). Provenance is
+        always empty: nothing was probed, because nothing was read.
+        """
+        if binding.ref is None:
+            binding.ref = self.ctx.node(
+                binding.name, dict(binding.options), [], [binding.output]
+            )
+        return _Stream(ref=binding.ref, type=binding.output, source=None)
 
     # -- WHERE ------------------------------------------------------------
 
@@ -1222,6 +1453,19 @@ class _Lowerer:
                     table_node,
                     fallback=where,
                     hint=self._known_hint(),
+                )
+            binding = env.bindings[alias]
+            if isinstance(binding, _SourceBinding):
+                # A generated source has no input file to seek and no
+                # timeline to trim: it is a filter that MAKES a stream, and
+                # how long a stream it makes is one of its own options.
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{alias}' is a generated source, so 'WHERE {alias}.t' has "
+                    "nothing to seek",
+                    conjunct,
+                    fallback=where,
+                    hint=_SOURCE_DURATION_HINT,
                 )
             start, end = windows.get(alias, (None, None))
             if low is not None:
@@ -1441,7 +1685,101 @@ class _Lowerer:
             )
         if isinstance(binding, _InputBinding):
             return alias, self._input_value(alias, name, index, anchor, select)
+        if isinstance(binding, _SourceBinding):
+            return alias, self._source_value(binding, name, index, anchor, select)
         return alias, self._cte_value(binding, name, index, anchor, select)
+
+    def _source_value(
+        self,
+        binding: _SourceBinding,
+        name: str,
+        index: int | None,
+        anchor: exp.Expr,
+        select: exp.Select,
+    ) -> _Value:
+        """One column of a generated-source alias — all of it statically known.
+
+        A source has exactly ONE output pad, of exactly one type, so the whole
+        column surface is decided by ``binding.output`` with no probe
+        anywhere:
+
+        * ``a.frame`` — sugar for ``a.video[1]``, and therefore VIDEO sources
+          only; on an audio source it is a wrong-type column like any other.
+        * ``a.video[1]`` / ``a.audio[1]`` — the stream, when the type matches.
+        * bare ``a.video`` / ``a.audio`` — an ARRAY of length 1, so it splats
+          into one Output and broadcasts a call exactly once. (Not a scalar:
+          a length-1 array is still an array, the same distinction a
+          single-track file's ``a.audio`` has.)
+        * a subscript other than ``[1]``, or a column of the other type
+          (``subtitle``/``data`` included) — STREAM_NOT_FOUND stating what the
+          source does produce.
+        * anything else — an unknown column.
+        """
+        produces = f"{binding.display} produces 1 {binding.output} stream"
+        if name == _TIME_COLUMN:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{binding.alias}.t' is a time column, not a stream",
+                anchor,
+                fallback=select,
+                hint=_SOURCE_DURATION_HINT,
+            )
+        if name == _FRAME_COLUMN:
+            if binding.output != "video":
+                raise _error(
+                    ErrorCode.STREAM_NOT_FOUND,
+                    f"'{binding.alias}.frame' does not exist: {produces}",
+                    anchor,
+                    fallback=select,
+                    hint=f"'{binding.alias}.frame' is sugar for "
+                    f"'{binding.alias}.video[1]'; write "
+                    f"'{binding.alias}.{binding.output}[1]'",
+                )
+            if index is not None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{binding.alias}.frame' is a single stream and cannot be "
+                    "subscripted",
+                    anchor,
+                    fallback=select,
+                    hint=f"'{binding.alias}.frame' is sugar for "
+                    f"'{binding.alias}.video[1]'",
+                )
+            return _scalar(self._source_stream_of(binding))
+        array_type = _ARRAY_COLUMNS.get(name)
+        if array_type is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"unknown column '{binding.alias}.{name}'",
+                anchor,
+                fallback=select,
+                hint=self._source_columns_hint(binding),
+            )
+        if array_type != binding.output:
+            raise _error(
+                ErrorCode.STREAM_NOT_FOUND,
+                f"'{binding.alias}.{name}' does not exist: {produces}",
+                anchor,
+                fallback=select,
+                hint=self._source_columns_hint(binding),
+            )
+        if index is None:
+            return _array(binding.output, (self._source_stream_of(binding),))
+        if index != 1:
+            raise _error(
+                ErrorCode.STREAM_NOT_FOUND,
+                f"'{binding.alias}.{name}[{index}]' does not exist: {produces}",
+                anchor,
+                fallback=select,
+                hint=_SUBSCRIPT_HINT,
+            )
+        return _scalar(self._source_stream_of(binding))
+
+    def _source_columns_hint(self, binding: _SourceBinding) -> str:
+        columns = [f"{binding.alias}.{binding.output}"]
+        if binding.output == "video":
+            columns.append(f"{binding.alias}.frame")
+        return f"'{binding.display}' exposes {' and '.join(columns)}"
 
     def _input_value(
         self,
@@ -2106,6 +2444,14 @@ class _Lowerer:
         """
         registry = self.registry
         if registry is not None and registry.available():
+            if registry.get_source(name) is not None:
+                # A generated source IS usable -- in FROM, where it belongs
+                # (RFC-005 §1). Say where rather than "unknown".
+                return (
+                    f"{FILTER_NAMESPACE}.{name} is a generated source, not a "
+                    f"function: put it in FROM, e.g. FROM {FILTER_NAMESPACE}."
+                    f"{name}(duration => 2) s"
+                )
             matches = difflib.get_close_matches(
                 name, sorted(registry.names()), n=1, cutoff=0.6
             )

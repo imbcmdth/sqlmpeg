@@ -96,6 +96,21 @@ joined with ``;`` (no whitespace). The README example therefore emits::
 
     [1:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];[0:v:0][n2]overlay=x=20:y=20[out0]
 
+Zero-input nodes (RFC-005 §1, plan 042)
+---------------------------------------
+A generated source (``FROM ffmpeg.testsrc(duration => 2) t``) lowers to a
+node with ``inputs=[]``. This pass needed no change for it, VERIFIED rather
+than assumed: such a node renders as a chain head with no input labels
+(``testsrc=duration=2[out0]``), :func:`_extends` refuses to comma-append any
+node that does not take exactly one input, so a source always STARTS a chain
+and can never be swallowed into the previous one, and what FOLLOWS it merges
+normally (``sine=frequency=440,volume=volume=0.5[out0]``).
+:func:`_verify_topological` and :func:`_check_fanout` both iterate
+``node.inputs``, so an empty list simply contributes nothing. A graph made
+only of sources has no ``-i`` at all: ``build_ffmpeg_args`` emits
+``ffmpeg -filter_complex ... -map [out0] out.mp4``, which is a complete and
+valid ffmpeg command.
+
 Argument rendering
 ------------------
 ``args`` renders in dict insertion order as ``filter=k1=v1:k2=v2``. Special

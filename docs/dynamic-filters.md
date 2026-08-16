@@ -74,6 +74,46 @@ FROM input('a.mp4') a, input('b.mp4') b
 
 The special-form grammars key on a *bare* name, so qualifying the call bypasses all of them at once: `ffmpeg.<anything>(...)` parses uniformly, arguments and `=>` options intact. A namespaced call resolves in the dynamic registry **only** — never the stdlib, never a builtin — so `ffmpeg.scale(a.frame, w => 640, h => -2)` is ffmpeg's `scale` filter with its own options, while bare `scale(a.frame, 0.5)` stays the stdlib function. It is otherwise an ordinary tier-2 call in every respect: stream inputs positional from the pad signature, options named, the same scope fence, the same `UNKNOWN_FUNCTION` when there is no ffmpeg (or under `--portable`), and an ordinary node in the IR that split, emit and the goldens can't tell apart. `ffmpeg` is a reserved name: an alias or CTE called `ffmpeg` is `UNSUPPORTED_SQL`.
 
+## Generated sources in `FROM`
+
+A handful of ffmpeg's filters take no input at all — they *make* a stream. `testsrc` draws a test pattern, `color` fills a rectangle, `anullsrc` produces silence, `sine` a tone. They are not callable as functions (a function needs something to be called *on*), so they live in `FROM`, under the same namespace and with the same mandatory alias `input()` has:
+
+```sql
+SELECT f.video[1], f.audio[1] FROM input('clip.mp4') f
+UNION ALL
+SELECT t.video[1], s.audio[1]
+FROM ffmpeg.testsrc2(duration => 1, size => '320x240', rate => 15) t,
+     ffmpeg.anullsrc(duration => 1) s
+```
+
+That is the motivating case: ffmpeg's `concat` needs every segment to have the same pad shape, so a generated video segment cannot join a clip that has audio unless something supplies the missing track. `ffmpeg.anullsrc` is that something, and it costs one filter node rather than a silent `.wav` on disk.
+
+The namespace is **mandatory** here — `FROM testsrc(...) t` is not a source, it is an unknown table function. One rule, and it earns its keep twice: bare names like `random` and `color` are things Postgres or a future dialect could reasonably claim, and the `ffmpeg.` prefix is the same marker of machine-dependence it is in call position.
+
+Sources take **no positional arguments at all** (they have no input pads — that is what makes them sources) and every option by name, validated exactly like a tier-2 call's, with the same `UNKNOWN_FILTER_OPTION` / `FILTER_OPTION_TYPE` codes.
+
+### What a source alias exposes
+
+Exactly one stream, of one type, known before anything is read:
+
+| written | video source (`testsrc`, `color`, ...) | audio source (`anullsrc`, `sine`, ...) |
+| --- | --- | --- |
+| `t.frame` | the stream | `STREAM_NOT_FOUND` |
+| `t.video[1]` / `t.audio[1]` | the stream / `STREAM_NOT_FOUND` | `STREAM_NOT_FOUND` / the stream |
+| `t.video` / `t.audio` (bare) | an array of length 1 | an array of length 1 |
+| `t.*` | that one column | that one column |
+| `t.video[2]` | `STREAM_NOT_FOUND` | `STREAM_NOT_FOUND` |
+
+No probe is involved in any of it: there is no file. For the same reason a source output carries no `language`/`title` provenance, and `WHERE t.t BETWEEN ...` is rejected — there is no input to seek. A source's length is its own `duration =>` option.
+
+A source is **not an `-i`**. It compiles to a zero-input filter node, so `SELECT s.audio[1] FROM ffmpeg.sine(frequency => 440, duration => 1) s` is a whole ffmpeg command with no input file at all. Referencing one alias twice inserts the usual `split`/`asplit`; the generator itself is built once.
+
+Sources are legal wherever an `input()` alias is: comma-joined with real inputs, inside a CTE body, and in a `UNION ALL` branch.
+
+### The source fence
+
+The same v1 scope fence applies. A source must have exactly one output pad, so `avsynctest` (`|->AV`, two pads) and `movie`/`amovie` (`|->N`, a variable count) are excluded, as are all four sinks (`->|`) — the registry never retains them, so they read as unknown names with a hint that states the fence. A name that *is* a real filter but takes inputs (`FROM ffmpeg.gblur(...)`) gets a rejection saying exactly that. With no ffmpeg — or under `--portable` — the whole `FROM ffmpeg.<source>` surface is gone, the same way the call namespace is.
+
 ### The collision census
 
 Measured, not guessed — a test parses `<name>(a.frame)` (plus two-, four-argument and `=>` forms) under `read="postgres"` for every filter in the registry and reports the names that do not arrive as an ordinary call. Against ffmpeg 7.1's 464 in-fence filters and sqlglot 30.17, eleven names collide:

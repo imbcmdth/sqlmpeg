@@ -38,6 +38,26 @@ statement is not. `--` and `/* */` comments are allowed.
 - Every alias and CTE name must be unique across the WHOLE query, including
   across `UNION ALL` branches.
 - Unquoted identifiers fold to lowercase. Never double-quote an identifier.
+- `FROM ffmpeg.<source>(<name> => <value>, ...) alias` GENERATES a stream with
+  a zero-input ffmpeg filter -- no file, no `-i`. The `ffmpeg.` namespace is
+  mandatory and the alias is too; options are named-only (a source has no
+  stream inputs, so nothing is positional) and are validated against the
+  installed ffmpeg exactly like a call's named arguments. Video sources:
+  `testsrc`, `testsrc2`, `color`, `smptebars`, `nullsrc`. Audio sources:
+  `anullsrc` (silence), `sine`, `aevalsrc`. Which ones exist is
+  machine-dependent, like everything else under `ffmpeg.`.
+- A source alias exposes exactly ONE stream, of a type fixed by the source:
+  `t.frame` / `t.video[1]` for a video source, `s.audio[1]` for an audio one,
+  the bare `t.video` / `s.audio` as a length-1 array, `t.*` as that one
+  column. The other type, or any subscript but `[1]`, is `STREAM_NOT_FOUND`.
+  `WHERE <alias>.t` is rejected -- there is nothing to seek; give the source a
+  length with its own `duration => <seconds>` option instead.
+- Sources are legal beside `input()` aliases, in CTE bodies and in `UNION ALL`
+  branches. The last is what they are FOR: `concat` needs every branch to have
+  the same stream shape, so a generated video segment joins a clip that has
+  audio by pairing it with silence --
+  `SELECT t.video[1], s.audio[1] FROM ffmpeg.testsrc2(duration => 1) t,
+  ffmpeg.anullsrc(duration => 1) s` as the second branch.
 - `input('path', <name> => <value>, ...)` also takes trailing named options,
   same `=>` syntax as a call's named arguments (RFC-003) -- CASE-SENSITIVE,
   unlike a sink option name. They set ffmpeg's own per-input flags, rendered
@@ -229,9 +249,10 @@ statement is not. `--` and `/* */` comments are allowed.
   `corr`, `copy`, `null`. Bare `trim(a.frame)` is Postgres's string `TRIM` and
   loses the argument; `ffmpeg.trim(a.frame, start => 1)` is the filter.
   `ffmpeg` is a reserved name: never use it as an alias or a CTE name.
-- Filters with a variable number of pads (`split`, `concat`), more than one
-  output, or no input at all (sources like `testsrc`) are NOT callable under
-  either spelling.
+- Filters with a variable number of pads (`split`, `concat`) or more than one
+  output are NOT callable under either spelling. Neither is a zero-input
+  filter: `ffmpeg.testsrc(...)` is a generated SOURCE and belongs in `FROM`
+  (see Dialect > Sources), never in the SELECT list.
 - This is machine-dependent, and it is the only part of the dialect that is:
   the stdlib above compiles anywhere, while a query naming a filter (or a
   named option) only compiles where that ffmpeg has it. Prefer a stdlib

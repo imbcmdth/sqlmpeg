@@ -99,6 +99,17 @@ def test_every_input_option_is_documented() -> None:
         assert spec.doc in PROMPT, spec.name
 
 
+def test_generated_sources_are_documented() -> None:
+    """RFC-005 SS1 (plan 042): the FROM-position half of the `ffmpeg.`
+    namespace, its column surface, and the silent-audio pattern it exists
+    for."""
+    assert "FROM ffmpeg.<source>(<name> => <value>, ...) alias" in PROMPT
+    assert "ffmpeg.anullsrc(duration => 1) s" in PROMPT
+    assert "duration => <seconds>" in PROMPT
+    # A source is NOT a column function; the prompt has to say where it goes.
+    assert "belongs in `FROM`" in PROMPT
+
+
 def test_prompt_is_deterministic() -> None:
     assert build_system_prompt() == build_system_prompt()
 

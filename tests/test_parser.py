@@ -6,6 +6,7 @@ from sqlglot import exp
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.parser import (
     RawInputOption,
+    RawSource,
     Resolved,
     parse,
     resolve,
@@ -786,6 +787,174 @@ def test_input_named_option_with_no_value_is_rejected() -> None:
     # sqlglot itself rejects a valueless `=>` -- never reaches the resolver.
     err = _reject("SELECT a.frame FROM input('x.png', loop =>) a")
     assert err.code is ErrorCode.PARSE_ERROR
+
+
+# ---------------------------------------------------------------------------
+# FROM ffmpeg.<source>(...) alias (RFC-005 SS1, plan 042)
+# ---------------------------------------------------------------------------
+#
+# Shape only: which sources exist and which options they take is the installed
+# ffmpeg's business (tests/test_lower.py, against a fixture registry).
+#
+# The sqlglot 30.17 shape this pass keys on -- MEASURED, and different from
+# the same namespace in CALL position, which is an `exp.Dot`:
+# `FROM ffmpeg.testsrc(duration => 2) t` is
+# `Table(this=Anonymous(testsrc, [Kwarg]), db=Identifier(ffmpeg),
+#  alias=TableAlias(t))`. `test_a_source_parses_as_a_table_with_a_db_qualifier`
+# pins it so a sqlglot upgrade that moves the qualifier cannot pass silently.
+
+
+def test_a_source_parses_as_a_table_with_a_db_qualifier() -> None:
+    table = _resolve("SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t").branches[
+        0
+    ].args["from_"].this
+    assert isinstance(table, exp.Table)
+    assert isinstance(table.this, exp.Anonymous)
+    assert str(table.this.this) == "testsrc"
+    db = table.args.get("db")
+    assert isinstance(db, exp.Identifier) and db.name == "ffmpeg"
+    assert not isinstance(table.this, exp.Dot)
+
+
+def test_source_is_collected_with_its_raw_options() -> None:
+    res = _resolve(
+        "SELECT t.frame FROM ffmpeg.testsrc(duration => 2, size => '320x240') t"
+    )
+    assert list(res.source_filters) == ["t"]
+    raw = res.source_filters["t"]
+    assert isinstance(raw, RawSource)
+    assert raw.alias == "t"
+    assert raw.name == "testsrc"
+    assert [o.name for o in raw.options] == ["duration", "size"]
+    assert isinstance(raw.options[0].value, exp.Literal)
+
+
+def test_a_source_takes_no_input_index() -> None:
+    """No `-i`: a source is a zero-input filter, so it is in neither table."""
+    res = _resolve("SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t")
+    assert res.input_paths == []
+    assert res.sources == {}
+
+
+def test_a_source_with_empty_parens_is_accepted() -> None:
+    res = _resolve("SELECT t.frame FROM ffmpeg.testsrc() t")
+    assert res.source_filters["t"].options == ()
+
+
+def test_a_source_without_parens_is_rejected_with_a_hint() -> None:
+    err = _reject("SELECT t.frame FROM ffmpeg.testsrc t")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'ffmpeg.testsrc' is not a table" in err.message
+    assert err.hint is not None and "is a CALL" in err.hint
+
+
+def test_a_source_requires_an_alias() -> None:
+    err = _reject("SELECT t.frame FROM ffmpeg.testsrc(duration => 2)")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "ffmpeg.testsrc() requires an alias" in err.message
+
+
+def test_a_source_takes_no_positional_arguments() -> None:
+    for sql in (
+        "SELECT t.frame FROM ffmpeg.testsrc(2) t",
+        "SELECT t.frame FROM ffmpeg.testsrc(2, duration => 1) t",
+        "SELECT t.frame FROM ffmpeg.testsrc(duration => 1, 2) t",
+    ):
+        err = _reject(sql)
+        assert err.code is ErrorCode.UNSUPPORTED_SQL, sql
+        assert "no stream inputs" in err.message, sql
+
+
+def test_a_source_rejects_a_duplicate_option() -> None:
+    err = _reject("SELECT t.frame FROM ffmpeg.testsrc(duration => 1, duration => 2) t")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "duplicate named argument 'duration'" in err.message
+
+
+def test_a_source_option_name_is_verbatim_and_its_own_name_is_folded() -> None:
+    """Function names are case-insensitive; ffmpeg AVOption names are not."""
+    res = _resolve("SELECT t.frame FROM FFMPEG.TestSrc(Duration => 2) t")
+    raw = res.source_filters["t"]
+    assert raw.name == "testsrc"
+    assert raw.options[0].name == "Duration"
+
+
+def test_a_source_alias_may_use_as() -> None:
+    res = _resolve("SELECT t.frame FROM ffmpeg.testsrc(duration => 2) AS t")
+    assert list(res.source_filters) == ["t"]
+
+
+def test_a_source_joins_an_input_with_a_comma() -> None:
+    res = _resolve(
+        "SELECT f.video[1], s.audio[1] FROM input('a.mp4') f, "
+        "ffmpeg.anullsrc(duration => 3) s"
+    )
+    assert res.input_paths == ["a.mp4"]
+    assert res.sources == {"f": 0}
+    assert list(res.source_filters) == ["s"]
+
+
+def test_a_source_is_legal_in_a_cte_body_and_a_union_branch() -> None:
+    res = _resolve(
+        "WITH bg AS (SELECT t.frame AS v FROM ffmpeg.testsrc(duration => 2) t) "
+        "SELECT bg.v FROM bg"
+    )
+    assert list(res.source_filters) == ["t"]
+    res = _resolve(
+        "SELECT f.frame FROM input('a.mp4') f UNION ALL "
+        "SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t"
+    )
+    assert list(res.source_filters) == ["t"]
+
+
+def test_a_source_alias_is_unique_across_the_whole_query() -> None:
+    for sql in (
+        "SELECT t.frame FROM ffmpeg.testsrc() t, ffmpeg.testsrc() t",
+        "SELECT t.frame FROM input('x.mp4') t, ffmpeg.testsrc() t",
+        "SELECT t.frame FROM ffmpeg.testsrc() t, input('x.mp4') t",
+    ):
+        err = _reject(sql)
+        assert err.code is ErrorCode.UNSUPPORTED_SQL, sql
+        assert "duplicate name 't'" in err.message, sql
+
+
+def test_a_source_may_not_be_aliased_ffmpeg() -> None:
+    """The namespace name stays reserved in FROM position too."""
+    err = _reject("SELECT ffmpeg.frame FROM ffmpeg.testsrc(duration => 2) ffmpeg")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'ffmpeg' is reserved for the filter namespace" in err.message
+
+
+def test_a_three_part_name_is_not_the_namespace() -> None:
+    err = _reject("SELECT t.frame FROM x.ffmpeg.testsrc(duration => 2) t")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "qualified table names are not supported" in err.message
+
+
+def test_a_non_namespace_qualifier_is_still_rejected() -> None:
+    err = _reject("SELECT a.frame FROM public.clips a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "qualified table names are not supported" in err.message
+
+
+def test_a_bare_source_name_in_from_is_not_a_table_function() -> None:
+    """The namespace is mandatory (RFC-005 SS1: `random` etc. collide bare)."""
+    err = _reject("SELECT t.frame FROM testsrc(duration => 2) t")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unsupported table function testsrc()" in err.message
+
+
+def test_a_source_column_is_not_whitelisted_by_the_parser() -> None:
+    """Which columns a source exposes depends on its output pad TYPE, which
+    only the registry knows -- so the resolver checks the alias and leaves the
+    column name to lower (unlike an input's fixed pseudo-column set)."""
+    res = _resolve("SELECT t.audio[1] FROM ffmpeg.testsrc(duration => 2) t")
+    assert list(res.source_filters) == ["t"]
+
+
+def test_a_source_rejection_is_line_anchored() -> None:
+    err = _reject("SELECT t.frame\nFROM ffmpeg.testsrc(2) t")
+    assert err.line == 2
 
 
 @pytest.mark.parametrize(

@@ -2438,6 +2438,11 @@ Filters:
  ... trim              V->V       Pick one continuous section from the input, drop the rest.
  TS. unsharp           V->V       Sharpen or blur the input video.
  .S. xfade             VV->V      Cross fade one video with another video.
+ ... anullsrc          |->A       Null audio source, return empty audio frames.
+ ... sine              |->A       Generate sine wave audio signal.
+ ..C avsynctest        |->AV      Generate an Audio Video Sync Test.
+ ..C movie             |->N       Read from a movie source.
+ ... anullsink         A->|       Do absolutely nothing with the input audio.
 """
 
 # Each entry is the AVOptions block of a real `ffmpeg -hide_banner -help
@@ -2520,6 +2525,41 @@ xfade AVOptions:
    duration          <duration>   ..FV....... set cross fade duration (default 1)
    offset            <duration>   ..FV....... set cross fade start relative to first input stream (default 0)
    expr              <string>     ..FV....... set expression for custom transition
+
+""",
+    # -- generated sources (RFC-005 SS1, plan 042). Same lazy `-help` path a
+    # regular filter's options take; the short/long alias pairs (size/s,
+    # rate/r, duration/d, frequency/f, ...) are real ffmpeg 7.1 captures.
+    "testsrc": """\
+testsrc AVOptions:
+   size              <image_size> ..FV....... set video size (default "320x240")
+   s                 <image_size> ..FV....... set video size (default "320x240")
+   rate              <video_rate> ..FV....... set video rate (default "25")
+   r                 <video_rate> ..FV....... set video rate (default "25")
+   duration          <duration>   ..FV....... set video duration (default -0.000001)
+   d                 <duration>   ..FV....... set video duration (default -0.000001)
+   decimals          <int>        ..FV....... set number of decimals to show (from 0 to 17) (default 0)
+   n                 <int>        ..FV....... set number of decimals to show (from 0 to 17) (default 0)
+
+""",
+    "anullsrc": """\
+anullsrc AVOptions:
+   channel_layout    <channel_layout> ..F.A...... set channel_layout (default "stereo")
+   cl                <channel_layout> ..F.A...... set channel_layout (default "stereo")
+   sample_rate       <int>        ..F.A...... set sample rate (from 1 to INT_MAX) (default 44100)
+   r                 <int>        ..F.A...... set sample rate (from 1 to INT_MAX) (default 44100)
+   duration          <duration>   ..F.A...... set the audio duration (default -0.000001)
+   d                 <duration>   ..F.A...... set the audio duration (default -0.000001)
+
+""",
+    "sine": """\
+sine AVOptions:
+   frequency         <double>     ..F.A...... set the sine frequency (from 0 to DBL_MAX) (default 440)
+   f                 <double>     ..F.A...... set the sine frequency (from 0 to DBL_MAX) (default 440)
+   sample_rate       <int>        ..F.A...... set the sample rate (from 1 to INT_MAX) (default 44100)
+   r                 <int>        ..F.A...... set the sample rate (from 1 to INT_MAX) (default 44100)
+   duration          <duration>   ..F.A...... set the audio duration (default 0)
+   d                 <duration>   ..F.A...... set the audio duration (default 0)
 
 """,
 }
@@ -3578,6 +3618,308 @@ def test_an_unrelated_qualified_call_is_still_rejected() -> None:
     sqlmpeg knows how to read."""
     err = _reject_lower("SELECT foo.gblur(a.frame) FROM input('x.mp4') a", {})
     assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+# ---------------------------------------------------------------------------
+# RFC-005 SS1 (plan 042): FROM ffmpeg.<source>(...) alias
+# ---------------------------------------------------------------------------
+#
+# Offline, against the same fixture registry: the fixture's `-filters` block
+# carries `testsrc` (|->V), `anullsrc`/`sine` (|->A), plus `avsynctest`
+# (|->AV) and `movie` (|->N), which the v1 scope fence excludes -- so the
+# fenced half is exercised without an ffmpeg on the machine either.
+
+
+def test_a_source_lowers_to_a_zero_input_node(_registry: Registry) -> None:
+    g = _dyn("SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2) t", _registry)
+    node = g.nodes["n1"]
+    assert node.filter == "testsrc"
+    assert node.args == {"duration": 2}
+    assert node.inputs == []
+    assert node.outputs == ["video"]
+    assert _outputs(g) == [("n1", "video", None)]
+
+
+def test_a_source_takes_no_input_index(_registry: Registry) -> None:
+    """The whole point: a source is a filter, not an `-i`. It appears in
+    neither `input_paths` nor `sources`, so nothing downstream can mistake it
+    for a file."""
+    res = resolve(parse("SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2) t"))
+    assert res.input_paths == []
+    assert res.sources == {}
+    assert set(res.source_filters) == {"t"}
+    g = _dyn("SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2) t", _registry)
+    assert g.input_paths == []
+    assert g.sources == {}
+
+
+def test_a_source_with_no_options_sets_no_args(_registry: Registry) -> None:
+    g = _dyn("SELECT t.video[1] FROM ffmpeg.testsrc() t", _registry)
+    assert g.nodes["n1"].args == {}
+
+
+def test_a_video_source_answers_to_frame_and_video(_registry: Registry) -> None:
+    for column in ("t.frame", "t.video[1]"):
+        g = _dyn(f"SELECT {column} FROM ffmpeg.testsrc(duration => 2) t", _registry)
+        assert _outputs(g) == [("n1", "video", None)], column
+
+
+def test_a_source_bare_array_is_a_length_one_array(_registry: Registry) -> None:
+    """`t.video` is an ARRAY of one element, not a scalar -- it splats into
+    exactly one Output and broadcasts a call exactly once. No probe is
+    consulted: the length is a property of the source's single output pad."""
+    g = _dyn("SELECT t.video FROM ffmpeg.testsrc(duration => 2) t", _registry)
+    assert _outputs(g) == [("n1", "video", None)]
+    g = _dyn("SELECT gblur(t.video, sigma => 2) FROM ffmpeg.testsrc() t", _registry)
+    assert _filters(g) == ["testsrc", "gblur"]
+    assert _outputs(g) == [("n2", "video", None)]
+
+
+def test_a_source_star_is_its_one_column(_registry: Registry) -> None:
+    g = _dyn("SELECT t.* FROM ffmpeg.testsrc(duration => 2) t", _registry)
+    assert _outputs(g) == [("n1", "video", None)]
+    g = _dyn("SELECT * FROM ffmpeg.anullsrc(duration => 1) s", _registry)
+    assert _outputs(g) == [("n1", "audio", None)]
+
+
+def test_an_audio_source_answers_to_audio(_registry: Registry) -> None:
+    g = _dyn("SELECT s.audio[1] FROM ffmpeg.sine(frequency => 440) s", _registry)
+    assert g.nodes["n1"].outputs == ["audio"]
+    assert _outputs(g) == [("n1", "audio", None)]
+
+
+def test_a_source_rejects_the_other_types_column(_registry: Registry) -> None:
+    """Statically typed: one output pad means the other type does not exist,
+    and the message says what the source DOES produce."""
+    err = _reject_dyn("SELECT t.audio[1] FROM ffmpeg.testsrc() t", _registry)
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "ffmpeg.testsrc produces 1 video stream" in err.message
+
+    err = _reject_dyn("SELECT s.video[1] FROM ffmpeg.anullsrc() s", _registry)
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "ffmpeg.anullsrc produces 1 audio stream" in err.message
+
+    err = _reject_dyn("SELECT t.subtitle[1] FROM ffmpeg.testsrc() t", _registry)
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "ffmpeg.testsrc produces 1 video stream" in err.message
+
+
+def test_frame_sugar_is_video_only_on_a_source(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT s.frame FROM ffmpeg.anullsrc() s", _registry)
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "ffmpeg.anullsrc produces 1 audio stream" in err.message
+    assert err.hint is not None and "s.audio[1]" in err.hint
+
+
+def test_a_source_subscript_is_bounded_statically(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT t.video[2] FROM ffmpeg.testsrc() t", _registry)
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "'t.video[2]' does not exist" in err.message
+    assert "ffmpeg.testsrc produces 1 video stream" in err.message
+
+
+def test_a_source_frame_cannot_be_subscripted(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT t.frame[1] FROM ffmpeg.testsrc() t", _registry)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot be subscripted" in err.message
+
+
+def test_a_source_rejects_an_unknown_column(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT t.bogus FROM ffmpeg.testsrc() t", _registry)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 't.bogus'" in err.message
+    assert err.hint is not None and "t.video" in err.hint
+
+
+def test_a_source_node_is_minted_once_per_alias(_registry: Registry) -> None:
+    """Memoized on first column access, so fan-out is the split pass's
+    ordinary business -- never a second generator."""
+    g = _dyn(
+        "SELECT gblur(t.frame, sigma => 2), t.frame FROM ffmpeg.testsrc() t", _registry
+    )
+    assert _filters(g) == ["testsrc", "gblur"]
+    g = insert_splits(g)
+    assert _filters(g) == ["testsrc", "split", "gblur"]
+    assert g.nodes["n1_split"].inputs == ["n1"]
+
+
+def test_an_unused_source_alias_mints_no_node(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT a.frame FROM input('x.mp4') a, ffmpeg.testsrc(duration => 2) t",
+        _registry,
+    )
+    assert g.nodes == {}
+    assert _outputs(g) == [("src:a:v:0", "video", None)]
+
+
+def test_a_source_validates_its_options_against_the_registry(
+    _registry: Registry,
+) -> None:
+    err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrc(durationn => 2) t", _registry)
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+    assert "filter 'testsrc' has no option 'durationn'" in err.message
+    assert err.hint == "did you mean duration => ...?"
+
+    err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrc(decimals => 'x') t", _registry)
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "expects a number" in err.message
+
+
+def test_a_source_option_range_is_checked(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrc(decimals => 99) t", _registry)
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "from 0 to 17" in err.message
+
+
+def test_source_options_keep_their_written_order(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT t.frame FROM ffmpeg.testsrc(size => '320x240', rate => 15, "
+        "duration => 2) t",
+        _registry,
+    )
+    assert list(g.nodes["n1"].args.items()) == [
+        ("size", "320x240"),
+        ("rate", 15),
+        ("duration", 2),
+    ]
+    assert (
+        emit(insert_splits(g)).filter_complex
+        == "testsrc=size=320x240:rate=15:duration=2[out0]"
+    )
+
+
+def test_an_unknown_source_suggests_a_real_one(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrcc() t", _registry)
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert "unknown generated source ffmpeg.testsrcc()" in err.message
+    assert err.hint == "did you mean ffmpeg.testsrc()?"
+
+
+def test_a_fenced_source_gets_the_fence_message(_registry: Registry) -> None:
+    """`avsynctest` (|->AV) and `movie` (|->N) are in the fixture's -filters
+    output and excluded by the v1 scope fence, so the registry never retained
+    them -- they are indistinguishable from a typo here and land on the same
+    rejection, whose hint states the fence."""
+    for name in ("avsynctest", "movie", "amovie"):
+        err = _reject_dyn(f"SELECT t.frame FROM ffmpeg.{name}() t", _registry)
+        assert err.code is ErrorCode.UNKNOWN_FUNCTION, name
+        assert err.hint is not None
+        assert "more than one output pad (avsynctest)" in err.hint
+        assert "variable pad count (movie, amovie)" in err.hint
+
+
+def test_a_sink_is_not_a_source_either(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT t.audio[1] FROM ffmpeg.anullsink() t", _registry)
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+
+
+def test_a_regular_filter_in_from_says_it_takes_inputs(_registry: Registry) -> None:
+    """The one fenced case that IS positively identifiable: the name is a
+    real filter of this ffmpeg, it just has input pads."""
+    err = _reject_dyn("SELECT t.frame FROM ffmpeg.gblur(sigma => 2) t", _registry)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "ffmpeg.gblur is an ffmpeg filter, not a source" in err.message
+    assert err.hint is not None and "SELECT ffmpeg.gblur(a.frame)" in err.hint
+
+
+def test_a_source_needs_a_registry() -> None:
+    err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t", None)
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None and "ffmpeg was not found on PATH" in err.hint
+
+
+def test_portable_turns_the_source_namespace_off() -> None:
+    err = _reject_dyn(
+        "SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t", None, portable=True
+    )
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None and "--portable" in err.hint
+
+
+def test_where_on_a_source_alias_points_at_duration(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t WHERE t.t <= 1", _registry
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t' is a generated source" in err.message
+    assert err.hint is not None and "duration => 30" in err.hint
+
+
+def test_a_source_time_column_is_not_a_stream(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT t.t FROM ffmpeg.testsrc() t", _registry)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t.t' is a time column, not a stream" in err.message
+
+
+def test_a_source_carries_no_provenance(_registry: Registry) -> None:
+    """Nothing was probed, because nothing was read."""
+    g = _dyn("SELECT t.frame FROM ffmpeg.testsrc() t", _registry)
+    assert g.outputs[0].metadata == {}
+
+
+def test_a_source_works_inside_a_cte(_registry: Registry) -> None:
+    g = _dyn(
+        "WITH bg AS (SELECT t.frame AS v FROM ffmpeg.testsrc(duration => 2) t) "
+        "SELECT gblur(bg.v, sigma => 2) FROM bg",
+        _registry,
+    )
+    assert _filters(g) == ["testsrc", "gblur"]
+    assert _outputs(g) == [("n2", "video", None)]
+
+
+def test_the_silent_audio_union_all_branch(_registry: Registry) -> None:
+    """The headline (RFC-005 SS1): a real clip concatenated with a generated
+    segment whose audio is silence, so both branches agree on (video, audio)
+    and `concat` has something to join."""
+    g = _dyn(
+        "SELECT f.video[1], f.audio[1] FROM input('av.mp4') f "
+        "UNION ALL "
+        "SELECT t.video[1], s.audio[1] "
+        "FROM ffmpeg.testsrc(duration => 1) t, ffmpeg.anullsrc(duration => 1) s",
+        _registry,
+    )
+    assert _filters(g) == ["testsrc", "anullsrc", "concat"]
+    concat = g.nodes["n3"]
+    assert concat.args == {"n": 2, "v": 1, "a": 1}
+    assert concat.inputs == ["src:f:v:0", "src:f:a:0", "n1", "n2"]
+    assert concat.outputs == ["video", "audio"]
+    assert _outputs(g) == [("n3:0", "video", None), ("n3:1", "audio", None)]
+    assert g.input_paths == ["av.mp4"]
+
+
+def test_a_union_all_branch_signature_mismatch_still_fires(
+    _registry: Registry,
+) -> None:
+    """Without the silent-audio branch the shapes disagree, and the source
+    branch is just another branch as far as the check is concerned."""
+    err = _reject_dyn(
+        "SELECT f.video[1], f.audio[1] FROM input('av.mp4') f "
+        "UNION ALL SELECT t.video[1] FROM ffmpeg.testsrc(duration => 1) t",
+        _registry,
+    )
+    assert err.code is ErrorCode.CONCAT_MISMATCH
+    assert "branch 1 selects (video, audio), branch 2 selects (video)" in err.message
+
+
+def test_a_source_in_select_position_points_at_from(_registry: Registry) -> None:
+    """A source is not a column function: `SELECT ffmpeg.testsrc(...)` is
+    still UNKNOWN_FUNCTION (the registry's `get` never answers for a source),
+    but the hint now says where it belongs."""
+    err = _reject_dyn(
+        "SELECT ffmpeg.testsrc(duration => 2) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None
+    assert "is a generated source, not a function" in err.hint
+    assert "FROM ffmpeg.testsrc(duration => 2) s" in err.hint
+
+
+def test_an_unknown_alias_hint_lists_source_aliases(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT nope.frame FROM ffmpeg.testsrc(duration => 2) t", _registry
+    )
+    assert err.code is ErrorCode.UNKNOWN_ALIAS
+    assert err.hint == "known names: t"
 
 
 # ---------------------------------------------------------------------------

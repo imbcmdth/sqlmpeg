@@ -56,6 +56,23 @@ Notes for downstream passes (lower):
   RESERVES the name ``ffmpeg`` (:meth:`_Resolver._reserve`) so no alias or CTE
   can shadow the namespace; lower does the resolution.
 
+* ``FROM ffmpeg.<source>(<named options>) alias`` (RFC-005 §1, plan 042) is the
+  SAME namespace in TABLE position, and it is a DIFFERENT sqlglot shape from
+  the call one above — a ``Dot`` never appears. VERIFIED under sqlglot 30.17
+  ``read="postgres"``, see the table in :meth:`_Resolver._add_source`:
+  ``FROM ffmpeg.testsrc(duration => 2) t`` parses as
+  ``exp.Table(this=Anonymous(testsrc, [Kwarg...]), db=Identifier(ffmpeg),
+  alias=TableAlias(t))`` — the qualifier lands in the Table's ``db`` slot
+  (``catalog`` too, for a three-part name), NOT wrapped around the call. The
+  parenthesis-less ``FROM ffmpeg.testsrc t`` is the same Table with an
+  ``Identifier`` rather than an ``Anonymous`` ``this``, which is how that form
+  is told apart and rejected with a hint. A generated source takes NO ffmpeg
+  input index — it is a zero-input filter node, there is no ``-i`` — so it
+  never enters ``input_paths``/``sources``; its record goes into
+  ``Resolved.source_filters`` instead. Which source names exist, and which
+  options they take, is the installed ffmpeg's business: this pass checks the
+  SHAPE only (alias mandatory, arguments named-only) and lower does the rest.
+
 * Stream subscripts (``a.video[1]``) arrive as ``exp.Bracket`` wrapping the
   ``exp.Column``. **sqlglot rebases the index at parse time**: under
   ``read="postgres"`` (``INDEX_OFFSET = 1``) it rewrites the single subscript
@@ -81,6 +98,8 @@ __all__ = [
     "RawInputOption",
     "RawSink",
     "RawSinkOption",
+    "RawSource",
+    "RawSourceOption",
     "Resolved",
     "kwarg_name",
     "parse",
@@ -148,6 +167,13 @@ _STRICT_HINT = (
     "use >= / <=: seeks are time-based, a strict bound has no frame-level meaning"
 )
 _ALIAS_HINT = "add an alias, e.g. FROM input('clip.mp4') a"
+_SOURCE_ALIAS_HINT = (
+    f"add an alias, e.g. FROM {FILTER_NAMESPACE}.testsrc(duration => 2) t"
+)
+_SOURCE_CALL_HINT = (
+    f"a generated source is a CALL: write {FILTER_NAMESPACE}.<source>() alias, "
+    f"e.g. FROM {FILTER_NAMESPACE}.anullsrc(duration => 30) s"
+)
 _SUBSCRIPT_HINT = (
     "stream subscripts are 1-based integer literals: a.video[1] is the first "
     "video stream"
@@ -518,6 +544,48 @@ class RawInputOption:
     path_node: exp.Expr
 
 
+@dataclass(frozen=True)
+class RawSourceOption:
+    """One ``ffmpeg.<source>(name => value)`` option (RFC-005 §1, plan 042).
+
+    Shape only, exactly like :class:`RawInputOption` -- but validated against
+    the INSTALLED ffmpeg's option table for that source filter (the same
+    ``Registry.options`` path a tier-2 call's named arguments take), not
+    against a curated table, so `name` is kept VERBATIM: ffmpeg AVOption
+    names are case-sensitive.
+
+    `name_node` is the ``exp.Kwarg``'s ``Var``, which carries no token
+    position; `call_node` is the ``exp.Anonymous`` of the source call, which
+    does (it sits on the source NAME) and is the last-resort anchor.
+    """
+
+    name: str
+    value: exp.Expr
+    name_node: exp.Expr
+    call_node: exp.Expr
+
+
+@dataclass(frozen=True)
+class RawSource:
+    """``FROM ffmpeg.<source>(<named options>) alias`` (RFC-005 §1, plan 042).
+
+    A generated source has NO ffmpeg input index -- it lowers to a zero-input
+    filter node, and there is no ``-i`` for it -- so it appears in
+    ``Resolved.source_filters`` and in NEITHER ``Resolved.input_paths`` nor
+    ``Resolved.sources``.
+
+    `name` is the source filter's name, folded lowercase (function names are
+    case-insensitive in this dialect; ffmpeg's own filter names are lowercase).
+    Whether such a source exists, and what options it takes, is the installed
+    ffmpeg's business -- lower asks ``Registry.get_source`` / ``options``.
+    """
+
+    alias: str
+    name: str
+    options: tuple[RawSourceOption, ...]
+    call_node: exp.Expr
+
+
 @dataclass
 class Resolved:
     """Output of the resolve pass — the validated query plus its input table."""
@@ -543,6 +611,11 @@ class Resolved:
     input_options: dict[str, tuple[RawInputOption, ...]] = field(default_factory=dict)
     """Input alias -> its trailing named options (RFC-005). Only aliases that
     wrote at least one option get an entry -- absent means none."""
+
+    source_filters: dict[str, RawSource] = field(default_factory=dict)
+    """``FROM ffmpeg.<source>(...) alias`` records, keyed by alias, in FROM
+    order across the whole query (RFC-005 §1). Disjoint from ``sources``: a
+    generated source has no ``-i`` and therefore no input index."""
 
 
 def _unwrap(node: exp.Expr) -> exp.Expr:
@@ -780,27 +853,32 @@ def _sink_options(copy: exp.Copy, target: exp.Expr) -> tuple[RawSinkOption, ...]
     return tuple(options)
 
 
-def _input_options(rest: list[exp.Expr], path_node: exp.Expr) -> tuple[RawInputOption, ...]:
-    """``input('path', name => value, ...)``'s trailing arguments, shape-checked.
+def _named_only_arguments(
+    rest: list[exp.Expr], fallback: exp.Expr, *, positional_message: str
+) -> list[tuple[str, exp.Expr, exp.Expr]]:
+    """Shape-check a table function's ``name => value`` arguments.
 
-    The path (already consumed by the caller) is the sole positional
-    argument; everything after it must be an ``exp.Kwarg`` -- a second bare
-    positional (before OR after any named one) is rejected the same as
-    RFC-003's "positional arguments must come before named arguments" rule,
-    just stricter: input() allows no second positional at all. Which option
-    names actually exist is ``sqlmpeg.inputs.INPUT_OPTIONS``' business, not
-    the parser's (mirrors ``RawSinkOption`` / ``_sink_options``).
+    Shared by ``input('path', ...)`` (plan 041) and
+    ``ffmpeg.<source>(...)`` (plan 042): both take named arguments ONLY past
+    a fixed positional prefix (one path literal for ``input``, none at all for
+    a source), so a bare positional among `rest` is rejected outright rather
+    than by RFC-003's softer "positional arguments must come before named
+    arguments" rule. `positional_message` is what that rejection says, and it
+    is the only difference between the two callers.
+
+    Returns ``(name, value, name_node)`` triples in written order; which
+    option names actually exist is the caller's business (a curated table for
+    input options, the installed ffmpeg for a source's).
     """
-    options: list[RawInputOption] = []
+    out: list[tuple[str, exp.Expr, exp.Expr]] = []
     seen: set[str] = set()
     for arg in rest:
         if not isinstance(arg, exp.Kwarg):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                "input() takes one positional path; every argument after it "
-                "must be a named option",
+                positional_message,
                 arg,
-                fallback=path_node,
+                fallback=fallback,
                 hint=_KWARG_HINT,
             )
         name = kwarg_name(arg)
@@ -811,7 +889,7 @@ def _input_options(rest: list[exp.Expr], path_node: exp.Expr) -> tuple[RawInputO
                 ErrorCode.UNSUPPORTED_SQL,
                 "malformed named argument",
                 anchor,
-                fallback=path_node,
+                fallback=fallback,
                 hint=_KWARG_HINT,
             )
         if not isinstance(value, exp.Expr):
@@ -819,7 +897,7 @@ def _input_options(rest: list[exp.Expr], path_node: exp.Expr) -> tuple[RawInputO
                 ErrorCode.UNSUPPORTED_SQL,
                 f"named argument '{name}' has no value",
                 arg,
-                fallback=path_node,
+                fallback=fallback,
                 hint=_KWARG_HINT,
             )
         if name in seen:
@@ -827,15 +905,54 @@ def _input_options(rest: list[exp.Expr], path_node: exp.Expr) -> tuple[RawInputO
                 ErrorCode.UNSUPPORTED_SQL,
                 f"duplicate named argument '{name}'",
                 anchor,
-                fallback=path_node,
+                fallback=fallback,
                 hint="each named argument may be given at most once",
             )
         seen.add(name)
-        name_node = arg.this if isinstance(arg.this, exp.Expr) else arg
-        options.append(
-            RawInputOption(name=name, value=value, name_node=name_node, path_node=path_node)
+        out.append((name, value, arg.this if isinstance(arg.this, exp.Expr) else arg))
+    return out
+
+
+def _input_options(rest: list[exp.Expr], path_node: exp.Expr) -> tuple[RawInputOption, ...]:
+    """``input('path', name => value, ...)``'s trailing arguments, shape-checked.
+
+    The path (already consumed by the caller) is the sole positional
+    argument; everything after it must be an ``exp.Kwarg``. Which option
+    names actually exist is ``sqlmpeg.inputs.INPUT_OPTIONS``' business, not
+    the parser's (mirrors ``RawSinkOption`` / ``_sink_options``).
+    """
+    return tuple(
+        RawInputOption(name=name, value=value, name_node=name_node, path_node=path_node)
+        for name, value, name_node in _named_only_arguments(
+            rest,
+            path_node,
+            positional_message="input() takes one positional path; every argument "
+            "after it must be a named option",
         )
-    return tuple(options)
+    )
+
+
+def _source_options(
+    args: list[exp.Expr], call_node: exp.Expr, name: str
+) -> tuple[RawSourceOption, ...]:
+    """``ffmpeg.<source>(name => value, ...)``'s arguments, shape-checked.
+
+    A generated source has NO input pads at all -- that is what makes it a
+    source -- so it takes no positional arguments whatsoever, and a bare one
+    is rejected here with a message that says exactly that rather than the
+    generic named-argument-ordering one.
+    """
+    return tuple(
+        RawSourceOption(
+            name=option_name, value=value, name_node=name_node, call_node=call_node
+        )
+        for option_name, value, name_node in _named_only_arguments(
+            args,
+            call_node,
+            positional_message=f"{FILTER_NAMESPACE}.{name}() is a generated source: "
+            "it has no stream inputs, and its options are named",
+        )
+    )
 
 
 class _Resolver:
@@ -844,6 +961,7 @@ class _Resolver:
         self.sources: dict[str, int] = {}
         self.ctes: dict[str, QueryExpr] = {}
         self.input_options: dict[str, tuple[RawInputOption, ...]] = {}
+        self.source_filters: dict[str, RawSource] = {}
 
     # -- entry point ------------------------------------------------------
 
@@ -884,6 +1002,7 @@ class _Resolver:
             branches=branches,
             sink=sink,
             input_options=self.input_options,
+            source_filters=self.source_filters,
         )
 
     # -- CTEs -------------------------------------------------------------
@@ -953,7 +1072,7 @@ class _Resolver:
                 hint=f"{FILTER_NAMESPACE}.<filter>(...) calls an ffmpeg filter "
                 "directly; pick another alias or CTE name",
             )
-        if name in self.ctes or name in self.sources:
+        if name in self.ctes or name in self.sources or name in self.source_filters:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"duplicate name '{name}'",
@@ -1169,14 +1288,23 @@ class _Resolver:
                 table,
                 hint="use a WITH ... AS (...) CTE instead of a subquery",
             )
-        if table.args.get("db") or table.args.get("catalog"):
+        # `FROM ffmpeg.<source>(...) alias` (plan 042) is the ONE qualified
+        # table name there is: the namespace lands in `db`. A three-part name
+        # (`x.ffmpeg.testsrc(...)`) also fills `catalog`, and is not it.
+        db = table.args.get("db")
+        namespaced = (
+            not table.args.get("catalog")
+            and isinstance(db, exp.Expr)
+            and _ident_name(db) == FILTER_NAMESPACE
+        )
+        if (db or table.args.get("catalog")) and not namespaced:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 "qualified table names are not supported",
                 table,
             )
         for key, value in table.args.items():
-            if key in ("this", "alias") or not value:
+            if key in ("this", "alias", "db") or not value:
                 continue
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -1194,6 +1322,9 @@ class _Resolver:
                 alias_node,
             )
 
+        if namespaced:
+            self._add_source(table, inner, alias_node, scope)
+            return
         if isinstance(inner, exp.Anonymous):
             self._add_input(table, inner, alias_node, scope)
             return
@@ -1283,6 +1414,85 @@ class _Resolver:
             self.input_options[alias] = options
         scope[alias] = "input"
 
+    def _add_source(
+        self,
+        table: exp.Table,
+        inner: exp.Expr | None,
+        alias_node: exp.Expr | None,
+        scope: dict[str, str],
+    ) -> None:
+        """``FROM ffmpeg.<source>(<named options>) alias`` (RFC-005 §1, plan 042).
+
+        Shapes VERIFIED under sqlglot 30.17 ``read="postgres"`` (every one of
+        them a plain ``exp.Table`` with ``db=Identifier(ffmpeg)`` -- an
+        ``exp.Dot`` never appears in FROM position, unlike the same namespace
+        in CALL position):
+
+        ==================================== ==========================================
+        written                              ``Table.this`` / how it lands here
+        ==================================== ==========================================
+        ``ffmpeg.testsrc(duration => 2) t``  ``Anonymous(testsrc, [Kwarg(duration, 2)])``
+        ``ffmpeg.testsrc() t``               ``Anonymous(testsrc)``, no ``expressions``
+        ``ffmpeg.testsrc t``                 ``Identifier(testsrc)`` -> rejected, hint
+        ``ffmpeg.testsrc(duration => 2)``    no ``alias`` -> rejected (alias mandatory)
+        ``ffmpeg.testsrc(2) t``              ``Anonymous`` with a bare ``Literal`` arg
+        ``ffmpeg.testsrc(2, d => 1) t``      ``Literal`` then ``Kwarg``, same rejection
+        ``FFMPEG.TestSrc(...) t``            name kept VERBATIM (``'TestSrc'``), folded
+                                             here; ``db`` folds the Postgres way
+        ``x.ffmpeg.testsrc(...) t``          also fills ``catalog`` -> not the namespace
+        ==================================== ==========================================
+
+        A CTE body and a ``UNION ALL`` branch produce the identical Table
+        shape (they are ordinary SELECTs), and so does a comma cross-join
+        alongside ``input('...')`` -- the source lands in ``Join.this``, which
+        :meth:`_collect_scope` feeds through this same path.
+
+        Options are collected raw and are NOT looked at here: which options a
+        source has is a property of the installed ffmpeg, and only lower (with
+        its registry) knows that.
+        """
+        if isinstance(inner, exp.Identifier):
+            # `FROM ffmpeg.testsrc t` -- a bare qualified NAME, not a call.
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{FILTER_NAMESPACE}.{_ident_name(inner)}' is not a table",
+                inner,
+                fallback=table,
+                hint=_SOURCE_CALL_HINT,
+            )
+        if not isinstance(inner, exp.Anonymous):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"malformed {FILTER_NAMESPACE}.<source>() in FROM",
+                inner if isinstance(inner, exp.Expr) else None,
+                fallback=table,
+                hint=_SOURCE_CALL_HINT,
+            )
+        # Function names are case-insensitive in this dialect (lower folds a
+        # call's name the same way); ffmpeg's own filter names are lowercase.
+        name = str(inner.this).lower()
+        options = _source_options(inner.expressions, inner, name)
+        if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{FILTER_NAMESPACE}.{name}() requires an alias",
+                inner,
+                fallback=table,
+                hint=_SOURCE_ALIAS_HINT,
+            )
+        alias = _ident_name(alias_node.this)
+        self._reserve(alias, alias_node.this)
+        if alias in scope:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
+            )
+        # NO input index is assigned: a source is a zero-input filter node,
+        # not an `-i` (RFC-005 §1). `input_paths`/`sources` stay untouched.
+        self.source_filters[alias] = RawSource(
+            alias=alias, name=name, options=options, call_node=inner
+        )
+        scope[alias] = "source"
+
     def _known_hint(self, names: set[str] | dict[str, str]) -> str:
         known = ", ".join(sorted(names))
         return f"known names: {known}" if known else "no aliases are in scope"
@@ -1337,7 +1547,9 @@ class _Resolver:
             if isinstance(sub.this, exp.Star):
                 continue
             # An input exposes a fixed set of pseudo-columns. A CTE exposes
-            # whatever its body named with AS, so only lower can check those.
+            # whatever its body named with AS, and a generated source exposes
+            # exactly one stream of a type only the registry knows, so only
+            # lower can check either of those.
             if kind == "input" and _ident_name(sub.this) not in _INPUT_COLUMNS:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,

@@ -414,3 +414,31 @@ def test_input_options_survive_a_graph_that_does_split() -> None:
     out = insert_splits(g)
     assert out.nodes["n0_split"].outputs == ["video", "video"]
     assert out.input_options == {"a": {"stream_loop": -1}}
+
+
+# ---------------------------------------------------------------------------
+# RFC-005 SS1 generated sources: a zero-input node fans out like any other
+# ---------------------------------------------------------------------------
+
+
+def test_a_zero_input_node_fans_out_through_an_ordinary_split() -> None:
+    """`FROM ffmpeg.testsrc(...) t` lowers to `inputs=[]` and is minted ONCE
+    per alias, so two consumers of it are this pass's ordinary business -- a
+    `split` in front, not a second generator."""
+    g = Graph(input_paths=[], sources={})
+    g.nodes["n1"] = Node(
+        id="n1", filter="testsrc", args={"duration": 2}, inputs=[], outputs=["video"]
+    )
+    g.nodes["n2"] = Node(
+        id="n2", filter="hflip", args={}, inputs=["n1"], outputs=["video"]
+    )
+    g.outputs = [_out("n2"), _out("n1")]
+
+    out = insert_splits(g)
+
+    assert list(out.nodes) == ["n1", "n1_split", "n2"]
+    assert out.nodes["n1"].inputs == []
+    assert out.nodes["n1_split"].inputs == ["n1"]
+    assert out.nodes["n1_split"].outputs == ["video", "video"]
+    assert out.nodes["n2"].inputs == ["n1_split:0"]
+    assert [o.ref for o in out.outputs] == ["n2", "n1_split:1"]
