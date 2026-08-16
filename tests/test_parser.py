@@ -590,6 +590,91 @@ def test_cte_body_must_be_a_select() -> None:
 
 
 # ---------------------------------------------------------------------------
+# named arguments — SHAPE only (RFC-003, plan 031)
+# ---------------------------------------------------------------------------
+#
+# Which options exist, and what they accept, is a property of the installed
+# ffmpeg and belongs to lower + the registry (tests/test_lower.py). Resolve
+# only knows that a named argument trails the positional ones and appears once.
+
+
+def test_named_arguments_resolve() -> None:
+    """The resolver accepts them structurally: `sigma` is not an alias, not a
+    column, and not checked against anything here."""
+    projection = _projection("SELECT gblur(a.frame, sigma => 5) FROM input('x.mp4') a")
+    assert isinstance(projection, exp.Anonymous)
+    kwarg = projection.expressions[1]
+    assert isinstance(kwarg, exp.Kwarg)
+    assert kwarg.this.name == "sigma"
+
+
+def test_named_argument_names_keep_their_case() -> None:
+    """Unquoted identifiers fold lowercase in Postgres, but an option name is
+    an ffmpeg AVOption, not an identifier: gblur's sigmaV must survive."""
+    from sqlmpeg.parser import kwarg_name
+
+    projection = _projection("SELECT gblur(a.frame, sigmaV => 5) FROM input('x.mp4') a")
+    assert isinstance(projection, exp.Anonymous)
+    kwarg = projection.expressions[1]
+    assert isinstance(kwarg, exp.Kwarg)
+    assert kwarg_name(kwarg) == "sigmaV"
+
+
+def test_named_arguments_may_be_nested_and_repeated_across_calls() -> None:
+    _resolve(
+        "SELECT gblur(unsharp(a.frame, lx => 7), sigma => 2), gblur(a.frame, sigma => 3) "
+        "FROM input('x.mp4') a"
+    )
+
+
+def test_a_positional_argument_after_a_named_one_is_rejected() -> None:
+    err = _reject("SELECT blur(a.frame, planes => 1, 5) FROM input('x.mp4') a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "must come before named arguments" in err.message
+
+
+def test_a_duplicate_named_argument_is_rejected() -> None:
+    err = _reject("SELECT blur(a.frame, 5, planes => 1, planes => 2) FROM input('x.mp4') a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "duplicate named argument 'planes'" in err.message
+
+
+def test_a_duplicate_named_argument_is_anchored_on_the_second_one() -> None:
+    err = _reject(
+        "SELECT blur(a.frame, 5,\n  planes => 1,\n  planes => 2)\nFROM input('x.mp4') a"
+    )
+    assert err.line == 3
+
+
+def test_named_arguments_are_checked_inside_a_cte_and_a_union() -> None:
+    for sql in (
+        "WITH c AS (SELECT blur(a.frame, planes => 1, 5) AS f FROM input('x.mp4') a) "
+        "SELECT c.f FROM c",
+        "SELECT a.frame FROM input('x.mp4') a UNION ALL "
+        "SELECT blur(b.frame, planes => 1, 5) FROM input('y.mp4') b",
+    ):
+        assert _reject(sql).code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_a_named_argument_does_not_smuggle_in_a_column() -> None:
+    """The value goes through the same column whitelist everything else does."""
+    err = _reject("SELECT gblur(a.frame, sigma => b.frame) FROM input('x.mp4') a")
+    assert err.code is ErrorCode.UNKNOWN_ALIAS
+
+
+def test_overlay_cannot_take_named_arguments() -> None:
+    """Postgres has a builtin OVERLAY(x PLACING y FROM n FOR m) and sqlglot
+    parses the stdlib's overlay() with that grammar, so `=>` inside it does not
+    even tokenize as a named argument -- a documented dead end, not a silent
+    mis-parse."""
+    err = _reject(
+        "SELECT overlay(a.frame, b.frame, 0, 0, eof_action => 'pass') "
+        "FROM input('x.mp4') a, input('y.mp4') b"
+    )
+    assert err.code is ErrorCode.PARSE_ERROR
+
+
+# ---------------------------------------------------------------------------
 # COPY ... TO ... WITH (...)  — the sink wrapper (RFC-002, plan 026)
 # ---------------------------------------------------------------------------
 

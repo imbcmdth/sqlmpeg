@@ -173,7 +173,47 @@ statement is not. `--` and `/* */` comments are allowed.
   yourself and write the literal.
 - `str` is a single-quoted literal; double a quote to escape it (`'it''s'`).
   In Postgres double quotes mean identifier, never string.
-- Function names are case-insensitive."""
+- Function names are case-insensitive.
+
+### Named arguments
+- Any call may take trailing `<name> => <value>` arguments, which set options
+  on the ffmpeg filter behind it: `blur(a.frame, 5, planes => 1)`,
+  `scale(a.frame, 1280, 720, flags => 'lanczos')`. They come AFTER every
+  positional argument, at most one per name.
+- Option names are case-sensitive and are exactly ffmpeg's own (`sigmaV`,
+  `luma_msize_x`). They are checked against the installed ffmpeg, so a wrong
+  name is `UNKNOWN_FILTER_OPTION` with the real list in `hint`, and a wrong
+  value is `FILTER_OPTION_TYPE` with the type, range or constants in
+  `message`. Values are bare numbers, `true`/`false`, or single-quoted
+  strings -- enum options take a quoted constant name, never its number.
+- A named argument may not set something the call already sets: the positional
+  form wins, and `crop(a.frame, 0, 0, 10, 10, w => 5)` is rejected rather than
+  silently overridden. Use the overload that takes the value positionally.
+- `blur_regions` is a macro over several filters, so it takes no named
+  arguments at all.
+- `overlay` is the one function that cannot take them either: Postgres has a
+  builtin `OVERLAY(...)` and `=>` inside it is a `PARSE_ERROR`. Write
+  `overlay(base, top, x, y)` positionally and nothing else.
+
+### Beyond the stdlib
+- Any filter the installed ffmpeg reports can be called directly by its ffmpeg
+  name, with its stream inputs positional and every option named:
+  `unsharp(a.frame, luma_msize_x => 7, luma_amount => 1.5)`,
+  `curves(a.frame, preset => 'lighter')`, `atadenoise(a.frame)`. The number
+  and types of the positional arguments are that filter's input pads -- one
+  for `V->V` filters, two for `VV->V` ones like `xfade` -- and nothing else is
+  positional.
+- Filters with a variable number of pads (`split`, `concat`), more than one
+  output, or no input at all (sources like `testsrc`) are NOT callable.
+- This is machine-dependent, and it is the only part of the dialect that is:
+  the stdlib above compiles anywhere, while a query naming a filter (or a
+  named option) only compiles where that ffmpeg has it. Prefer a stdlib
+  function whenever one does the job, and reach for a raw filter name for
+  effects the stdlib does not cover. A stdlib name always wins: `scale` is the
+  function above, not ffmpeg's `scale` filter.
+- If the filter set is unavailable (no ffmpeg, or `--portable`), every such
+  call is `UNKNOWN_FUNCTION` and every named argument is `UNSUPPORTED_SQL`;
+  the message says which."""
 
 
 # ---------------------------------------------------------------------------
@@ -250,9 +290,10 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   `WITH RECURSIVE`, nested `WITH`, CTE column lists, table functions other than
   `input()`, any statement that is not a `SELECT`, more than one statement, a
   zero/negative/computed array subscript.
-- Any function not listed below, including transitions between concatenated
-  branches, motion tracking, subtitle/data-stream filtering, and anything
-  requiring more than one pass over the stream."""
+- Any name that is neither a function listed below nor a filter the installed
+  ffmpeg provides (see "Beyond the stdlib"), including transitions between
+  concatenated branches, motion tracking, subtitle/data-stream filtering, and
+  anything requiring more than one pass over the stream."""
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +572,22 @@ _REPAIR: dict[ErrorCode, str] = {
         "option needs a bare integer literal with no quotes and no decimal "
         "point (e.g. `crf 20`), and a `bool` option needs exactly `true` or "
         "`false` with no quotes."
+    ),
+    ErrorCode.UNKNOWN_FILTER_OPTION: (
+        "A `<name> => <value>` argument names an option the ffmpeg filter does "
+        "not have. Take the did-you-mean from `hint` if there is one; otherwise "
+        "pick from the option names `hint` lists -- they were read out of the "
+        "installed ffmpeg, so they are the complete set for that filter. Never "
+        "invent an option name, and never move the value to a positional "
+        "argument: a dynamic filter takes only its stream inputs positionally."
+    ),
+    ErrorCode.FILTER_OPTION_TYPE: (
+        "The value of a `<name> => <value>` argument does not match what the "
+        "option accepts, and `message` says exactly what it does accept: a bare "
+        "number (with the allowed range, if ffmpeg declares one), the bare word "
+        "`true`/`false`, or one of a listed set of named constants -- those go "
+        "in single quotes, e.g. `transition => 'wipeleft'`. Change the value "
+        "only; the option name was accepted."
     ),
     ErrorCode.INTERNAL: (
         "A compiler bug, not your SQL. Re-emit the simplest query that still "

@@ -13,7 +13,20 @@ broadcasting, since an array's length comes from the file — is exercised
 either with a hand-built ``ProbeResult`` through ``lower`` directly, or, for
 the real thing, in an ``exec``-marked test against ``tests/fixtures/av.mp4``
 (1 audio track) and ``tests/fixtures/av2.mp4`` (2 language-tagged tracks).
+
+Tier-2 behavior (RFC-003) is tested twice over: once against a `Registry`
+built from the captured ffmpeg output embedded below, so the default suite
+stays offline and machine-independent, and once (``exec``-marked) against the
+real installed ffmpeg, where only what ffmpeg itself guarantees is asserted.
 """
+
+# ruff: noqa: E501
+# The `-filters` / `-help filter=X` fixture text below is embedded verbatim
+# (byte-for-byte, not retyped or rewrapped) so it stays trustworthy as a
+# record of real ffmpeg output; a few of its option lines exceed the 100-col
+# limit. Whole-file exemption for the same reason tests/test_registry.py
+# takes one: a per-line noqa comment would have to sit inside the fixture
+# string it applies to, corrupting it.
 
 from __future__ import annotations
 
@@ -27,6 +40,7 @@ import pytest
 
 from sqlmpeg import compiler
 from sqlmpeg import lower as lower_module
+from sqlmpeg import registry as registry_module
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.emit import build_ffmpeg_args, emit
 from sqlmpeg.errors import ErrorCode, SqlmpegError
@@ -34,6 +48,7 @@ from sqlmpeg.ir import Graph
 from sqlmpeg.lower import lower
 from sqlmpeg.parser import parse, resolve
 from sqlmpeg.probe import ProbeResult, StreamMeta
+from sqlmpeg.registry import Registry
 from sqlmpeg.split import insert_splits
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1353,7 +1368,9 @@ def test_overlay_drops_provenance_when_one_side_is_unprobed() -> None:
 
 
 def test_a_colliding_builtin_is_an_unknown_function() -> None:
-    err = _reject("SELECT trim(a.frame) FROM input('x.mp4') a")
+    """`lower` is a Postgres builtin sqlglot parses into its own Func class, and
+    it is neither a stdlib function nor (in any ffmpeg) a filter name."""
+    err = _reject("SELECT lower(a.frame) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
 
 
@@ -1495,7 +1512,7 @@ def test_split_pass_picks_asplit_for_audio() -> None:
 def test_compile_sql_wraps_unexpected_exceptions_as_internal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def boom(res: object, probes: object) -> Graph:
+    def boom(res: object, probes: object, **kwargs: object) -> Graph:
         raise ValueError("kaboom")
 
     monkeypatch.setattr(compiler, "lower", boom)
@@ -1650,6 +1667,685 @@ def test_sink_does_not_change_the_graph_shape() -> None:
     wrapped = compile_sql(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH (crf 20)").to_dict()
     assert wrapped.pop("sink") == {"path": "out.mkv", "options": {"crf": 20}}
     assert wrapped == plain
+
+
+# ---------------------------------------------------------------------------
+# RFC-003: dynamic filters + named arguments, against an OFFLINE registry
+# ---------------------------------------------------------------------------
+#
+# These build a real `Registry` over faked subprocess output, exactly as
+# tests/test_registry.py does, so the whole tier-2 surface is exercised with
+# no ffmpeg on the machine and no machine-dependent expectations. The
+# `exec`-marked tests further down run the same shapes against the REAL
+# installed ffmpeg, where the option tables are whatever that binary says.
+
+_FILTERS_FIXTURE = """\
+Filters:
+  T.. = Timeline support
+  .S. = Slice threading
+  ..C = Command support
+  A = Audio input/output
+  V = Video input/output
+  N = Dynamic number and/or type of input/output
+  | = Source or sink filter
+ .S. acrossover        A->N       Split audio into per-bands streams.
+ ... aecho             A->A       Add echoing to the audio.
+ ..C crop              V->V       Crop the input video.
+ T.C feedback          VV->VV     Apply feedback video filter.
+ TSC deband            V->V       Debands video.
+ TSC gblur             V->V       Apply Gaussian Blur filter.
+ ..C scale             V->V       Scale the input video size and/or convert the image format.
+ ... split             V->N       Pass on the input to N video outputs.
+ ... testsrc           |->V       Generate test pattern.
+ ... trim              V->V       Pick one continuous section from the input, drop the rest.
+ TS. unsharp           V->V       Sharpen or blur the input video.
+ .S. xfade             VV->V      Cross fade one video with another video.
+"""
+
+# Each entry is the AVOptions block of a real `ffmpeg -hide_banner -help
+# filter=X` capture (ffmpeg 7.1), trimmed to the block the parser reads --
+# and, for xfade, to the first 16 of its 59 transition constants, which is
+# still more than a message lists before it starts counting.
+_HELP_FIXTURES: dict[str, str] = {
+    "gblur": """\
+gblur AVOptions:
+   sigma             <float>      ..FV.....T. set sigma (from 0 to 1024) (default 0.5)
+   steps             <int>        ..FV.....T. set number of steps (from 1 to 6) (default 1)
+   planes            <int>        ..FV.....T. set planes to filter (from 0 to 15) (default 15)
+   sigmaV            <float>      ..FV.....T. set vertical sigma (from -1 to 1024) (default -1)
+
+""",
+    "unsharp": """\
+unsharp AVOptions:
+   luma_msize_x      <int>        ..FV....... set luma matrix horizontal size (from 3 to 23) (default 5)
+   lx                <int>        ..FV....... set luma matrix horizontal size (from 3 to 23) (default 5)
+   luma_amount       <float>      ..FV....... set luma effect strength (from -2 to 5) (default 1)
+   la                <float>      ..FV....... set luma effect strength (from -2 to 5) (default 1)
+
+""",
+    "deband": """\
+deband AVOptions:
+   range             <int>        ..FV.....T. set range (from INT_MIN to INT_MAX) (default 16)
+   r                 <int>        ..FV.....T. set range (from INT_MIN to INT_MAX) (default 16)
+   blur              <boolean>    ..FV.....T. set blur (default true)
+   b                 <boolean>    ..FV.....T. set blur (default true)
+   coupling          <boolean>    ..FV.....T. set plane coupling (default false)
+   c                 <boolean>    ..FV.....T. set plane coupling (default false)
+
+""",
+    "aecho": """\
+aecho AVOptions:
+   in_gain           <float>      ..F.A...... set signal input gain (from 0 to 1) (default 0.6)
+   out_gain          <float>      ..F.A...... set signal output gain (from 0 to 1) (default 0.3)
+   delays            <string>     ..F.A...... set list of signal delays (default "1000")
+   decays            <string>     ..F.A...... set list of signal decays (default "0.5")
+
+""",
+    "crop": """\
+crop AVOptions:
+   out_w             <string>     ..FV.....T. set the width crop area expression (default "iw")
+   w                 <string>     ..FV.....T. set the width crop area expression (default "iw")
+   out_h             <string>     ..FV.....T. set the height crop area expression (default "ih")
+   h                 <string>     ..FV.....T. set the height crop area expression (default "ih")
+   keep_aspect       <boolean>    ..FV....... keep aspect ratio (default false)
+   exact             <boolean>    ..FV....... do exact cropping (default false)
+
+""",
+    "scale": """\
+scale AVOptions:
+   w                 <string>     ..FV.....T. Output video width
+   width             <string>     ..FV.....T. Output video width
+   h                 <string>     ..FV.....T. Output video height
+   height            <string>     ..FV.....T. Output video height
+   flags             <string>     ..FV....... Flags to pass to libswscale (default "")
+   interl            <boolean>    ..FV....... set interlacing (default false)
+
+""",
+    "xfade": """\
+xfade AVOptions:
+   transition        <int>        ..FV....... set cross fade transition (from -1 to 57) (default fade)
+     custom          -1           ..FV....... custom transition
+     fade            0            ..FV....... fade transition
+     wipeleft        1            ..FV....... wipe left transition
+     wiperight       2            ..FV....... wipe right transition
+     wipeup          3            ..FV....... wipe up transition
+     wipedown        4            ..FV....... wipe down transition
+     slideleft       5            ..FV....... slide left transition
+     slideright      6            ..FV....... slide right transition
+     slideup         7            ..FV....... slide up transition
+     slidedown       8            ..FV....... slide down transition
+     circlecrop      9            ..FV....... circle crop transition
+     rectcrop        10           ..FV....... rect crop transition
+     distance        11           ..FV....... distance transition
+     fadeblack       12           ..FV....... fadeblack transition
+     fadewhite       13           ..FV....... fadewhite transition
+   duration          <duration>   ..FV....... set cross fade duration (default 1)
+   offset            <duration>   ..FV....... set cross fade start relative to first input stream (default 0)
+   expr              <string>     ..FV....... set expression for custom transition
+
+""",
+}
+
+_FIXTURE_VERSION_LINE = (
+    "ffmpeg version 7.1-full_build-www.gyan.dev Copyright (c) 2000-2024 the FFmpeg developers"
+)
+
+
+@pytest.fixture
+def _registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Registry:
+    """A real Registry over the captured fixtures above -- no ffmpeg needed.
+
+    A fresh instance rather than ``registry.load()``: the singleton is
+    process-wide, and the disk cache is redirected into tmp_path so a test
+    never reads (or writes) the developer's own ~/.cache/sqlmpeg.
+    """
+    monkeypatch.setattr(registry_module, "_cache_dir", lambda: tmp_path / "cache")
+    monkeypatch.setattr(registry_module.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if "-version" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout=_FIXTURE_VERSION_LINE, stderr="")
+        if "-filters" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout=_FILTERS_FIXTURE, stderr="")
+        for arg in argv:
+            if arg.startswith("filter="):
+                name = arg[len("filter=") :]
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=_HELP_FIXTURES.get(name, ""), stderr=""
+                )
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(registry_module.subprocess, "run", fake_run)
+    return Registry()
+
+
+def _dyn(
+    sql: str,
+    registry: Registry | None,
+    probes: dict[str, ProbeResult | None] | None = None,
+    *,
+    portable: bool = False,
+) -> Graph:
+    return lower(resolve(parse(sql)), probes or {}, registry=registry, portable=portable)
+
+
+def _reject_dyn(
+    sql: str,
+    registry: Registry | None,
+    probes: dict[str, ProbeResult | None] | None = None,
+    *,
+    portable: bool = False,
+) -> SqlmpegError:
+    with pytest.raises(SqlmpegError) as excinfo:
+        _dyn(sql, registry, probes, portable=portable)
+    return _anchored(excinfo.value)
+
+
+# -- tier 2: calling a filter the registry reports --------------------------
+
+
+def test_dynamic_filter_lowers_to_a_plain_node(_registry: Registry) -> None:
+    g = _dyn("SELECT gblur(a.frame, sigma => 5) FROM input('x.mp4') a", _registry)
+    node = g.nodes["n1"]
+    assert node.filter == "gblur"
+    assert node.args == {"sigma": 5}
+    assert node.inputs == ["src:a:v:0"]
+    assert node.outputs == ["video"]
+    assert _outputs(g) == [("n1", "video", None)]
+
+
+def test_dynamic_filter_without_options_sets_no_args(_registry: Registry) -> None:
+    g = _dyn("SELECT gblur(a.frame) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].args == {}
+
+
+def test_dynamic_options_keep_their_written_order(_registry: Registry) -> None:
+    """emit renders args in insertion order, so written order is the rendered
+    order -- both directions are checked here."""
+    g = _dyn(
+        "SELECT unsharp(a.frame, luma_amount => 1.5, luma_msize_x => 7) "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    assert list(g.nodes["n1"].args.items()) == [("luma_amount", 1.5), ("luma_msize_x", 7)]
+    assert "unsharp=luma_amount=1.5:luma_msize_x=7" in emit(insert_splits(g)).filter_complex
+
+
+def test_dynamic_filter_takes_only_its_pads_positionally(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT gblur(a.frame, 5) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "gblur(video), got gblur(video, num)" in err.message
+    assert err.hint is not None and "options by name" in err.hint
+
+
+def test_dynamic_filter_checks_its_pad_types(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT gblur(a.audio[1], sigma => 1) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "got gblur(audio)" in err.message
+
+
+def test_two_pad_dynamic_filter_needs_both_inputs(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT xfade(a.frame) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "xfade(video, video), got xfade(video)" in err.message
+
+
+def test_two_pad_dynamic_filter_lowers_both_inputs(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT xfade(a.frame, b.frame, transition => 'wipeleft', duration => 1) "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    assert g.nodes["n1"].inputs == ["src:a:v:0", "src:b:v:0"]
+    assert g.nodes["n1"].args == {"transition": "wipeleft", "duration": 1}
+
+
+def test_excluded_filters_are_not_callable(_registry: Registry) -> None:
+    """The v1 scope fence lives in the registry: dynamic pads (acrossover),
+    multiple outputs (feedback) and sources (testsrc) are all in the fixture's
+    -filters output but excluded, so lowering never sees them at all."""
+    for sql in (
+        "SELECT acrossover(a.audio[1]) FROM input('x.mp4') a",
+        "SELECT feedback(a.frame, a.frame) FROM input('x.mp4') a",
+        "SELECT testsrc(a.frame) FROM input('x.mp4') a",
+    ):
+        assert _reject_dyn(sql, _registry).code is ErrorCode.UNKNOWN_FUNCTION
+
+
+def test_the_stdlib_wins_a_name_collision(_registry: Registry) -> None:
+    """`scale` and `crop` are both stdlib functions and real ffmpeg filters:
+    the stdlib's argument order and remapping are what a query gets."""
+    g = _dyn("SELECT scale(a.frame, 0.5) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].args == {"w": "iw*0.5", "h": "-2"}
+    g = _dyn("SELECT crop(a.frame, 1, 2, 3, 4) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].args == {"w": 3, "h": 4, "x": 1, "y": 2}
+
+
+def test_a_builtin_that_is_also_a_filter_resolves_to_tier_two(_registry: Registry) -> None:
+    """sqlglot parses `trim(...)` with its own TRIM grammar, which parks the
+    argument under `this` rather than in the argument list -- so the call
+    resolves to ffmpeg's trim filter but arrives with NO positional args. The
+    rejection is typed (and names the pad signature), not a panic."""
+    err = _reject_dyn("SELECT trim(a.frame) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "trim(video), got trim()" in err.message
+
+
+def test_a_dynamic_call_nests_inside_a_stdlib_call(_registry: Registry) -> None:
+    g = _dyn("SELECT scale(gblur(a.frame, sigma => 2), 0.5) FROM input('x.mp4') a", _registry)
+    assert _filters(g) == ["gblur", "scale"]
+    assert g.nodes["n2"].inputs == ["n1"]
+
+
+def test_a_stdlib_call_nests_inside_a_dynamic_call(_registry: Registry) -> None:
+    g = _dyn("SELECT gblur(scale(a.frame, 0.5), sigma => 2) FROM input('x.mp4') a", _registry)
+    assert _filters(g) == ["scale", "gblur"]
+    assert g.nodes["n2"].inputs == ["n1"]
+
+
+# -- named option validation (both tiers, same two codes) -------------------
+
+
+def test_unknown_option_suggests_a_real_one(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT gblur(a.frame, sigmma => 5) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+    assert "filter 'gblur' has no option 'sigmma'" in err.message
+    assert err.hint is not None and "sigma" in err.hint
+
+
+def test_unknown_option_without_a_match_lists_the_real_options(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT gblur(a.frame, zzzz => 5) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+    assert err.hint is not None
+    assert "sigma" in err.hint and "planes" in err.hint
+
+
+def test_option_names_are_case_sensitive(_registry: Registry) -> None:
+    """ffmpeg AVOption names are case-sensitive, so the name is NOT folded the
+    Postgres way: sigmaV is a real option, SIGMA is not."""
+    g = _dyn("SELECT gblur(a.frame, sigmaV => 3) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].args == {"sigmaV": 3}
+    err = _reject_dyn("SELECT gblur(a.frame, SIGMA => 5) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+
+
+def test_numeric_option_rejects_a_string(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT gblur(a.frame, sigma => '5') FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "expects a number" in err.message
+
+
+def test_numeric_option_enforces_the_introspected_range(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT gblur(a.frame, sigma => 5000) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "from 0 to 1024" in err.message
+    assert "got 5000" in err.message
+
+
+def test_numeric_option_range_check_is_two_sided(_registry: Registry) -> None:
+    assert (
+        _reject_dyn("SELECT gblur(a.frame, steps => 0) FROM input('x.mp4') a", _registry).code
+        is ErrorCode.FILTER_OPTION_TYPE
+    )
+    assert _dyn(
+        "SELECT gblur(a.frame, steps => 6) FROM input('x.mp4') a", _registry
+    ).nodes["n1"].args == {"steps": 6}
+
+
+def test_an_unbounded_numeric_option_takes_any_number(_registry: Registry) -> None:
+    """deband's `range` is `(from INT_MIN to INT_MAX)`, which does not parse as
+    a float -- the registry records no bounds and no range is enforced."""
+    g = _dyn("SELECT deband(a.frame, range => -4000) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].args == {"range": -4000}
+
+
+def test_boolean_option_takes_bare_true_and_false(_registry: Registry) -> None:
+    g = _dyn("SELECT deband(a.frame, blur => false) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].args == {"blur": False}
+    # emit renders an ffmpeg boolean as 1/0
+    assert "deband=blur=0" in emit(insert_splits(g)).filter_complex
+
+
+def test_boolean_option_rejects_a_number(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT deband(a.frame, blur => 1) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "expects true or false" in err.message
+
+
+def test_enum_option_accepts_one_of_its_constants(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT xfade(a.frame, b.frame, transition => 'circlecrop') "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    assert g.nodes["n1"].args == {"transition": "circlecrop"}
+
+
+def test_enum_option_rejects_anything_else(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT xfade(a.frame, b.frame, transition => 'nope') "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "named constants" in err.message
+    assert "wipeleft" in err.message
+
+
+def test_enum_option_message_stops_counting_at_a_dozen(_registry: Registry) -> None:
+    """xfade's transition has 15 constants in the fixture (59 in a real
+    ffmpeg): the message lists the first dozen and counts the rest."""
+    err = _reject_dyn(
+        "SELECT xfade(a.frame, b.frame, transition => 'nope') "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    assert "(3 more)" in err.message
+
+
+def test_enum_option_suggests_a_near_miss_constant(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT xfade(a.frame, b.frame, transition => 'wipelft') "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    assert err.hint is not None and "wipeleft" in err.hint
+
+
+def test_enum_option_rejects_the_constants_number(_registry: Registry) -> None:
+    """The registry records constant NAMES, not their values, so a bare number
+    is not something sqlmpeg can check -- it is rejected, with the names."""
+    err = _reject_dyn(
+        "SELECT xfade(a.frame, b.frame, transition => 1) "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert err.hint is not None and "constant name" in err.hint
+
+
+def test_a_string_option_also_takes_a_bare_number(_registry: Registry) -> None:
+    """xfade's duration/offset are ffmpeg `<duration>` options, i.e. strings --
+    but an option value is text on the command line either way, and writing
+    `duration => '1'` for a number would be a papercut."""
+    g = _dyn(
+        "SELECT xfade(a.frame, b.frame, duration => 1, offset => 2.5) "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    assert g.nodes["n1"].args == {"duration": 1, "offset": 2.5}
+
+
+def test_a_string_option_rejects_a_boolean(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT xfade(a.frame, b.frame, expr => true) "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "expects a string" in err.message
+
+
+def test_option_rejection_anchors_on_the_value(_registry: Registry) -> None:
+    """A Kwarg's Var name carries no token position, so the anchor is the
+    value literal -- here on line 2, where the option was written."""
+    err = _reject_dyn(
+        "SELECT gblur(a.frame,\n       sigma => 5000)\nFROM input('x.mp4') a", _registry
+    )
+    assert err.line == 2
+
+
+# -- tier-1 named extras ----------------------------------------------------
+
+
+def test_stdlib_named_extra_reaches_the_underlying_filter(_registry: Registry) -> None:
+    """blur's named_target is gblur, so `planes` is validated against gblur's
+    options and merged AFTER the positionally-mapped sigma."""
+    g = _dyn("SELECT blur(a.frame, 5, planes => 1) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].filter == "gblur"
+    assert list(g.nodes["n1"].args.items()) == [("sigma", 5), ("planes", 1)]
+
+
+def test_stdlib_named_extras_keep_their_written_order(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT scale(a.frame, 1280, 720, interl => true, flags => 'lanczos') "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    assert list(g.nodes["n1"].args.items()) == [
+        ("w", 1280),
+        ("h", 720),
+        ("interl", True),
+        ("flags", "lanczos"),
+    ]
+
+
+def test_stdlib_named_extra_is_validated_like_a_dynamic_one(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT blur(a.frame, 5, planes => 99) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "from 0 to 15" in err.message
+
+    err = _reject_dyn("SELECT blur(a.frame, 5, planez => 1) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+    assert "filter 'gblur'" in err.message
+
+
+def test_stdlib_named_extra_cannot_override_the_positional_signature(
+    _registry: Registry,
+) -> None:
+    """`w` is what crop's positional signature maps its width onto (ffmpeg's own
+    long name for it is out_w), so this is a conflict, never a silent override."""
+    err = _reject_dyn(
+        "SELECT crop(a.frame, 0, 0, 10, 10, w => 5) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "already sets 'w'" in err.message
+    assert err.hint is not None and "positionally" in err.hint
+
+
+def test_stdlib_named_transition_merges_into_the_four_arg_crossfade(
+    _registry: Registry,
+) -> None:
+    """The 4-argument crossfade leaves `transition` unset (ffmpeg defaults to
+    fade), so both the named form and the 5-argument positional overload can
+    supply it -- the RFC amendment's own example."""
+    both = "FROM input('x.mp4') a, input('y.mp4') b"
+    g = _dyn(
+        f"SELECT crossfade(a.frame, b.frame, 1, 8, transition => 'wipeleft') {both}",
+        _registry,
+    )
+    assert g.nodes["n1"].args == {"duration": 1, "offset": 8, "transition": "wipeleft"}
+    g = _dyn(f"SELECT crossfade(a.frame, b.frame, 1, 8, 'wipeleft') {both}", _registry)
+    assert g.nodes["n1"].args["transition"] == "wipeleft"
+
+
+def test_stdlib_named_extra_conflicts_with_the_five_arg_crossfade(
+    _registry: Registry,
+) -> None:
+    """When the 5-arg overload sets the transition positionally, a named one
+    on top of it is a genuine conflict."""
+    err = _reject_dyn(
+        "SELECT crossfade(a.frame, b.frame, 1, 8, 'fade', transition => 'wipeleft') "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "already sets 'transition'" in err.message
+
+
+def test_stdlib_named_extra_that_the_signature_leaves_free(_registry: Registry) -> None:
+    """The 4-argument crossfade sets no `expr`, so a named one merges in."""
+    g = _dyn(
+        "SELECT crossfade(a.frame, b.frame, 1, 8, expr => 'A') "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    assert g.nodes["n1"].args["expr"] == "A"
+
+
+def test_a_macro_rejects_named_extras(_registry: Registry) -> None:
+    """blur_regions expands to crop+gblur+overlay, so there is no single filter
+    to set an option on -- rejected whether or not a registry is available."""
+    for registry in (_registry, None):
+        err = _reject_dyn(
+            "SELECT blur_regions(a.frame, 1, 2, 3, 4, 5, planes => 1) FROM input('x.mp4') a",
+            registry,
+        )
+        assert err.code is ErrorCode.UDF_ARG_TYPE
+        assert "more than one ffmpeg filter" in err.message
+
+
+def test_named_extras_on_a_filter_this_ffmpeg_lacks(_registry: Registry) -> None:
+    """subtitles is a stdlib function whose named_target is not in this
+    (fixture) ffmpeg's filter set: typed, not a crash and not a guess."""
+    err = _reject_dyn(
+        "SELECT subtitles(a.frame, 'subs.srt', force_style => 'x') FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "does not provide" in err.message
+
+
+# -- broadcasting is tier-agnostic -----------------------------------------
+
+
+def test_a_dynamic_call_broadcasts_over_an_array(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT aecho(a.audio, in_gain => 0.5) FROM input('x.mp4') a",
+        _registry,
+        {"a": _probe_result(per_audio_tags=[{"language": "eng"}, {"language": "fra"}])},
+    )
+    assert _filters(g) == ["aecho", "aecho"]
+    assert g.nodes["n1"].inputs == ["src:a:a:0"]
+    assert g.nodes["n2"].inputs == ["src:a:a:1"]
+    assert g.nodes["n1"].args == g.nodes["n2"].args == {"in_gain": 0.5}
+    # provenance threads through a single-stream-input dynamic call, exactly
+    # as it does through a stdlib one
+    assert [o.metadata for o in g.outputs] == [{"language": "eng"}, {"language": "fra"}]
+
+
+def test_a_two_pad_dynamic_call_zips_two_arrays(_registry: Registry) -> None:
+    probes = {
+        "a": _probe_result(videos=2, audios=0, video_tags={"language": "eng"}),
+        "b": _probe_result(videos=2, audios=0, video_tags={"language": "eng"}),
+    }
+    g = _dyn(
+        "SELECT xfade(a.video, b.video, duration => 1) "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+        probes,
+    )
+    assert _filters(g) == ["xfade", "xfade"]
+    assert g.nodes["n1"].inputs == ["src:a:v:0", "src:b:v:0"]
+    assert g.nodes["n2"].inputs == ["src:a:v:1", "src:b:v:1"]
+    # both inputs of each pad agree on the language, so the join keeps it
+    assert [o.metadata for o in g.outputs] == [{"language": "eng"}] * 2
+
+
+def test_a_dynamic_call_reports_a_zip_mismatch(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT xfade(a.video, b.video) FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+        {
+            "a": _probe_result(videos=2, audios=0),
+            "b": _probe_result(videos=1, audios=0),
+        },
+    )
+    assert err.code is ErrorCode.BROADCAST_MISMATCH
+
+
+def test_a_dynamic_join_drops_a_disagreeing_tag(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT xfade(a.frame, b.frame) FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+        {
+            "a": _probe_result(video_tags={"language": "eng"}),
+            "b": _probe_result(video_tags={"language": "fra"}),
+        },
+    )
+    assert g.outputs[0].metadata == {}
+
+
+def test_a_dynamic_node_is_split_like_any_other(_registry: Registry) -> None:
+    g = insert_splits(
+        _dyn(
+            "WITH c AS (SELECT gblur(a.frame, sigma => 2) AS f FROM input('x.mp4') a) "
+            "SELECT hstack(c.f, c.f) FROM c",
+            _registry,
+        )
+    )
+    assert [node.filter for node in g.nodes.values()] == ["gblur", "split", "hstack"]
+
+
+# -- no registry at all: no ffmpeg, or --portable ---------------------------
+
+
+def test_without_a_registry_a_filter_name_is_an_unknown_function() -> None:
+    """`deband` is close to no stdlib name, so the hint has room to say WHY the
+    filter set is missing rather than a did-you-mean."""
+    err = _reject_dyn("SELECT deband(a.frame, range => 8) FROM input('x.mp4') a", None)
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None and "ffmpeg on PATH" in err.hint
+
+
+def test_a_close_stdlib_name_still_wins_the_hint() -> None:
+    """gblur is what blur() expands to, so the stdlib suggestion is the useful
+    one even though the reason it did not resolve is the missing filter set."""
+    err = _reject_dyn("SELECT gblur(a.frame, sigma => 5) FROM input('x.mp4') a", None)
+    assert err.hint is not None and "blur()" in err.hint
+
+
+def test_portable_says_so_instead() -> None:
+    err = _reject_dyn(
+        "SELECT deband(a.frame, range => 8) FROM input('x.mp4') a", None, portable=True
+    )
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None and "--portable" in err.hint
+
+
+def test_named_extras_need_an_ffmpeg() -> None:
+    err = _reject_dyn("SELECT blur(a.frame, 5, planes => 1) FROM input('x.mp4') a", None)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "ffmpeg was not found" in err.message
+    assert err.hint is not None and "install ffmpeg" in err.hint
+
+
+def test_portable_rejects_named_extras_the_same_way() -> None:
+    """One rule: named arguments ARE your installed ffmpeg. --portable rejects
+    exactly what a machine without ffmpeg rejects, so a portable query compiles
+    everywhere."""
+    err = _reject_dyn(
+        "SELECT blur(a.frame, 5, planes => 1) FROM input('x.mp4') a", None, portable=True
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "--portable" in err.message
+
+
+def test_portable_leaves_the_stdlib_alone() -> None:
+    g = _dyn("SELECT blur(a.frame, 5) FROM input('x.mp4') a", None, portable=True)
+    assert g.nodes["n1"].args == {"sigma": 5}
+
+
+def test_did_you_mean_spans_both_tiers(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT gblu(a.frame) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None and "gblur()" in err.hint
+
+
+def test_did_you_mean_still_prefers_the_stdlib_list(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT zzzz(a.frame) FROM input('x.mp4') a", _registry)
+    assert err.hint is not None and "blur_regions" in err.hint
+
+
+def test_compile_sql_portable_skips_the_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--portable (plan 032's CLI flag) must not even build a registry: the
+    point is a compile that behaves like a machine with no ffmpeg."""
+    def boom() -> Registry:
+        raise AssertionError("registry.load() must not be called with portable=True")
+
+    monkeypatch.setattr(compiler.registry_module, "load", boom)
+    g = compile_sql("SELECT blur(a.frame, 5) FROM input('x.mp4') a", portable=True)
+    assert g.nodes["n1"].filter == "gblur"
 
 
 # ---------------------------------------------------------------------------
@@ -1840,7 +2536,141 @@ def test_crossfade_of_two_trimmed_segments_compiles(
     assert _filters(g) == ["trim", "setpts", "trim", "setpts", "xfade"]
     xfade = g.nodes["n5"]
     assert xfade.filter == "xfade"
-    assert xfade.args == {"transition": "fade", "duration": 1, "offset": 1}
+    assert xfade.args == {"duration": 1, "offset": 1}
     assert xfade.inputs == ["n2", "n4"]
     assert xfade.outputs == ["video"]
     assert _outputs(g) == [("n5", "video", None)]
+
+
+# ---------------------------------------------------------------------------
+# RFC-003: the same shapes against the REAL installed ffmpeg (plan 031)
+# ---------------------------------------------------------------------------
+#
+# The offline tests above pin the semantics against captured fixtures; these
+# pin the CONTRACT with the actual binary -- that the option tables sqlmpeg
+# introspects really do describe filters ffmpeg then accepts, and that a
+# compiled tier-2 command runs. Expectations here are therefore about what
+# ffmpeg does, never about a specific option list.
+
+
+def _run_compiled(query: str, out_path: Path) -> None:
+    """Compile, emit and RUN a query; the exit code is the assertion."""
+    args = build_ffmpeg_args(emit(compile_sql(query)), str(out_path))
+    args.insert(1, "-y")
+    result = subprocess.run(args, capture_output=True, text=True, timeout=60.0)
+    assert result.returncode == 0, result.stderr
+    assert out_path.exists()
+
+
+@pytest.mark.exec
+def test_a_pure_tier_two_filter_compiles_and_runs(
+    _av_fixture: str, tmp_path: Path
+) -> None:
+    """curves is in no stdlib table: name, pad signature, `preset` and its
+    constants all come from the installed ffmpeg -- and the command runs."""
+    query = (
+        f"SELECT curves(a.frame, preset => 'lighter'), a.audio[1] "
+        f"FROM input('{_av_fixture}') a"
+    )
+    g = compile_sql(query)
+    assert g.nodes["n1"].filter == "curves"
+    assert g.nodes["n1"].args == {"preset": "lighter"}
+    assert "curves=preset=lighter" in emit(g).filter_complex
+    _run_compiled(query, tmp_path / "curves.mp4")
+
+
+@pytest.mark.exec
+def test_two_named_options_on_a_real_filter_run(_av_fixture: str, tmp_path: Path) -> None:
+    query = (
+        f"SELECT unsharp(a.frame, luma_msize_x => 7, luma_amount => 1.5) "
+        f"FROM input('{_av_fixture}') a"
+    )
+    assert compile_sql(query).nodes["n1"].args == {"luma_msize_x": 7, "luma_amount": 1.5}
+    _run_compiled(query, tmp_path / "unsharp.mp4")
+
+
+@pytest.mark.exec
+def test_a_real_boolean_option_renders_as_ffmpeg_wants_it(
+    _av_fixture: str, tmp_path: Path
+) -> None:
+    """deband's `blur` is a real <boolean> AVOption; SQL writes true/false and
+    emit renders 1/0, which is what ffmpeg parses."""
+    query = f"SELECT deband(a.frame, blur => false) FROM input('{_av_fixture}') a"
+    assert "deband=blur=0" in emit(compile_sql(query)).filter_complex
+    _run_compiled(query, tmp_path / "deband.mp4")
+
+
+@pytest.mark.exec
+def test_the_real_gblur_range_comes_from_ffmpeg(_av_fixture: str) -> None:
+    err = _reject(f"SELECT gblur(a.frame, sigma => 5000) FROM input('{_av_fixture}') a")
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "0 to 1024" in err.message
+
+
+@pytest.mark.exec
+def test_the_real_xfade_transition_constants_are_enforced(
+    _av2_fixture: str, _av3_fixture: str, tmp_path: Path
+) -> None:
+    """xfade as a DYNAMIC call (the stdlib name is crossfade): its transition
+    is an ffmpeg enum, so a constant name is checked against the real list."""
+    both = f"FROM input('{_av2_fixture}') a, input('{_av3_fixture}') b"
+    err = _reject(f"SELECT xfade(a.frame, b.frame, transition => 'sideways') {both}")
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "wipeleft" in err.message
+
+    query = (
+        f"SELECT xfade(a.frame, b.frame, transition => 'wipeleft', "
+        f"duration => 1, offset => 1) {both}"
+    )
+    assert compile_sql(query).nodes["n1"].args == {
+        "transition": "wipeleft",
+        "duration": 1,
+        "offset": 1,
+    }
+    _run_compiled(query, tmp_path / "xfade.mp4")
+
+
+@pytest.mark.exec
+def test_a_real_unknown_option_lists_the_real_ones(_av_fixture: str) -> None:
+    err = _reject(f"SELECT gblur(a.frame, sigmma => 5) FROM input('{_av_fixture}') a")
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+    assert err.hint is not None and "sigma" in err.hint
+
+
+@pytest.mark.exec
+def test_a_tier_one_named_extra_runs(_av_fixture: str, tmp_path: Path) -> None:
+    """blur() reaches through to gblur's full option set: `planes` is not in any
+    sqlmpeg table, it was read out of this ffmpeg."""
+    query = f"SELECT blur(a.frame, 5, planes => 1) FROM input('{_av_fixture}') a"
+    assert compile_sql(query).nodes["n1"].args == {"sigma": 5, "planes": 1}
+    _run_compiled(query, tmp_path / "blur-planes.mp4")
+
+
+@pytest.mark.exec
+def test_a_tier_two_audio_filter_broadcasts_over_real_tracks(
+    _av2_fixture: str, tmp_path: Path
+) -> None:
+    """The broadcast machinery is type-driven, so a dynamic audio filter
+    expands over every language track exactly as reverb() does -- tags and
+    all -- and the result runs."""
+    query = (
+        f"SELECT a.video[1], aecho(a.audio, in_gain => 0.5) "
+        f"FROM input('{_av2_fixture}') a"
+    )
+    g = compile_sql(query)
+    assert _filters(g) == ["aecho", "aecho"]
+    assert g.nodes["n1"].inputs == ["src:a:a:0"]
+    assert g.nodes["n2"].inputs == ["src:a:a:1"]
+    assert [o.metadata for o in g.outputs] == [
+        {},
+        {"language": "eng"},
+        {"language": "fra"},
+    ]
+    _run_compiled(query, tmp_path / "aecho.mkv")
+
+
+@pytest.mark.exec
+def test_did_you_mean_reaches_into_the_real_filter_set(_av_fixture: str) -> None:
+    err = _reject(f"SELECT gblu(a.frame) FROM input('{_av_fixture}') a")
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None and "gblur()" in err.hint

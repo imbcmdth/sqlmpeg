@@ -305,13 +305,12 @@ def _expand_crossfade(ctx: ExpandCtx, args: list[object]) -> FrameRef:
     a = _as_stream(args[0])
     b = _as_stream(args[1])
     dur, offset = args[2], args[3]
-    transition = args[4] if len(args) == 5 else "fade"
-    return ctx.node(
-        "xfade",
-        {"transition": transition, "duration": dur, "offset": offset},
-        [a, b],
-        ["video"],
-    )
+    # The 4-arg form sets no transition (ffmpeg's own default is "fade"), so a
+    # trailing `transition => '...'` named extra stays mergeable (RFC-003).
+    node_args: dict[str, object] = {"duration": dur, "offset": offset}
+    if len(args) == 5:
+        node_args = {"transition": args[4], **node_args}
+    return ctx.node("xfade", node_args, [a, b], ["video"])
 
 
 def _expand_subtitles(ctx: ExpandCtx, args: list[object]) -> FrameRef:

@@ -30,6 +30,10 @@ class ErrorCode(str, Enum):
     # option not in sqlmpeg.sink.SINK_OPTIONS
     SINK_OPTION_TYPE = "SINK_OPTION_TYPE"  # COPY ... WITH (...) option value
     # doesn't match its declared type (str/int/bool)
+    UNKNOWN_FILTER_OPTION = "UNKNOWN_FILTER_OPTION"  # a `name => value` argument
+    # names an option the ffmpeg filter it targets does not have (RFC-003)
+    FILTER_OPTION_TYPE = "FILTER_OPTION_TYPE"  # a `name => value` argument's value
+    # does not match the option's introspected type, range or constant set
     INTERNAL = "INTERNAL"  # bug backstop; fuzz asserts this never fires
 
 

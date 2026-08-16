@@ -622,7 +622,9 @@ def test_crossfade_default_transition() -> None:
     assert len(ctx.nodes) == 1
     node_id, filt, args, inputs, outputs = ctx.nodes[0]
     assert filt == "xfade"
-    assert args == {"transition": "fade", "duration": 1.0, "offset": 5.0}
+    # No transition key in the 4-arg form: ffmpeg defaults to "fade", and
+    # leaving it unset keeps `transition => '...'` named extras mergeable.
+    assert args == {"duration": 1.0, "offset": 5.0}
     assert inputs == ["src:a", "src:b"]
     assert outputs == ["video"]
     assert out == node_id

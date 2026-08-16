@@ -73,8 +73,15 @@ FROM input('x.mp4') a
 {"line": 1, "col": 8, "code": "UNKNOWN_FUNCTION", "message": "unknown function sharpen()", "hint": "known functions: afade_in, afade_out, amix, atempo, blur, blur_regions, crop, draw_box, fade_in, fade_out, hflip, overlay, reverb, scale, speed, text, vflip, volume"}
 ```
 
-The hint is a plain alphabetical listing of all known function names, not a
-fuzzy "did you mean" match against the misspelled name.
+The hint is a "did you mean" match when the name is close to a known one, and
+otherwise a plain alphabetical listing of the stdlib.
+
+Since RFC-003 the lookup spans BOTH tiers: the stdlib first, then every filter
+the installed ffmpeg reports (`sqlmpeg/registry.py`), so this code means "no
+stdlib function and no filter of this ffmpeg" and the did-you-mean can suggest
+a filter name (`gblu` -> `gblur`). Where there is no ffmpeg to ask -- or
+`--portable` was passed -- the listing hint says so, because the same query
+might well compile elsewhere.
 
 ## UNKNOWN_ALIAS
 
@@ -200,6 +207,13 @@ statements, unsupported clause keys, `SELECT *`, explicit `JOIN` syntax
 RECURSIVE`, malformed or duplicate CTE/alias names, an empty `WHERE`
 clause, a non-positive or non-literal array subscript, or a top-level
 statement that isn't a `SELECT`/`UNION ALL`.
+
+Two RFC-003 rejections also land here: a named argument written out of place
+(a positional argument after a named one, or the same name twice), and a
+named argument when there is no ffmpeg to validate it against -- because it
+was not found, or because `--portable` deliberately turned the introspection
+off. The rule is one line: named arguments ARE your installed ffmpeg, so a
+query that compiles portably compiles everywhere.
 
 **Fires when:** (one example among many) the query selects `*` instead of
 explicit stream expressions.
@@ -354,6 +368,68 @@ COPY (
 ```json
 {"line": 5, "col": 7, "code": "SINK_OPTION_TYPE", "message": "option 'crf' expects an int, got 'high'", "hint": "crf takes a bare integer literal, e.g. crf 20"}
 ```
+
+## UNKNOWN_FILTER_OPTION
+
+**Meaning:** A named argument (`<name> => <value>`, RFC-003) names an option
+the ffmpeg filter it targets does not have. The option set is read out of the
+installed ffmpeg (`ffmpeg -help filter=<name>`, see `sqlmpeg/registry.py`),
+so it is exactly what that binary supports -- not a table in sqlmpeg.
+
+**Fires when:** the option name is misspelled or belongs to a different
+filter -- either on a dynamically-resolved call (`gblur(a.frame, sigmma =>
+5)`) or on a stdlib call's trailing named extras, which are checked against
+the filter that spec expands to (`blur` -> `gblur`).
+
+**Example query:**
+
+```sql
+SELECT gblur(a.frame, sigmma => 5)
+FROM input('x.mp4') a
+```
+
+**Error JSON** (against ffmpeg 7.1; the option list is that binary's):
+
+```json
+{"line": 1, "col": 33, "code": "UNKNOWN_FILTER_OPTION", "message": "filter 'gblur' has no option 'sigmma'", "hint": "did you mean sigma => ...?"}
+```
+
+The anchor lands on the option's VALUE: sqlglot records no token position on
+the `exp.Var` holding a named argument's name (the same gap `COPY ... WITH`
+option names have), so `line`/`col` point at the `5`.
+
+Machine-dependence is the point of this code -- a query using it compiles
+only where that ffmpeg does. See `UNSUPPORTED_SQL` for what happens when
+there is no ffmpeg to check against at all.
+
+## FILTER_OPTION_TYPE
+
+**Meaning:** A named argument's value does not match the option's
+introspected type, declared range, or set of named constants.
+
+**Fires when:** a numeric option gets a string or a number outside
+`(from A to B)`, a boolean option gets anything but `true`/`false`, an enum
+option gets something that is not one of its constants (or gets a bare
+number instead of a quoted constant name), or the option's ffmpeg type is
+one sqlmpeg cannot set at all (`binary`, `dictionary`).
+
+**Example query:**
+
+```sql
+SELECT gblur(a.frame, sigma => 5000)
+FROM input('x.mp4') a
+```
+
+**Error JSON** (against ffmpeg 7.1; the range is that binary's):
+
+```json
+{"line": 1, "col": 32, "code": "FILTER_OPTION_TYPE", "message": "option 'sigma' of filter 'gblur' accepts a number from 0 to 1024, got 5000", "hint": "pick a value from 0 to 1024"}
+```
+
+Enum options quote their constant name (`transition => 'wipeleft'`), and the
+message lists the constants (truncated with a count when there are many --
+`xfade`'s `transition` has 59). Anchoring is the same as
+`UNKNOWN_FILTER_OPTION`'s: the value, not the name.
 
 ## INTERNAL
 

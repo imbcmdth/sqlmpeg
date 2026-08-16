@@ -31,6 +31,37 @@ What lowering does, in order:
   ``stdlib.FUNCTIONS[name].variants`` (kinds are ``video``/``audio``/``num``/
   ``str``) and then delegates node creation to the spec's ``expand``
   (guardrail #4: no per-function lowering logic lives here).
+
+Two function tiers (RFC-003)
+----------------------------
+A call name resolves against the stdlib FIRST and against the ``registry`` —
+the filter set of the ffmpeg on PATH — only if the stdlib does not have it, so
+tier 1 wins every collision (``scale``, ``crop`` and ``overlay`` are both
+stdlib functions and real ffmpeg filters, and the stdlib's argument order is
+the documented one). Tier 2 is deliberately machine-dependent: what compiles
+depends on what that ffmpeg reports, and a None registry (no ffmpeg, or
+``--portable``) means the whole tier is simply absent — an unknown name, not
+an INTERNAL error.
+
+* A tier-2 call takes its STREAM INPUTS positionally, count and types straight
+  from the pad signature (``gblur`` is ``V->V``, ``xfade`` is ``VV->V``), and
+  every option by name (``sigma => 5``). Its node is an ordinary
+  :class:`~sqlmpeg.ir.Node`, so split, emit and the goldens neither know nor
+  care that it came from introspection.
+* A tier-1 call may ALSO carry trailing named arguments, validated against
+  ``FuncSpec.named_target``'s options (``blur`` -> ``gblur``) and merged into
+  the single node its expansion produced, after the positionally-mapped args
+  and in written order. A macro spec (``named_target`` None: ``blur_regions``)
+  has no single target and rejects them.
+* Both use the same two codes — ``UNKNOWN_FILTER_OPTION`` (did-you-mean over
+  that filter's REAL options) and ``FILTER_OPTION_TYPE`` (the introspected
+  type, plus the range or the constant list) — and the same rule: named
+  arguments are your installed ffmpeg, so without one they are rejected rather
+  than guessed at.
+* Broadcasting and zipping are type-driven and tier-agnostic: they run off the
+  stream-argument POSITIONS, which come from a stdlib variant or from a pad
+  signature, so ``volume(a.audio, 0.5)`` and ``anlmdn(a.audio, s => 0.01)``
+  expand identically.
 * A UNION ALL (top level or inside a CTE) lowers each branch and joins them
   with one ``concat`` node. Branch column counts, types and order must match
   exactly (``CONCAT_MISMATCH``); concat inputs interleave per ffmpeg's segment
@@ -85,6 +116,17 @@ sqlglot notes that matter here
 * ``exp.Literal.to_py()`` returns ``decimal.Decimal`` for non-integer numbers,
   which neither ``emit`` nor JSON can render, so numeric literals are coerced
   to ``int``/``float`` here. ``-1.5`` parses as ``exp.Neg(Literal)``.
+* A named argument is an ``exp.Kwarg(this=Var(name), expression=value)``. The
+  ``Var`` carries NO token position (the same gap sink option names have), so
+  every rejection about one anchors on the VALUE — a literal, which does have a
+  position — and falls back to the call itself for a ``Boolean`` value, which
+  does not.
+* Postgres has a builtin ``OVERLAY(x PLACING y FROM n FOR m)``, and sqlglot
+  parses ``overlay(...)`` with that grammar: a ``=>`` inside it is a PARSE_ERROR
+  before lowering ever sees the call, so ``overlay`` is the one stdlib function
+  whose named extras are unreachable. Its underlying filter is reachable as a
+  tier-2 ``overlay`` call only if the stdlib entry is not shadowing it — which
+  it is. (Both facts are surface-level sqlglot behavior, not a lowering rule.)
 * A COPY option value (``WITH (crf 20)``) is NOT always a ``Literal``: ``true``
   / ``false`` arrive as ``exp.Boolean``, a bare word as ``exp.Var``, a
   double-quoted word as ``exp.Identifier``, ``NULL`` as ``exp.Null``.
@@ -96,18 +138,19 @@ sqlglot notes that matter here
 from __future__ import annotations
 
 import difflib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from sqlglot import exp
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.ir import FrameRef, Graph, Node, Output, Sink, StreamType
-from sqlmpeg.parser import RawSink, Resolved, _pos, subscript_index, union_branches
+from sqlmpeg.parser import RawSink, Resolved, _pos, kwarg_name, subscript_index, union_branches
 from sqlmpeg.parser import _ident_name as _fold
 from sqlmpeg.probe import ProbeResult, StreamMeta
+from sqlmpeg.registry import DynamicFilter, FilterOption, Registry
 from sqlmpeg.sink import validate_option
-from sqlmpeg.stdlib import FUNCTIONS, ExpandCtx, Param, signatures
+from sqlmpeg.stdlib import FUNCTIONS, ExpandCtx, FuncSpec, Param, signatures
 
 __all__ = ["lower"]
 
@@ -136,6 +179,22 @@ _ZIP_HINT = (
     "broadcast arrays zip elementwise, one output per element; "
     "subscript one of them to pair a single stream with the other, e.g. a.audio[1]"
 )
+_MACRO_HINT = (
+    "call the underlying ffmpeg filters directly instead; each of those takes "
+    "named options"
+)
+_NO_REGISTRY_HINT = (
+    "install ffmpeg (or put it on PATH) to use named arguments; a stdlib call "
+    "with positional arguments only compiles anywhere"
+)
+_PORTABLE_HINT = (
+    "--portable keeps a query machine-independent: drop the named arguments, or "
+    "compile without --portable"
+)
+
+# Longest option/constant list a hint or message renders before it stops
+# counting (xfade's `transition` alone has 59 constants).
+_MAX_LISTED = 12
 
 
 # ---------------------------------------------------------------------------
@@ -214,35 +273,83 @@ def _flatten_and(node: exp.Expr | None) -> list[exp.Expr]:
     return out
 
 
-def _call_parts(node: exp.Expr) -> tuple[str, list[exp.Expr]] | None:
-    """``(name, positional args)`` if `node` is a function call, else None.
+@dataclass(frozen=True)
+class _NamedArg:
+    """One ``name => value`` call argument (RFC-003).
+
+    `name` is verbatim (ffmpeg AVOption names are case-sensitive) and `value` is
+    the raw sqlglot node — the option table this is checked against comes from
+    the installed ffmpeg, so nothing is interpreted before the registry says
+    what the option's type is.
+    """
+
+    name: str
+    value: exp.Expr
+
+
+@dataclass(frozen=True)
+class _Call:
+    """A function call as lowering sees it: a name, positional args, named args."""
+
+    name: str
+    args: list[exp.Expr]
+    named: list[_NamedArg]
+
+
+def _call_parts(node: exp.Expr) -> _Call | None:
+    """The call `node` is, else None.
 
     ``exp.Overlay`` is normalized back to the four positional arguments the
     SQL surface uses; sqlglot parks them under named keys because Postgres
-    spells the builtin ``OVERLAY(x PLACING y FROM n FOR m)``.
+    spells the builtin ``OVERLAY(x PLACING y FROM n FOR m)``. (That builtin
+    grammar also means ``overlay(...)`` is the one stdlib call that cannot
+    take named arguments: sqlglot rejects ``=>`` inside it at PARSE time.)
+
+    Named arguments arrive as ``exp.Kwarg`` among the positional ones and are
+    split out here. Their TRAILING position is enforced by resolve; the check
+    is repeated defensively because a Kwarg among positional args would
+    otherwise silently shift every parameter after it.
     """
     if isinstance(node, exp.Overlay):
-        named = [
+        parts = [
             node.this,
             node.args.get("expression"),
             node.args.get("from_"),
             node.args.get("for_"),
         ]
-        return "overlay", [arg for arg in named if isinstance(arg, exp.Expr)]
+        return _Call("overlay", [arg for arg in parts if isinstance(arg, exp.Expr)], [])
     if isinstance(node, exp.Anonymous):
-        return str(node.this), [arg for arg in node.expressions if isinstance(arg, exp.Expr)]
+        return _split_args(str(node.this), node)
     if isinstance(node, exp.Func):
-        name = node.sql_name().lower()
-        args = [arg for arg in node.expressions if isinstance(arg, exp.Expr)]
-        return name, args
+        return _split_args(node.sql_name().lower(), node)
     return None
 
 
-def _unknown_function_hint(name: str) -> str:
-    matches = difflib.get_close_matches(name, sorted(FUNCTIONS), n=1, cutoff=0.6)
-    if matches:
-        return f"did you mean {matches[0]}()?"
-    return "known functions: " + ", ".join(sorted(FUNCTIONS))
+def _split_args(name: str, call: exp.Expr) -> _Call:
+    positional: list[exp.Expr] = []
+    named: list[_NamedArg] = []
+    for arg in call.expressions:
+        if not isinstance(arg, exp.Expr):
+            continue
+        if isinstance(arg, exp.Kwarg):
+            value = arg.args.get("expression")
+            if not isinstance(value, exp.Expr):  # resolve already rejected this
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"named argument '{kwarg_name(arg)}' has no value",
+                    arg,
+                )
+            named.append(_NamedArg(name=kwarg_name(arg), value=value))
+            continue
+        if named:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "positional arguments must come before named arguments",
+                arg,
+                fallback=call,
+            )
+        positional.append(arg)
+    return _Call(name, positional, named)
 
 
 # ---------------------------------------------------------------------------
@@ -461,9 +568,17 @@ class _NodeFactory:
 
 
 class _Lowerer:
-    def __init__(self, res: Resolved, probes: dict[str, ProbeResult | None]) -> None:
+    def __init__(
+        self,
+        res: Resolved,
+        probes: dict[str, ProbeResult | None],
+        registry: Registry | None,
+        portable: bool,
+    ) -> None:
         self.res = res
         self.probes = probes
+        self.registry = registry
+        self.portable = portable
         self.graph = Graph(input_paths=list(res.input_paths), sources=dict(res.sources))
         # Annotated as the protocol so mypy checks the structural match.
         self.ctx: ExpandCtx = _NodeFactory(self.graph)
@@ -819,9 +934,9 @@ class _Lowerer:
                 fallback=select,
                 hint="a stream has exactly one type",
             )
-        parts = _call_parts(node)
-        if parts is not None:
-            return self._lower_call(node, parts, env, select)
+        call = _call_parts(node)
+        if call is not None:
+            return self._lower_call(node, call, env, select)
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             "every SELECT column must be a stream expression, got "
@@ -1104,25 +1219,42 @@ class _Lowerer:
     # -- calls -------------------------------------------------------------
 
     def _lower_call(
+        self, node: exp.Expr, call: _Call, env: _Env, select: exp.Select
+    ) -> _Value:
+        """Resolve a call against tier 1, then tier 2 (RFC-003).
+
+        The stdlib ALWAYS wins a name collision (``scale``, ``crop``, ``overlay``
+        are both stdlib functions and real ffmpeg filters): tier 1 is the
+        portable, documented-forever surface, tier 2 is whatever the installed
+        ffmpeg happens to provide.
+        """
+        name = call.name.lower()
+        spec = FUNCTIONS.get(name)
+        if spec is not None:
+            return self._lower_stdlib_call(node, name, spec, call, env, select)
+        dynamic = self.registry.get(name) if self.registry is not None else None
+        if dynamic is None:
+            raise _error(
+                ErrorCode.UNKNOWN_FUNCTION,
+                f"unknown function {call.name}()",
+                node,
+                fallback=select,
+                hint=self._unknown_function_hint(name),
+            )
+        return self._lower_dynamic_call(node, name, dynamic, call, env, select)
+
+    # -- tier 1: the curated stdlib, plus trailing named extras ------------
+
+    def _lower_stdlib_call(
         self,
         node: exp.Expr,
-        parts: tuple[str, list[exp.Expr]],
+        name: str,
+        spec: FuncSpec,
+        call: _Call,
         env: _Env,
         select: exp.Select,
     ) -> _Value:
-        raw_name, arg_nodes = parts
-        name = raw_name.lower()
-        spec = FUNCTIONS.get(name)
-        if spec is None:
-            raise _error(
-                ErrorCode.UNKNOWN_FUNCTION,
-                f"unknown function {raw_name}()",
-                node,
-                fallback=select,
-                hint=_unknown_function_hint(name),
-            )
-
-        kinds = [self._classify(arg, env, select) for arg in arg_nodes]
+        kinds = [self._classify(arg, env, select) for arg in call.args]
         variant = _match_variant(spec.variants, kinds)
         if variant is None:
             got = ", ".join(kinds)
@@ -1133,11 +1265,166 @@ class _Lowerer:
                 fallback=select,
                 hint=_ARG_HINT,
             )
+        target = self._named_extras_target(name, spec, call, node)
+        streams, literals = self._lower_arguments(variant, call.args, env, select)
 
-        # Every argument is lowered exactly ONCE — a stream argument used by
-        # several elements is one subgraph fanned out by the split pass, not a
-        # copy per element — and only then does the CALL broadcast over the
-        # arrays among them.
+        # The extras are validated ONCE, against the arg keys the expansion
+        # produced — which is only known after expanding — and then merged into
+        # every element's node, so a broadcast call sets them on each one.
+        checked: dict[str, object] = {}
+        validated = False
+
+        def build(values: list[object]) -> FrameRef:
+            nonlocal checked, validated
+            ref = spec.expand(self.ctx, values)
+            if target is None:
+                return ref
+            filter_name, options = target
+            produced = self._expanded_node(name, filter_name, ref, node, select)
+            if not validated:
+                checked = self._check_named_args(
+                    filter_name,
+                    options,
+                    call.named,
+                    node,
+                    owner=name,
+                    occupied=set(produced.args),
+                )
+                validated = True
+            produced.args.update(checked)
+            return ref
+
+        return self._expand_call(
+            name,
+            node,
+            call.args,
+            select,
+            streams=streams,
+            literals=literals,
+            arity=len(variant),
+            positions=_stream_positions(variant),
+            returns=spec.returns,
+            build=build,
+        )
+
+    def _named_extras_target(
+        self, name: str, spec: FuncSpec, call: _Call, node: exp.Expr
+    ) -> tuple[str, dict[str, FilterOption]] | None:
+        """``(filter, its options)`` the trailing named args of a stdlib call target.
+
+        None when the call has no named args at all. A spec whose
+        ``named_target`` is None is a MACRO over several filters (only
+        ``blur_regions`` today), so there is no single option set to reach
+        through to and the named args are rejected outright.
+        """
+        if not call.named:
+            return None
+        anchor = call.named[0].value
+        if spec.named_target is None:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{name}() expands to more than one ffmpeg filter, so its named "
+                f"argument '{call.named[0].name}' has no single filter to set it on",
+                anchor,
+                fallback=node,
+                hint=_MACRO_HINT,
+            )
+        return spec.named_target, self._filter_options(spec.named_target, anchor, node)
+
+    def _expanded_node(
+        self, name: str, filter_name: str, ref: FrameRef, node: exp.Expr, select: exp.Select
+    ) -> Node:
+        """The single node a ``named_target`` spec's expansion produced.
+
+        Invariant (stdlib.FuncSpec): a spec that names a ``named_target`` is
+        single-filter by construction, so the ref its expand returned is that
+        node's id and its filter is the target. A spec that breaks the invariant
+        is a bug in the table, not in the query — hence INTERNAL.
+        """
+        produced = self.graph.nodes.get(ref)
+        if produced is None or produced.filter != filter_name:
+            raise _error(
+                ErrorCode.INTERNAL,
+                f"{name}() declares named_target '{filter_name}' but its expansion "
+                "did not produce exactly that one filter",
+                node,
+                fallback=select,
+                hint="please report this query as a bug",
+            )
+        return produced
+
+    # -- tier 2: any filter the installed ffmpeg reports -------------------
+
+    def _lower_dynamic_call(
+        self,
+        node: exp.Expr,
+        name: str,
+        dynamic: DynamicFilter,
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Value:
+        """A call resolved from the registry: streams positionally, options named.
+
+        The pad signature IS the signature: ``gblur`` (``V->V``) takes exactly
+        one video argument, ``xfade`` (``VV->V``) exactly two. Everything else
+        about the call — every option — is named, because ffmpeg option order is
+        not a thing users should have to know.
+        """
+        kinds = [self._classify(arg, env, select) for arg in call.args]
+        expected = list(dynamic.inputs)
+        if kinds != expected:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{name}() is an ffmpeg filter: it expects "
+                f"{name}({', '.join(expected)}), got {name}({', '.join(kinds)})",
+                node,
+                fallback=select,
+                hint=f"only stream inputs are positional for a dynamic filter; pass "
+                f"options by name, e.g. {name}({', '.join(expected)}, <option> => <value>)",
+            )
+        options = self._filter_options(name, node, select) if call.named else {}
+        args = self._check_named_args(
+            name, options, call.named, node, owner=name, occupied=set()
+        )
+        streams = {
+            position: self._lower_expr(arg, env, select)
+            for position, arg in enumerate(call.args)
+        }
+        output = dynamic.output
+
+        def build(values: list[object]) -> FrameRef:
+            return self.ctx.node(
+                name, dict(args), [_as_ref(value) for value in values], [output]
+            )
+
+        return self._expand_call(
+            name,
+            node,
+            call.args,
+            select,
+            streams=streams,
+            literals={},
+            arity=len(expected),
+            positions=list(range(len(expected))),
+            returns=output,
+            build=build,
+        )
+
+    # -- shared call machinery --------------------------------------------
+
+    def _lower_arguments(
+        self,
+        variant: tuple[Param, ...],
+        arg_nodes: list[exp.Expr],
+        env: _Env,
+        select: exp.Select,
+    ) -> tuple[dict[int, _Value], dict[int, object]]:
+        """Lower each argument ONCE, into ``(streams, literals)`` by position.
+
+        A stream argument used by several broadcast elements is one subgraph
+        fanned out by the split pass, not a copy per element.
+        """
         streams: dict[int, _Value] = {}
         literals: dict[int, object] = {}
         for position, (param, arg) in enumerate(zip(variant, arg_nodes)):
@@ -1147,34 +1434,166 @@ class _Lowerer:
                 literals[position] = _number(arg)
             else:
                 literals[position] = _string(arg)
+        return streams, literals
 
+    def _expand_call(
+        self,
+        name: str,
+        node: exp.Expr,
+        arg_nodes: list[exp.Expr],
+        select: exp.Select,
+        *,
+        streams: dict[int, _Value],
+        literals: dict[int, object],
+        arity: int,
+        positions: list[int],
+        returns: StreamType,
+        build: Callable[[list[object]], FrameRef],
+    ) -> _Value:
+        """Broadcast `build` over the array arguments, if there are any.
+
+        Type-driven and tier-agnostic: `positions` is where the stream
+        arguments are (from a stdlib variant, or from a dynamic filter's pad
+        signature) and `build` is what turns one element's argument values into
+        a subgraph.
+        """
         length = self._zip_length(name, node, arg_nodes, streams, select)
-        positions = _stream_positions(variant)
         expanded: list[_Stream] = []
         for element in range(1 if length is None else length):
             values: list[object] = [
                 streams[position].at(element).ref
                 if position in streams
                 else literals[position]
-                for position in range(len(variant))
+                for position in range(arity)
             ]
             # A single-stream-input function is 1:1, so its result inherits
             # that one input's provenance unconditionally. A call over two or
-            # more streams (amix, overlay) is a join like concat's: it threads
-            # provenance only when every input stream agrees (_agreed_source)
-            # -- mixing two English tracks yields an English track.
+            # more streams (amix, overlay, xfade) is a join like concat's: it
+            # threads provenance only when every input stream agrees
+            # (_agreed_source) -- mixing two English tracks yields an English
+            # track.
             if len(positions) == 1:
                 source = streams[positions[0]].at(element).source
             elif len(positions) >= 2:
                 source = _agreed_source([streams[p].at(element) for p in positions])
             else:
                 source = None
-            expanded.append(
-                _Stream(ref=spec.expand(self.ctx, values), type=spec.returns, source=source)
-            )
+            expanded.append(_Stream(ref=build(values), type=returns, source=source))
         if length is None:
             return _scalar(expanded[0])
-        return _array(spec.returns, expanded)
+        return _array(returns, expanded)
+
+    # -- named argument validation (RFC-003, both tiers) -------------------
+
+    def _filter_options(
+        self, filter_name: str, anchor: exp.Expr, fallback: exp.Expr
+    ) -> dict[str, FilterOption]:
+        """The introspected options of `filter_name`, or a typed rejection.
+
+        One rule, stated the same way everywhere: named arguments ARE the
+        installed ffmpeg. Without a registry — no ffmpeg, or ``--portable`` —
+        there is nothing to validate them against, and guessing is exactly what
+        this compiler does not do.
+
+        ``Registry.options`` returns None only for a filter this ffmpeg does not
+        have (or that the v1 scope fence excluded); an empty dict is a real
+        answer (a filter with no options) and is passed through as one.
+        """
+        if self.registry is None:
+            if self.portable:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "named arguments are validated against your installed ffmpeg, "
+                    "and --portable turns that off",
+                    anchor,
+                    fallback=fallback,
+                    hint=_PORTABLE_HINT,
+                )
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "named arguments are validated against your installed ffmpeg; "
+                "ffmpeg was not found",
+                anchor,
+                fallback=fallback,
+                hint=_NO_REGISTRY_HINT,
+            )
+        options = self.registry.options(filter_name)
+        if options is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"named arguments are validated against the ffmpeg filter "
+                f"'{filter_name}', which your ffmpeg does not provide",
+                anchor,
+                fallback=fallback,
+                hint="drop the named arguments, or install an ffmpeg that has "
+                f"the '{filter_name}' filter",
+            )
+        return options
+
+    def _check_named_args(
+        self,
+        filter_name: str,
+        options: dict[str, FilterOption],
+        named: list[_NamedArg],
+        call: exp.Expr,
+        *,
+        owner: str,
+        occupied: set[str],
+    ) -> dict[str, object]:
+        """Validate every named argument against `options`, in written order.
+
+        `occupied` holds the arg keys a stdlib call's expansion already set —
+        both the ones mapped from its positional arguments (``crop``'s ``w``)
+        and the constants the spec hardcodes (``crossfade``'s default
+        ``transition``, ``scale(f, 0.5)``'s ``h=-2``). A named argument that
+        collides with one is rejected rather than silently overriding it
+        (RFC-003), and the overload that takes it positionally, if there is one,
+        is the way to set it.
+
+        The collision check comes FIRST so that ``crop(f, 0, 0, 10, 10, w => 5)``
+        reads as the conflict it is — ffmpeg's own name for that option is
+        ``out_w``, so a registry check would otherwise call ``w`` unknown.
+        """
+        checked: dict[str, object] = {}
+        for arg in named:
+            if arg.name in occupied:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{owner}() already sets '{arg.name}' on the "
+                    f"'{filter_name}' filter it expands to",
+                    arg.value,
+                    fallback=call,
+                    hint="a named argument never overrides what the call itself "
+                    "set; drop it, or use the overload that takes it positionally",
+                )
+            option = options.get(arg.name)
+            if option is None:
+                raise _error(
+                    ErrorCode.UNKNOWN_FILTER_OPTION,
+                    f"filter '{filter_name}' has no option '{arg.name}'",
+                    arg.value,
+                    fallback=call,
+                    hint=_option_hint(arg.name, options),
+                )
+            checked[arg.name] = _option_value(filter_name, option, arg, call)
+        return checked
+
+    def _unknown_function_hint(self, name: str) -> str:
+        """Did-you-mean across BOTH tiers, then why tier 2 might be missing."""
+        candidates = set(FUNCTIONS)
+        registry = self.registry
+        dynamic = registry is not None and registry.available()
+        if registry is not None and dynamic:
+            candidates |= set(registry.names())
+        matches = difflib.get_close_matches(name, sorted(candidates), n=1, cutoff=0.6)
+        if matches:
+            return f"did you mean {matches[0]}()?"
+        known = "known functions: " + ", ".join(sorted(FUNCTIONS))
+        if self.portable:
+            return f"{known} (dynamic ffmpeg filters are disabled by --portable)"
+        if not dynamic:
+            return f"{known} (dynamic ffmpeg filters need ffmpeg on PATH)"
+        return known
 
     def _zip_length(
         self,
@@ -1216,7 +1635,9 @@ class _Lowerer:
         Stream arguments resolve to ``video``/``audio`` without creating any
         node, so a mismatch is reported before the graph grows. Nested calls
         to unknown functions are reported here rather than being labelled a
-        stream and swallowed by an outer arity error.
+        stream and swallowed by an outer arity error. A nested call resolves
+        across BOTH tiers, so ``scale(gblur(a.frame, sigma => 2), 0.5)`` sees
+        the inner call's output pad type.
         """
         node = _unwrap(node)
         if isinstance(node, exp.Literal):
@@ -1231,19 +1652,22 @@ class _Lowerer:
             return self._base_stream(node, env, select)[1].type
         if isinstance(node, exp.Cast):
             return _EXPR_KIND
-        parts = _call_parts(node)
-        if parts is not None:
-            name = parts[0].lower()
+        call = _call_parts(node)
+        if call is not None:
+            name = call.name.lower()
             spec = FUNCTIONS.get(name)
-            if spec is None:
+            if spec is not None:
+                return spec.returns
+            dynamic = self.registry.get(name) if self.registry is not None else None
+            if dynamic is None:
                 raise _error(
                     ErrorCode.UNKNOWN_FUNCTION,
-                    f"unknown function {parts[0]}()",
+                    f"unknown function {call.name}()",
                     node,
                     fallback=select,
-                    hint=_unknown_function_hint(name),
+                    hint=self._unknown_function_hint(name),
                 )
-            return spec.returns
+            return dynamic.output
         return _EXPR_KIND
 
 
@@ -1333,6 +1757,197 @@ def _is_single_video_column(binding: _CteBinding) -> bool:
     return value.type == "video" and not value.is_array
 
 
+def _as_ref(value: object) -> FrameRef:
+    """A lowered argument value as a stream ref (dynamic calls take only those)."""
+    if not isinstance(value, str):  # pragma: no cover -- structurally impossible
+        raise SqlmpegError(
+            ErrorCode.INTERNAL,
+            "a dynamic filter argument lowered to something that is not a stream",
+            line=1,
+            col=1,
+            hint="please report this query as a bug",
+        )
+    return value
+
+
+def _listed(names: Iterable[str]) -> str:
+    """Comma-list at most ``_MAX_LISTED`` names, then count the rest."""
+    items = list(names)
+    if len(items) <= _MAX_LISTED:
+        return ", ".join(items)
+    rest = len(items) - _MAX_LISTED
+    return ", ".join(items[:_MAX_LISTED]) + f", ... ({rest} more)"
+
+
+def _option_hint(name: str, options: dict[str, FilterOption]) -> str:
+    """Did-you-mean over the filter's REAL option names, else list them."""
+    matches = difflib.get_close_matches(name, sorted(options), n=1, cutoff=0.6)
+    if matches:
+        return f"did you mean {matches[0]} => ...?"
+    if not options:
+        return "this filter has no options sqlmpeg can set"
+    return "its options: " + _listed(sorted(options))
+
+
+def _number_text(value: float) -> str:
+    """A range bound as ffmpeg meant it: ``1024`` rather than ``1024.0``."""
+    if value == int(value):
+        return str(int(value))
+    return str(value)
+
+
+def _range_text(option: FilterOption) -> str | None:
+    if option.minimum is not None and option.maximum is not None:
+        return f"from {_number_text(option.minimum)} to {_number_text(option.maximum)}"
+    if option.minimum is not None:
+        return f"at least {_number_text(option.minimum)}"
+    if option.maximum is not None:
+        return f"at most {_number_text(option.maximum)}"
+    return None
+
+
+def _literal_value(node: exp.Expr) -> object | None:
+    """A named argument's value as a python scalar, or None if it is not a literal.
+
+    Deliberately separate from :func:`_number` / :func:`_string`: those raise the
+    stdlib's own message, and an option's expected type is only known after the
+    registry has been consulted, so reading the value and judging it are two
+    steps here.
+    """
+    node = _unwrap(node)
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    negated = False
+    if isinstance(node, exp.Neg) and isinstance(node.this, exp.Expr):
+        negated = True
+        node = _unwrap(node.this)
+    if not isinstance(node, exp.Literal):
+        return None
+    if node.is_string:
+        return None if negated else str(node.this)
+    try:
+        value = node.to_py()
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    if isinstance(value, bool):  # sqlglot never does this; be explicit anyway
+        return None
+    number = value if isinstance(value, int) else float(value)
+    return -number if negated else number
+
+
+def _option_got(node: exp.Expr, value: object) -> str:
+    """How a rejected option value is echoed back in the message."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return str(value)
+    if isinstance(value, str):
+        return repr(value)
+    return _describe(_unwrap(node))
+
+
+def _option_error(
+    filter_name: str, option: FilterOption, arg: _NamedArg, call: exp.Expr, what: str, hint: str
+) -> SqlmpegError:
+    return _error(
+        ErrorCode.FILTER_OPTION_TYPE,
+        f"option '{option.name}' of filter '{filter_name}' {what}",
+        arg.value,
+        fallback=call,
+        hint=hint,
+    )
+
+
+def _option_value(
+    filter_name: str, option: FilterOption, arg: _NamedArg, call: exp.Expr
+) -> object:
+    """One named argument's value, checked against its introspected AVOption.
+
+    The type map is the RFC's: numeric AVOptions take a bare number (range
+    checked whenever ffmpeg printed a parseable one), booleans take ``true`` /
+    ``false``, an enum takes one of its named constants, and everything else
+    takes a string — or a bare number, since an ffmpeg option value is text on
+    the command line either way and ``duration``/``video_rate``/expression
+    options (``xfade``'s ``duration``, ``crop``'s ``x``) are routinely numeric.
+    """
+    value = _literal_value(arg.value)
+    got = _option_got(arg.value, value)
+    if option.unusable:
+        raise _option_error(
+            filter_name,
+            option,
+            arg,
+            call,
+            "has an ffmpeg type (binary/dictionary) sqlmpeg cannot set",
+            "drop it; sqlmpeg sets numeric, string and boolean options only",
+        )
+    if option.type == "num":
+        if not isinstance(value, int | float) or isinstance(value, bool):
+            bounds = _range_text(option)
+            raise _option_error(
+                filter_name,
+                option,
+                arg,
+                call,
+                f"expects a number, got {got}",
+                f"write a bare numeric literal ({bounds})" if bounds else
+                "write a bare numeric literal, e.g. sigma => 5",
+            )
+        bounds = _range_text(option)
+        below = option.minimum is not None and value < option.minimum
+        above = option.maximum is not None and value > option.maximum
+        if (below or above) and bounds is not None:
+            raise _option_error(
+                filter_name,
+                option,
+                arg,
+                call,
+                f"accepts a number {bounds}, got {got}",
+                f"pick a value {bounds}",
+            )
+        return value
+    if option.type == "bool":
+        if not isinstance(value, bool):
+            raise _option_error(
+                filter_name,
+                option,
+                arg,
+                call,
+                f"expects true or false, got {got}",
+                "write the bare word true or false, with no quotes",
+            )
+        return value
+    if option.constants:
+        if not isinstance(value, str) or value not in option.constants:
+            constants = _listed(option.constants)
+            matches = (
+                difflib.get_close_matches(value, list(option.constants), n=1, cutoff=0.6)
+                if isinstance(value, str)
+                else []
+            )
+            raise _option_error(
+                filter_name,
+                option,
+                arg,
+                call,
+                f"expects one of its named constants ({constants}), got {got}",
+                f"did you mean '{matches[0]}'?"
+                if matches
+                else "the value is a single-quoted constant name, not a number",
+            )
+        return value
+    if isinstance(value, str) or (isinstance(value, int | float) and not isinstance(value, bool)):
+        return value
+    raise _option_error(
+        filter_name,
+        option,
+        arg,
+        call,
+        f"expects a string, got {got}",
+        "write a single-quoted string literal, e.g. flags => 'lanczos'",
+    )
+
+
 def _stream_positions(variant: tuple[Param, ...]) -> list[int]:
     """Every parameter position of `variant` whose kind is a stream type, in order."""
     return [i for i, param in enumerate(variant) if param.kind in ("video", "audio")]
@@ -1367,17 +1982,34 @@ def _match_variant(
 # ---------------------------------------------------------------------------
 
 
-def lower(res: Resolved, probes: dict[str, ProbeResult | None]) -> Graph:
+def lower(
+    res: Resolved,
+    probes: dict[str, ProbeResult | None],
+    *,
+    registry: Registry | None = None,
+    portable: bool = False,
+) -> Graph:
     """Lower a resolved query into an IR graph.
 
     `probes` is keyed by input ALIAS (``compiler.compile_sql`` builds it, one
     ``probe()`` per distinct path); a missing or ``None`` entry means that
     input could not be read, and lowering stays symbolic for it.
 
+    `registry` is the tier-2 half of the function surface (RFC-003): the filter
+    set of the ffmpeg on PATH, introspected lazily. It is a PARAMETER rather
+    than a module lookup so that a caller — ``compile_sql``, or a test — decides
+    whether this compile may consult the local ffmpeg at all. None means it may
+    not: every name is then resolved against the stdlib alone.
+
+    `portable` only changes what a rejection SAYS. None registry + portable
+    means the caller turned tier 2 off deliberately (``--portable``); None
+    registry without it means ffmpeg was not found. Both reject the same
+    queries, so a query that compiles portably compiles everywhere.
+
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     try:
-        return _Lowerer(res, probes).run()
+        return _Lowerer(res, probes, registry, portable).run()
     except SqlmpegError:
         raise
     except Exception as err:  # backstop: guardrail #7, no panics on user input

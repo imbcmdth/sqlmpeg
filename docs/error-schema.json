@@ -30,6 +30,8 @@
         "BROADCAST_MISMATCH",
         "UNKNOWN_SINK_OPTION",
         "SINK_OPTION_TYPE",
+        "UNKNOWN_FILTER_OPTION",
+        "FILTER_OPTION_TYPE",
         "INTERNAL"
       ]
     },

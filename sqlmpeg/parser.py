@@ -26,6 +26,14 @@ Notes for downstream passes (lower):
   wraps goes through the EXACT same validation a bare SELECT does; a bare
   SELECT leaves ``sink`` None. Only the shape is checked here — option NAMES
   and VALUES are validated against ``sqlmpeg.sink.SINK_OPTIONS`` by lower.
+* Named function arguments (``gblur(a.frame, sigma => 5)``, RFC-003) are native
+  Postgres syntax: sqlglot parses each into an ``exp.Kwarg(this=Var(name),
+  expression=<value>)`` inside the call's ``expressions`` list. The resolver only
+  checks their SHAPE — named args must TRAIL the positional ones and may not
+  repeat — because which options exist is a property of the installed ffmpeg,
+  which only lower (and its registry) knows. Names are kept VERBATIM, not folded:
+  ffmpeg option names are case-sensitive (``gblur``'s ``sigmaV``).
+
 * Stream subscripts (``a.video[1]``) arrive as ``exp.Bracket`` wrapping the
   ``exp.Column``. **sqlglot rebases the index at parse time**: under
   ``read="postgres"`` (``INDEX_OFFSET = 1``) it rewrites the single subscript
@@ -50,6 +58,7 @@ __all__ = [
     "RawSink",
     "RawSinkOption",
     "Resolved",
+    "kwarg_name",
     "parse",
     "resolve",
     "subscript_index",
@@ -109,6 +118,10 @@ _SUBSCRIPT_HINT = (
 )
 _SINK_HINT = "the only sink form is COPY (<query>) TO '<path>' WITH (<options>)"
 _OPTION_HINT = "sink options are name/value pairs, e.g. crf 20 or video_codec 'libx264'"
+_KWARG_HINT = (
+    "named arguments are written <name> => <value> and come last, "
+    "e.g. gblur(a.frame, sigma => 5)"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +218,25 @@ def subscript_index(bracket: exp.Bracket) -> int | None:
     if not _DIGITS_RE.match(text):
         return None
     return int(text) + _INDEX_OFFSET
+
+
+# ---------------------------------------------------------------------------
+# named arguments (RFC-003)
+# ---------------------------------------------------------------------------
+
+
+def kwarg_name(kwarg: exp.Kwarg) -> str:
+    """The option name of a ``name => value`` argument, VERBATIM.
+
+    Deliberately NOT folded the Postgres way: the name is not an identifier in
+    any table, it is an ffmpeg AVOption name, and those are case-sensitive
+    (``gblur``'s ``sigmaV``, ``loudnorm``'s ``I``). Empty string if sqlglot put
+    something nameless on the left of the ``=>``.
+    """
+    left = kwarg.this
+    if not isinstance(left, exp.Expr):
+        return ""
+    return str(left.name)
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +785,64 @@ class _Resolver:
                 )
             if isinstance(sub, exp.Bracket):
                 self._check_subscript(sub, select)
+            if isinstance(sub, exp.Func):
+                self._check_named_arguments(sub, select)
+
+    def _check_named_arguments(self, call: exp.Func, select: exp.Select) -> None:
+        """``name => value`` arguments must TRAIL the positional ones, once each.
+
+        Shape only (RFC-003): whether the option exists, and what type it takes,
+        depends on the ffmpeg the query is compiled against, so lower's registry
+        owns those two checks (`UNKNOWN_FILTER_OPTION` / `FILTER_OPTION_TYPE`).
+
+        Anchoring: an ``exp.Kwarg``'s ``Var`` name carries no token position (the
+        same gap sink option names have), so a rejection anchors on the offending
+        VALUE where it is a literal and falls back to the call itself.
+        """
+        seen: set[str] = set()
+        named = False
+        for arg in call.expressions:
+            if not isinstance(arg, exp.Expr):
+                continue
+            if not isinstance(arg, exp.Kwarg):
+                if named:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        "positional arguments must come before named arguments",
+                        arg,
+                        fallback=select,
+                        hint=_KWARG_HINT,
+                    )
+                continue
+            named = True
+            name = kwarg_name(arg)
+            value = arg.args.get("expression")
+            anchor = value if isinstance(value, exp.Expr) else arg
+            if not name:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "malformed named argument",
+                    anchor,
+                    fallback=select,
+                    hint=_KWARG_HINT,
+                )
+            if not isinstance(value, exp.Expr):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"named argument '{name}' has no value",
+                    arg,
+                    fallback=select,
+                    hint=_KWARG_HINT,
+                )
+            if name in seen:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"duplicate named argument '{name}'",
+                    anchor,
+                    fallback=select,
+                    hint="each named argument may be given at most once",
+                )
+            seen.add(name)
 
     def _check_subscript(self, bracket: exp.Bracket, select: exp.Select) -> None:
         """A subscript selects exactly one stream: ``<alias>.<column>[<int>]``."""

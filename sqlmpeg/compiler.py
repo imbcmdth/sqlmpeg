@@ -16,6 +16,13 @@ blocked by an unreadable input — it just loses the extra validation (subscript
 bounds) and the provenance metadata that probing would have added. Passing
 ``probe=False`` skips probing entirely, for byte-reproducible offline compiles.
 
+The filter REGISTRY (RFC-003) is the second opportunistic lookup, and follows
+the same policy: :func:`sqlmpeg.registry.load` never raises and degrades to an
+empty registry when ffmpeg is missing, so a stdlib-only query compiles with or
+without it, while a query that calls a dynamic filter (or passes named options)
+compiles only where that ffmpeg is. ``portable=True`` skips the registry
+entirely — the compile then sees exactly what any other machine would.
+
 Guardrail #7 lives here: no input, however malformed, may produce anything but
 a compile result or a :class:`~sqlmpeg.errors.SqlmpegError`. Each pass already
 carries its own backstop; this one catches anything that still slips through
@@ -25,6 +32,7 @@ carries its own backstop; this one catches anything that still slips through
 
 from __future__ import annotations
 
+from . import registry as registry_module
 from .errors import ErrorCode, SqlmpegError
 from .ir import Graph
 from .lower import lower
@@ -48,19 +56,29 @@ def _probe_inputs(res: Resolved) -> dict[str, ProbeResult | None]:
     return by_alias
 
 
-def compile_sql(text: str, *, probe: bool = True) -> Graph:
+def compile_sql(text: str, *, probe: bool = True, portable: bool = False) -> Graph:
     """Compile SQL `text` into a split-complete IR graph.
 
     With ``probe=True`` (the default) every input is probed opportunistically;
     with ``probe=False`` nothing is read from disk and lowering is fully
     symbolic.
 
+    With ``portable=False`` (the default) the installed ffmpeg's filter set is
+    available as tier 2 (RFC-003), so a query may call any filter that ffmpeg
+    reports and pass named options to stdlib calls. ``portable=True`` compiles
+    against the stdlib ALONE — no registry is even constructed, nothing is
+    introspected — which is what a query that has to compile on someone else's
+    machine wants. Like probing, tier 2 is opportunistic: a missing ffmpeg
+    simply leaves the registry empty, it never fails a compile that the stdlib
+    alone can satisfy.
+
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     try:
         res = resolve(parse(text))
         probes = _probe_inputs(res) if probe else {}
-        return insert_splits(lower(res, probes))
+        registry = None if portable else registry_module.load()
+        return insert_splits(lower(res, probes, registry=registry, portable=portable))
     except SqlmpegError:
         raise
     except RecursionError as err:
