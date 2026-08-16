@@ -180,6 +180,13 @@ compiles therefore depends on what that ffmpeg reports, and an empty registry
   must agree with how many were supplied (``UDF_ARG_TYPE`` naming both
   numbers when it does not). Unlike the array trio these are reachable BARE
   as well as namespaced — no Postgres grammar claims their names.
+* ``sqlmpeg.<name>(...)`` (RFC-007, plan 052) is a THIRD namespace, resolved
+  against :data:`sqlmpeg.macros.MACROS` and NEVER the registry -- macros work
+  offline, with no ffmpeg on PATH at all. A macro owns its own fixed
+  positional signature (no named arguments, no option table) and expands to a
+  small filter subgraph (:data:`sqlmpeg.macros.Macro.expand`); its one stream
+  argument broadcasts elementwise through the same :meth:`_expand_call` every
+  other call uses.
 * Broadcasting and zipping run off the stream-argument POSITIONS, which are
   always the leading ones, so ``volume(a.audio, 0.5)`` and
   ``anlmdn(a.audio, s => 0.01)`` expand identically.
@@ -271,8 +278,10 @@ from sqlglot import exp
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import validate_option as validate_input_option
 from sqlmpeg.ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType
+from sqlmpeg.macros import MACROS
 from sqlmpeg.parser import (
     FILTER_NAMESPACE,
+    MACRO_NAMESPACE,
     RawSink,
     RawSource,
     Resolved,
@@ -747,17 +756,25 @@ class _Call:
 
     `namespaced` marks the ``ffmpeg.<filter>(...)`` spelling (plan 038), which
     resolves in the registry under a name no Postgres grammar can claim.
+    `is_macro` marks the ``sqlmpeg.<name>(...)`` spelling (plan 052), which
+    resolves against :data:`MACROS` and never touches the registry. The two
+    are mutually exclusive (different Dot qualifiers).
     """
 
     name: str
     args: list[exp.Expr]
     named: list[_NamedArg]
     namespaced: bool = False
+    is_macro: bool = False
 
     @property
     def display(self) -> str:
         """The call as the user spelled it, for error messages."""
-        return f"{FILTER_NAMESPACE}.{self.name}" if self.namespaced else self.name
+        if self.namespaced:
+            return f"{FILTER_NAMESPACE}.{self.name}"
+        if self.is_macro:
+            return f"{MACRO_NAMESPACE}.{self.name}"
+        return self.name
 
 
 def _namespaced_call(node: exp.Expr) -> exp.Anonymous | None:
@@ -776,6 +793,24 @@ def _namespaced_call(node: exp.Expr) -> exp.Anonymous | None:
         return None
     qualifier = node.this
     if not isinstance(qualifier, exp.Identifier) or _fold(qualifier) != FILTER_NAMESPACE:
+        return None
+    inner = node.args.get("expression")
+    return inner if isinstance(inner, exp.Anonymous) else None
+
+
+def _macro_call(node: exp.Expr) -> exp.Anonymous | None:
+    """The ``exp.Anonymous`` inside ``sqlmpeg.<name>(...)``, else None.
+
+    Mirrors :func:`_namespaced_call` exactly, and VERIFIED (plan 052) to parse
+    to the identical shape under sqlglot 30.17 ``read="postgres"`` for all
+    three macro names: ``exp.Dot(this=Identifier(sqlmpeg),
+    expression=exp.Anonymous(this=<macro>, expressions=[...]))``, symmetric
+    with plan 038's ffmpeg-namespace findings.
+    """
+    if not isinstance(node, exp.Dot):
+        return None
+    qualifier = node.this
+    if not isinstance(qualifier, exp.Identifier) or _fold(qualifier) != MACRO_NAMESPACE:
         return None
     inner = node.args.get("expression")
     return inner if isinstance(inner, exp.Anonymous) else None
@@ -800,6 +835,9 @@ def _call_parts(node: exp.Expr) -> _Call | None:
     inner = _namespaced_call(node)
     if inner is not None:
         return _split_args(str(inner.this), inner, namespaced=True)
+    macro_inner = _macro_call(node)
+    if macro_inner is not None:
+        return _split_args(str(macro_inner.this), macro_inner, is_macro=True)
     if isinstance(node, exp.Overlay):
         parts = [
             node.this,
@@ -815,7 +853,9 @@ def _call_parts(node: exp.Expr) -> _Call | None:
     return None
 
 
-def _split_args(name: str, call: exp.Expr, *, namespaced: bool = False) -> _Call:
+def _split_args(
+    name: str, call: exp.Expr, *, namespaced: bool = False, is_macro: bool = False
+) -> _Call:
     positional: list[exp.Expr] = []
     named: list[_NamedArg] = []
     for arg in call.expressions:
@@ -839,7 +879,7 @@ def _split_args(name: str, call: exp.Expr, *, namespaced: bool = False) -> _Call
                 fallback=call,
             )
         positional.append(arg)
-    return _Call(name, positional, named, namespaced)
+    return _Call(name, positional, named, namespaced, is_macro)
 
 
 # ---------------------------------------------------------------------------
@@ -2308,6 +2348,8 @@ class _Lowerer:
         Postgres special forms at PARSE time.
         """
         name = call.name.lower()
+        if call.is_macro:
+            return self._lower_macro_call(node, name, call, env, select)
         if call.namespaced:
             options = self._array_options(name)
             if options is not None:
@@ -2329,6 +2371,117 @@ class _Lowerer:
                 else self._unknown_function_hint(name),
             )
         return self._lower_dynamic_call(node, name, dynamic, call, env, select)
+
+    # -- the sqlmpeg macro namespace (plan 052) -----------------------------
+
+    def _lower_macro_call(
+        self, node: exp.Expr, name: str, call: _Call, env: _Env, select: exp.Select
+    ) -> _Value:
+        """Resolve ``sqlmpeg.<name>(...)`` against :data:`MACROS`, and nowhere
+        else -- the registry is never consulted, so a macro compiles OFFLINE
+        (``which() -> None``) exactly as well as it does against a live ffmpeg.
+
+        A macro owns its OWN positional signature: there is no option table to
+        bind against, so named arguments are rejected outright (UNSUPPORTED_SQL,
+        the same shape-violation code resolve's own named-only/positional-only
+        argument rules use) and arity/kind mismatches are UDF_ARG_TYPE naming
+        the macro's signature -- mirroring the registry call's stream-signature
+        message, but there is exactly one stream position (always index 0) to
+        check, so no `_bind_options` machinery is involved.
+
+        Broadcasting reuses :meth:`_expand_call` unchanged: it is type-driven
+        off `positions`/`streams`, so a macro's single stream argument
+        broadcasts elementwise exactly like any registry call's would.
+        """
+        macro = MACROS.get(name)
+        if macro is None:
+            raise _error(
+                ErrorCode.UNKNOWN_FUNCTION,
+                f"unknown function {call.display}()",
+                node,
+                fallback=select,
+                hint=self._macro_function_hint(name),
+            )
+        if call.named:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{call.display}() is a sqlmpeg macro: its arguments are "
+                "positional only, in the documented order",
+                call.named[0].value,
+                fallback=node,
+                hint=f"its signature is {macro.signature}",
+            )
+        if len(call.args) != len(macro.params):
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() takes {len(macro.params)} argument"
+                f"{'' if len(macro.params) == 1 else 's'}, got {len(call.args)}",
+                node,
+                fallback=select,
+                hint=f"its signature is {macro.signature}",
+            )
+        stream_pos = macro.stream_positions[0]
+        stream_param = macro.params[stream_pos]
+        kind = self._classify(call.args[stream_pos], env, select)
+        self._reject_passthrough_args(call.display, [kind], call, call.args[stream_pos])
+        if kind != stream_param.stream_type:
+            hint = macro.kind_hints.get(
+                kind,
+                f"stream inputs come first, then options in the macro's own "
+                f"order: {macro.signature}",
+            )
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() takes a {stream_param.stream_type} stream as "
+                f"its '{stream_param.name}' argument, got {kind}",
+                call.args[stream_pos],
+                fallback=node,
+                hint=hint,
+            )
+        literals: dict[int, object] = {}
+        for position, param in enumerate(macro.params):
+            if param.kind != "num":
+                continue
+            arg = call.args[position]
+            try:
+                literals[position] = _number(arg)
+            except SqlmpegError as exc:
+                raise _error(
+                    exc.code,
+                    f"{call.display}()'s '{param.name}' argument must be a "
+                    "numeric literal",
+                    arg,
+                    fallback=node,
+                    hint=f"its signature is {macro.signature}",
+                ) from None
+        streams = {stream_pos: self._lower_expr(call.args[stream_pos], env, select)}
+
+        def build(values: list[object]) -> FrameRef:
+            return macro.expand(values, self.ctx.node)
+
+        return self._expand_call(
+            call.display,
+            node,
+            call.args,
+            select,
+            streams=streams,
+            literals=literals,
+            arity=len(macro.params),
+            positions=[stream_pos],
+            returns=macro.output,
+            build=build,
+        )
+
+    def _macro_function_hint(self, name: str) -> str:
+        """Did-you-mean over :data:`MACROS`, RFC-007's small-by-design trio."""
+        matches = difflib.get_close_matches(name, sorted(MACROS), n=1, cutoff=0.6)
+        if matches:
+            return f"did you mean {MACRO_NAMESPACE}.{matches[0]}()?"
+        return (
+            f"{MACRO_NAMESPACE}.<name> is one of sqlmpeg's own macros -- "
+            f"{', '.join(sorted(MACROS))} -- not an ffmpeg filter; filters live "
+            f"bare or under {FILTER_NAMESPACE}.<filter>(...)"
+        )
 
     # -- the ordinary case: any filter the installed ffmpeg reports --------
 
@@ -3073,6 +3226,17 @@ class _Lowerer:
         call = _call_parts(node)
         if call is not None:
             name = call.name.lower()
+            if call.is_macro:
+                macro = MACROS.get(name)
+                if macro is None:
+                    raise _error(
+                        ErrorCode.UNKNOWN_FUNCTION,
+                        f"unknown function {call.display}()",
+                        node,
+                        fallback=select,
+                        hint=self._macro_function_hint(name),
+                    )
+                return macro.output
             # An array-returning call is classified by its ELEMENT type, which
             # is what makes it a legal argument: `volume(ffmpeg.channelsplit(
             # a.audio[1]), 0.5)` broadcasts over the channels.

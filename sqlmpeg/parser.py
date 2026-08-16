@@ -66,6 +66,15 @@ Notes for downstream passes (lower):
   RESERVES the name ``ffmpeg`` (:meth:`_Resolver._reserve`) so no alias or CTE
   can shadow the namespace; lower does the resolution.
 
+* The ``sqlmpeg.<name>(...)`` macro namespace (RFC-007, plan 052) is the SAME
+  shape, re-probed empirically and IDENTICAL: ``exp.Dot(this=Identifier(
+  sqlmpeg), expression=exp.Anonymous(this=<macro>, expressions=[...]))`` for
+  all three macro names (none collides with a Postgres special form, so the
+  namespace is optional there, but the shape does not care). ``sqlmpeg`` joins
+  ``ffmpeg`` as a second reserved qualifier (:data:`MACRO_NAMESPACE`,
+  :meth:`_Resolver._reserve`); lower resolves the call against
+  ``sqlmpeg.macros.MACROS`` and nowhere else.
+
 * ``FROM ffmpeg.<source>(<named options>) alias`` (RFC-005 §1, plan 042) is the
   SAME namespace in TABLE position, and it is a DIFFERENT sqlglot shape from
   the call one above — a ``Dot`` never appears. VERIFIED under sqlglot 30.17
@@ -105,6 +114,7 @@ from sqlmpeg.errors import ErrorCode, SqlmpegError
 
 __all__ = [
     "FILTER_NAMESPACE",
+    "MACRO_NAMESPACE",
     "RawInputOption",
     "RawSink",
     "RawSinkOption",
@@ -123,6 +133,12 @@ __all__ = [
 # (plan 038). It is not an alias and never resolves against the FROM clause, so
 # no alias or CTE may claim the name (`_Resolver._reserve`).
 FILTER_NAMESPACE = "ffmpeg"
+
+# The reserved qualifier of the macro namespace: `sqlmpeg.<name>(...)` (RFC-007,
+# plan 052). Joins FILTER_NAMESPACE as a second reserved alias/CTE name; the
+# macro table itself (`sqlmpeg.macros.MACROS`) is lower's business, not this
+# pass's.
+MACRO_NAMESPACE = "sqlmpeg"
 
 # A top-level (or CTE-level) query: a plain SELECT, or a UNION ALL of them.
 QueryExpr = exp.Select | exp.Union
@@ -1386,6 +1402,14 @@ class _Resolver:
                 hint=f"{FILTER_NAMESPACE}.<filter>(...) calls an ffmpeg filter "
                 "directly; pick another alias or CTE name",
             )
+        if name == MACRO_NAMESPACE:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{MACRO_NAMESPACE}' is reserved for the macro namespace",
+                node,
+                hint=f"{MACRO_NAMESPACE}.<name>(...) calls a sqlmpeg macro "
+                "directly; pick another alias or CTE name",
+            )
         if name in self.ctes or name in self.sources or name in self.source_filters:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -1866,13 +1890,20 @@ class _Resolver:
                 # `ffmpeg.<x>` with no parentheses is a COLUMN, not a namespaced
                 # call: the namespace only exists in call position, so say so
                 # instead of listing aliases the user never meant.
-                hint = (
-                    f"{FILTER_NAMESPACE}.<filter>(...) is a call, not a column; "
-                    f"write {FILTER_NAMESPACE}.{sub.name}(<stream>, "
-                    "<option> => <value>) or select a real alias's stream"
-                    if name == FILTER_NAMESPACE
-                    else self._known_hint(scope)
-                )
+                if name == FILTER_NAMESPACE:
+                    hint = (
+                        f"{FILTER_NAMESPACE}.<filter>(...) is a call, not a column; "
+                        f"write {FILTER_NAMESPACE}.{sub.name}(<stream>, "
+                        "<option> => <value>) or select a real alias's stream"
+                    )
+                elif name == MACRO_NAMESPACE:
+                    hint = (
+                        f"{MACRO_NAMESPACE}.<name>(...) is a call, not a column; "
+                        f"write {MACRO_NAMESPACE}.{sub.name}(<stream>, ...) or "
+                        "select a real alias's stream"
+                    )
+                else:
+                    hint = self._known_hint(scope)
                 raise _error(
                     ErrorCode.UNKNOWN_ALIAS,
                     f"unknown alias '{name}'",
