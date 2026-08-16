@@ -20,10 +20,12 @@ success this prints nothing and exits 0. On rejection it prints one JSON
 object to stdout and exits 1. Every example below is real output captured by
 running that exact command against the example query — nothing here is
 invented. Errors that require reading the file (`STREAM_NOT_FOUND`,
-`BROADCAST_MISMATCH`, some `INPUT_NOT_FOUND` cases) were captured against the
-real fixtures in `tests/fixtures/` (`av.mp4`: one video stream, one audio
-stream; `av2.mp4`: one video stream, two audio streams tagged
-`language=eng`/`language=fra`).
+`BROADCAST_MISMATCH`, some `INPUT_NOT_FOUND` cases, the caption/trim example
+under `UNSUPPORTED_SQL`) were captured against the real fixtures in
+`tests/fixtures/` (`av.mp4`: one video stream, one audio stream; `av2.mp4`:
+one video stream, two audio streams tagged `language=eng`/`language=fra`;
+`avs.mkv`: one video stream, one audio stream, one subtitle stream tagged
+`language=eng`).
 
 ## PARSE_ERROR
 
@@ -203,11 +205,14 @@ dialect and isn't one of the more specific codes above (it has no
 streaming-vs-batch distinction to make; it's simply not part of the
 surface sqlmpeg accepts). This is by far the most common code in practice —
 most of `sqlmpeg/parser.py`'s rejections use it, for things like: multiple
-statements, unsupported clause keys, `SELECT *`, explicit `JOIN` syntax
-(only comma cross-joins are supported), aliased/nested subqueries, `WITH
-RECURSIVE`, malformed or duplicate CTE/alias names, an empty `WHERE`
-clause, a non-positive or non-literal array subscript, or a top-level
-statement that isn't a `SELECT`/`UNION ALL`.
+statements, unsupported clause keys, explicit `JOIN` syntax (only comma
+cross-joins are supported), aliased/nested subqueries, `WITH RECURSIVE`,
+malformed or duplicate CTE/alias names, an empty `WHERE` clause, a
+non-positive or non-literal array subscript, or a top-level statement that
+isn't a `SELECT`/`UNION ALL`. (`SELECT *` and `<alias>.*` compile now —
+RFC-004 — so they are no longer on this list; see
+[docs/dynamic-filters.md](dynamic-filters.md) for the two RFC-003 rejections
+below and [docs/trimming.md](trimming.md) for the caption one.)
 
 Two RFC-003 rejections also land here: a named argument written out of place
 (a positional argument after a named one, or the same name twice), and a
@@ -216,20 +221,36 @@ was not found, or because `--portable` deliberately turned the introspection
 off. The rule is one line: named arguments ARE your installed ffmpeg, so a
 query that compiles portably compiles everywhere.
 
-**Fires when:** (one example among many) the query selects `*` instead of
-explicit stream expressions.
+Three RFC-004 rejections land here too, all a consequence of the same
+measured fact — ffmpeg does not retime subtitle/data packets under an input
+seek (see [docs/trimming.md](trimming.md)):
 
-**Example query:**
+- a `WHERE <alias>.t BETWEEN ...` window on an INPUT alias whose
+  subtitle/data column is ALSO selected in the same query — the seeked track
+  would play out of sync with the rebased video, so it is rejected rather
+  than shipped broken (captured example below);
+- a `WHERE` window on a CTE name whose columns include a subtitle/data
+  column — a CTE trim is a filtergraph trim (`trim`/`atrim`), which cannot
+  carry captions at all, so this is rejected unconditionally, not only when
+  the column happens to be selected;
+- a subtitle/data column inside a `UNION ALL` branch — ffmpeg's `concat`
+  filter has video/audio pads only.
+
+**Fires when:** (one example among many) the query selects a subtitle stream
+that is also inside its own alias's `WHERE` time window.
+
+**Example query** (`tests/fixtures/avs.mkv` has one subtitle stream):
 
 ```sql
-SELECT *
-FROM input('x.mp4') a
+SELECT a.subtitle[1]
+FROM input('tests/fixtures/avs.mkv') a
+WHERE a.t BETWEEN 1 AND 2
 ```
 
 **Error JSON:**
 
 ```json
-{"line": 1, "col": 8, "code": "UNSUPPORTED_SQL", "message": "SELECT * is not supported", "hint": "select a single frame expression"}
+{"line": 1, "col": 8, "code": "UNSUPPORTED_SQL", "message": "'WHERE a.t' cannot trim a selected subtitle stream: ffmpeg does not retime caption packets under an input seek, so they would play out of sync with the trimmed video", "hint": "trim the video/audio without selecting the subtitle/data columns, or select them in a query without a WHERE time range; to caption a trimmed clip, join an external subtitle file whose cues are timed for the cut"}
 ```
 
 ## STREAM_NOT_FOUND

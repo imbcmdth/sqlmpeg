@@ -150,12 +150,16 @@ an ordinary function call:
   ...)` and friends), and sqlglot parses a bare `trim(x)` call with that
   grammar too, folding the argument into a different part of the parsed
   expression than an ordinary function call would. sqlmpeg's own lowering
-  already generates ffmpeg's `trim`/`atrim` filters internally for
-  `WHERE <alias>.t BETWEEN ...` -- that path is unaffected, since it never
-  goes through SQL call syntax -- but calling `trim(...)` directly as a
-  tier-2 filter name does not work: the argument sqlglot parsed does not land
-  where the tier-2 call reader looks, so it presents as a wrong arity rather
-  than the filter you asked for.
+  still generates ffmpeg's `trim`/`atrim` filters internally for a
+  `WHERE <alias>.t BETWEEN ...` window on a CTE name (RFC-004: a CTE output
+  is a filtergraph pad, not an input, so its window stays a filter trim) --
+  that path is unaffected, since it never goes through SQL call syntax. A
+  window on an `input()` alias no longer generates a filter at all; it
+  lowers to an input-level `-ss`/`-to` seek instead (see
+  [docs/trimming.md](trimming.md)). Either way, calling `trim(...)` directly
+  as a tier-2 filter name does not work: the argument sqlglot parsed does not
+  land where the tier-2 call reader looks, so it presents as a wrong arity
+  rather than the filter you asked for.
 - **`split`.** ffmpeg's `split`/`asplit` filters have a variable pad count
   (`V->N`) and are already excluded by the v1 scope fence above, so this one
   is moot in practice -- but for the record, Postgres/sqlglot's own

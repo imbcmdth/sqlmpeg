@@ -2,7 +2,7 @@
 
 A standalone CLI that compiles SQL into an ffmpeg `-filter_complex` invocation. Write a `SELECT` statement; get a runnable ffmpeg command. FFmpeg is the executor — this tool never touches pixels.
 
-**Status: Work in progress (v0.4.0)**
+**Status: Work in progress (v0.5.0)**
 
 ## Example
 
@@ -83,7 +83,7 @@ This is deliberately machine-dependent: it compiles only where the installed ffm
 
 ## Streams
 
-Every input exposes two array-typed pseudo-columns, `<alias>.video` and `<alias>.audio` (1-based indexing, Postgres array semantics; `<alias>.frame` is sugar for `<alias>.video[1]`). **The SELECT list is the output stream list** — one expression is one output stream, and column order is `-map` order. There is no implicit audio track: select it explicitly, or it is not in the output.
+Every input exposes four array-typed pseudo-columns, `<alias>.video`, `<alias>.audio`, `<alias>.subtitle`, and `<alias>.data` (1-based indexing, Postgres array semantics; `<alias>.frame` is sugar for `<alias>.video[1]`). **The SELECT list is the output stream list** — one expression is one output stream, and column order is `-map` order. There is no implicit audio (or caption) track: select it explicitly, or it is not in the output.
 
 A bare subscript that no function ever touches is passed straight through as a stream copy (`-c:<n> copy`, nothing re-encoded); a subscript wrapped in a function is filtered and gets an `[out0]`, `[out1]`, ... label.
 
@@ -112,6 +112,38 @@ ffmpeg -i film.mkv -filter_complex '[0:a:0]aecho=in_gain=0.8:out_gain=0.9:delays
 ```
 
 (That example needs a real, readable file to know how many audio streams to broadcast over — `sqlmpeg compile` opportunistically probes any local file that exists and falls back to a fully symbolic, offline compile otherwise; `--no-probe` forces the offline path even when the file is present, for byte-reproducible output.)
+
+`SELECT *` (and `<alias>.*`) is the fastest way to say "keep everything, untouched" — every stream of every `FROM` alias, video/audio/subtitle/data alike, each one a plain passthrough column:
+
+```sql
+SELECT * FROM input('tests/fixtures/avs.mkv') a
+```
+
+```
+$ sqlmpeg compile "SELECT * FROM input('tests/fixtures/avs.mkv') a"
+ffmpeg -i tests/fixtures/avs.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 0:s:0 -c:2 copy -metadata:s:2 language=eng out.mp4
+```
+
+## Trims
+
+`WHERE <alias>.t BETWEEN <start> AND <end>` on an `input()` alias trims and rebases that WHOLE input via an ffmpeg input seek — `-ss <start> -to <end>` immediately before that alias's own `-i` — rather than a filtergraph node, so a trimmed column nothing else filters can stay a plain stream copy:
+
+```sql
+SELECT a.video[1], a.audio[1]
+FROM input('clip.mp4') a
+WHERE a.t BETWEEN 5 AND 60
+```
+
+```
+$ sqlmpeg compile --no-probe "SELECT a.video[1], a.audio[1] FROM input('clip.mp4') a WHERE a.t BETWEEN 5 AND 60"
+ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy out.mp4
+```
+
+A decoded (filtered/re-encoded) stream trims frame-accurate; a stream-copied one snaps back to the previous keyframe and may start up to a GOP early. Because the seek covers the whole input, it also seeks any subtitle/data streams that input has — but ffmpeg does not retime caption packets under an input seek, so selecting a captioned track from the SAME seeked alias is a typed rejection rather than a track that plays out of sync. Trim without selecting the captions, or join an external subtitle file already timed for the cut instead (see Captions below). The full measured story, including the mkv-duration caveat, is in [docs/trimming.md](docs/trimming.md).
+
+## Captions and data streams
+
+Subtitle and data streams (`<alias>.subtitle`, `<alias>.data`) are selected exactly like video/audio — bare, subscripted, splatted, carried through a CTE column, or picked up by `SELECT *` — but they are passthrough-only: no function, stdlib or dynamic, ever takes one as an argument, and they have no place in a `UNION ALL` branch. Extracting one out to its own file needs no new syntax, just a sink with no video/audio columns: `COPY (SELECT a.subtitle[1] FROM input('film.mkv') a) TO 'subs.en.srt'`. Joining an external subtitle file in is exactly as unsurprising — it falls out of streams-as-columns plus an ordinary cross join, no special join syntax at all: add the subtitle file as another `input()` alias and select its `.subtitle[1]` column alongside the rest, setting `subtitle_codec` in `WITH (...)` to transcode it (`'mov_text'` for an mp4 container, `'webvtt'`, `'srt'`, ...).
 
 ## Use with an AI
 

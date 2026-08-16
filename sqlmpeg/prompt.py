@@ -93,22 +93,43 @@ statement is not. `--` and `/* */` comments are allowed.
 - Unquoted identifiers fold to lowercase. Never double-quote an identifier.
 
 ### Columns
-- `<alias>.video` and `<alias>.audio` are array-typed pseudo-columns, one
-  entry per stream of that type in the file, in file order. `<alias>.video[k]`
-  / `<alias>.audio[k]` picks the k-th stream, 1-based (`<alias>.video[1]` is
+- `<alias>.video`, `<alias>.audio`, `<alias>.subtitle`, and `<alias>.data` are
+  array-typed pseudo-columns, one entry per stream of that type in the file,
+  in file order. `<alias>.video[k]` / `<alias>.audio[k]` / `<alias>.subtitle[k]`
+  / `<alias>.data[k]` picks the k-th stream, 1-based (`<alias>.video[1]` is
   the first video stream). `<alias>.frame` is sugar for `<alias>.video[1]`.
 - Subscripts are positive integer literals only -- `0`, negative numbers, and
   computed subscripts are rejected.
-- A bare `<alias>.video` / `<alias>.audio` (no subscript) is the WHOLE array.
-  It is legal splatted directly into the SELECT list (one output stream per
-  element, in order) and legal as a function argument, where it broadcasts
-  (see Broadcasting below). Either use needs a readable input to know how many
-  streams there are: `sqlmpeg compile` probes local files automatically, but a
-  URL, a missing file, or `--no-probe` falls back to a fully symbolic compile,
-  where a bare array cannot be sized and is rejected.
+- A bare `<alias>.video` / `<alias>.audio` / `<alias>.subtitle` / `<alias>.data`
+  (no subscript) is the WHOLE array. It is legal splatted directly into the
+  SELECT list (one output stream per element, in order) and legal as a
+  function argument, where a video/audio array broadcasts (see Broadcasting
+  below). Either use needs a readable input to know how many streams there
+  are: `sqlmpeg compile` probes local files automatically, but a URL, a
+  missing file, or `--no-probe` falls back to a fully symbolic compile, where
+  a bare array cannot be sized and is rejected.
+- `subtitle` and `data` streams are PASSTHROUGH-ONLY: select them (bare,
+  subscripted, splatted, or carried through a CTE column), but never filter
+  them. Passing one to any function -- stdlib or a filter beyond the stdlib --
+  is `UDF_ARG_TYPE` ("cannot be filtered, only selected"); putting one in a
+  `UNION ALL` branch is `UNSUPPORTED_SQL` (ffmpeg's `concat` has video/audio
+  pads only). A caption or data track's `language`/`title` tag rides straight
+  through to the output, exactly like an untouched audio track's.
+- `SELECT *` selects every stream of every `FROM` alias, in `FROM` order and
+  file order within each alias, all four types -- each one a plain
+  passthrough column, the same as writing every subscript out by hand.
+  `<alias>.*` does the same for one alias, and mixes freely with other
+  columns: `SELECT a.*, b.audio[1]`. Star over an `input()` alias needs a
+  readable file to size it (same policy as a bare array: `INPUT_NOT_FOUND` if
+  it cannot be probed); star over a CTE name expands that CTE's recorded
+  columns instead, with no probe needed.
+- Joining an external subtitle file needs no special syntax: add it as
+  another `input()` alias and select its `<alias>.subtitle[1]` alongside the
+  rest of the columns. Set `subtitle_codec` (see Output options) to transcode
+  it, e.g. `'mov_text'` to carry a `.vtt` track into an `.mp4` container.
 - `<alias>.t` is time in seconds. It is legal ONLY inside the `WHERE` form
   below; it is not a stream and cannot appear in the SELECT list.
-- There are no other columns and no `*`.
+- There are no other columns.
 
 ### Broadcasting
 - Passing a bare array where a function expects one stream applies the call
@@ -148,10 +169,24 @@ statement is not. `--` and `/* */` comments are allowed.
   `WHERE a.t BETWEEN 0 AND 5 AND b.t BETWEEN 2 AND 7`.
 - No `OR`, no `NOT BETWEEN`, no `<`/`>`/`=`, no expressions as bounds, no
   second range for the same alias.
-- The trim applies to that alias everywhere it appears in that `SELECT` --
-  every video stream drawn from it and every audio stream drawn from it,
-  kept in sync -- and rebases the clip to start at t=0. It works on CTE
-  names too.
+- On an `input()` alias, the window becomes an INPUT seek (`-ss <start> -to
+  <end>` immediately before that alias's own `-i`), not a filter: it trims
+  AND rebases to t=0 every stream of that input, selected or not -- video,
+  audio, subtitle, data alike -- so a column nothing else filters can stay a
+  plain stream copy instead of forcing a re-encode. A DECODED stream
+  (anything filtered/re-encoded) trims frame-accurate; a STREAM-COPIED one
+  snaps back to the preceding keyframe and may start up to one GOP early.
+- On a CTE name, the window is still a filtergraph trim (`trim`+`setpts` /
+  `atrim`+`asetpts`), because a CTE's output is a filtergraph pad, not an
+  input -- video/audio only, same as before RFC-004.
+- Caption caveat: ffmpeg does not retime subtitle/data packets under an
+  input seek, so a track that is both inside its own alias's WHERE window
+  AND selected in the same query would play out of sync with the rebased
+  video -- that combination is rejected (`UNSUPPORTED_SQL`). Trim the alias
+  without selecting its subtitle/data columns, or select them from a query
+  that puts no WHERE window on that alias; to caption an already-trimmed
+  clip, join an external subtitle file whose cues are timed for the cut
+  instead (see Columns above).
 
 ### Concatenation
 - `UNION ALL` concatenates branches in order. Every branch must select the
@@ -292,16 +327,21 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   `max`, ...), `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `QUALIFY`, `WINDOW`,
   window functions (`OVER`), subquery predicates (`IN (SELECT ...)`, `EXISTS`),
   `UNION` without `ALL`.
-- Outside the dialect: `SELECT *`, subqueries anywhere (use a CTE), explicit
-  `JOIN ... ON` / `USING`, casts (`::` or `CAST`), arithmetic or any non-literal
-  in an argument, unqualified columns, schema-qualified tables, aliasing a CTE,
+- Outside the dialect: subqueries anywhere (use a CTE), explicit `JOIN ...
+  ON` / `USING`, casts (`::` or `CAST`), arithmetic or any non-literal in an
+  argument, unqualified columns, schema-qualified tables, aliasing a CTE,
   `WITH RECURSIVE`, nested `WITH`, CTE column lists, table functions other than
   `input()`, any statement that is not a `SELECT`, more than one statement, a
   zero/negative/computed array subscript.
 - Any name that is neither a function listed below nor a filter the installed
   ffmpeg provides (see "Beyond the stdlib"), including transitions between
   concatenated branches, motion tracking, subtitle/data-stream filtering, and
-  anything requiring more than one pass over the stream."""
+  anything requiring more than one pass over the stream.
+- A `WHERE` window on an alias whose subtitle/data column is ALSO selected in
+  the same query (ffmpeg cannot retime captions under an input seek -- see
+  Time selection); a subtitle/data column inside a CTE that also carries a
+  `WHERE` window (a CTE trim is a filtergraph trim, which cannot carry
+  captions at all)."""
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +440,18 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
         "SELECT fade_out(fade_in(speed(a.frame, 2), 1), 1.5, 8.5)\n"
         "FROM input('clip.mp4') a",
     ),
+    (
+        "Pull the first subtitle track out of film.mkv into its own file.",
+        "COPY (SELECT a.subtitle[1] FROM input('film.mkv') a) TO 'subs.en.srt'",
+    ),
+    (
+        "Join subs.en.vtt onto clip.mp4 as a proper subtitle track, mov_text "
+        "coded for an mp4 output, video and audio untouched.",
+        "COPY (\n"
+        "  SELECT a.video[1], a.audio[1], s.subtitle[1]\n"
+        "  FROM input('clip.mp4') a, input('subs.en.vtt') s\n"
+        ") TO 'out.mp4' WITH (subtitle_codec 'mov_text')",
+    ),
 )
 
 # Examples that broadcast a bare array need a real, readable file to know how
@@ -432,6 +484,11 @@ _PROBED_EXAMPLES: tuple[tuple[str, str], ...] = (
         "SELECT overlay(f.frame, pip.frame, 20, 20),\n"
         "       amix(volume(f.audio, 0.65), volume(pip.sound, 0.35))\n"
         "FROM input('film.mkv') f, pip",
+    ),
+    (
+        "Keep absolutely everything in film.mkv untouched -- every video, "
+        "audio, subtitle and data stream it has.",
+        "SELECT * FROM input('film.mkv') a",
     ),
 )
 
