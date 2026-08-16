@@ -70,11 +70,17 @@ def _signature(name: str, variant: tuple[Param, ...]) -> str:
 
 
 def _filters_for(spec: FuncSpec) -> list[str]:
-    """Run `spec.expand` with dummy args and return the distinct filter names used."""
-    variant = spec.variants[0]
-    args: list[object] = [_DUMMY_ARGS[p.kind] for p in variant]
+    """Run EVERY overload's expansion with dummy args; the distinct filters used.
+
+    Per overload rather than just the first, because an overload can lower to
+    something else entirely (``delay``'s audio form is ``adelay``, its video
+    form a ``format``+``tpad`` macro). For every spec whose overloads differ
+    only in arity this is the same list the first one alone produced.
+    """
     ctx = _FilterCollector()
-    spec.expand(ctx, args)
+    for index, variant in enumerate(spec.variants):
+        args: list[object] = [_DUMMY_ARGS[p.kind] for p in variant]
+        spec.impl(index).expand(ctx, args)
 
     seen: list[str] = []
     for name in ctx.filters:

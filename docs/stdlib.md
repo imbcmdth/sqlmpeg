@@ -315,9 +315,11 @@ FFmpeg filter(s): `lowpass`
 
 `delay(a: audio, seconds: num)`
 
-Delay audio by seconds (converted to integer milliseconds; ffmpeg adelay).
+`delay(f: video, seconds: num)`
 
-FFmpeg filter(s): `adelay`
+Delay a stream by seconds: audio shifts by that many milliseconds (adelay), video becomes a transparent canvas that is empty before the clip starts and after it ends (format + tpad), so it composites straight into overlay.
+
+FFmpeg filter(s): `adelay`, `format`, `tpad`
 
 ## acrossfade
 

@@ -35,12 +35,37 @@ class ExpandCtx(Protocol):
         ...
 
 
+Expand = Callable[[ExpandCtx, list[object]], FrameRef]
+
+
+@dataclass(frozen=True)
+class VariantImpl:
+    """How ONE overload of a spec lowers, when the overloads differ in kind.
+
+    Most functions have overloads that differ only in arity (``scale``,
+    ``pad``): one ``expand`` reads ``len(args)`` and one output type and one
+    ``named_target`` cover them all, so their :class:`FuncSpec` needs none of
+    this. ``delay`` is the exception (plan 038) — its audio overload is one
+    ``adelay`` node and its video overload is a two-filter macro returning
+    ``video`` — and an ``expand`` cannot tell them apart, because both arities
+    are 2 and the stream argument is a plain ``FrameRef`` in either case. So
+    the MATCHED VARIANT INDEX, which lower knows and nothing else does, selects
+    the implementation: see :attr:`FuncSpec.by_variant`.
+    """
+
+    expand: Expand
+    returns: StreamType
+    # Same meaning as FuncSpec.named_target, per overload: None = this overload
+    # is a macro over several filters and rejects named arguments.
+    named_target: str | None = None
+
+
 @dataclass(frozen=True)
 class FuncSpec:
     name: str
     variants: tuple[tuple[Param, ...], ...]  # overloads; arity+kinds checked by lower
     doc: str  # one line, drives --help/docs/LLM prompt
-    expand: Callable[[ExpandCtx, list[object]], FrameRef]
+    expand: Expand
     # expand args: FrameRef for video/audio params, python int/float/str for
     # literals, in SQL argument order. Returns the FrameRef of the subgraph
     # output.
@@ -49,6 +74,17 @@ class FuncSpec:
     # arguments (RFC-003 "Tier-1 named extras"); None = named args rejected
     # (macros).
     named_target: str | None = None
+    # Per-overload override of the three fields above, ONE ENTRY PER VARIANT in
+    # `variants` order (plan 038). None -- every entry but `delay` -- means all
+    # overloads share the spec-level expand/returns/named_target, which is what
+    # `impl()` then hands back.
+    by_variant: tuple[VariantImpl, ...] | None = None
+
+    def impl(self, index: int) -> VariantImpl:
+        """How overload `index` (its position in ``variants``) lowers."""
+        if self.by_variant is None:
+            return VariantImpl(self.expand, self.returns, self.named_target)
+        return self.by_variant[index]
 
 
 # --------------------------------------------------------------------------
@@ -355,6 +391,45 @@ def _expand_delay(ctx: ExpandCtx, args: list[object]) -> FrameRef:
     assert isinstance(seconds, (int, float))
     ms = round(seconds * 1000)
     return ctx.node("adelay", {"delays": ms, "all": 1}, [a], ["audio"])
+
+
+def _expand_delay_video(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    """`delay(f: video, seconds)` -- a transparent-padded canvas (plan 038).
+
+    A MACRO over two filters, so it has no ``named_target``:
+
+    * ``format=pix_fmts=yuva420p`` gives the stream an alpha plane, without
+      which a transparent pad colour is simply black;
+    * ``tpad=start_duration=<seconds>:stop=1:color=black@0`` puts `seconds` of
+      fully transparent frames in FRONT of it, and exactly ONE fully
+      transparent frame BEHIND it.
+
+    That single trailing frame is the whole trick, and it is what makes the
+    result composable with ``overlay`` (VERIFIED against ffmpeg 7.1,
+    2026-08-15):
+
+    * ``overlay`` keeps redisplaying its top input's LAST frame after that
+      input ends (``repeatlast``, on by default). Without the pad, the last
+      frame is the delayed clip's final picture, which would then freeze on
+      screen for the whole rest of the base stream. With it, the frame that
+      gets held forever is transparent, so the clip simply disappears.
+    * ``tpad``'s "pad for ever" spelling, ``stop=-1``, would say the same thing
+      more directly, but a never-ending top input makes ``overlay`` never
+      terminate: measured, the compile runs until it is killed. One frame plus
+      ``repeatlast`` is the same picture with an end.
+
+    So the composite ends when the LONGER of (base, delay + clip) ends, and the
+    delayed video is transparent before its start and after its clip.
+    """
+    f = _as_stream(args[0])
+    seconds = args[1]
+    alpha = ctx.node("format", {"pix_fmts": "yuva420p"}, [f], ["video"])
+    return ctx.node(
+        "tpad",
+        {"start_duration": seconds, "stop": 1, "color": "black@0"},
+        [alpha],
+        ["video"],
+    )
 
 
 def _expand_acrossfade(ctx: ExpandCtx, args: list[object]) -> FrameRef:
@@ -723,11 +798,25 @@ FUNCTIONS: dict[str, FuncSpec] = {
     ),
     "delay": FuncSpec(
         name="delay",
-        variants=((_audio("a"), _num("seconds")),),
-        doc="Delay audio by seconds (converted to integer milliseconds; ffmpeg adelay).",
+        variants=(
+            (_audio("a"), _num("seconds")),
+            (_video("f"), _num("seconds")),
+        ),
+        doc=(
+            "Delay a stream by seconds: audio shifts by that many milliseconds "
+            "(adelay), video becomes a transparent canvas that is empty before "
+            "the clip starts and after it ends (format + tpad), so it composites "
+            "straight into overlay."
+        ),
         expand=_expand_delay,
         returns="audio",
         named_target="adelay",
+        # The two overloads differ in more than arity: audio is one adelay node,
+        # video is a two-filter macro that returns video (plan 038).
+        by_variant=(
+            VariantImpl(_expand_delay, "audio", "adelay"),
+            VariantImpl(_expand_delay_video, "video", None),
+        ),
     ),
     "acrossfade": FuncSpec(
         name="acrossfade",

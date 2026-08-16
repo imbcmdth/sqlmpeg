@@ -619,6 +619,131 @@ def test_subtitle_extraction_writes_a_parseable_srt_file(tmp_path: Path) -> None
     assert [s["codec_type"] for s in streams] == ["subtitle"]
 
 
+# ---------------------------------------------------------------------------
+# plan 038: the ad insert -- a video delay composed with overlay
+# ---------------------------------------------------------------------------
+#
+# `delay(f, s)` on VIDEO is format=yuva420p + tpad=start_duration=s:stop=1,
+# i.e. a transparent canvas: empty for `s` seconds, then the clip, then one
+# transparent frame that overlay's `repeatlast` holds for the rest of the base.
+# These two tests are the reason that shape was chosen -- they check the
+# composite really does run to completion and really is transparent on both
+# sides of the clip.
+
+# The overlay rectangle of the queries below: a 0.33-scaled 320x240 clip
+# (105x79 after scale's even-height rounding) placed at (20, 20). Sampled a few
+# pixels inside its edges so a one-pixel rounding difference cannot matter.
+_PIP_BOX = (24, 24, 120, 94)
+
+# Mean per-channel difference over `_PIP_BOX`, in 0..255. The composite and the
+# bare base go through different filter chains, so "identical" is a small
+# number rather than zero; "the clip is visible" is a large one.
+_PIP_SAME = 6.0
+_PIP_DIFFERENT = 20.0
+
+
+def _pip_bytes(path: Path) -> bytes:
+    with Image.open(path) as img:
+        return img.convert("RGB").crop(_PIP_BOX).tobytes()
+
+
+def _pip_difference(left: Path, right: Path) -> float:
+    """Mean per-channel difference over the overlay rectangle, in 0..255."""
+    a, b = _pip_bytes(left), _pip_bytes(right)
+    assert len(a) == len(b) > 0
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+
+def test_ad_insert_composites_a_delayed_clip_over_the_film(tmp_path: Path) -> None:
+    """The plan 038 driving case, compiled and RUN.
+
+    A 0.33-scale copy of the ad, delayed one second, composited into the
+    film's corner, with its audio delayed by the same second and mixed under
+    the film's at half volume. Both fixtures are 2s, so the delayed ad is the
+    longer of the two branches and the output runs to delay + ad = 3s.
+    """
+    _require_fixture(_AV2)
+    _require_fixture(_AV3)
+    out_path = tmp_path / "ad-insert.mp4"
+    query = (
+        "SELECT overlay(f.frame, delay(scale(a.frame, 0.33), 1), 20, 20), "
+        "       amix(f.audio[1], volume(delay(a.audio[1], 1), 0.5)) "
+        f"FROM input('{_sql_path(_AV2)}') f, input('{_sql_path(_AV3)}') a"
+    )
+
+    graph = compile_sql(query)
+    assert [node.filter for node in graph.nodes.values()] == [
+        "scale",
+        "format",
+        "tpad",
+        "overlay",
+        "adelay",
+        "volume",
+        "amix",
+    ]
+    filter_complex = emit(graph).filter_complex
+    assert "format=pix_fmts=yuva420p" in filter_complex
+    assert "tpad=start_duration=1:stop=1:color=black@0" in filter_complex
+
+    _compile_and_run(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["video", "audio"]
+    assert _ffprobe_duration(out_path) == pytest.approx(
+        1 + _ffprobe_duration(_AV3), abs=0.3
+    )
+
+
+def test_a_delayed_video_is_transparent_before_and_after_its_clip(
+    tmp_path: Path,
+) -> None:
+    """The semantics the macro promises, measured pixel by pixel.
+
+    The base here is av2+av3 concatenated (4s), so it outlasts the delayed
+    clip (1s + 2s) and there is an "after" to look at. The same base is also
+    rendered on its own; the composite must be indistinguishable from it
+    inside the overlay rectangle before t=1 and after t=3, and clearly
+    different in between. The 4s duration is itself the other half of the
+    claim: a transparent canvas that padded FOREVER (tpad stop=-1) would make
+    overlay never terminate at all.
+    """
+    _require_fixture(_AV2)
+    _require_fixture(_AV3)
+    base_cte = (
+        "WITH base AS ("
+        f"  SELECT f.frame FROM input('{_sql_path(_AV2)}') f "
+        "  UNION ALL "
+        f"  SELECT g.frame FROM input('{_sql_path(_AV3)}') g"
+        ") "
+    )
+    base_path = tmp_path / "base.mp4"
+    composite_path = tmp_path / "composite.mp4"
+
+    _compile_and_run(base_cte + "SELECT base.frame FROM base", base_path)
+    _compile_and_run(
+        base_cte
+        + "SELECT overlay(base.frame, delay(scale(a.frame, 0.33), 1), 20, 20) "
+        f"FROM base, input('{_sql_path(_AV3)}') a",
+        composite_path,
+    )
+
+    # The composite ends WITH the base, not with the never-ending canvas.
+    assert _ffprobe_duration(composite_path) == pytest.approx(
+        _ffprobe_duration(base_path), abs=0.3
+    )
+
+    for moment, expected in ((0.3, "same"), (1.5, "different"), (3.5, "same")):
+        base_png = tmp_path / f"base-{moment}.png"
+        composite_png = tmp_path / f"composite-{moment}.png"
+        _extract_frame(base_path, moment, base_png)
+        _extract_frame(composite_path, moment, composite_png)
+        difference = _pip_difference(base_png, composite_png)
+        if expected == "same":
+            assert difference < _PIP_SAME, f"t={moment}: overlay is not transparent"
+        else:
+            assert difference > _PIP_DIFFERENT, f"t={moment}: the clip is not visible"
+
+
 def test_the_same_subtitle_track_may_be_mapped_twice(tmp_path: Path) -> None:
     """Duplicate consumption of one subtitle src ref: two Outputs, two identical
     bare -maps, no split filter anywhere (RFC-004's split/emit exemption)."""

@@ -2,7 +2,7 @@
 
 SQL in, ffmpeg command out. You write a `SELECT` statement, sqlmpeg compiles it into a `-filter_complex` invocation, and ffmpeg does the actual pixel-pushing. This tool never decodes a single frame: it's a compiler, and ffmpeg is the executor.
 
-**Status: v0.5.0, not yet on PyPI. Works on my machine (and the CI machine).**
+**Status: v0.6.0, not yet on PyPI. Works on my machine (and the CI machine).**
 
 Why does this exist? The ffmpeg engine is a marvel. The filtergraph syntax is the hard part: hand-labeled pads that must each be consumed exactly once, positional arguments in surprising orders (`crop` takes `w:h:x:y`, when everyone thinks in `x,y,w,h`), and quoting rules deep enough that the official docs include a worked escaping example. SQL, meanwhile, has been describing dataflow DAGs for fifty years, and it's the language every developer (and every LLM) already speaks. This project connects the two.
 
@@ -81,7 +81,7 @@ $ sqlmpeg compile -f query.sql
 ffmpeg -i clip.mp4 -filter_complex '[0:v:0]unsharp=luma_msize_x=7:luma_amount=1.5[out0]' -map '[out0]' -map 0:a:0 -c:1 copy out.mp4
 ```
 
-This is machine-dependent on purpose: the query compiles where an `unsharp` filter exists and nowhere else, and the option names, types, ranges, and enum constants are all validated against what your binary actually reports. Named options also reach through stdlib calls to the underlying filter's full option set (`blur(a.frame, 5, planes => 1)` sets `gblur`'s `planes`, which no table anywhere lists). When a query needs to travel, `--portable` compiles it against the stdlib alone and tells you exactly what a machine with no ffmpeg would think of it. Details, including the one known wart, live in [docs/dynamic-filters.md](docs/dynamic-filters.md).
+This is machine-dependent on purpose: the query compiles where an `unsharp` filter exists and nowhere else, and the option names, types, ranges, and enum constants are all validated against what your binary actually reports. Named options also reach through stdlib calls to the underlying filter's full option set (`blur(a.frame, 5, planes => 1)` sets `gblur`'s `planes`, which no table anywhere lists). Every filter is additionally callable as `ffmpeg.<name>(...)`, a spelling that resolves in the filter set alone - which is how you reach the raw filter behind a stdlib name, and the eleven filters whose names Postgres itself parses specially (`ffmpeg.trim`, `ffmpeg.format`, `ffmpeg.overlay`, ...). When a query needs to travel, `--portable` compiles it against the stdlib alone and tells you exactly what a machine with no ffmpeg would think of it. Details live in [docs/dynamic-filters.md](docs/dynamic-filters.md).
 
 ## Streams are columns
 

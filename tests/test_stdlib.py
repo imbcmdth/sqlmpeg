@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from sqlmpeg.ir import FrameRef, StreamType
-from sqlmpeg.stdlib import FUNCTIONS, ExpandCtx, signatures
+from sqlmpeg.stdlib import FUNCTIONS, ExpandCtx, VariantImpl, signatures
 
 EXPECTED_NAMES = {
     "scale",
@@ -181,6 +181,8 @@ def test_returns_video_or_audio() -> None:
         ("normalize", {1, 2}),
         ("highpass", {2}),
         ("lowpass", {2}),
+        # Both delay overloads take (stream, seconds); only the stream KIND
+        # tells them apart (plan 038).
         ("delay", {2}),
         ("acrossfade", {3}),
         ("areverse", {1}),
@@ -838,3 +840,110 @@ def test_blur_regions_named_target_is_none() -> None:
     # blur_regions is a macro (three nodes: crop, gblur, overlay) with no
     # single underlying filter to validate named extras against.
     assert FUNCTIONS["blur_regions"].named_target is None
+
+
+# --------------------------------------------------------------------------
+# plan 038: per-overload implementations (FuncSpec.by_variant / .impl)
+# --------------------------------------------------------------------------
+
+
+def test_only_delay_needs_per_variant_implementations() -> None:
+    """Every other spec's overloads differ in arity alone, so one expand, one
+    output type and one named_target cover them."""
+    assert {n for n, s in FUNCTIONS.items() if s.by_variant is not None} == {"delay"}
+
+
+def test_by_variant_has_exactly_one_entry_per_overload() -> None:
+    for name, spec in FUNCTIONS.items():
+        if spec.by_variant is None:
+            continue
+        assert len(spec.by_variant) == len(spec.variants), name
+
+
+def test_impl_falls_back_to_the_spec_level_fields() -> None:
+    """A spec without by_variant answers the same for every overload index."""
+    spec = FUNCTIONS["pad"]
+    for index in range(len(spec.variants)):
+        assert spec.impl(index) == VariantImpl(
+            spec.expand, spec.returns, spec.named_target
+        )
+
+
+def test_delay_overloads_differ_in_kind_not_just_arity() -> None:
+    spec = FUNCTIONS["delay"]
+    assert [tuple(p.kind for p in variant) for variant in spec.variants] == [
+        ("audio", "num"),
+        ("video", "num"),
+    ]
+    assert [spec.impl(i).returns for i in (0, 1)] == ["audio", "video"]
+    # The video overload is a macro: no single filter to hang named args on.
+    assert [spec.impl(i).named_target for i in (0, 1)] == ["adelay", None]
+
+
+def test_delay_audio_overload_is_still_one_adelay_node() -> None:
+    ctx = FakeCtx()
+    out = FUNCTIONS["delay"].impl(0).expand(ctx, ["src:a", 0.25])
+    assert len(ctx.nodes) == 1
+    node_id, filt, args, inputs, outputs = ctx.nodes[0]
+    assert (filt, args, inputs, outputs) == (
+        "adelay",
+        {"delays": 250, "all": 1},
+        ["src:a"],
+        ["audio"],
+    )
+    assert out == node_id
+
+
+def test_delay_video_overload_is_a_format_plus_tpad_macro() -> None:
+    """format gives the stream an alpha plane; tpad puts `seconds` of
+    transparent frames in front of it and exactly ONE behind it, which is what
+    overlay's repeatlast then holds for the rest of the base stream."""
+    ctx = FakeCtx()
+    out = FUNCTIONS["delay"].impl(1).expand(ctx, ["src:a", 1])
+    assert len(ctx.nodes) == 2
+
+    fmt_id, fmt_filt, fmt_args, fmt_inputs, fmt_outputs = ctx.nodes[0]
+    assert fmt_filt == "format"
+    assert fmt_args == {"pix_fmts": "yuva420p"}
+    assert fmt_inputs == ["src:a"]
+    assert fmt_outputs == ["video"]
+
+    tpad_id, tpad_filt, tpad_args, tpad_inputs, tpad_outputs = ctx.nodes[1]
+    assert tpad_filt == "tpad"
+    assert tpad_args == {"start_duration": 1, "stop": 1, "color": "black@0"}
+    assert tpad_inputs == [fmt_id]
+    assert tpad_outputs == ["video"]
+
+    assert out == tpad_id
+
+
+def test_delay_video_pad_duration_is_the_seconds_as_written() -> None:
+    """tpad takes a <duration>, so fractional seconds go through untouched --
+    no millisecond rounding (that is the audio overload's adelay contract)."""
+    ctx = FakeCtx()
+    FUNCTIONS["delay"].impl(1).expand(ctx, ["src:a", 0.5])
+    assert ctx.nodes[1][2]["start_duration"] == 0.5
+
+
+def test_every_single_filter_overload_produces_its_named_target() -> None:
+    """The FuncSpec invariant lower relies on, checked per OVERLOAD: an
+    overload that names a target expands to exactly that one filter."""
+    samples: dict[str, list[list[object]]] = {
+        "delay": [["src:a", 0.25], ["src:a", 1]],
+    }
+    for name, spec in FUNCTIONS.items():
+        if spec.by_variant is None:
+            continue
+        for index, args in enumerate(samples[name]):
+            impl = spec.impl(index)
+            ctx = FakeCtx()
+            impl.expand(ctx, args)
+            if impl.named_target is None:
+                assert len(ctx.nodes) > 1, (name, index)
+                continue
+            assert len(ctx.nodes) == 1, (name, index)
+            assert ctx.nodes[0][1] == impl.named_target, (name, index)
+
+
+def test_delay_signature_lists_both_overloads() -> None:
+    assert signatures("delay") == "delay(audio, num) | delay(video, num)"

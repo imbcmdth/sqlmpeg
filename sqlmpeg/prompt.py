@@ -232,11 +232,15 @@ statement is not. `--` and `/* */` comments are allowed.
 - A named argument may not set something the call already sets: the positional
   form wins, and `crop(a.frame, 0, 0, 10, 10, w => 5)` is rejected rather than
   silently overridden. Use the overload that takes the value positionally.
-- `blur_regions` is a macro over several filters, so it takes no named
-  arguments at all.
+- A call that expands to more than one ffmpeg filter takes no named arguments
+  at all, because there is no single filter to set them on: `blur_regions`,
+  and `delay` on a VIDEO stream. `delay` on an AUDIO stream is one filter and
+  does take them.
 - `overlay` is the one function that cannot take them either: Postgres has a
   builtin `OVERLAY(...)` and `=>` inside it is a `PARSE_ERROR`. Write
-  `overlay(base, top, x, y)` positionally and nothing else.
+  `overlay(base, top, x, y)` positionally, or use the namespaced raw filter
+  `ffmpeg.overlay(base, top, x => 20, y => 20, ...)` (see Beyond the stdlib),
+  which has no such grammar problem and reaches every overlay option.
 
 ### Beyond the stdlib
 - Any filter the installed ffmpeg reports can be called directly by its ffmpeg
@@ -246,14 +250,26 @@ statement is not. `--` and `/* */` comments are allowed.
   and types of the positional arguments are that filter's input pads -- one
   for `V->V` filters, two for `VV->V` ones like `xfade` -- and nothing else is
   positional.
+- EVERY filter is also callable as `ffmpeg.<name>(...)`, e.g.
+  `ffmpeg.unsharp(a.frame, luma_amount => 1.5)`. That spelling resolves in the
+  installed ffmpeg's filter set ONLY -- never the stdlib -- so
+  `ffmpeg.scale(a.frame, w => 640, h => -2)` is ffmpeg's own `scale` filter
+  rather than the stdlib function of the same name. Use it whenever you want
+  the raw filter, and ALWAYS for a name Postgres parses specially: `trim`,
+  `format`, `overlay`, `pad`, `normalize`, `reverse`, `median`, `random`,
+  `corr`, `copy`, `null`. Bare `trim(a.frame)` is Postgres's string `TRIM` and
+  loses the argument; `ffmpeg.trim(a.frame, start => 1)` is the filter.
+  `ffmpeg` is a reserved name: never use it as an alias or a CTE name.
 - Filters with a variable number of pads (`split`, `concat`), more than one
-  output, or no input at all (sources like `testsrc`) are NOT callable.
+  output, or no input at all (sources like `testsrc`) are NOT callable under
+  either spelling.
 - This is machine-dependent, and it is the only part of the dialect that is:
   the stdlib above compiles anywhere, while a query naming a filter (or a
   named option) only compiles where that ffmpeg has it. Prefer a stdlib
   function whenever one does the job, and reach for a raw filter name for
-  effects the stdlib does not cover. A stdlib name always wins: `scale` is the
-  function above, not ffmpeg's `scale` filter.
+  effects the stdlib does not cover. A stdlib name always wins the BARE
+  spelling: `scale` is the function above, not ffmpeg's `scale` filter --
+  `ffmpeg.scale` is how you ask for the filter.
 - If the filter set is unavailable (no ffmpeg, or `--portable`), every such
   call is `UNKNOWN_FUNCTION` and every named argument is `UNSUPPORTED_SQL`;
   the message says which."""
@@ -555,12 +571,20 @@ _REPAIR: dict[ErrorCode, str] = {
     ErrorCode.PARSE_ERROR: (
         "Not valid Postgres SQL. Check for unbalanced parentheses, a missing "
         "comma between FROM items, double quotes used for a string, or text "
-        "after the statement. Re-emit one well-formed SELECT."
+        "after the statement. One more cause: a `=>` argument inside a call "
+        "whose name Postgres parses specially (`overlay`, `trim`, `format`, "
+        "...) -- write that call as `ffmpeg.<name>(...)` instead. Re-emit one "
+        "well-formed SELECT."
     ),
     ErrorCode.UNKNOWN_FUNCTION: (
-        "That name is not in the stdlib. Take the did-you-mean from `hint` if "
-        "there is one; otherwise rebuild the effect from the listed functions, "
-        "or declare it inexpressible. Do not invent ffmpeg filter names."
+        "That name is neither a stdlib function nor a filter the installed "
+        "ffmpeg has. Take the did-you-mean from `hint` if there is one -- it "
+        "comes back in the spelling that works, so `ffmpeg.<name>()` in the "
+        "hint means write it with the namespace. Otherwise rebuild the effect "
+        "from the listed functions, or declare it inexpressible. Do not invent "
+        "ffmpeg filter names, and do not retry a bare name as "
+        "`ffmpeg.<name>` unless the filter really exists: the namespace "
+        "changes which tier resolves the name, not which filters exist."
     ),
     ErrorCode.UNKNOWN_ALIAS: (
         "The qualifier before the dot is not in this SELECT's FROM. Add "
@@ -577,7 +601,9 @@ _REPAIR: dict[ErrorCode, str] = {
         "`video`/`audio` in the got-list where the other was expected usually "
         "means you mixed up video and audio; a stream kind where `num` was "
         "expected usually means you passed a stream or `<alias>.t` instead of "
-        "a number."
+        "a number. A got-list that is EMPTY (`trim(), got trim()`) for a call "
+        "you did pass arguments to means Postgres claimed the name: rewrite it "
+        "as `ffmpeg.<name>(...)`."
     ),
     ErrorCode.SINGLE_OUTPUT_ONLY: (
         "Reserved; sqlmpeg never raises this code -- a multi-column SELECT is "

@@ -37,6 +37,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import sqlglot
 
 from sqlmpeg import compiler
 from sqlmpeg import lower as lower_module
@@ -3099,6 +3100,303 @@ def test_crossfade_of_two_trimmed_segments_compiles(
 
 
 # ---------------------------------------------------------------------------
+# plan 038: delay's VIDEO overload (per-variant expansion)
+# ---------------------------------------------------------------------------
+#
+# `delay` is the only spec whose overloads differ in more than arity: both are
+# (stream, seconds), so nothing but the matched variant INDEX can tell an
+# adelay node from the format+tpad macro. These pin that the index really is
+# what selects the expansion, the output type and the named-argument target.
+
+_AD_INSERT = (
+    "SELECT overlay(f.video[1], delay(scale(a.video[1], 0.33), 1), 20, 20), "
+    "       amix(f.audio[1], volume(delay(a.audio[1], 1), 0.5)) "
+    "FROM input('film.mp4') f, input('ad.mp4') a"
+)
+
+
+def test_video_delay_expands_to_format_plus_tpad() -> None:
+    g = _lower("SELECT delay(a.frame, 1) FROM input('x.mp4') a")
+    assert _filters(g) == ["format", "tpad"]
+    assert g.nodes["n1"].args == {"pix_fmts": "yuva420p"}
+    assert g.nodes["n2"].args == {"start_duration": 1, "stop": 1, "color": "black@0"}
+    assert g.nodes["n2"].inputs == ["n1"]
+    assert _outputs(g) == [("n2", "video", None)]
+
+
+def test_audio_delay_still_expands_to_one_adelay() -> None:
+    g = _lower("SELECT delay(a.audio[1], 1) FROM input('x.mp4') a")
+    assert _filters(g) == ["adelay"]
+    assert g.nodes["n1"].args == {"delays": 1000, "all": 1}
+    assert _outputs(g) == [("n1", "audio", None)]
+
+
+def test_the_stream_kind_alone_picks_the_delay_overload() -> None:
+    """Same name, same arity, same literal -- two different expansions."""
+    g = _lower(
+        "SELECT delay(a.frame, 1), delay(a.audio[1], 1) FROM input('x.mp4') a"
+    )
+    assert _filters(g) == ["format", "tpad", "adelay"]
+    assert [o.type for o in g.outputs] == ["video", "audio"]
+
+
+def test_a_delayed_video_is_classified_as_video_by_its_caller() -> None:
+    """The nested-call type check reads the matched OVERLOAD's return type, so
+    a video delay satisfies overlay's second video parameter."""
+    g = _lower(
+        "SELECT overlay(a.frame, delay(b.frame, 1), 20, 20) "
+        "FROM input('x.mp4') a, input('y.mp4') b"
+    )
+    assert _filters(g) == ["format", "tpad", "overlay"]
+    assert g.nodes["n3"].inputs == ["src:a:v:0", "n2"]
+
+
+def test_a_delayed_audio_is_still_classified_as_audio() -> None:
+    g = _lower("SELECT volume(delay(a.audio[1], 1), 0.5) FROM input('x.mp4') a")
+    assert _filters(g) == ["adelay", "volume"]
+    assert g.nodes["n2"].inputs == ["n1"]
+
+
+def test_the_ad_insert_composition_lowers_end_to_end() -> None:
+    """The plan 038 driving case: a clip delayed onto a film, video and audio
+    (golden 096-ad-insert pins the whole IR; this pins the shape)."""
+    g = _lower(_AD_INSERT)
+    assert _filters(g) == [
+        "scale",
+        "format",
+        "tpad",
+        "overlay",
+        "adelay",
+        "volume",
+        "amix",
+    ]
+    assert g.nodes["n4"].inputs == ["src:f:v:0", "n3"]
+    assert g.nodes["n7"].inputs == ["src:f:a:0", "n6"]
+    assert [o.type for o in g.outputs] == ["video", "audio"]
+
+
+def test_delay_arity_error_lists_both_overloads() -> None:
+    err = _reject_lower("SELECT delay(a.frame, a.frame) FROM input('x.mp4') a", {})
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "delay(audio, num) | delay(video, num)" in err.message
+    assert "got delay(video, video)" in err.message
+
+
+def test_video_delay_broadcasts_over_a_video_array() -> None:
+    g = _lower(
+        "SELECT delay(a.video, 1) FROM input('x.mp4') a",
+        {"a": _probe_result(videos=2, audios=0)},
+    )
+    assert _filters(g) == ["format", "tpad", "format", "tpad"]
+    assert g.nodes["n1"].inputs == ["src:a:v:0"]
+    assert g.nodes["n3"].inputs == ["src:a:v:1"]
+
+
+def test_video_delay_threads_provenance_like_any_1_to_1_chain() -> None:
+    g = _lower(
+        "SELECT delay(a.frame, 1) FROM input('x.mp4') a",
+        {"a": _probe_result(video_tags={"language": "eng"})},
+    )
+    assert [o.metadata for o in g.outputs] == [{"language": "eng"}]
+
+
+def test_video_delay_rejects_named_extras_as_a_macro(_registry: Registry) -> None:
+    """The video overload is two filters, so there is no single option set to
+    reach through to -- the same rule blur_regions follows."""
+    err = _reject_dyn(
+        "SELECT delay(a.frame, 1, color => 'red') FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "expands to more than one ffmpeg filter" in err.message
+
+
+def test_audio_delay_still_targets_adelay_for_named_extras(_registry: Registry) -> None:
+    """named_target is per OVERLOAD: the audio one still reaches adelay, which
+    the fixture ffmpeg does not have -- so the rejection NAMES adelay rather
+    than calling the call a macro."""
+    err = _reject_dyn(
+        "SELECT delay(a.audio[1], 1, all => false) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'adelay'" in err.message
+
+
+def test_delay_over_a_passthrough_stream_is_still_udf_arg_type() -> None:
+    err = _reject_lower("SELECT delay(a.subtitle[1], 1) FROM input('x.mp4') a", {})
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "cannot take a subtitle stream" in err.message
+
+
+# ---------------------------------------------------------------------------
+# plan 038: the `ffmpeg.<filter>(...)` namespace
+# ---------------------------------------------------------------------------
+#
+# One spelling of a filter name that no SQL grammar has an opinion about, and
+# that resolves in the registry ALONE. The offline fixture registry above has
+# `trim` in it, which is exactly the interesting case: bare `trim(a.frame)` is
+# Postgres's string TRIM and loses the argument.
+
+
+def test_a_namespaced_call_lowers_to_an_ordinary_node(_registry: Registry) -> None:
+    g = _dyn("SELECT ffmpeg.gblur(a.frame, sigma => 5) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].filter == "gblur"  # the NODE knows nothing of the namespace
+    assert g.nodes["n1"].args == {"sigma": 5}
+    assert g.nodes["n1"].inputs == ["src:a:v:0"]
+    assert _outputs(g) == [("n1", "video", None)]
+
+
+def test_the_namespace_resolves_past_the_stdlib(_registry: Registry) -> None:
+    """`scale` is both a stdlib function and a real filter. The bare name is
+    the stdlib's, forever; the namespaced one is the filter's."""
+    raw = _dyn(
+        "SELECT ffmpeg.scale(a.frame, width => 640) FROM input('x.mp4') a", _registry
+    )
+    assert raw.nodes["n1"].filter == "scale"
+    # ffmpeg's own option names, not the stdlib's w=iw*<factor>, h=-2 mapping.
+    assert raw.nodes["n1"].args == {"width": 640}
+
+    stdlib = _dyn("SELECT scale(a.frame, 0.5) FROM input('x.mp4') a", _registry)
+    assert stdlib.nodes["n1"].args == {"w": "iw*0.5", "h": "-2"}
+
+
+def test_the_namespace_reaches_a_name_postgres_claimed(_registry: Registry) -> None:
+    """Bare `trim(a.frame)` parses as Postgres's TRIM and arrives with NO
+    positional arguments; the namespaced spelling keeps them."""
+    err = _reject_dyn("SELECT trim(a.frame) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "got trim()" in err.message
+
+    g = _dyn("SELECT ffmpeg.trim(a.frame) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].filter == "trim"
+    assert g.nodes["n1"].inputs == ["src:a:v:0"]
+
+
+def test_the_namespace_qualifier_folds_like_any_identifier(_registry: Registry) -> None:
+    g = _dyn("SELECT FFMPEG.GBlur(a.frame, sigma => 1) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].filter == "gblur"
+
+
+def test_a_namespaced_call_checks_its_pad_signature(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT ffmpeg.gblur(a.audio[1]) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "ffmpeg.gblur(video), got ffmpeg.gblur(audio)" in err.message
+
+
+def test_a_namespaced_option_is_validated_the_ordinary_way(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT ffmpeg.gblur(a.frame, sigmma => 5) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+    # The message names the FILTER, which is what has the options.
+    assert "filter 'gblur' has no option 'sigmma'" in err.message
+    assert err.hint is not None and "sigma" in err.hint
+
+
+def test_a_namespaced_unknown_name_suggests_the_namespaced_spelling(
+    _registry: Registry,
+) -> None:
+    err = _reject_dyn("SELECT ffmpeg.gblurr(a.frame) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert "unknown function ffmpeg.gblurr()" in err.message
+    assert err.hint == "did you mean ffmpeg.gblur()?"
+
+
+def test_a_namespaced_did_you_mean_never_reaches_into_the_stdlib(
+    _registry: Registry,
+) -> None:
+    """`reverb` is a stdlib name and no filter of this ffmpeg. The bare
+    spelling's did-you-mean spans both tiers and finds it; the namespace's
+    spans the registry alone, so it must not offer a tier-1 name."""
+    assert _reject_dyn(
+        "SELECT reverbb(a.audio[1]) FROM input('x.mp4') a", _registry
+    ).hint == "did you mean reverb()?"
+
+    err = _reject_dyn("SELECT ffmpeg.reverb(a.audio[1]) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None
+    assert "reverb" not in err.hint.replace("ffmpeg.<filter>", "")
+    assert "not one of them" in err.hint
+
+
+def test_the_scope_fence_applies_to_the_namespace_too(_registry: Registry) -> None:
+    for sql in (
+        "SELECT ffmpeg.acrossover(a.audio[1]) FROM input('x.mp4') a",
+        "SELECT ffmpeg.feedback(a.frame, a.frame) FROM input('x.mp4') a",
+        "SELECT ffmpeg.testsrc(a.frame) FROM input('x.mp4') a",
+        "SELECT ffmpeg.split(a.frame) FROM input('x.mp4') a",
+    ):
+        assert _reject_dyn(sql, _registry).code is ErrorCode.UNKNOWN_FUNCTION
+
+
+def test_namespaced_calls_nest_in_both_directions(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT scale(ffmpeg.gblur(a.frame, sigma => 2), 0.5) FROM input('x.mp4') a",
+        _registry,
+    )
+    assert _filters(g) == ["gblur", "scale"]
+    g = _dyn(
+        "SELECT ffmpeg.gblur(scale(a.frame, 0.5), sigma => 2) FROM input('x.mp4') a",
+        _registry,
+    )
+    assert _filters(g) == ["scale", "gblur"]
+
+
+def test_a_namespaced_call_broadcasts_like_any_other(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT ffmpeg.aecho(a.audio, in_gain => 0.5) FROM input('x.mp4') a",
+        _registry,
+        {"a": _probe_result(per_audio_tags=[{"language": "eng"}, {"language": "fra"}])},
+    )
+    assert _filters(g) == ["aecho", "aecho"]
+    assert [o.metadata for o in g.outputs] == [{"language": "eng"}, {"language": "fra"}]
+
+
+def test_without_a_registry_the_namespace_is_an_unknown_function() -> None:
+    err = _reject_dyn("SELECT ffmpeg.gblur(a.frame) FROM input('x.mp4') a", None)
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None and "ffmpeg was not found on PATH" in err.hint
+
+
+def test_portable_says_so_for_the_namespace_too() -> None:
+    err = _reject_dyn(
+        "SELECT ffmpeg.gblur(a.frame) FROM input('x.mp4') a", None, portable=True
+    )
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None and "--portable" in err.hint
+
+
+def test_ffmpeg_is_reserved_as_an_input_alias() -> None:
+    err = _reject_lower("SELECT ffmpeg.frame FROM input('x.mp4') ffmpeg", {})
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "reserved for the filter namespace" in err.message
+
+
+def test_ffmpeg_is_reserved_as_a_cte_name() -> None:
+    err = _reject_lower(
+        "WITH ffmpeg AS (SELECT a.frame FROM input('x.mp4') a) "
+        "SELECT ffmpeg.frame FROM ffmpeg",
+        {},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "reserved for the filter namespace" in err.message
+
+
+def test_a_bare_ffmpeg_column_points_at_the_call_form() -> None:
+    """`ffmpeg.gblur` with no parentheses is a COLUMN, and the namespace only
+    exists in call position -- so the hint names the call form."""
+    err = _reject_lower("SELECT ffmpeg.gblur FROM input('x.mp4') a", {})
+    assert err.code is ErrorCode.UNKNOWN_ALIAS
+    assert err.hint is not None and "ffmpeg.gblur(<stream>" in err.hint
+
+
+def test_an_unrelated_qualified_call_is_still_rejected() -> None:
+    """The namespace is exactly one name; `foo.gblur(...)` is not a call
+    sqlmpeg knows how to read."""
+    err = _reject_lower("SELECT foo.gblur(a.frame) FROM input('x.mp4') a", {})
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+# ---------------------------------------------------------------------------
 # RFC-003: the same shapes against the REAL installed ffmpeg (plan 031)
 # ---------------------------------------------------------------------------
 #
@@ -3230,3 +3528,168 @@ def test_did_you_mean_reaches_into_the_real_filter_set(_av_fixture: str) -> None
     err = _reject(f"SELECT gblu(a.frame) FROM input('{_av_fixture}') a")
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert err.hint is not None and "gblur()" in err.hint
+
+
+# ---------------------------------------------------------------------------
+# plan 038: the collision census, measured against the REAL filter set
+# ---------------------------------------------------------------------------
+#
+# Which filter names Postgres parses specially is a property of sqlglot's
+# grammar crossed with this ffmpeg's filter list, so it is MEASURED rather
+# than reasoned about: parse `<name>(...)` for every in-fence filter, in
+# several argument shapes (a collision can depend on the arity -- `overlay(a)`
+# is a PARSE_ERROR while `overlay(a, b, 1, 2)` is the builtin), and collect
+# every name that does not arrive as an ordinary anonymous call.
+#
+# The list this pins is the one docs/dynamic-filters.md publishes. It is
+# allowed to grow with a new ffmpeg or a new sqlglot; what must never grow is
+# the set of filters you cannot reach, which is why the second half of the
+# census compiles every collided name through the namespace.
+
+_CENSUS_ARG_FORMS = (
+    "a.frame",
+    "a.frame, b.frame",
+    "a.frame, b.frame, 1, 2",
+    "a.frame, x => 1",
+)
+
+# Measured against ffmpeg 7.1 (464 in-fence filters) and sqlglot 30.17.
+_KNOWN_COLLISIONS = frozenset(
+    {
+        "copy",
+        "corr",
+        "format",
+        "median",
+        "normalize",
+        "null",
+        "overlay",
+        "pad",
+        "random",
+        "reverse",
+        "trim",
+    }
+)
+
+
+def _parses_as_a_plain_call(sql: str, *, namespaced: bool) -> bool:
+    """Did sqlglot read this as an ordinary function call and nothing else?
+
+    A namespaced call's ordinary shape is one level deeper --
+    ``Dot(Identifier(ffmpeg), Anonymous(...))`` -- which is the whole reason
+    the namespace works: the qualifier is what the parser sees first, so no
+    special form ever matches.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, read="postgres")
+    except Exception:
+        return False
+    node = tree.expressions[0]
+    if not namespaced:
+        return isinstance(node, sqlglot.exp.Anonymous)
+    return isinstance(node, sqlglot.exp.Dot) and isinstance(
+        node.args.get("expression"), sqlglot.exp.Anonymous
+    )
+
+
+def _census(names: list[str], *, namespaced: bool = False) -> set[str]:
+    prefix = "ffmpeg." if namespaced else ""
+    return {
+        name
+        for name in names
+        for form in _CENSUS_ARG_FORMS
+        if not _parses_as_a_plain_call(
+            f"SELECT {prefix}{name}({form}) FROM t", namespaced=namespaced
+        )
+    }
+
+
+@pytest.mark.exec
+def test_the_collision_census_is_the_documented_set() -> None:
+    """Every filter name Postgres parses specially, enumerated empirically."""
+    names = registry_module.load().names()
+    assert names, "no filters: this test needs a real ffmpeg"
+    assert _census(names) == _KNOWN_COLLISIONS & set(names)
+
+
+@pytest.mark.exec
+def test_the_namespace_never_collides_with_the_grammar() -> None:
+    """The other half of the census: prefixed with the namespace, EVERY filter
+    name parses as an ordinary call in every argument shape."""
+    names = registry_module.load().names()
+    assert names, "no filters: this test needs a real ffmpeg"
+    assert _census(names, namespaced=True) == set()
+
+
+@pytest.mark.exec
+def test_every_collided_filter_compiles_through_the_namespace(
+    _av_fixture: str, _av2_fixture: str
+) -> None:
+    """The point of the whole feature: no in-fence filter is unreachable.
+
+    Each collided name is called with exactly its own input pads (from the
+    real pad signature), one distinct alias per pad so nothing needs a split,
+    so the compile is the genuine one -- probe, registry lookup, pad type
+    check and all.
+    """
+    registry = registry_module.load()
+    collided = sorted(_KNOWN_COLLISIONS & set(registry.names()))
+    assert collided, "no collisions on this ffmpeg: nothing to prove"
+    files = (_av_fixture, _av2_fixture)
+
+    for name in collided:
+        dynamic = registry.get(name)
+        assert dynamic is not None
+        aliases = "abcd"[: len(dynamic.inputs)]
+        assert len(aliases) == len(dynamic.inputs), name
+        pads = ", ".join(
+            f"{alias}.video[1]" if kind == "video" else f"{alias}.audio[1]"
+            for alias, kind in zip(aliases, dynamic.inputs)
+        )
+        sources = ", ".join(
+            f"input('{files[i % len(files)]}') {alias}"
+            for i, alias in enumerate(aliases)
+        )
+        query = f"SELECT ffmpeg.{name}({pads}) FROM {sources}"
+        graph = compile_sql(query)
+        assert [node.filter for node in graph.nodes.values()] == [name], query
+
+
+@pytest.mark.exec
+def test_the_real_overlay_options_are_reachable_through_the_namespace(
+    _av2_fixture: str, _av3_fixture: str, tmp_path: Path
+) -> None:
+    """`overlay`'s named extras are unreachable in its stdlib spelling (the
+    OVERLAY..PLACING grammar makes `=>` a PARSE_ERROR); namespaced, the whole
+    option set is there -- and the command runs."""
+    query = (
+        "SELECT ffmpeg.overlay(a.frame, b.frame, x => 20, y => 20, "
+        "eof_action => 'pass') "
+        f"FROM input('{_av2_fixture}') a, input('{_av3_fixture}') b"
+    )
+    g = compile_sql(query)
+    assert g.nodes["n1"].filter == "overlay"
+    assert g.nodes["n1"].args == {"x": 20, "y": 20, "eof_action": "pass"}
+    _run_compiled(query, tmp_path / "ns-overlay.mp4")
+
+    assert _reject(
+        "SELECT overlay(a.frame, b.frame, x => 20, y => 20) "
+        f"FROM input('{_av2_fixture}') a, input('{_av3_fixture}') b"
+    ).code is ErrorCode.PARSE_ERROR
+
+
+@pytest.mark.exec
+def test_the_real_trim_filter_runs_through_the_namespace(
+    _av_fixture: str, tmp_path: Path
+) -> None:
+    """ffmpeg's `trim` filter, the one Postgres's TRIM grammar hides.
+
+    The option names are ffmpeg's own as the registry reports them, aliases
+    deduped to the longer spelling (`starti`, not `start`) -- read out of the
+    binary, not from any table here.
+    """
+    query = (
+        f"SELECT ffmpeg.trim(a.frame, starti => 0.5, durationi => 1) "
+        f"FROM input('{_av_fixture}') a"
+    )
+    assert compile_sql(query).nodes["n1"].args == {"starti": 0.5, "durationi": 1}
+    _run_compiled(query, tmp_path / "ns-trim.mp4")

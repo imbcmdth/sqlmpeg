@@ -179,11 +179,15 @@ statement is not. `--` and `/* */` comments are allowed.
 - A named argument may not set something the call already sets: the positional
   form wins, and `crop(a.frame, 0, 0, 10, 10, w => 5)` is rejected rather than
   silently overridden. Use the overload that takes the value positionally.
-- `blur_regions` is a macro over several filters, so it takes no named
-  arguments at all.
+- A call that expands to more than one ffmpeg filter takes no named arguments
+  at all, because there is no single filter to set them on: `blur_regions`,
+  and `delay` on a VIDEO stream. `delay` on an AUDIO stream is one filter and
+  does take them.
 - `overlay` is the one function that cannot take them either: Postgres has a
   builtin `OVERLAY(...)` and `=>` inside it is a `PARSE_ERROR`. Write
-  `overlay(base, top, x, y)` positionally and nothing else.
+  `overlay(base, top, x, y)` positionally, or use the namespaced raw filter
+  `ffmpeg.overlay(base, top, x => 20, y => 20, ...)` (see Beyond the stdlib),
+  which has no such grammar problem and reaches every overlay option.
 
 ### Beyond the stdlib
 - Any filter the installed ffmpeg reports can be called directly by its ffmpeg
@@ -193,14 +197,26 @@ statement is not. `--` and `/* */` comments are allowed.
   and types of the positional arguments are that filter's input pads -- one
   for `V->V` filters, two for `VV->V` ones like `xfade` -- and nothing else is
   positional.
+- EVERY filter is also callable as `ffmpeg.<name>(...)`, e.g.
+  `ffmpeg.unsharp(a.frame, luma_amount => 1.5)`. That spelling resolves in the
+  installed ffmpeg's filter set ONLY -- never the stdlib -- so
+  `ffmpeg.scale(a.frame, w => 640, h => -2)` is ffmpeg's own `scale` filter
+  rather than the stdlib function of the same name. Use it whenever you want
+  the raw filter, and ALWAYS for a name Postgres parses specially: `trim`,
+  `format`, `overlay`, `pad`, `normalize`, `reverse`, `median`, `random`,
+  `corr`, `copy`, `null`. Bare `trim(a.frame)` is Postgres's string `TRIM` and
+  loses the argument; `ffmpeg.trim(a.frame, start => 1)` is the filter.
+  `ffmpeg` is a reserved name: never use it as an alias or a CTE name.
 - Filters with a variable number of pads (`split`, `concat`), more than one
-  output, or no input at all (sources like `testsrc`) are NOT callable.
+  output, or no input at all (sources like `testsrc`) are NOT callable under
+  either spelling.
 - This is machine-dependent, and it is the only part of the dialect that is:
   the stdlib above compiles anywhere, while a query naming a filter (or a
   named option) only compiles where that ffmpeg has it. Prefer a stdlib
   function whenever one does the job, and reach for a raw filter name for
-  effects the stdlib does not cover. A stdlib name always wins: `scale` is the
-  function above, not ffmpeg's `scale` filter.
+  effects the stdlib does not cover. A stdlib name always wins the BARE
+  spelling: `scale` is the function above, not ffmpeg's `scale` filter --
+  `ffmpeg.scale` is how you ask for the filter.
 - If the filter set is unavailable (no ffmpeg, or `--portable`), every such
   call is `UNKNOWN_FUNCTION` and every named argument is `UNSUPPORTED_SQL`;
   the message says which.
@@ -359,8 +375,8 @@ argument kinds.
   Attenuate frequencies below freq Hz (ffmpeg highpass).
 - `lowpass(a: audio, freq: num)`
   Attenuate frequencies above freq Hz (ffmpeg lowpass).
-- `delay(a: audio, seconds: num)`
-  Delay audio by seconds (converted to integer milliseconds; ffmpeg adelay).
+- `delay(a: audio, seconds: num) | delay(f: video, seconds: num)`
+  Delay a stream by seconds: audio shifts by that many milliseconds (adelay), video becomes a transparent canvas that is empty before the clip starts and after it ends (format + tpad), so it composites straight into overlay.
 - `acrossfade(a: audio, b: audio, dur: num)`
   Cross fade from a to b over dur seconds of audio.
 - `areverse(a: audio)`
@@ -515,10 +531,10 @@ what the error names, then re-validate. Do not rewrite the whole query, and do
 not repeat a fix that already failed -- if a construct is rejected twice, it is
 not in the dialect.
 
-- `PARSE_ERROR` -- Not valid Postgres SQL. Check for unbalanced parentheses, a missing comma between FROM items, double quotes used for a string, or text after the statement. Re-emit one well-formed SELECT.
-- `UNKNOWN_FUNCTION` -- That name is not in the stdlib. Take the did-you-mean from `hint` if there is one; otherwise rebuild the effect from the listed functions, or declare it inexpressible. Do not invent ffmpeg filter names.
+- `PARSE_ERROR` -- Not valid Postgres SQL. Check for unbalanced parentheses, a missing comma between FROM items, double quotes used for a string, or text after the statement. One more cause: a `=>` argument inside a call whose name Postgres parses specially (`overlay`, `trim`, `format`, ...) -- write that call as `ffmpeg.<name>(...)` instead. Re-emit one well-formed SELECT.
+- `UNKNOWN_FUNCTION` -- That name is neither a stdlib function nor a filter the installed ffmpeg has. Take the did-you-mean from `hint` if there is one -- it comes back in the spelling that works, so `ffmpeg.<name>()` in the hint means write it with the namespace. Otherwise rebuild the effect from the listed functions, or declare it inexpressible. Do not invent ffmpeg filter names, and do not retry a bare name as `ffmpeg.<name>` unless the filter really exists: the namespace changes which tier resolves the name, not which filters exist.
 - `UNKNOWN_ALIAS` -- The qualifier before the dot is not in this SELECT's FROM. Add `input('path') <alias>` or the CTE name to that FROM clause; `hint` lists what is in scope. Names do not cross UNION ALL branches, and a CTE is in scope only in the branches whose FROM names it.
-- `UDF_ARG_TYPE` -- Wrong arity or wrong argument kind. Count the arguments against one signature in `message` and fix the mismatched slot: `video` needs `<alias>.video[k]`, `<alias>.frame`, or a nested video-returning call; `audio` needs `<alias>.audio[k]` or a nested audio-returning call; `num` needs a bare number; `str` needs a single-quoted literal. `video`/`audio` in the got-list where the other was expected usually means you mixed up video and audio; a stream kind where `num` was expected usually means you passed a stream or `<alias>.t` instead of a number.
+- `UDF_ARG_TYPE` -- Wrong arity or wrong argument kind. Count the arguments against one signature in `message` and fix the mismatched slot: `video` needs `<alias>.video[k]`, `<alias>.frame`, or a nested video-returning call; `audio` needs `<alias>.audio[k]` or a nested audio-returning call; `num` needs a bare number; `str` needs a single-quoted literal. `video`/`audio` in the got-list where the other was expected usually means you mixed up video and audio; a stream kind where `num` was expected usually means you passed a stream or `<alias>.t` instead of a number. A got-list that is EMPTY (`trim(), got trim()`) for a call you did pass arguments to means Postgres claimed the name: rewrite it as `ffmpeg.<name>(...)`.
 - `SINGLE_OUTPUT_ONLY` -- Reserved; sqlmpeg never raises this code -- a multi-column SELECT is ordinary usage, one column per output stream. If you see it anyway, treat it as INTERNAL: re-emit the simplest form of the query.
 - `NO_STREAMING_EQUIVALENT` -- Delete the clause named in `message`; there is no filtergraph form for it. If you used it to pick a time range, use `WHERE <alias>.t BETWEEN a AND b`. If you used it to pick one branch, just write that branch.
 - `CONCAT_MISMATCH` -- UNION ALL branches disagree. `message` says how: if it names stream types, column counts, or order, make every branch select the same columns, the same types, in the same order (a splatted array counts one column per element, so array lengths must match too); if it is a resolution/frame-rate mismatch, wrap each branch's video column in `scale(<expr>, w, h)` with the same w and h everywhere.

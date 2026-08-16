@@ -45,6 +45,17 @@ Notes for downstream passes (lower):
   never feed one. The resolver checks the qualifier is a known alias; lower
   does the expansion (it is the pass that has the probes).
 
+* The ``ffmpeg.<filter>(...)`` namespace (plan 038) needs nothing from this
+  pass but a reserved name. VERIFIED under sqlglot 30.17 ``read="postgres"``:
+  a qualified call parses as ``exp.Dot(this=Identifier(ffmpeg),
+  expression=exp.Anonymous(this=<filter>, expressions=[...]))`` for EVERY
+  filter name, collision victims included — the builtin special-form grammars
+  (``OVERLAY ... PLACING``, ``TRIM``, ``FORMAT``, ...) key on a bare name, so
+  qualifying it bypasses them completely, and ``=>`` arguments land in the
+  ``Anonymous`` as ordinary ``exp.Kwarg``s. The resolver therefore only
+  RESERVES the name ``ffmpeg`` (:meth:`_Resolver._reserve`) so no alias or CTE
+  can shadow the namespace; lower does the resolution.
+
 * Stream subscripts (``a.video[1]``) arrive as ``exp.Bracket`` wrapping the
   ``exp.Column``. **sqlglot rebases the index at parse time**: under
   ``read="postgres"`` (``INDEX_OFFSET = 1``) it rewrites the single subscript
@@ -66,6 +77,7 @@ from sqlglot.errors import ParseError, SqlglotError
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 
 __all__ = [
+    "FILTER_NAMESPACE",
     "RawSink",
     "RawSinkOption",
     "Resolved",
@@ -76,6 +88,11 @@ __all__ = [
     "subscript_index",
     "union_branches",
 ]
+
+# The reserved qualifier of the raw-filter namespace: `ffmpeg.<filter>(...)`
+# (plan 038). It is not an alias and never resolves against the FROM clause, so
+# no alias or CTE may claim the name (`_Resolver._reserve`).
+FILTER_NAMESPACE = "ffmpeg"
 
 # A top-level (or CTE-level) query: a plain SELECT, or a UNION ALL of them.
 QueryExpr = exp.Select | exp.Union
@@ -756,6 +773,14 @@ class _Resolver:
     def _reserve(self, name: str, node: exp.Expr | None) -> None:
         if not name:
             raise _error(ErrorCode.UNSUPPORTED_SQL, "empty name", node)
+        if name == FILTER_NAMESPACE:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{FILTER_NAMESPACE}' is reserved for the filter namespace",
+                node,
+                hint=f"{FILTER_NAMESPACE}.<filter>(...) calls an ffmpeg filter "
+                "directly; pick another alias or CTE name",
+            )
         if name in self.ctes or name in self.sources:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -1112,12 +1137,22 @@ class _Resolver:
             name = _ident_name(table_node)
             kind = scope.get(name)
             if kind is None:
+                # `ffmpeg.<x>` with no parentheses is a COLUMN, not a namespaced
+                # call: the namespace only exists in call position, so say so
+                # instead of listing aliases the user never meant.
+                hint = (
+                    f"{FILTER_NAMESPACE}.<filter>(...) is a call, not a column; "
+                    f"write {FILTER_NAMESPACE}.{sub.name}(<stream>, "
+                    "<option> => <value>) or select a real alias's stream"
+                    if name == FILTER_NAMESPACE
+                    else self._known_hint(scope)
+                )
                 raise _error(
                     ErrorCode.UNKNOWN_ALIAS,
                     f"unknown alias '{name}'",
                     table_node,
                     fallback=select,
-                    hint=self._known_hint(scope),
+                    hint=hint,
                 )
             # `<alias>.*` is an exp.Column whose `this` is a Star: the alias
             # still has to exist (checked just above), but there is no column

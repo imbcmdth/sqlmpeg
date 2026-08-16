@@ -4,7 +4,7 @@ The curated stdlib ([docs/stdlib.md](stdlib.md)) is a few dozen functions. The f
 
 ## Two tiers
 
-- **Tier 1, the curated stdlib.** Portable: every stdlib query compiles on any machine, with or without ffmpeg installed. Its argument order is the hand-picked, documented one (`scale(f, w, h)` rather than ffmpeg's own option spellings), and it wins every name collision. `scale`, `crop`, `blur` and a handful of others are both a stdlib function and a real filter name; the stdlib entry is what those names resolve to, always.
+- **Tier 1, the curated stdlib.** Portable: every stdlib query compiles on any machine, with or without ffmpeg installed. Its argument order is the hand-picked, documented one (`scale(f, w, h)` rather than ffmpeg's own option spellings), and it wins every name collision. `scale`, `crop`, `blur` and a handful of others are both a stdlib function and a real filter name; the bare name is what the stdlib entry answers to, always, and `ffmpeg.scale(...)` is how you ask for the filter instead.
 - **Tier 2, the dynamic registry.** Every filter the installed ffmpeg reports, minus the scope fence below. Machine-dependent on purpose: a query naming a tier-2 filter compiles only on a machine whose ffmpeg has that filter. The compiles-forever promise belongs to tier 1 alone; tier 2 promises exactly "whatever `ffmpeg -filters` says on this machine, right now," no more and no less.
 
 Call a tier-2 filter by its ffmpeg name, stream inputs positional, every option by name:
@@ -16,6 +16,8 @@ FROM input('clip.mp4') a
 
 The positional count and types come straight from the filter's pad signature: `unsharp` is `V->V`, so exactly one video in; `xfade` is `VV->V`, so two. Options are named-only. `unsharp(a.frame, 7, 1.5)` is rejected, because tier 2 has no concept of ffmpeg's option order on purpose: `unsharp` has thirteen options, and named arguments mean you never have to remember which two the bare numbers would have bound to.
 
+The same filter is also callable as `ffmpeg.unsharp(...)`. That spelling resolves in the registry alone, so it both reaches filters whose names Postgres has claimed and asks for the raw filter where a stdlib function shares the name — see [the `ffmpeg.` namespace](#the-ffmpeg-namespace-names-postgres-got-to-first) below.
+
 ### Tier-1 named extras
 
 Stdlib calls also take trailing named arguments, reaching through to the underlying filter's full option set. The hand-picked positional signature covers the everyday case; named extras cover the other 90% of the option surface without anyone writing a second, wider variant of the same function:
@@ -26,7 +28,7 @@ scale(a.frame, 1280, 720, flags => 'lanczos')
 crossfade(a.frame, b.frame, 1, 8, transition => 'wipeleft')
 ```
 
-A macro with no single underlying filter (`blur_regions` expands to a three-filter subgraph) takes no named arguments; there is no one filter to validate them against. A named argument colliding with something the positional signature already set is a typed error, never a silent override: `crop(f, 0, 0, 10, 10, w => 5)` tells you `'w'` is already taken.
+A macro with no single underlying filter (`blur_regions` expands to a three-filter subgraph) takes no named arguments; there is no one filter to validate them against. That is per OVERLOAD, not per function: `delay` on audio is one `adelay` node and takes them, `delay` on video is a `format`+`tpad` macro and does not. A named argument colliding with something the positional signature already set is a typed error, never a silent override: `crop(f, 0, 0, 10, 10, w => 5)` tells you `'w'` is already taken.
 
 ## Named arguments and validation
 
@@ -58,12 +60,40 @@ Parsed results are cached on disk under `~/.cache/sqlmpeg/`, one file per ffmpeg
 
 `sqlmpeg explain` annotates dynamically-resolved filters in the IR dump, so the machine-dependence stays visible. The graph itself doesn't care: a tier-2 node is an ordinary node, and split, emit, and the golden tests neither know nor ask where it came from.
 
-## Known limitation: names Postgres got to first
+## The `ffmpeg.` namespace: names Postgres got to first
 
-A few ffmpeg filter names collide with grammar that Postgres (and therefore sqlglot, per guardrail #2) parses specially, before lowering ever sees an ordinary function call:
+Some ffmpeg filter names are also Postgres grammar. `overlay` is `OVERLAY(x PLACING y FROM n FOR m)`, `trim` is `TRIM(BOTH ... FROM ...)`, `format` is the `FORMAT(...)` builtin — sqlglot (which parses every query, per guardrail #2) recognizes the special form before anything of sqlmpeg's runs, and the call arrives as something other than an ordinary function call: with its arguments folded into the wrong slot, or as a `PARSE_ERROR`.
 
-- **`overlay`.** Postgres has a builtin `OVERLAY(x PLACING y FROM n FOR m)`, so `overlay(...)` always parses with that grammar. Harmless day to day, since `overlay` is a stdlib function and the stdlib wins the name, but it means `overlay`'s named extras are unreachable: a `=>` inside `overlay(...)` is a `PARSE_ERROR` before sqlmpeg's handling ever runs.
-- **`trim`.** Postgres owns string `TRIM(...)` (`TRIM(BOTH ... FROM ...)` and its relatives), and sqlglot parses a bare `trim(x)` with that grammar, folding the argument somewhere an ordinary call reader doesn't look. Calling `trim(...)` as a tier-2 filter therefore presents as a wrong arity instead of the filter you meant. Nothing internal is affected: a CTE's `WHERE` window still generates `trim`/`atrim` nodes directly (never through SQL call syntax), and an input alias's window doesn't generate a filter at all, it becomes an input seek (see [docs/trimming.md](trimming.md)).
-- **`split`.** Would collide the same way via `SPLIT_PART(...)` grammar, but ffmpeg's `split`/`asplit` are variable-pad (`V->N`) and already outside the scope fence, so the collision never gets its moment.
+Every filter is therefore also reachable as **`ffmpeg.<name>(...)`**, which never collides:
 
-A known wart, tracked separately, and documented here so it costs you a paragraph instead of an afternoon.
+```sql
+SELECT ffmpeg.trim(a.frame, start => 1, end => 4),
+       ffmpeg.overlay(a.frame, b.frame, x => 20, y => 20, eof_action => 'pass')
+FROM input('a.mp4') a, input('b.mp4') b
+```
+
+The special-form grammars key on a *bare* name, so qualifying the call bypasses all of them at once: `ffmpeg.<anything>(...)` parses uniformly, arguments and `=>` options intact. A namespaced call resolves in the dynamic registry **only** — never the stdlib, never a builtin — so `ffmpeg.scale(a.frame, w => 640, h => -2)` is ffmpeg's `scale` filter with its own options, while bare `scale(a.frame, 0.5)` stays the stdlib function. It is otherwise an ordinary tier-2 call in every respect: stream inputs positional from the pad signature, options named, the same scope fence, the same `UNKNOWN_FUNCTION` when there is no ffmpeg (or under `--portable`), and an ordinary node in the IR that split, emit and the goldens can't tell apart. `ffmpeg` is a reserved name: an alias or CTE called `ffmpeg` is `UNSUPPORTED_SQL`.
+
+### The collision census
+
+Measured, not guessed — a test parses `<name>(a.frame)` (plus two-, four-argument and `=>` forms) under `read="postgres"` for every filter in the registry and reports the names that do not arrive as an ordinary call. Against ffmpeg 7.1's 464 in-fence filters and sqlglot 30.17, eleven names collide:
+
+| filter | what Postgres does with the bare name |
+| --- | --- |
+| `copy` | `COPY` statement grammar — `PARSE_ERROR` |
+| `corr` | aggregate `corr(x, y)` |
+| `format` | `FORMAT(...)` builtin — argument lost |
+| `median` | `MEDIAN(...)` builtin |
+| `normalize` | `NORMALIZE(...)` builtin |
+| `null` | the `NULL` keyword — `PARSE_ERROR` |
+| `overlay` | `OVERLAY(x PLACING y FROM n FOR m)` |
+| `pad` | `PAD` grammar |
+| `random` | `RANDOM()` builtin |
+| `reverse` | `REVERSE(...)` builtin |
+| `trim` | `TRIM(...)` builtin — argument lost |
+
+Which shape a collision takes depends on the argument count (`overlay(a, b, 1, 2)` parses as the builtin, `overlay(a)` is a `PARSE_ERROR`), which is exactly why the census tests several arities rather than reasoning about the grammar. Four of the eleven — `overlay`, `pad`, `normalize`, `reverse` — are stdlib function names too, so their bare spelling was already the stdlib's and the collision only ever hid the raw filter.
+
+`split` would collide the same way via `SPLIT_PART(...)`, but ffmpeg's `split`/`asplit` are variable-pad (`V->N`) and outside the scope fence, so it is `UNKNOWN_FUNCTION` under either spelling.
+
+Two things the collisions never touched: `overlay`'s stdlib entry works positionally as it always has (`overlay(base, top, x, y)`), and sqlmpeg's own internal `trim`/`atrim` nodes — a CTE's `WHERE` window — are built directly, never through SQL call syntax (an input alias's window is not even a filter; it is an input seek, see [docs/trimming.md](trimming.md)).
