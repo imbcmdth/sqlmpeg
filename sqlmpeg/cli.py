@@ -6,7 +6,7 @@ plan 008 (plan 037 for the SQL-string-is-the-default-input convention below).
 
 Subcommands:
 
-* ``compile SQL [-f FILE] [--graph-only] [-o OUT] [--no-probe] [--portable]``
+* ``compile SQL [-f FILE] [--graph-only] [-o OUT] [--no-probe]``
   -- print the full ffmpeg command (POSIX-quoted via ``shlex.join``, even on
   Windows -- it is documentation output, not something meant to be pasted
   into cmd.exe), or just the ``-filter_complex`` string with
@@ -16,18 +16,17 @@ Subcommands:
   compiles to ONE ffmpeg command with one output file per COPY, so ``-o`` --
   which names a single file -- is a usage error (exit 2) against it, naming
   the paths the script found.
-* ``explain SQL [-f FILE] [--no-probe] [--portable]`` -- dump the IR graph
+* ``explain SQL [-f FILE] [--no-probe]`` -- dump the IR graph
   as JSON (the sinks, with their paths and options, are part of that JSON
   already).
-* ``validate SQL [-f FILE] [--json] [--no-probe] [--portable]`` -- exit 0
+* ``validate SQL [-f FILE] [--json] [--no-probe]`` -- exit 0
   silent on success; on error, exit 1 with either a one-line human message
   or ``err.to_dict()`` JSON.
 * ``run SQL [-f FILE] [-o OUT] [--timeout SECS] [-y]`` -- compile and
   execute ffmpeg as a subprocess (guardrail #6: argv list, no shell, timeout
   enforced, stderr captured and surfaced on failure). ``run`` always
   probes -- the files must exist to execute, so there is no ``--no-probe``
-  escape hatch here; it has no ``--portable`` either, since it needs an
-  installed ffmpeg to execute against regardless. Output path: ``-o`` if
+  escape hatch here. Output path: ``-o`` if
   given, else the query's sink paths, else a usage error (exit 2) -- unlike
   ``compile``, ``run`` never falls back to a placeholder path. A multi-COPY
   script runs as the single ffmpeg command it compiles to, writing every
@@ -61,12 +60,11 @@ byte-reproducible, fully offline compile (RFC-001 "Probing policy"): no
 array splats fail with ``INPUT_NOT_FOUND``, and provenance metadata is never
 attached.
 
-``--portable`` (compile/explain/validate only; RFC-003) compiles against the
-stdlib alone -- no ffmpeg filter registry is even constructed, so a query
-naming a dynamic (tier-2) filter or passing a named option is rejected
-(``UNKNOWN_FUNCTION`` / ``UNSUPPORTED_SQL``) exactly as it would be on a
-machine with no ffmpeg installed at all. Use it to confirm a query will
-compile on someone else's machine.
+``--portable`` is GONE (RFC-007, plan 051). There is no longer a portable
+subset to compile against: every function is a filter of the installed
+ffmpeg, so "will this compile elsewhere" is answered by the ffmpeg build, not
+by a flag. ``--no-probe`` survives unchanged -- probing is about FILES, not
+filters.
 """
 
 from __future__ import annotations
@@ -140,23 +138,11 @@ def _build_parser() -> argparse.ArgumentParser:
     compile_p.add_argument(
         "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
     )
-    compile_p.add_argument(
-        "--portable",
-        action="store_true",
-        help="reject filters and named options that depend on the installed ffmpeg",
-    )
-
     explain_p = subparsers.add_parser("explain", help="dump the compiled IR graph as JSON")
     _add_query_arguments(explain_p)
     explain_p.add_argument(
         "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
     )
-    explain_p.add_argument(
-        "--portable",
-        action="store_true",
-        help="reject filters and named options that depend on the installed ffmpeg",
-    )
-
     validate_p = subparsers.add_parser("validate", help="check that a query compiles")
     _add_query_arguments(validate_p)
     validate_p.add_argument(
@@ -165,12 +151,6 @@ def _build_parser() -> argparse.ArgumentParser:
     validate_p.add_argument(
         "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
     )
-    validate_p.add_argument(
-        "--portable",
-        action="store_true",
-        help="reject filters and named options that depend on the installed ffmpeg",
-    )
-
     run_p = subparsers.add_parser("run", help="compile and execute ffmpeg")
     _add_query_arguments(run_p)
     run_p.add_argument(
@@ -311,7 +291,7 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         return code
 
     try:
-        graph = compile_sql(text, probe=not args.no_probe, portable=args.portable)
+        graph = compile_sql(text, probe=not args.no_probe)
         emitted = emit(graph)
     except SqlmpegError as err:
         _print_error(err, source=args.query)
@@ -342,7 +322,7 @@ def _cmd_explain(args: argparse.Namespace) -> int:
         return code
 
     try:
-        graph = compile_sql(text, probe=not args.no_probe, portable=args.portable)
+        graph = compile_sql(text, probe=not args.no_probe)
     except SqlmpegError as err:
         _print_error(err, source=args.query)
         return 1
@@ -357,7 +337,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         return code
 
     try:
-        compile_sql(text, probe=not args.no_probe, portable=args.portable)
+        compile_sql(text, probe=not args.no_probe)
     except SqlmpegError as err:
         if args.as_json:
             # Machine contract: stdout stays pure JSON, the library error

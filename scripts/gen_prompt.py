@@ -2,7 +2,7 @@
 
 The committed markdown file is the human-browsable copy of what
 ``sqlmpeg prompt`` prints; ``tests/test_prompt.py`` asserts the two are in
-sync, so run this after touching ``sqlmpeg/prompt.py`` or the stdlib table.
+sync, so run this after touching ``sqlmpeg/prompt.py``.
 
 Idempotent: the prompt builder is pure, so re-running rewrites identical
 bytes. Newlines are forced to ``\\n`` on every platform.

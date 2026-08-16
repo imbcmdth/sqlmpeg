@@ -72,8 +72,32 @@ fixtures this was verified against:
     duplicate-doc groups across a full scan of ffmpeg 7.1's included
     filters); file ORDER is not a reliable signal by itself (`scale` lists
     `w` before `width`, but `size` before `s` -- inconsistent). This module
-    dedups by identical doc text within a filter and keeps the longest
-    name, breaking length ties by first occurrence.
+    dedups by identical doc text and keeps the longest name, breaking
+    length ties by first occurrence -- but ONLY within a run of CONSECUTIVE
+    lines that share that doc text.
+
+    The adjacency requirement is ffmpeg's own rule, not a heuristic
+    (plan 051). An alias pair is two AVOption entries at the same struct
+    OFFSET, and libavfilter's `process_options` walks the option list to
+    bind POSITIONAL filtergraph arguments (`gblur=5`, `crop=100:50:10:20`),
+    skipping an entry only when its offset equals the one it just consumed
+    -- i.e. only when the duplicate is ADJACENT. So the surviving list is
+    exactly ffmpeg's positional binding order, which is what plan 051's
+    positional call syntax binds against.
+
+    Grouping by doc text ALONE (the pre-051 rule) merged options that are
+    genuinely distinct and merely happen to share a description, which both
+    dropped real options and shifted every positional slot after them.
+    Measured against ffmpeg 7.1, 7 of 477 filters/sources were affected:
+    `deshake` (`x`/`rx` and `y`/`ry` -- `x`,`y` vanished and slot 1 became
+    `w`, where ffmpeg binds `x`), `noise` (`all_*`/`c0_*` -- the six `c0_`
+    options vanished and slot 4 became `c1_seed`, where ffmpeg binds
+    `c0_seed`), `cropdetect` (`reset`/`reset_count`, non-adjacent -- ffmpeg
+    binds BOTH, to slots 3 and 5), `trim` and `atrim` (`end`/`endi`/
+    `end_pts` -- `end` vanished and every slot from 2 on shifted),
+    `buffer` (several empty-doc options collapsed into one) and `abuffer`
+    (`channels` vanished). Every other filter's option list is byte-for-byte
+    unchanged by the adjacency rule.
   - Enum options are `<int>`-typed AVOptions whose default is often a
     CONSTANT NAME rather than a number (e.g. xfade's `transition` default
     is "fade", not "0"); the constants are the 5-space-indented lines
@@ -150,7 +174,6 @@ build:
 from __future__ import annotations
 
 import hashlib
-import importlib.resources
 import json
 import os
 import re
@@ -381,22 +404,30 @@ def _parse_option_block(lines: list[str]) -> dict[str, FilterOption]:
 
 
 def _dedup_and_convert(raw: list[_RawOption]) -> dict[str, FilterOption]:
-    # Group by identical doc text (ffmpeg's signal for short/long aliases,
-    # e.g. scale's `w`/`width`) and keep only the longest name per group,
-    # breaking length ties by first occurrence.
-    by_doc: dict[str, list[int]] = {}
-    for i, o in enumerate(raw):
-        by_doc.setdefault(o.doc, []).append(i)
-    keep: set[int] = set()
-    for idxs in by_doc.values():
-        best = idxs[0]
-        for i in idxs[1:]:
+    # Collapse each run of CONSECUTIVE lines sharing one doc text (ffmpeg's
+    # signal for a short/long alias pair, e.g. scale's `w`/`width`) to the
+    # longest name in that run, breaking length ties by first occurrence.
+    #
+    # Adjacency is the whole rule: ffmpeg's own positional binding skips a
+    # duplicate only when it sits immediately after the entry it aliases, so
+    # two same-doc options that are NOT adjacent are two real options and both
+    # keep their slot (see the module docstring for the seven filters where
+    # this differs, and why the pre-051 global grouping was wrong).
+    keep: list[int] = []
+    start = 0
+    while start < len(raw):
+        end = start
+        while end + 1 < len(raw) and raw[end + 1].doc == raw[start].doc:
+            end += 1
+        best = start
+        for i in range(start + 1, end + 1):
             if len(raw[i].name) > len(raw[best].name):
                 best = i
-        keep.add(best)
+        keep.append(best)
+        start = end + 1
 
     result: dict[str, FilterOption] = {}
-    for i in sorted(keep):
+    for i in keep:
         o = raw[i]
         unusable = o.type in _UNUSABLE_TYPES
         if unusable or o.constants:
@@ -860,14 +891,16 @@ def load() -> Registry:
     return _registry
 
 
-_REFERENCE_RESOURCE = "reference_registry.json"
+def load_reference(path: str | Path) -> Registry:
+    """Build a fully-populated `Registry` from a reference snapshot FILE.
 
+    `path` is explicit and required (plan 051): the snapshot is a committed
+    TEST FIXTURE (`tests/data/reference_registry.json`), not package data,
+    and nothing in the installed package reads it. The test suite passes the
+    path it wants; there is no implicit lookup and no `importlib.resources`
+    involvement, so an installed sqlmpeg does not carry the file at all.
 
-def load_reference() -> Registry:
-    """Build a fully-populated `Registry` from the vendored reference snapshot.
-
-    Reads `sqlmpeg/reference_registry.json` (package data, via
-    `importlib.resources`) -- the parsed `-filters`/`-help` data
+    The payload is the parsed `-filters`/`-help` data
     `scripts/gen_snapshot.py` captured ahead of time from a real ffmpeg,
     wrapped with `snapshot_of` (that ffmpeg's `-version` first line) and
     `generated` (the `--stamp` the script was run with). Every in-fence
@@ -878,22 +911,17 @@ def load_reference() -> Registry:
     platform, with or without ffmpeg on PATH.
 
     Returns a FRESH `Registry` every call (unlike `load()`'s process-wide
-    singleton) -- callers that want memoization do it themselves (plan 051).
+    singleton) -- callers that want memoization do it themselves.
 
-    NEVER raises: a missing or malformed snapshot (should not happen for a
-    correctly built package, but this module's contract holds regardless)
-    degrades to an empty, unavailable `Registry` with `source ==
-    "reference"` -- exactly like a live `Registry` with no ffmpeg on PATH.
+    NEVER raises: a missing or malformed snapshot degrades to an empty,
+    unavailable `Registry` with `source == "reference"` -- exactly like a
+    live `Registry` with no ffmpeg on PATH.
     """
     registry = Registry()
     registry.source = "reference"
     registry._loaded = True  # never let _ensure_loaded touch which()/subprocess
     try:
-        raw_text = (
-            importlib.resources.files("sqlmpeg")
-            .joinpath(_REFERENCE_RESOURCE)
-            .read_text(encoding="utf-8")
-        )
+        raw_text = Path(path).read_text(encoding="utf-8")
         data = json.loads(raw_text)
         if not isinstance(data, dict):
             return registry
@@ -903,7 +931,7 @@ def load_reference() -> Registry:
         version_line = _require_optional_str(data.get("version_line"))
         snapshot_of = _require_optional_str(data.get("snapshot_of"))
         generated = _require_optional_str(data.get("generated"))
-    except (OSError, ModuleNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return registry
     registry._filters = disk.filters
     registry._sources = disk.sources

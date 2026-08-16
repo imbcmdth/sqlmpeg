@@ -31,15 +31,6 @@ Homepage = "https://github.com/imbcmdth/sqlmpeg"
 [tool.setuptools]
 packages = ["sqlmpeg"]
 
-# `packages = [...]` above is an explicit list, not automatic discovery, so
-# setuptools ships only `.py` files by default -- `reference_registry.json`
-# (plan 050's vendored reference snapshot, RFC-007) needs an explicit
-# package-data entry or it is silently absent from built wheels/sdists
-# (editable installs are unaffected: `pip install -e .` resolves imports
-# straight from the source tree via a finder, package-data or not).
-[tool.setuptools.package-data]
-sqlmpeg = ["reference_registry.json"]
-
 [project.optional-dependencies]
 dev = [
     "pytest",

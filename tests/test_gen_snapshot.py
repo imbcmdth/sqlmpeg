@@ -1,6 +1,9 @@
-"""Tests for scripts/gen_snapshot.py and sqlmpeg.registry.load_reference()
-(plan 050, RFC-007 "Offline compile: the reference snapshot replaces
---portable").
+"""Tests for scripts/gen_snapshot.py and sqlmpeg.registry.load_reference().
+
+The snapshot is a committed TEST FIXTURE, `tests/data/reference_registry.json`
+(plan 051): it is NOT package data, nothing in the installed package reads it,
+and `load_reference(_SNAPSHOT_PATH)` takes the path explicitly. It exists so the suite can
+build a fully-populated Registry with no ffmpeg and no subprocess.
 
 Split like tests/test_registry.py: monkeypatched / no-subprocess tests are
 unmarked so the default suite (`pytest`, `-m "not exec"`) stays offline;
@@ -11,7 +14,6 @@ comparing it against a freshly-introspected live Registry) are marked
 
 from __future__ import annotations
 
-import importlib.resources
 import importlib.util
 import json
 import subprocess
@@ -25,7 +27,7 @@ from sqlmpeg.registry import Registry, clear_cache, load_reference
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _GEN_SNAPSHOT_PATH = _REPO_ROOT / "scripts" / "gen_snapshot.py"
-_SNAPSHOT_PATH = _REPO_ROOT / "sqlmpeg" / "reference_registry.json"
+_SNAPSHOT_PATH = _REPO_ROOT / "tests" / "data" / "reference_registry.json"
 
 
 def _load_gen_snapshot() -> ModuleType:
@@ -76,7 +78,7 @@ def test_snapshot_is_up_to_date(_forced_registry: Registry) -> None:
     stamp = json.loads(committed)["generated"]
     regenerated = gen_snapshot.render(stamp, registry=_forced_registry)
     assert regenerated == committed, (
-        "sqlmpeg/reference_registry.json is stale -- run "
+        "tests/data/reference_registry.json is stale -- run "
         "`python scripts/gen_snapshot.py --stamp <value>` to regenerate"
     )
 
@@ -138,7 +140,7 @@ def test_build_registry_raises_without_ffmpeg(monkeypatch: pytest.MonkeyPatch) -
 def test_round_trip_matches_live_registry_spot_check() -> None:
     live = registry_mod.load()
     assert live.available() is True  # force _ensure_loaded() before anything else
-    ref = load_reference()
+    ref = load_reference(_SNAPSHOT_PATH)
 
     assert ref.source == "reference"
     assert ref.snapshot_of is not None and ref.snapshot_of.startswith("ffmpeg version")
@@ -179,21 +181,63 @@ def test_round_trip_matches_live_registry_spot_check() -> None:
 
 
 # ---------------------------------------------------------------------------
-# wheel-data presence
+# option ORDER is data, not presentation (plan 051)
 # ---------------------------------------------------------------------------
 
 
-def test_reference_json_findable_via_importlib_resources() -> None:
-    """importlib.resources finds the package-data file from the installed
-    (here: editable, `pip install -e .`) sqlmpeg package."""
-    text = importlib.resources.files("sqlmpeg").joinpath("reference_registry.json").read_text(
-        encoding="utf-8"
-    )
-    data = json.loads(text)
+def test_snapshot_preserves_ffmpeg_option_order() -> None:
+    """The snapshot must NOT be alphabetised.
+
+    An option table's order is ffmpeg's AVOption declaration order, which is
+    what a positional filter argument binds against (`crop(f, 100, 50, 10,
+    20)` -> out_w, out_h, x, y). `sort_keys=True` -- harmless while the
+    snapshot was read only for its CONTENT -- silently rewrites every
+    positional call compiled against it, so this pins a few hand-checked
+    orders that alphabetising would visibly break.
+    """
+    ref = load_reference(_SNAPSHOT_PATH)
+    expected = {
+        "crop": ["out_w", "out_h", "x", "y"],
+        "gblur": ["sigma", "steps", "planes", "sigmaV"],
+        "scale": ["width", "height", "flags"],
+        "xfade": ["transition", "duration", "offset"],
+        "eq": ["contrast", "brightness", "saturation"],
+    }
+    for name, head in expected.items():
+        options = ref.options(name)
+        assert options is not None, name
+        assert list(options)[: len(head)] == head, name
+
+
+def test_snapshot_carries_the_fenced_tables_lowering_needs() -> None:
+    """Both fence-escape tables are in the payload, or they are uncallable offline."""
+    ref = load_reference(_SNAPSHOT_PATH)
+    for name in ("channelsplit", "acrossover", "extractplanes"):
+        assert ref.fenced_options(name), name
+    for name in ("amix", "hstack", "vstack"):
+        options = ref.fenced_options(name)
+        assert options is not None and "inputs" in options, name
+        assert options["inputs"].default == "2", name
+
+
+# ---------------------------------------------------------------------------
+# the fixture exists, and is NOT shipped inside the package
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_fixture_is_present_and_well_shaped() -> None:
+    data = json.loads(_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     assert data["format_version"] == 2
     assert isinstance(data["filters"], dict) and len(data["filters"]) > 300
     assert isinstance(data["sources"], dict) and len(data["sources"]) > 20
     assert isinstance(data["options"], dict) and len(data["options"]) > 300
+
+
+def test_snapshot_is_not_package_data() -> None:
+    """It lives under tests/, never under sqlmpeg/ -- the wheel must not carry
+    a 800 KB fixture no installed code path reads (plan 051)."""
+    assert not (_REPO_ROOT / "sqlmpeg" / "reference_registry.json").exists()
+    assert not list((_REPO_ROOT / "sqlmpeg").glob("*.json"))
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +261,7 @@ def test_load_reference_never_spawns_a_subprocess_with_no_ffmpeg(
     monkeypatch.setattr(registry_mod.shutil, "which", fake_which)
     monkeypatch.setattr(registry_mod.subprocess, "run", fake_run)
 
-    ref = load_reference()
+    ref = load_reference(_SNAPSHOT_PATH)
     assert ref.source == "reference"
     assert ref.available() is True
     assert ref.get("gblur") is not None
@@ -249,7 +293,7 @@ def test_load_reference_never_spawns_a_subprocess_with_ffmpeg_present(
     monkeypatch.setattr(registry_mod.shutil, "which", fake_which)
     monkeypatch.setattr(registry_mod.subprocess, "run", fake_run)
 
-    ref = load_reference()
+    ref = load_reference(_SNAPSHOT_PATH)
     assert ref.available() is True
     assert ref.get("gblur") is not None
     assert calls == []
@@ -267,7 +311,7 @@ def test_default_registry_source_is_live() -> None:
 
 
 def test_load_reference_source_and_stamps_are_set() -> None:
-    ref = load_reference()
+    ref = load_reference(_SNAPSHOT_PATH)
     assert ref.source == "reference"
     assert ref.snapshot_of is not None and ref.snapshot_of.startswith("ffmpeg version")
     assert ref.generated is not None
@@ -278,66 +322,42 @@ def test_load_reference_source_and_stamps_are_set() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_load_reference_missing_resource_degrades_permissively(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class _BrokenFiles:
-        def joinpath(self, name: str) -> _BrokenFiles:
-            return self
-
-        def read_text(self, encoding: str) -> str:
-            raise FileNotFoundError("no such resource")
-
-    monkeypatch.setattr(registry_mod.importlib.resources, "files", lambda pkg: _BrokenFiles())
-    ref = load_reference()
+def test_load_reference_missing_file_degrades_permissively(tmp_path: Path) -> None:
+    ref = load_reference(tmp_path / "nope.json")
     assert ref.source == "reference"
     assert ref.available() is False
     assert ref.get("gblur") is None
     assert ref.names() == []
 
 
-def test_load_reference_corrupt_json_degrades_permissively(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class _GarbageFiles:
-        def joinpath(self, name: str) -> _GarbageFiles:
-            return self
-
-        def read_text(self, encoding: str) -> str:
-            return "{not valid json"
-
-    monkeypatch.setattr(registry_mod.importlib.resources, "files", lambda pkg: _GarbageFiles())
-    ref = load_reference()
+def test_load_reference_corrupt_json_degrades_permissively(tmp_path: Path) -> None:
+    path = tmp_path / "bad.json"
+    path.write_text("{not valid json", encoding="utf-8")
+    ref = load_reference(path)
     assert ref.available() is False
 
 
-def test_load_reference_wrong_format_version_degrades_permissively(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class _StaleFiles:
-        def joinpath(self, name: str) -> _StaleFiles:
-            return self
-
-        def read_text(self, encoding: str) -> str:
-            return json.dumps({"format_version": 999, "filters": {}, "sources": {}, "options": {}})
-
-    monkeypatch.setattr(registry_mod.importlib.resources, "files", lambda pkg: _StaleFiles())
-    ref = load_reference()
+def test_load_reference_wrong_format_version_degrades_permissively(tmp_path: Path) -> None:
+    path = tmp_path / "stale.json"
+    path.write_text(
+        json.dumps({"format_version": 999, "filters": {}, "sources": {}, "options": {}}),
+        encoding="utf-8",
+    )
+    ref = load_reference(path)
     assert ref.available() is False
 
 
-def test_load_reference_bad_shape_degrades_permissively(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class _BadShapeFiles:
-        def joinpath(self, name: str) -> _BadShapeFiles:
-            return self
-
-        def read_text(self, encoding: str) -> str:
-            return json.dumps(
-                {"format_version": 2, "filters": "not-a-dict", "sources": {}, "options": {}}
-            )
-
-    monkeypatch.setattr(registry_mod.importlib.resources, "files", lambda pkg: _BadShapeFiles())
-    ref = load_reference()
+def test_load_reference_bad_shape_degrades_permissively(tmp_path: Path) -> None:
+    path = tmp_path / "shape.json"
+    path.write_text(
+        json.dumps({"format_version": 2, "filters": "not-a-dict", "sources": {}, "options": {}}),
+        encoding="utf-8",
+    )
+    ref = load_reference(path)
     assert ref.available() is False
+
+
+def test_load_reference_accepts_a_string_path() -> None:
+    ref = load_reference(str(_SNAPSHOT_PATH))
+    assert ref.available() is True
+    assert ref.source == "reference"

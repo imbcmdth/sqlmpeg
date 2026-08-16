@@ -9,10 +9,18 @@ Two properties the no-arg path (``dynamic=None``) must keep:
 * **Deterministic and pure.** No I/O, no clock, no environment. The same string
   every call, on every machine -- ``scripts/gen_prompt.py`` commits it to
   ``docs/system-prompt.md`` and a test asserts the committed copy is fresh.
-* **Generated from the real surface.** The function reference is rendered from
-  :data:`sqlmpeg.stdlib.FUNCTIONS` (guardrail #4) and the repair guidance is
-  keyed by :class:`sqlmpeg.errors.ErrorCode`, so a new function or code cannot
-  silently go undocumented. Nothing about the stdlib is hardcoded here.
+* **Generated from the real surface.** The repair guidance is keyed by
+  :class:`sqlmpeg.errors.ErrorCode`, so a new code cannot silently go
+  undocumented.
+
+.. note::
+   PLAN 051 STUB. The stdlib this module documented is deleted (RFC-007):
+   there is one calling convention now, and every function is a filter of the
+   installed ffmpeg. The prose below still describes the old two-tier surface
+   and the ``## Functions`` section is a placeholder -- ``tests/test_prompt.py``
+   and ``tests/test_docs.py`` are EXPECTED RED until wave 053/054 rewrites this
+   module against the new surface. Nothing here is touched beyond what import
+   breakage forced.
 
 ``build_system_prompt(dynamic=registry.load())`` (``sqlmpeg prompt --dynamic``)
 appends one more, deliberately impure section: what THIS machine's installed
@@ -40,7 +48,6 @@ from sqlmpeg.errors import ErrorCode
 from sqlmpeg.inputs import INPUT_OPTIONS
 from sqlmpeg.registry import Registry
 from sqlmpeg.sink import SINK_OPTIONS
-from sqlmpeg.stdlib import FUNCTIONS, Param
 
 __all__ = ["build_system_prompt"]
 
@@ -489,35 +496,24 @@ These are typed errors, never a best-effort graph. Do not reach for them.
 
 
 # ---------------------------------------------------------------------------
-# function reference (generated from stdlib.FUNCTIONS)
+# function reference -- PLAN 051 STUB
 # ---------------------------------------------------------------------------
+#
+# This section used to be generated from `sqlmpeg.stdlib.FUNCTIONS`, which no
+# longer exists (RFC-007 deleted the stdlib). Rewriting it against the new
+# surface -- the calling convention, the two namespaces, the macro trio -- is
+# wave 053/054's deliverable, and it is a PROSE job, not a mechanical one.
+# Until then this is the smallest thing that keeps the module importable.
 
-_FUNCTIONS_HEADER = """\
-## Functions
+_FUNCTIONS_HEADER = """## Functions
 
-The complete stdlib. A `video` parameter takes `<alias>.video[k]`,
-`<alias>.frame`, a bare array to broadcast over, or a nested call that
-returns `video`; an `audio` parameter takes `<alias>.audio[k]`, a bare array,
-or a nested call that returns `audio`. `num`, `str` and `expr` take literals
-only -- `expr` accepting either a number or a quoted ffmpeg expression (see
-Dialect > Arguments). Overloads are separated by `|` -- match one exactly, on
-both arity and argument kinds."""
-
-
-def _render_signature(name: str, variant: tuple[Param, ...]) -> str:
-    params = ", ".join(f"{param.name}: {param.kind}" for param in variant)
-    return f"{name}({params})"
+(This section is being rewritten: sqlmpeg's function surface is now the
+installed ffmpeg's filter set, called as `<filter>(<streams...>,
+<positional options...>, <named options...>)`.)"""
 
 
 def _function_reference() -> str:
-    lines = [_FUNCTIONS_HEADER, ""]
-    for spec in FUNCTIONS.values():
-        signatures = " | ".join(
-            _render_signature(spec.name, variant) for variant in spec.variants
-        )
-        lines.append(f"- `{signatures}`")
-        lines.append(f"  {spec.doc}")
-    return "\n".join(lines)
+    return _FUNCTIONS_HEADER
 
 
 # ---------------------------------------------------------------------------

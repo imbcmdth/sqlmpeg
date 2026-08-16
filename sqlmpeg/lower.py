@@ -84,19 +84,18 @@ What lowering does, in order:
     stream shares one ``trim``+``setpts`` (video) / ``atrim``+``asetpts``
     (audio) pair. Being a filtergraph trim, it cannot carry captions.
 * Each projection lowers bottom-up to one :class:`~sqlmpeg.ir.Output` per
-  stream it carries (an array column splats into consecutive Outputs). A
-  stdlib call type-checks its arguments against
-  ``stdlib.FUNCTIONS[name].variants`` (kinds are ``video``/``audio``/``num``/
-  ``str``) and then delegates node creation to the spec's ``expand``
-  (guardrail #4: no per-function lowering logic lives here).
+  stream it carries (an array column splats into consecutive Outputs). A call
+  type-checks its stream arguments against the filter's pad signature and its
+  option arguments against that filter's introspected AVOptions (see "One
+  calling convention" below).
 
 Generated sources: ``FROM ffmpeg.<source>(...) a`` (RFC-005 §1)
 --------------------------------------------------------------
 A source alias is the third kind of binding (:class:`_SourceBinding`), and
-it is the tier-2 surface in TABLE position: the name resolves through
-``Registry.get_source`` alone (never the stdlib, never ``get``), and its
-options through the same ``Registry.options`` path a call's named arguments
-take, with the same two codes.
+it is the registry surface in TABLE position: the name resolves through
+``Registry.get_source`` alone (never ``get``), and its options through the
+same ``Registry.options`` path a call's named arguments take, with the same
+two codes.
 
 What makes it different from an ``input()`` alias is that there is no FILE:
 
@@ -123,30 +122,48 @@ ffmpeg.testsrc2(...) t, ffmpeg.anullsrc(...) s`` as the second branch of a
 concat, is the motivating case — and the node it builds is one split, emit
 and the goldens cannot tell apart from any other.
 
-Two function tiers (RFC-003)
-----------------------------
-A call name resolves against the stdlib FIRST and against the ``registry`` —
-the filter set of the ffmpeg on PATH — only if the stdlib does not have it, so
-tier 1 wins every collision (``scale``, ``crop`` and ``overlay`` are both
-stdlib functions and real ffmpeg filters, and the stdlib's argument order is
-the documented one). Tier 2 is deliberately machine-dependent: what compiles
-depends on what that ffmpeg reports, and a None registry (no ffmpeg, or
-``--portable``) means the whole tier is simply absent — an unknown name, not
-an INTERNAL error.
+One calling convention (RFC-007, plan 051)
+------------------------------------------
+Every call is an ffmpeg filter, spelled the way ffmpeg's own filtergraph
+syntax spells it::
 
-* A tier-2 call takes its STREAM INPUTS positionally, count and types straight
-  from the pad signature (``gblur`` is ``V->V``, ``xfade`` is ``VV->V``), and
-  every option by name (``sigma => 5``). Its node is an ordinary
-  :class:`~sqlmpeg.ir.Node`, so split, emit and the goldens neither know nor
-  care that it came from introspection.
-* ``ffmpeg.<filter>(...)`` is tier 2 under a name no SQL grammar can claim
-  (plan 038). It resolves in the registry ONLY — never the stdlib, never a
-  Postgres builtin — so ``ffmpeg.scale(a.frame, w => 640)`` is the raw filter,
-  ``ffmpeg.overlay(base, top, x => 20, eof_action => 'pass')`` reaches the
-  option set the OVERLAY..PLACING grammar hides, and ``ffmpeg.trim(...)`` /
-  ``ffmpeg.format(...)`` arrive with their arguments intact. Everything else
-  about such a call is a bare tier-2 call's, verbatim; the node it builds
-  carries the FILTER's name, so nothing downstream knows the namespace exists.
+    <name>(<stream inputs...>, <positional options...>, <named options...>)
+
+There is no curated stdlib and no tier system: a name resolves in the
+``registry`` — the filter set of the ffmpeg on PATH — and nowhere else. What
+compiles therefore depends on what that ffmpeg reports, and an empty registry
+(no ffmpeg) means every call name is simply UNKNOWN, not an INTERNAL error.
+
+* STREAM INPUTS come first, count and types straight from the pad signature
+  (``gblur`` is ``V->V``, ``xfade`` is ``VV->V``). A count or type mismatch
+  against that signature is ``UDF_ARG_TYPE`` — the code's whole remaining job.
+* POSITIONAL OPTIONS follow, binding to the filter's options in REGISTRY
+  ORDER, which is ffmpeg's AVOption declaration order and therefore exactly
+  the order ``gblur=5:2`` binds in a filtergraph (see
+  ``sqlmpeg/registry.py``'s dedup docstring for why the deduped list is that
+  order, and what had to be fixed for it to be). ``crop(f, 100, 50, 10, 20)``
+  is ``crop=out_w=100:out_h=50:x=10:y=20``; ``scale(f, 640, 480)`` is
+  ``scale=width=640:height=480``. A positional binds AS the option it lands
+  on and is validated as that option — same type/range/enum checks, same two
+  codes — so option problems are uniformly ``UNKNOWN_FILTER_OPTION`` /
+  ``FILTER_OPTION_TYPE`` whether the option was written positionally or by
+  name. More positionals than the filter has options is ``UDF_ARG_TYPE``,
+  naming that count.
+* NAMED OPTIONS (``sigma => 5``) come last. Mixing rules: a positional after
+  a named is ``UNSUPPORTED_SQL`` (:func:`_split_args`, resolve's rule), and a
+  named that collides with an option already bound positionally is
+  ``FILTER_OPTION_TYPE`` — a named argument never silently overrides one.
+* ``enable`` stays NAMED-ONLY and framework-level: it is in no filter's option
+  table, so it can never be reached positionally, and it is admitted by the
+  ``T`` flag alone (RFC-005 §2).
+* ``ffmpeg.<filter>(...)`` is the same call under a name no SQL grammar can
+  claim (plan 038): identical semantics, but it bypasses Postgres's special
+  forms, so ``ffmpeg.overlay(base, top, x => 20, eof_action => 'pass')``
+  reaches the option set the ``OVERLAY..PLACING`` grammar hides, and
+  ``ffmpeg.trim(...)`` / ``ffmpeg.format(...)`` arrive with their arguments
+  intact. It is REQUIRED for the census's eleven collided names and optional
+  everywhere else. The node it builds carries the FILTER's name, so nothing
+  downstream knows the namespace exists.
 * Three ``->N`` filters are callable through that namespace despite the pad
   fence, because their output COUNT is fixed by an option: ``channelsplit``,
   ``acrossover`` and ``extractplanes`` (RFC-006, :data:`ARRAY_RETURNING`).
@@ -155,25 +172,17 @@ an INTERNAL error.
   a CTE column and broadcasts elementwise like any other array. The table is
   consulted before the registry's verdict, since the registry has no entry to
   give; every other fenced name keeps its ``UNKNOWN_FUNCTION``.
-* A tier-1 call may ALSO carry trailing named arguments, validated against the
-  matched overload's ``named_target`` options (``blur`` -> ``gblur``) and
-  merged into the single node its expansion produced, after the
-  positionally-mapped args and in written order. A macro overload
-  (``named_target`` None: ``blur_regions``, and ``delay``'s video overload) has
-  no single target and rejects them.
-* Which OVERLOAD matched is what selects a stdlib call's expansion, output type
-  and named target (``FuncSpec.impl``), not just its arity: ``delay(audio,
-  num)`` is one ``adelay`` node, ``delay(video, num)`` a ``format``+``tpad``
-  macro returning video.
-* Both use the same two codes — ``UNKNOWN_FILTER_OPTION`` (did-you-mean over
-  that filter's REAL options) and ``FILTER_OPTION_TYPE`` (the introspected
-  type, plus the range or the constant list) — and the same rule: named
-  arguments are your installed ffmpeg, so without one they are rejected rather
-  than guessed at.
-* Broadcasting and zipping are type-driven and tier-agnostic: they run off the
-  stream-argument POSITIONS, which come from a stdlib variant or from a pad
-  signature, so ``volume(a.audio, 0.5)`` and ``anlmdn(a.audio, s => 0.01)``
-  expand identically.
+* Three ``N->1`` filters are re-admitted the mirror way (:data:`N_INPUT`,
+  plan 051): ``amix``, ``hstack`` and ``vstack`` take a variable number of
+  INPUT pads fixed by their ``inputs`` option, so the pad fence excludes them
+  too, yet the count is statically knowable the moment that option is read.
+  Their leading stream arguments ARE the input pads and their `inputs` option
+  must agree with how many were supplied (``UDF_ARG_TYPE`` naming both
+  numbers when it does not). Unlike the array trio these are reachable BARE
+  as well as namespaced — no Postgres grammar claims their names.
+* Broadcasting and zipping run off the stream-argument POSITIONS, which are
+  always the leading ones, so ``volume(a.audio, 0.5)`` and
+  ``anlmdn(a.audio, s => 0.01)`` expand identically.
 * A UNION ALL (top level or inside a CTE) lowers each branch and joins them
   with one ``concat`` node. Branch column counts, types and order must match
   exactly (``CONCAT_MISMATCH``); concat inputs interleave per ffmpeg's segment
@@ -209,7 +218,7 @@ English tracks keeps ``language=eng``, but mixing English with French, or with
 an untagged stream, keeps neither. Same rule, one function: ``_agreed_source``.
 
 Node ids are ``n1, n2, ...`` in creation order across the whole graph, minted
-by :class:`_NodeFactory`, the :class:`sqlmpeg.stdlib.ExpandCtx` implementation.
+by :class:`_NodeFactory`.
 
 sqlglot notes that matter here
 ------------------------------
@@ -235,8 +244,8 @@ sqlglot notes that matter here
   does not.
 * Postgres has a builtin ``OVERLAY(x PLACING y FROM n FOR m)``, and sqlglot
   parses ``overlay(...)`` with that grammar: a ``=>`` inside it is a PARSE_ERROR
-  before lowering ever sees the call, so ``overlay`` is the one stdlib function
-  whose named extras are unreachable. Eleven registry names collide with a
+  before lowering ever sees the call, so a BARE ``overlay`` can take its
+  options positionally but never by name. Eleven registry names collide with a
   Postgres special form this way (see docs/dynamic-filters.md for the census);
   ``ffmpeg.<filter>(...)`` is the spelling that reaches every one of them,
   because the special-form grammars key on a BARE name and a qualified call
@@ -278,7 +287,6 @@ from sqlmpeg.parser import _ident_name as _fold
 from sqlmpeg.probe import ProbeResult, StreamMeta
 from sqlmpeg.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from sqlmpeg.sink import validate_option as validate_sink_option
-from sqlmpeg.stdlib import FUNCTIONS, ExpandCtx, FuncSpec, Param, VariantImpl, signatures
 
 __all__ = ["lower"]
 
@@ -308,15 +316,13 @@ _TYPE_MARKERS: dict[StreamType, str] = {
 _PASSTHROUGH_ONLY: frozenset[StreamType] = frozenset({"subtitle", "data"})
 
 # Kind label used in UDF_ARG_TYPE "got" lists for anything that is neither a
-# literal nor a stream-typed subexpression (e.g. `1 + 2`, NULL, TRUE).
-#
-# The angle brackets are load-bearing (RFC-005 SS3): this label is compared
-# against `Param.kind` by :func:`_match_variant`, and `ParamKind` now HAS an
-# ``"expr"`` member (a num literal or a quoted ffmpeg expression). A bare
-# ``"expr"`` here would make every un-lowerable expression match those
-# parameters silently. No ParamKind can ever spell itself with brackets, so
-# the two can never be confused again.
+# literal nor a stream-typed subexpression (e.g. `1 + 2`, NULL, TRUE). The
+# angle brackets keep it from ever colliding with a StreamType name.
 _UNSUPPORTED_KIND = "<expr>"
+
+# Kind labels :meth:`_Lowerer._classify` gives a stream-valued argument -- the
+# only kinds that may occupy a call's leading (stream input) positions.
+_STREAM_KINDS: frozenset[str] = frozenset({"video", "audio", "subtitle", "data"})
 
 # Provenance tags copied onto a passthrough Output. "und" is what mp4 muxers
 # stamp on untagged streams; it carries no information, so it is not copied.
@@ -327,24 +333,15 @@ _TIME_HINT = (
     "<alias>.t is only usable as WHERE <alias>.t BETWEEN <start> AND <end>, "
     "<alias>.t >= <start>, or <alias>.t <= <end>"
 )
-_ARG_HINT = "arguments are stream expressions or literals, in the order shown"
 _STREAM_HINT = "a SELECT column must be a stream, e.g. a.video[1] or scale(a.frame, 0.5)"
 _SUBSCRIPT_HINT = "stream subscripts are 1-based: a.video[1] is the first video stream"
 _ZIP_HINT = (
     "broadcast arrays zip elementwise, one output per element; "
     "subscript one of them to pair a single stream with the other, e.g. a.audio[1]"
 )
-_MACRO_HINT = (
-    "call the underlying ffmpeg filters directly instead; each of those takes "
-    "named options"
-)
 _NO_REGISTRY_HINT = (
-    "install ffmpeg (or put it on PATH) to use named arguments; a stdlib call "
-    "with positional arguments only compiles anywhere"
-)
-_PORTABLE_HINT = (
-    "--portable keeps a query machine-independent: drop the named arguments, or "
-    "compile without --portable"
+    "sqlmpeg's function surface IS your installed ffmpeg's filter set; install "
+    "ffmpeg, or put it on PATH"
 )
 _PASSTHROUGH_HINT = (
     "subtitle and data streams can only be selected (and copied), never filtered; "
@@ -607,6 +604,54 @@ _ARRAY_INPUT_HINT = (
 
 
 # ---------------------------------------------------------------------------
+# fixed-count N-INPUT filters (plan 051)
+# ---------------------------------------------------------------------------
+#
+# The mirror image of ARRAY_RETURNING. Three ffmpeg filters take a number of
+# INPUT pads that is fixed, statically, by one of their options and produce
+# exactly one output pad. Their `-filters` spec is `N->A` / `N->V`, so the v1
+# pad fence excludes all three and `Registry.get` says None for them -- yet
+# the count is knowable the moment the option is read, which is the same
+# argument that re-admits the array-returning trio.
+#
+# Re-admitted under BOTH spellings, bare and namespaced: unlike the array
+# trio, none of these three names collides with a Postgres special form, and
+# `amix(a, b)` is the spelling everybody already writes.
+#
+# The mechanism generalizes to any `N->1` filter whose input count is one
+# option (`concat`'s `n`, `mix`, `interleave`, ...); it is deliberately
+# scoped to these three for now, since the general variadic/array-CONSUMING
+# story (passing one array where N streams are wanted) is queued separately.
+
+
+@dataclass(frozen=True)
+class _NInputFilter:
+    """One fixed-count N-input filter: its pads, and the option fixing the count."""
+
+    name: str
+    stream: StreamType  # what every one of its INPUT pads carries
+    output: StreamType  # its single output pad
+    option: str  # the option whose value IS the input-pad count
+    fallback: int  # count when the option is neither written nor introspectable
+
+
+N_INPUT: dict[str, _NInputFilter] = {
+    "amix": _NInputFilter(name="amix", stream="audio", output="audio", option="inputs", fallback=2),
+    "hstack": _NInputFilter(
+        name="hstack", stream="video", output="video", option="inputs", fallback=2
+    ),
+    "vstack": _NInputFilter(
+        name="vstack", stream="video", output="video", option="inputs", fallback=2
+    ),
+}
+
+_N_INPUT_HINT = (
+    "the number of streams you pass IS the filter's input count; either pass "
+    "that many streams, or set the count explicitly, e.g. amix(a, b, c, inputs => 3)"
+)
+
+
+# ---------------------------------------------------------------------------
 # errors
 # ---------------------------------------------------------------------------
 
@@ -697,25 +742,11 @@ class _NamedArg:
 
 
 @dataclass(frozen=True)
-class _NamedTarget:
-    """The ffmpeg filter a stdlib call's trailing named args reach through to.
-
-    Everything :meth:`_Lowerer._check_named_args` needs about it, resolved once
-    per call: its name, its introspected option table, and whether ffmpeg flags
-    it as timeline-capable (which is what admits ``enable``).
-    """
-
-    filter: str
-    options: dict[str, FilterOption]
-    timeline: bool
-
-
-@dataclass(frozen=True)
 class _Call:
     """A function call as lowering sees it: a name, positional args, named args.
 
     `namespaced` marks the ``ffmpeg.<filter>(...)`` spelling (plan 038), which
-    resolves in the REGISTRY ONLY — never the stdlib, never a Postgres builtin.
+    resolves in the registry under a name no Postgres grammar can claim.
     """
 
     name: str
@@ -756,10 +787,10 @@ def _call_parts(node: exp.Expr) -> _Call | None:
     ``exp.Overlay`` is normalized back to the four positional arguments the
     SQL surface uses; sqlglot parks them under named keys because Postgres
     spells the builtin ``OVERLAY(x PLACING y FROM n FOR m)``. (That builtin
-    grammar also means ``overlay(...)`` is the one stdlib call that cannot
-    take named arguments: sqlglot rejects ``=>`` inside it at PARSE time.
-    ``ffmpeg.overlay(base, top, x => 20, y => 20)`` reaches the raw filter and
-    its whole option set instead.)
+    grammar also means a BARE ``overlay(...)`` cannot take named arguments at
+    all: sqlglot rejects ``=>`` inside it at PARSE time. Its options are still
+    reachable positionally, and ``ffmpeg.overlay(base, top, x => 20, y => 20)``
+    reaches every one of them by name.)
 
     Named arguments arrive as ``exp.Kwarg`` among the positional ones and are
     split out here. Their TRAILING position is enforced by resolve; the check
@@ -838,29 +869,6 @@ def _number(node: exp.Expr, code: ErrorCode = ErrorCode.UDF_ARG_TYPE) -> int | f
         return sign * value if isinstance(value, int) else sign * float(value)
     except (ArithmeticError, TypeError, ValueError):
         raise _error(code, f"could not read {str(node.this)!r} as a number", node) from None
-
-
-def _string(node: exp.Expr) -> str:
-    node = _unwrap(node)
-    if not isinstance(node, exp.Literal) or not node.is_string:
-        raise _error(ErrorCode.UDF_ARG_TYPE, "expected a string literal", node)
-    return str(node.this)
-
-
-def _expression(node: exp.Expr) -> object:
-    """An ``expr``-kind argument: a number as a number, a string as a string.
-
-    The two shapes stay distinct all the way into the IR (RFC-005 SS3):
-    ``crop(f, 10, ...)`` still carries the int ``10``, not ``"10"``, so no
-    golden moves and nothing downstream has to re-parse a number out of a
-    string. A quoted argument passes through verbatim as the ffmpeg expression
-    it is -- its VARIABLES are per-filter and are checked by ffmpeg at run
-    time, never here (RFC-005 non-goals).
-    """
-    inner = _unwrap(node)
-    if isinstance(inner, exp.Literal) and inner.is_string:
-        return _string(node)
-    return _number(node)
 
 
 @dataclass(frozen=True)
@@ -1074,7 +1082,7 @@ class _Env:
 
 
 class _NodeFactory:
-    """:class:`sqlmpeg.stdlib.ExpandCtx` impl: mints ``n1, n2, ...`` into a graph."""
+    """Mints ``n1, n2, ...`` node ids into a graph, in creation order."""
 
     def __init__(self, graph: Graph) -> None:
         self._graph = graph
@@ -1110,15 +1118,12 @@ class _Lowerer:
         res: Resolved,
         probes: dict[str, ProbeResult | None],
         registry: Registry | None,
-        portable: bool,
     ) -> None:
         self.res = res
         self.probes = probes
         self.registry = registry
-        self.portable = portable
         self.graph = Graph(input_paths=list(res.input_paths), sources=dict(res.sources))
-        # Annotated as the protocol so mypy checks the structural match.
-        self.ctx: ExpandCtx = _NodeFactory(self.graph)
+        self.ctx = _NodeFactory(self.graph)
         self.cte_columns: dict[str, tuple[_Column, ...]] = {}
 
     # -- entry point ------------------------------------------------------
@@ -1611,8 +1616,8 @@ class _Lowerer:
         * the name is a REGULAR filter of this ffmpeg (``ffmpeg.gblur``) — it
           has input pads, so it is a call, not a table: UNSUPPORTED_SQL saying
           so, the one fenced case that is positively identifiable;
-        * there is no registry at all (no ffmpeg, or ``--portable``) — the
-          standard tier-2 unavailability wording, same as a namespaced CALL's;
+        * there is no registry at all (no ffmpeg) — the standard
+          unavailability wording, same as a namespaced CALL's;
         * the name is unknown to both tables — UNKNOWN_FUNCTION with a
           did-you-mean over ``source_names()``. Sources the v1 scope fence
           excluded (``avsynctest``'s ``|->AV``, ``movie``/``amovie``'s
@@ -1663,12 +1668,6 @@ class _Lowerer:
                 "your installed ffmpeg, and this is not one of them; sources with "
                 "more than one output pad (avsynctest) or a variable pad count "
                 "(movie, amovie) are not usable"
-            )
-        if self.portable:
-            return (
-                f"--portable turns the whole {FILTER_NAMESPACE}.<source> namespace "
-                "off; read a real file with input('path'), or compile without "
-                "--portable"
             )
         return (
             f"FROM {FILTER_NAMESPACE}.<source>(...) generates a stream with your "
@@ -2291,60 +2290,33 @@ class _Lowerer:
     def _lower_call(
         self, node: exp.Expr, call: _Call, env: _Env, select: exp.Select
     ) -> _Value:
-        """Resolve a call against tier 1, then tier 2 (RFC-003).
+        """Resolve a call in the registry, and nowhere else (RFC-007).
 
-        The stdlib ALWAYS wins a name collision (``scale``, ``crop``, ``overlay``
-        are both stdlib functions and real ffmpeg filters): tier 1 is the
-        portable, documented-forever surface, tier 2 is whatever the installed
-        ffmpeg happens to provide.
+        One convention, three shapes of filter, tried in the order that makes
+        each reachable at all:
 
-        ``ffmpeg.<filter>(...)`` (plan 038) opts out of that rule entirely: it
-        is tier 2 and nothing else, so ``ffmpeg.scale(a.frame, w => 640)`` is
-        the raw filter even though ``scale`` is also a stdlib function.
+        * :data:`ARRAY_RETURNING` (namespaced spelling ONLY, RFC-006) and
+          :data:`N_INPUT` (either spelling) come first, because both tables
+          exist precisely for names the v1 pad fence keeps OUT of the registry
+          — asking ``get`` about them first would answer "unknown" and the
+          tables would never be reached;
+        * then the registry proper, whose pad signature is the call's stream
+          signature.
+
+        ``ffmpeg.<filter>(...)`` differs from the bare spelling only in what a
+        message calls the function (``call.display``) and in skipping the
+        Postgres special forms at PARSE time.
         """
         name = call.name.lower()
         if call.namespaced:
-            return self._lower_namespaced_call(node, name, call, env, select)
-        spec = FUNCTIONS.get(name)
-        if spec is not None:
-            return self._lower_stdlib_call(node, name, spec, call, env, select)
-        dynamic = self.registry.get(name) if self.registry is not None else None
-        if dynamic is None:
-            raise _error(
-                ErrorCode.UNKNOWN_FUNCTION,
-                f"unknown function {call.name}()",
-                node,
-                fallback=select,
-                hint=self._unknown_function_hint(name),
-            )
-        return self._lower_dynamic_call(node, name, dynamic, call, env, select)
-
-    # -- the raw-filter namespace: `ffmpeg.<filter>(...)` (plan 038) --------
-
-    def _lower_namespaced_call(
-        self, node: exp.Expr, name: str, call: _Call, env: _Env, select: exp.Select
-    ) -> _Value:
-        """A namespaced call: tier 2, with the stdlib and the builtins skipped.
-
-        Every filter the registry reports has exactly one spelling that no SQL
-        grammar can claim, and this is it — which is what makes the collision
-        list in docs/dynamic-filters.md a footnote rather than a wall. The
-        semantics are otherwise a bare tier-2 call's, verbatim: stream inputs
-        positional from the pad signature, every option named, and no registry
-        (no ffmpeg, or ``--portable``) means the name is simply UNKNOWN, the
-        same rejection a bare tier-2 name gets there.
-
-        :data:`ARRAY_RETURNING` is consulted BEFORE the registry's verdict
-        (RFC-006, plan 047): its three names are fenced OUT of the registry by
-        their ``->N`` pad spec, so asking `get` about them first would answer
-        "unknown" and the table would never be reached. Every other fenced name
-        keeps exactly today's rejection.
-        """
-        options = self._array_options(name)
-        if options is not None:
-            return self._lower_array_call(
-                node, ARRAY_RETURNING[name], options, call, env, select
-            )
+            options = self._array_options(name)
+            if options is not None:
+                return self._lower_array_call(
+                    node, ARRAY_RETURNING[name], options, call, env, select
+                )
+        n_input = self._n_input_options(name)
+        if n_input is not None:
+            return self._lower_n_input_call(node, N_INPUT[name], n_input, call, env, select)
         dynamic = self.registry.get(name) if self.registry is not None else None
         if dynamic is None:
             raise _error(
@@ -2352,145 +2324,13 @@ class _Lowerer:
                 f"unknown function {call.display}()",
                 node,
                 fallback=select,
-                hint=self._namespaced_function_hint(name),
+                hint=self._namespaced_function_hint(name)
+                if call.namespaced
+                else self._unknown_function_hint(name),
             )
         return self._lower_dynamic_call(node, name, dynamic, call, env, select)
 
-    # -- tier 1: the curated stdlib, plus trailing named extras ------------
-
-    def _lower_stdlib_call(
-        self,
-        node: exp.Expr,
-        name: str,
-        spec: FuncSpec,
-        call: _Call,
-        env: _Env,
-        select: exp.Select,
-    ) -> _Value:
-        kinds = [self._classify(arg, env, select) for arg in call.args]
-        self._reject_passthrough_args(name, kinds, call, node)
-        index = _match_variant(spec.variants, kinds)
-        if index is None:
-            got = ", ".join(kinds)
-            raise _error(
-                ErrorCode.UDF_ARG_TYPE,
-                f"{name}() expects {signatures(name)}, got {name}({got})",
-                node,
-                fallback=select,
-                hint=_ARG_HINT,
-            )
-        variant = spec.variants[index]
-        # Which OVERLOAD matched decides how the call lowers, not just how many
-        # arguments it took (plan 038): `delay(audio, num)` is one adelay node
-        # that takes named extras, `delay(video, num)` is a two-filter macro
-        # that returns video and takes none.
-        impl = spec.impl(index)
-        target = self._named_extras_target(name, impl, call, node)
-        streams, literals = self._lower_arguments(variant, call.args, env, select)
-
-        # The extras are validated ONCE, against the arg keys the expansion
-        # produced — which is only known after expanding — and then merged into
-        # every element's node, so a broadcast call sets them on each one.
-        checked: dict[str, object] = {}
-        validated = False
-
-        def build(values: list[object]) -> FrameRef:
-            nonlocal checked, validated
-            ref = impl.expand(self.ctx, values)
-            if target is None:
-                return ref
-            produced = self._expanded_node(name, target.filter, ref, node, select)
-            if not validated:
-                checked = self._check_named_args(
-                    target.filter,
-                    target.options,
-                    call.named,
-                    node,
-                    owner=name,
-                    occupied=set(produced.args),
-                    timeline=target.timeline,
-                )
-                validated = True
-            produced.args.update(checked)
-            return ref
-
-        return self._expand_call(
-            name,
-            node,
-            call.args,
-            select,
-            streams=streams,
-            literals=literals,
-            arity=len(variant),
-            positions=_stream_positions(variant),
-            returns=impl.returns,
-            build=build,
-        )
-
-    def _named_extras_target(
-        self, name: str, impl: VariantImpl, call: _Call, node: exp.Expr
-    ) -> _NamedTarget | None:
-        """The filter the trailing named args of a stdlib call target, with its facts.
-
-        None when the call has no named args at all. An overload whose
-        ``named_target`` is None is a MACRO over several filters
-        (``blur_regions``, and the VIDEO overload of ``delay``), so there is no
-        single option set to reach through to and the named args are rejected
-        outright. Per-OVERLOAD, not per-function: ``delay(a.audio[1], 1,
-        all => false)`` still reaches ``adelay``, because that overload is one
-        filter.
-
-        ``timeline`` comes from the registry entry for that same filter name,
-        which is what lets a tier-1 call take ``enable`` exactly where the
-        underlying filter honours it (RFC-005 SS2). A named_target the registry
-        has no ENTRY for — the v1 pad fence excludes ``amix``, ``hstack``,
-        ``vstack``, whose options still load fine — reads as no timeline
-        support, which is what ``ffmpeg -filters`` says of all three anyway.
-        """
-        if not call.named:
-            return None
-        anchor = call.named[0].value
-        if impl.named_target is None:
-            raise _error(
-                ErrorCode.UDF_ARG_TYPE,
-                f"{name}() expands to more than one ffmpeg filter, so its named "
-                f"argument '{call.named[0].name}' has no single filter to set it on",
-                anchor,
-                fallback=node,
-                hint=_MACRO_HINT,
-            )
-        target = impl.named_target
-        options = self._filter_options(target, anchor, node)
-        entry = self.registry.get(target) if self.registry is not None else None
-        return _NamedTarget(
-            filter=target,
-            options=options,
-            timeline=entry is not None and entry.timeline,
-        )
-
-    def _expanded_node(
-        self, name: str, filter_name: str, ref: FrameRef, node: exp.Expr, select: exp.Select
-    ) -> Node:
-        """The single node a ``named_target`` spec's expansion produced.
-
-        Invariant (stdlib.FuncSpec): a spec that names a ``named_target`` is
-        single-filter by construction, so the ref its expand returned is that
-        node's id and its filter is the target. A spec that breaks the invariant
-        is a bug in the table, not in the query — hence INTERNAL.
-        """
-        produced = self.graph.nodes.get(ref)
-        if produced is None or produced.filter != filter_name:
-            raise _error(
-                ErrorCode.INTERNAL,
-                f"{name}() declares named_target '{filter_name}' but its expansion "
-                "did not produce exactly that one filter",
-                node,
-                fallback=select,
-                hint="please report this query as a bug",
-            )
-        return produced
-
-    # -- tier 2: any filter the installed ffmpeg reports -------------------
+    # -- the ordinary case: any filter the installed ffmpeg reports --------
 
     def _lower_dynamic_call(
         self,
@@ -2501,46 +2341,35 @@ class _Lowerer:
         env: _Env,
         select: exp.Select,
     ) -> _Value:
-        """A call resolved from the registry: streams positionally, options named.
+        """A call resolved from the registry: streams, then options.
 
-        The pad signature IS the signature: ``gblur`` (``V->V``) takes exactly
-        one video argument, ``xfade`` (``VV->V``) exactly two. Everything else
-        about the call — every option — is named, because ffmpeg option order is
-        not a thing users should have to know.
+        The pad signature IS the stream signature: ``gblur`` (``V->V``) takes
+        exactly one video argument, ``xfade`` (``VV->V``) exactly two. Every
+        positional argument after those binds to one of the filter's OPTIONS,
+        in ffmpeg's own declared order (:meth:`_bind_options`).
 
-        Reached by both tier-2 spellings — a bare filter name and
-        ``ffmpeg.<filter>(...)`` — which differ only in what a message calls
-        the function (``call.display``). The NODE always carries the filter's
-        own name, so the IR, split and emit never learn that the namespace
-        exists.
+        Reached by both spellings — a bare filter name and
+        ``ffmpeg.<filter>(...)`` — which differ only in ``call.display``. The
+        NODE always carries the filter's own name, so the IR, split and emit
+        never learn that the namespace exists.
         """
-        kinds = [self._classify(arg, env, select) for arg in call.args]
-        self._reject_passthrough_args(call.display, kinds, call, node)
         expected = list(dynamic.inputs)
+        kinds = self._stream_kinds(call, env, select, len(expected))
         if kinds != expected:
-            shown = call.display
-            raise _error(
-                ErrorCode.UDF_ARG_TYPE,
-                f"{shown}() is an ffmpeg filter: it expects "
-                f"{shown}({', '.join(expected)}), got {shown}({', '.join(kinds)})",
-                node,
-                fallback=select,
-                hint=f"only stream inputs are positional for a dynamic filter; pass "
-                f"options by name, e.g. {shown}({', '.join(expected)}, <option> => <value>)",
-            )
-        options = self._filter_options(name, node, select) if call.named else {}
-        args = self._check_named_args(
+            raise self._bad_streams(call, node, select, expected, kinds)
+        args = self._bind_options(
             name,
-            options,
-            call.named,
+            call,
             node,
-            owner=call.display,
-            occupied=set(),
+            select,
+            env,
+            options=self._options_for(name, call, len(expected), node, select),
+            extras=call.args[len(expected) :],
             timeline=dynamic.timeline,
         )
         streams = {
             position: self._lower_expr(arg, env, select)
-            for position, arg in enumerate(call.args)
+            for position, arg in enumerate(call.args[: len(expected)])
         }
         output = dynamic.output
 
@@ -2562,15 +2391,143 @@ class _Lowerer:
             build=build,
         )
 
+    # -- fixed-count N-input filters (plan 051) ----------------------------
+
+    def _n_input_options(self, name: str) -> dict[str, FilterOption] | None:
+        """`name`'s option table if it is a callable fixed-count N-input filter.
+
+        Mirrors :meth:`_array_options` exactly: in the table, a registry to ask,
+        and an ffmpeg that actually HAS the filter. The last one is why options
+        are fetched even for a call that passes none — a fenced name is in no
+        registry table, so its option block is the only evidence this build has
+        it (see ``Registry.fenced_options``).
+        """
+        if name not in N_INPUT or self.registry is None:
+            return None
+        return self.registry.fenced_options(name)
+
+    def _lower_n_input_call(
+        self,
+        node: exp.Expr,
+        spec: _NInputFilter,
+        options: dict[str, FilterOption],
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Value:
+        """One node with N input pads, N being what the count option says.
+
+        The stream/option split cannot come from a pad signature here (there
+        is none — the registry fenced the filter out for exactly that reason),
+        so it comes from the arguments themselves: the LEADING RUN of
+        stream-valued arguments are the input pads, and everything after them
+        is an option. That is unambiguous because an option value is always a
+        literal and a pad is never one.
+
+        The count option is then read back and must AGREE with how many
+        streams were supplied — `amix(a, b)` (2 streams, `inputs` defaulted to
+        2) and `amix(a, b, c, inputs => 3)` are both consistent;
+        `amix(a, b, c)` is not, and says so with both numbers.
+        """
+        kinds = [self._classify(arg, env, select) for arg in call.args]
+        self._reject_passthrough_args(call.display, kinds, call, node)
+        count = 0
+        for kind in kinds:
+            if kind not in _STREAM_KINDS:
+                break
+            count += 1
+        supplied = kinds[:count]
+        if not supplied or any(kind != spec.stream for kind in supplied):
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() is an ffmpeg filter: its stream inputs are all "
+                f"{spec.stream}, got ({', '.join(supplied) or 'no streams'})",
+                node,
+                fallback=select,
+                hint=_N_INPUT_HINT,
+            )
+        args = self._bind_options(
+            spec.name,
+            call,
+            node,
+            select,
+            env,
+            options=options,
+            extras=call.args[count:],
+            timeline=False,
+        )
+        declared = self._n_input_count(spec, args, options)
+        if declared != count:
+            anchor = next(
+                (arg.value for arg in call.named if arg.name == spec.option), node
+            )
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() was given {_stream_count(count)} but its "
+                f"'{spec.option}' option says {declared}",
+                anchor,
+                fallback=select,
+                hint=_N_INPUT_HINT,
+            )
+        # The count is always written onto the node, defaulted or not: ffmpeg
+        # needs `inputs=N` in the filtergraph to grow the pads, and emit only
+        # renders args this dict carries.
+        args[spec.option] = count
+        streams = {
+            position: self._lower_expr(arg, env, select)
+            for position, arg in enumerate(call.args[:count])
+        }
+
+        def build(values: list[object]) -> FrameRef:
+            return self.ctx.node(
+                spec.name, dict(args), [_as_ref(value) for value in values], [spec.output]
+            )
+
+        return self._expand_call(
+            call.display,
+            node,
+            call.args,
+            select,
+            streams=streams,
+            literals={},
+            arity=count,
+            positions=list(range(count)),
+            returns=spec.output,
+            build=build,
+        )
+
+    def _n_input_count(
+        self,
+        spec: _NInputFilter,
+        args: dict[str, object],
+        options: dict[str, FilterOption],
+    ) -> int:
+        """What the count option says, written or introspected-default or fallback.
+
+        `args` has already been validated against the option table, so a
+        written value is a number in range; only the DEFAULT needs care, since
+        `FilterOption.default` is verbatim ffmpeg text that is documented as
+        never re-typed (it can be a constant name, or absent entirely).
+        """
+        written = args.get(spec.option)
+        if isinstance(written, (int, float)) and not isinstance(written, bool):
+            return int(written)
+        option = options.get(spec.option)
+        if option is not None and option.default is not None:
+            try:
+                return int(float(option.default))
+            except ValueError:
+                pass
+        return spec.fallback
+
     # -- array-returning filters (RFC-006, plan 047) -----------------------
 
     def _array_options(self, name: str) -> dict[str, FilterOption] | None:
         """`name`'s option table if it is a callable array-returning filter.
 
         Three questions, one answer, because they have the same shape: is the
-        name in :data:`ARRAY_RETURNING`, is there a registry at all (no ffmpeg
-        or ``--portable`` turns the whole namespace off, this table included),
-        and does THIS ffmpeg actually have the filter. The last one is why the
+        name in :data:`ARRAY_RETURNING`, is there a registry at all, and does
+        THIS ffmpeg actually have the filter. The last one is why the
         options are fetched even for a call with no named arguments: a fenced
         name is in no registry table, so its option block is the only evidence
         this build has it (see ``Registry.fenced_options``). None means "not
@@ -2602,26 +2559,18 @@ class _Lowerer:
         to every element (not ``_agreed_source``, which answers the opposite
         question), so splitting a ``language=eng`` track gives N eng channels.
         """
-        kinds = [self._classify(arg, env, select) for arg in call.args]
-        self._reject_passthrough_args(call.display, kinds, call, node)
-        if kinds != [spec.input]:
-            shown = call.display
-            raise _error(
-                ErrorCode.UDF_ARG_TYPE,
-                f"{shown}() is an ffmpeg filter: it expects {shown}({spec.input}), "
-                f"got {shown}({', '.join(kinds)})",
-                node,
-                fallback=select,
-                hint=f"only stream inputs are positional for a dynamic filter; pass "
-                f"options by name, e.g. {shown}({spec.input}, <option> => <value>)",
-            )
-        args = self._check_named_args(
+        expected = [spec.input]
+        kinds = self._stream_kinds(call, env, select, 1)
+        if kinds != expected:
+            raise self._bad_streams(call, node, select, expected, kinds)
+        args = self._bind_options(
             spec.name,
-            options,
-            call.named,
+            call,
             node,
-            owner=call.display,
-            occupied=set(),
+            select,
+            env,
+            options=options,
+            extras=call.args[1:],
             timeline=False,
         )
         count = spec.count(args)
@@ -2710,30 +2659,157 @@ class _Lowerer:
                 hint=_PASSTHROUGH_HINT,
             )
 
-    def _lower_arguments(
+    def _stream_kinds(
+        self, call: _Call, env: _Env, select: exp.Select, arity: int
+    ) -> list[str]:
+        """Kind labels for the call's LEADING `arity` arguments, checked for captions.
+
+        Only the leading run is classified: everything after it is an option
+        value, which is a literal that the OPTION table judges, not the
+        classifier. A short call classifies what it has, so the caller's
+        comparison against the pad signature reports the missing argument.
+        """
+        kinds = [self._classify(arg, env, select) for arg in call.args[:arity]]
+        if kinds:
+            self._reject_passthrough_args(call.display, kinds, call, call.args[0])
+        return kinds
+
+    def _bad_streams(
         self,
-        variant: tuple[Param, ...],
-        arg_nodes: list[exp.Expr],
+        call: _Call,
+        node: exp.Expr,
+        select: exp.Select,
+        expected: list[StreamType],
+        got: list[str],
+    ) -> SqlmpegError:
+        """The stream-signature rejection — UDF_ARG_TYPE's remaining job (RFC-007).
+
+        Option problems never reach here: they are ``UNKNOWN_FILTER_OPTION`` /
+        ``FILTER_OPTION_TYPE`` uniformly, positional or named.
+        """
+        shown = call.display
+        return _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{shown}() is an ffmpeg filter: it takes {', '.join(expected)} as its "
+            f"stream input{'' if len(expected) == 1 else 's'}, "
+            f"got ({', '.join(got) or 'nothing'})",
+            node,
+            fallback=select,
+            hint=f"stream inputs come first, then options in the filter's own order, "
+            f"then named options: {shown}({', '.join(expected)}, <option>, "
+            f"<option> => <value>)",
+        )
+
+    def _options_for(
+        self,
+        filter_name: str,
+        call: _Call,
+        stream_arity: int,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> dict[str, FilterOption]:
+        """The filter's option table, fetched only when the call actually needs it.
+
+        ``-help filter=X`` is a subprocess, and a call that passes no options
+        at all (``hflip(a.frame)``) has nothing to validate — so the table stays
+        unfetched, exactly as it did before positional options existed.
+        """
+        if len(call.args) <= stream_arity and not call.named:
+            return {}
+        return self._filter_options(filter_name, node, select)
+
+    def _reject_stream_option(
+        self,
+        filter_name: str,
+        option: FilterOption,
+        arg: exp.Expr,
+        node: exp.Expr,
         env: _Env,
         select: exp.Select,
-    ) -> tuple[dict[int, _Value], dict[int, object]]:
-        """Lower each argument ONCE, into ``(streams, literals)`` by position.
+    ) -> None:
+        """A stream where an option value belongs, said plainly.
 
-        A stream argument used by several broadcast elements is one subgraph
-        fanned out by the split pass, not a copy per element.
+        Classifying first is also what keeps a TYPO in a nested call readable:
+        `gblur(a.frame, nope(a.frame))` is UNKNOWN_FUNCTION for `nope`, raised
+        by the classifier, rather than a puzzled complaint about `sigma`'s type.
+        Only stream-SHAPED arguments are classified -- a literal is the option
+        validator's business and is left to it.
         """
-        streams: dict[int, _Value] = {}
-        literals: dict[int, object] = {}
-        for position, (param, arg) in enumerate(zip(variant, arg_nodes)):
-            if param.kind in ("video", "audio"):
-                streams[position] = self._lower_expr(arg, env, select)
-            elif param.kind == "num":
-                literals[position] = _number(arg)
-            elif param.kind == "expr":
-                literals[position] = _expression(arg)
-            else:
-                literals[position] = _string(arg)
-        return streams, literals
+        inner = _unwrap(arg)
+        if not isinstance(inner, exp.Bracket | exp.Column) and _call_parts(inner) is None:
+            return
+        kind = self._classify(arg, env, select)
+        if kind not in _STREAM_KINDS:
+            return
+        raise _error(
+            ErrorCode.FILTER_OPTION_TYPE,
+            f"option '{option.name}' of filter '{filter_name}' takes a value, "
+            f"got a {kind} stream",
+            arg,
+            fallback=node,
+            hint="stream inputs come first and are counted by the filter's pad "
+            "signature; everything after them is an option value",
+        )
+
+    def _bind_options(
+        self,
+        filter_name: str,
+        call: _Call,
+        node: exp.Expr,
+        select: exp.Select,
+        env: _Env,
+        *,
+        options: dict[str, FilterOption],
+        extras: list[exp.Expr],
+        timeline: bool,
+    ) -> dict[str, object]:
+        """Positional options first, then named ones — one merged arg dict.
+
+        `extras` is every positional argument past the stream inputs. Each
+        binds to the option at its own index in ``options``, whose insertion
+        order IS ffmpeg's AVOption declaration order and therefore its own
+        positional binding order (verified against ffmpeg 7.1 for the whole
+        registry; see ``sqlmpeg/registry.py``). Having landed on an option, a
+        positional is validated AS that option by the very same
+        :func:`_option_value` a named argument goes through, which is what
+        makes option errors uniform across the two spellings.
+
+        Named arguments are then checked with the positionally-bound names
+        marked `occupied`, so a named argument never silently overrides one the
+        call already set.
+        """
+        order = list(options)
+        if len(extras) > len(order):
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() got {len(extras)} positional option"
+                f"{'' if len(extras) == 1 else 's'}, but the '{filter_name}' filter "
+                f"has {len(order)}",
+                extras[len(order)] if len(order) < len(extras) else node,
+                fallback=select,
+                hint="its options, in the order they bind: " + _listed(order)
+                if order
+                else f"the '{filter_name}' filter has no options sqlmpeg can set",
+            )
+        bound: dict[str, object] = {}
+        for index, arg in enumerate(extras):
+            option = options[order[index]]
+            self._reject_stream_option(filter_name, option, arg, node, env, select)
+            bound[option.name] = _option_value(
+                filter_name, option, _NamedArg(name=option.name, value=arg), node
+            )
+        bound.update(
+            self._check_named_args(
+                filter_name,
+                options,
+                call.named,
+                node,
+                owner=call.display,
+                occupied=set(bound),
+                timeline=timeline,
+            )
+        )
+        return bound
 
     def _expand_call(
         self,
@@ -2752,9 +2828,9 @@ class _Lowerer:
         """Broadcast `build` over the array arguments, if there are any.
 
         Type-driven and tier-agnostic: `positions` is where the stream
-        arguments are (from a stdlib variant, or from a dynamic filter's pad
-        signature) and `build` is what turns one element's argument values into
-        a subgraph.
+        arguments are (always the LEADING positions, from the pad signature or
+        from an N-input call's own count) and `build` is what turns one
+        element's argument values into a subgraph.
         """
         length = self._zip_length(name, node, arg_nodes, streams, select)
         expanded: list[_Stream] = []
@@ -2789,28 +2865,20 @@ class _Lowerer:
     ) -> dict[str, FilterOption]:
         """The introspected options of `filter_name`, or a typed rejection.
 
-        One rule, stated the same way everywhere: named arguments ARE the
-        installed ffmpeg. Without a registry — no ffmpeg, or ``--portable`` —
-        there is nothing to validate them against, and guessing is exactly what
-        this compiler does not do.
+        One rule: options ARE the installed ffmpeg. Without a registry there is
+        nothing to validate them against, and guessing is exactly what this
+        compiler does not do. (A CALL cannot reach this with a None registry —
+        its name would already be UNKNOWN_FUNCTION — but a generated source in
+        FROM position can, so the branch stays.)
 
         ``Registry.options`` returns None only for a filter this ffmpeg does not
         have (or that the v1 scope fence excluded); an empty dict is a real
         answer (a filter with no options) and is passed through as one.
         """
         if self.registry is None:
-            if self.portable:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    "named arguments are validated against your installed ffmpeg, "
-                    "and --portable turns that off",
-                    anchor,
-                    fallback=fallback,
-                    hint=_PORTABLE_HINT,
-                )
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                "named arguments are validated against your installed ffmpeg; "
+                "options are validated against your installed ffmpeg; "
                 "ffmpeg was not found",
                 anchor,
                 fallback=fallback,
@@ -2820,11 +2888,11 @@ class _Lowerer:
         if options is None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"named arguments are validated against the ffmpeg filter "
+                f"options are validated against the ffmpeg filter "
                 f"'{filter_name}', which your ffmpeg does not provide",
                 anchor,
                 fallback=fallback,
-                hint="drop the named arguments, or install an ffmpeg that has "
+                hint="drop the options, or install an ffmpeg that has "
                 f"the '{filter_name}' filter",
             )
         return options
@@ -2842,17 +2910,15 @@ class _Lowerer:
     ) -> dict[str, object]:
         """Validate every named argument against `options`, in written order.
 
-        `occupied` holds the arg keys a stdlib call's expansion already set —
-        both the ones mapped from its positional arguments (``crop``'s ``w``)
-        and the constants the spec hardcodes (``crossfade``'s default
-        ``transition``, ``scale(f, 0.5)``'s ``h=-2``). A named argument that
-        collides with one is rejected rather than silently overriding it
-        (RFC-003), and the overload that takes it positionally, if there is one,
-        is the way to set it.
+        `occupied` holds the option names this call already bound
+        POSITIONALLY, so ``crop(f, 100, 50, 10, 20, out_w => 5)`` reads as the
+        conflict it is rather than silently overriding what the call itself
+        said. A collision is ``FILTER_OPTION_TYPE`` — an option problem, like
+        every other one under RFC-007 — and the fix is to drop one of the two
+        spellings.
 
-        The collision check comes FIRST so that ``crop(f, 0, 0, 10, 10, w => 5)``
-        reads as the conflict it is — ffmpeg's own name for that option is
-        ``out_w``, so a registry check would otherwise call ``w`` unknown.
+        The collision check comes FIRST so the message names the conflict
+        rather than whatever the registry would say about the name.
 
         `timeline` is the target's ``DynamicFilter.timeline`` flag, and it is a
         PARAMETER because this method cannot look filters up: every caller
@@ -2867,13 +2933,13 @@ class _Lowerer:
         for arg in named:
             if arg.name in occupied:
                 raise _error(
-                    ErrorCode.UDF_ARG_TYPE,
-                    f"{owner}() already sets '{arg.name}' on the "
-                    f"'{filter_name}' filter it expands to",
+                    ErrorCode.FILTER_OPTION_TYPE,
+                    f"option '{arg.name}' of filter '{filter_name}' is already set "
+                    f"positionally by {owner}()",
                     arg.value,
                     fallback=call,
                     hint="a named argument never overrides what the call itself "
-                    "set; drop it, or use the overload that takes it positionally",
+                    "set; drop one of the two spellings",
                 )
             if arg.name == _ENABLE:
                 checked[_ENABLE] = _enable_value(filter_name, arg, call, timeline)
@@ -2891,29 +2957,33 @@ class _Lowerer:
         return checked
 
     def _unknown_function_hint(self, name: str) -> str:
-        """Did-you-mean across BOTH tiers, then why tier 2 might be missing."""
-        candidates = set(FUNCTIONS)
+        """Did-you-mean over the registry (RFC-007: there is nothing else)."""
         registry = self.registry
-        dynamic = registry is not None and registry.available()
-        if registry is not None and dynamic:
-            candidates |= set(registry.names())
-        matches = difflib.get_close_matches(name, sorted(candidates), n=1, cutoff=0.6)
-        if matches:
-            return f"did you mean {matches[0]}()?"
-        known = "known functions: " + ", ".join(sorted(FUNCTIONS))
-        if self.portable:
-            return f"{known} (dynamic ffmpeg filters are disabled by --portable)"
-        if not dynamic:
-            return f"{known} (dynamic ffmpeg filters need ffmpeg on PATH)"
-        return known
+        if registry is not None and registry.available():
+            if registry.get_source(name) is not None:
+                return (
+                    f"{name} is a generated source, not a function: put it in FROM, "
+                    f"e.g. FROM {FILTER_NAMESPACE}.{name}(duration => 2) s"
+                )
+            # `name` itself can be in the candidate set -- N_INPUT lists three
+            # names unconditionally, and this ffmpeg may simply not have one --
+            # and "did you mean amix()?" for `amix()` helps nobody.
+            candidates = sorted((set(registry.names()) | set(N_INPUT)) - {name})
+            matches = difflib.get_close_matches(name, candidates, n=1, cutoff=0.6)
+            if matches:
+                return f"did you mean {matches[0]}()?"
+            return (
+                "every function is a filter of your installed ffmpeg, and this is "
+                "not one of them; filters with a variable pad count, more than one "
+                "output, or no input at all are not callable"
+            )
+        return _NO_REGISTRY_HINT
 
     def _namespaced_function_hint(self, name: str) -> str:
-        """Did-you-mean for ``ffmpeg.<filter>()``, over the REGISTRY alone.
+        """Did-you-mean for ``ffmpeg.<filter>()``, keeping the namespace spelling.
 
-        The namespace never resolves against the stdlib, so neither does its
-        did-you-mean: suggesting ``blur()`` for ``ffmpeg.blurr()`` would point
-        at a different tier. Suggestions keep the namespace spelling, which is
-        the one that works for every filter name.
+        Suggestions keep the ``ffmpeg.`` prefix, which is the one spelling that
+        works for every filter name whatever Postgres thinks of it.
         """
         registry = self.registry
         if registry is not None and registry.available():
@@ -2925,20 +2995,16 @@ class _Lowerer:
                     f"function: put it in FROM, e.g. FROM {FILTER_NAMESPACE}."
                     f"{name}(duration => 2) s"
                 )
-            matches = difflib.get_close_matches(
-                name, sorted(registry.names()), n=1, cutoff=0.6
+            candidates = sorted(
+                (set(registry.names()) | set(ARRAY_RETURNING) | set(N_INPUT)) - {name}
             )
+            matches = difflib.get_close_matches(name, candidates, n=1, cutoff=0.6)
             if matches:
                 return f"did you mean {FILTER_NAMESPACE}.{matches[0]}()?"
             return (
                 f"{FILTER_NAMESPACE}.<filter> is a filter of your installed ffmpeg, "
                 "and this is not one of them; filters with a variable pad count, "
                 "more than one output, or no input at all are not callable"
-            )
-        if self.portable:
-            return (
-                f"--portable turns the whole {FILTER_NAMESPACE}.<filter> namespace "
-                "off; use a stdlib function, or compile without --portable"
             )
         return (
             f"the {FILTER_NAMESPACE}.<filter> namespace is your installed ffmpeg's "
@@ -2980,14 +3046,15 @@ class _Lowerer:
         return None if first is None else first[1]
 
     def _classify(self, node: exp.Expr, env: _Env, select: exp.Select) -> str:
-        """Kind label for one call argument, matched against ``Param.kind``.
+        """Kind label for one call argument: a stream type, ``num``/``str``, or
+        :data:`_UNSUPPORTED_KIND`.
 
         Stream arguments resolve to ``video``/``audio`` without creating any
         node, so a mismatch is reported before the graph grows. Nested calls
         to unknown functions are reported here rather than being labelled a
-        stream and swallowed by an outer arity error. A nested call resolves
-        across BOTH tiers — and through the ``ffmpeg.<filter>`` namespace — so
-        ``scale(gblur(a.frame, sigma => 2), 0.5)`` sees the inner call's output
+        stream and swallowed by an outer arity error, and a nested call
+        resolves exactly the way a top-level one does, so
+        ``scale(gblur(a.frame, 2), 640, 480)`` sees the inner call's output
         pad type.
         """
         node = _unwrap(node)
@@ -3006,14 +3073,13 @@ class _Lowerer:
         call = _call_parts(node)
         if call is not None:
             name = call.name.lower()
-            spec = None if call.namespaced else FUNCTIONS.get(name)
-            if spec is not None:
-                return self._stdlib_returns(spec, call, env, select)
             # An array-returning call is classified by its ELEMENT type, which
             # is what makes it a legal argument: `volume(ffmpeg.channelsplit(
             # a.audio[1]), 0.5)` broadcasts over the channels.
             if call.namespaced and self._array_options(name) is not None:
                 return ARRAY_RETURNING[name].element
+            if self._n_input_options(name) is not None:
+                return N_INPUT[name].output
             dynamic = self.registry.get(name) if self.registry is not None else None
             if dynamic is None:
                 raise _error(
@@ -3027,25 +3093,6 @@ class _Lowerer:
                 )
             return dynamic.output
         return _UNSUPPORTED_KIND
-
-    def _stdlib_returns(
-        self, spec: FuncSpec, call: _Call, env: _Env, select: exp.Select
-    ) -> str:
-        """What a nested stdlib call yields, per OVERLOAD where that matters.
-
-        ``delay`` is the one spec whose overloads disagree about it (plan 038),
-        so only ``by_variant`` specs pay for re-classifying their arguments;
-        every other spec answers straight from ``spec.returns``. A call that
-        matches no overload falls back to the spec-level answer: it is about to
-        be lowered for real, and THAT is where its own UDF_ARG_TYPE is raised,
-        with its own signature list.
-        """
-        if spec.by_variant is None:
-            return spec.returns
-        kinds = [self._classify(arg, env, select) for arg in call.args]
-        index = _match_variant(spec.variants, kinds)
-        return spec.returns if index is None else spec.impl(index).returns
-
 
 # ---------------------------------------------------------------------------
 # provenance & small value helpers
@@ -3206,10 +3253,9 @@ def _range_text(option: FilterOption) -> str | None:
 def _literal_value(node: exp.Expr) -> object | None:
     """A named argument's value as a python scalar, or None if it is not a literal.
 
-    Deliberately separate from :func:`_number` / :func:`_string`: those raise the
-    stdlib's own message, and an option's expected type is only known after the
-    registry has been consulted, so reading the value and judging it are two
-    steps here.
+    Deliberately separate from :func:`_number`: that raises its own message,
+    and an option's expected type is only known after the registry has been
+    consulted, so reading the value and judging it are two steps here.
     """
     node = _unwrap(node)
     if isinstance(node, exp.Boolean):
@@ -3240,7 +3286,12 @@ def _option_got(node: exp.Expr, value: object) -> str:
         return str(value)
     if isinstance(value, str):
         return repr(value)
-    return _describe(_unwrap(node))
+    inner = _unwrap(node)
+    if isinstance(inner, exp.Literal):
+        # A literal `_literal_value` could not read (sqlglot tokenizes `1e` as a
+        # number but `to_py()` raises): echo what was written, not its shape.
+        return repr(str(inner.this))
+    return _describe(inner)
 
 
 def _option_error(
@@ -3383,11 +3434,6 @@ def _option_value(
     )
 
 
-def _stream_positions(variant: tuple[Param, ...]) -> list[int]:
-    """Every parameter position of `variant` whose kind is a stream type, in order."""
-    return [i for i, param in enumerate(variant) if param.kind in ("video", "audio")]
-
-
 def _sql_text(node: exp.Expr) -> str:
     """The argument as the user wrote it, for a BROADCAST_MISMATCH message.
 
@@ -3401,41 +3447,6 @@ def _stream_count(count: int) -> str:
     return f"{count} stream" + ("" if count == 1 else "s")
 
 
-# What each ParamKind accepts out of :meth:`_Lowerer._classify`. Explicit
-# membership rather than equality (RFC-005 SS3): ``expr`` is the one kind that
-# takes two classifier answers, a bare number or a quoted expression string.
-# Stating the whole table -- rather than special-casing ``expr`` against an
-# otherwise-equality rule -- is also what keeps the classifier's own
-# `_UNSUPPORTED_KIND` fallback and the passthrough stream types (`subtitle`,
-# `data`) matching NOTHING, by construction.
-_KIND_ACCEPTS: dict[str, frozenset[str]] = {
-    "video": frozenset({"video"}),
-    "audio": frozenset({"audio"}),
-    "num": frozenset({"num"}),
-    "str": frozenset({"str"}),
-    "expr": frozenset({"num", "str"}),
-}
-
-
-def _match_variant(
-    variants: Iterable[tuple[Param, ...]], kinds: list[str]
-) -> int | None:
-    """The INDEX of the first overload `kinds` matches, or None.
-
-    The index rather than the variant itself: it is what selects the overload's
-    implementation (``FuncSpec.impl``), which for ``delay`` differs in more
-    than shape.
-    """
-    for index, variant in enumerate(variants):
-        if len(variant) != len(kinds):
-            continue
-        if all(
-            kind in _KIND_ACCEPTS[param.kind] for param, kind in zip(variant, kinds)
-        ):
-            return index
-    return None
-
-
 # ---------------------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------------------
@@ -3446,7 +3457,6 @@ def lower(
     probes: dict[str, ProbeResult | None],
     *,
     registry: Registry | None = None,
-    portable: bool = False,
 ) -> Graph:
     """Lower a resolved query into an IR graph.
 
@@ -3454,21 +3464,16 @@ def lower(
     ``probe()`` per distinct path); a missing or ``None`` entry means that
     input could not be read, and lowering stays symbolic for it.
 
-    `registry` is the tier-2 half of the function surface (RFC-003): the filter
-    set of the ffmpeg on PATH, introspected lazily. It is a PARAMETER rather
-    than a module lookup so that a caller — ``compile_sql``, or a test — decides
-    whether this compile may consult the local ffmpeg at all. None means it may
-    not: every name is then resolved against the stdlib alone.
-
-    `portable` only changes what a rejection SAYS. None registry + portable
-    means the caller turned tier 2 off deliberately (``--portable``); None
-    registry without it means ffmpeg was not found. Both reject the same
-    queries, so a query that compiles portably compiles everywhere.
+    `registry` IS the function surface (RFC-007): the filter set of the ffmpeg
+    on PATH, introspected lazily. It is a PARAMETER rather than a module lookup
+    so that a caller — ``compile_sql``, or a test — decides which ffmpeg (or
+    which captured snapshot) this compile resolves against. None, or an empty
+    one, means every call name is UNKNOWN_FUNCTION.
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     try:
-        return _Lowerer(res, probes, registry, portable).run()
+        return _Lowerer(res, probes, registry).run()
     except SqlmpegError:
         raise
     except Exception as err:  # backstop: guardrail #7, no panics on user input

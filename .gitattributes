@@ -2,7 +2,8 @@
 # LF-only content: never CRLF-smudge them on checkout.
 docs/** text eol=lf
 
-# The reference registry snapshot (plan 050) is a generated, committed
-# package-data file whose regeneration test asserts byte-identity -- same
-# LF-only contract as docs/**, but it lives under sqlmpeg/ instead.
-sqlmpeg/*.json text eol=lf
+# The reference registry snapshot is a generated, committed TEST FIXTURE
+# whose regeneration test asserts byte-identity -- same LF-only contract as
+# docs/**. It is not shipped in the wheel (plan 051): nothing in the
+# installed package reads it, only the test suite does.
+tests/data/*.json text eol=lf

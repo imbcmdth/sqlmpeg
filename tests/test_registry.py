@@ -894,6 +894,122 @@ def test_scale_alias_dedup_regardless_of_file_order(monkeypatch: pytest.MonkeyPa
         "auto", "bt601", "bt470", "smpte170m", "bt709", "fcc", "smpte240m", "bt2020",
     )
     assert in_color_matrix.default == "auto"  # symbolic, not "-1"
+    # The kept names are in ffmpeg's own declared order, which IS its
+    # positional binding order (plan 051): `scale=640:480` binds w,h.
+    assert list(opts)[:3] == ["width", "height", "flags"]
+
+
+# --- dedup is ADJACENCY-scoped (plan 051) ---------------------------------
+#
+# ffmpeg's positional binding (`process_options`) skips a duplicate AVOption
+# only when it sits IMMEDIATELY after the entry it aliases, so two same-doc
+# options that are not adjacent are two REAL options that each own a
+# positional slot. Modelled on cropdetect, where `reset` (deprecated alias of
+# reset_count) and `reset_count` share doc text but are separated by `skip`:
+# ffmpeg 7.1 binds `cropdetect=24:16:-9` to 'reset' and
+# `cropdetect=24:16:0:-9' to 'skip' (measured 2026-08-16).
+
+HELP_CROPDETECT_TRIMMED = """\
+Filter cropdetect
+  Auto-detect crop size.
+cropdetect AVOptions:
+   limit             <float>      ..FV....... Threshold below which pixels are considered black (from 0 to 65535) (default 0.0941176)
+   round             <int>        ..FV....... Value by which the height/width should be divisible (from 0 to INT_MAX) (default 16)
+   reset             <int>        ..FV....... Recalculate the crop area after this many frames (from 0 to INT_MAX) (default 0)
+   skip              <int>        ..FV....... Number of initial frames to skip (from 0 to INT_MAX) (default 2)
+   reset_count       <int>        ..FV....... Recalculate the crop area after this many frames (from 0 to INT_MAX) (default 0)
+   max_outliers      <int>        ..FV....... Threshold count of outliers (from 0 to INT_MAX) (default 0)
+
+"""
+
+# deshake declares x,y,w,h and only THEN rx,ry -- x/rx and y/ry share doc
+# text but are four lines apart. The pre-051 global grouping dropped x and y
+# outright (they are shorter) and made slot 1 `w`, where ffmpeg binds `x`.
+HELP_DESHAKE_TRIMMED = """\
+Filter deshake
+  Stabilize shaky video.
+deshake AVOptions:
+   x                 <int>        ..FV....... set x for the rectangular search area (from -1 to INT_MAX) (default -1)
+   y                 <int>        ..FV....... set y for the rectangular search area (from -1 to INT_MAX) (default -1)
+   w                 <int>        ..FV....... set width for the rectangular search area (from -1 to INT_MAX) (default -1)
+   h                 <int>        ..FV....... set height for the rectangular search area (from -1 to INT_MAX) (default -1)
+   rx                <int>        ..FV....... set x for the rectangular search area (from 0 to 64) (default 16)
+   ry                <int>        ..FV....... set y for the rectangular search area (from 0 to 64) (default 16)
+
+"""
+
+
+def test_non_adjacent_same_doc_options_are_both_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`reset` and `reset_count` share doc text but are not adjacent."""
+    monkeypatch.setattr(registry_mod, "_run", lambda argv: HELP_CROPDETECT_TRIMMED)
+    opts = registry_mod._parse_filter_help("ffmpeg", "cropdetect")
+    assert "reset" in opts
+    assert "reset_count" in opts
+    assert list(opts) == [
+        "limit", "round", "reset", "skip", "reset_count", "max_outliers",
+    ]
+
+
+def test_non_adjacent_same_doc_options_keep_their_positional_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """deshake's x/rx and y/ry are four lines apart: all four survive, in order."""
+    monkeypatch.setattr(registry_mod, "_run", lambda argv: HELP_DESHAKE_TRIMMED)
+    opts = registry_mod._parse_filter_help("ffmpeg", "deshake")
+    assert list(opts) == ["x", "y", "w", "h", "rx", "ry"]
+    # x and rx are genuinely different options, with different ranges --
+    # merging them (pre-051) lost the one ffmpeg binds positionally first.
+    assert opts["x"].minimum == -1.0
+    assert opts["rx"].minimum == 0.0
+    assert opts["rx"].maximum == 64.0
+
+
+def test_adjacent_alias_run_of_three_keeps_the_longest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run longer than two collapses to one entry at the run's position."""
+    help_text = (
+        "Filter x\nx AVOptions:\n"
+        "   a                 <int>        ..FV....... first option (default 1)\n"
+        "   aa                <int>        ..FV....... shared doc (default 1)\n"
+        "   aaaa              <int>        ..FV....... shared doc (default 1)\n"
+        "   aaa               <int>        ..FV....... shared doc (default 1)\n"
+        "   z                 <int>        ..FV....... last option (default 1)\n"
+        "\n"
+    )
+    monkeypatch.setattr(registry_mod, "_run", lambda argv: help_text)
+    opts = registry_mod._parse_filter_help("ffmpeg", "x")
+    assert list(opts) == ["a", "aaaa", "z"]
+
+
+def test_adjacent_alias_run_ties_break_by_first_occurrence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    help_text = (
+        "Filter x\nx AVOptions:\n"
+        "   bb                <int>        ..FV....... shared doc (default 1)\n"
+        "   cc                <int>        ..FV....... shared doc (default 1)\n"
+        "\n"
+    )
+    monkeypatch.setattr(registry_mod, "_run", lambda argv: help_text)
+    opts = registry_mod._parse_filter_help("ffmpeg", "x")
+    assert list(opts) == ["bb"]
+
+
+def test_empty_doc_options_are_not_merged_across_the_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """buffer's options have EMPTY doc text; only adjacent ones may collapse."""
+    help_text = (
+        "Filter buffer\nbuffer AVOptions:\n"
+        "   width             <int>        ..FV.......\n"
+        "   video_size        <image_size> ..FV.......\n"
+        "   pix_fmt           <pix_fmt>    ..FV.......\n"
+        "\n"
+    )
+    monkeypatch.setattr(registry_mod, "_run", lambda argv: help_text)
+    opts = registry_mod._parse_filter_help("ffmpeg", "buffer")
+    assert list(opts) == ["width", "video_size", "pix_fmt"]
 
 
 # --- degradation paths ----------------------------------------------------

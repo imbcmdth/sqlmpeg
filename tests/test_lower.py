@@ -30,6 +30,7 @@ real installed ffmpeg, where only what ffmpeg itself guarantees is asserted.
 
 from __future__ import annotations
 
+import functools
 import re
 import shlex
 import subprocess
@@ -49,11 +50,12 @@ from sqlmpeg.ir import Graph, StreamType
 from sqlmpeg.lower import lower
 from sqlmpeg.parser import parse, resolve
 from sqlmpeg.probe import ProbeResult, StreamMeta
-from sqlmpeg.registry import Registry
+from sqlmpeg.registry import Registry, load_reference
 from sqlmpeg.split import insert_splits
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
+SNAPSHOT_PATH = REPO_ROOT / "tests" / "data" / "reference_registry.json"
 
 
 # README ```sql blocks are dispatched by CONTENT, not by position, so moving
@@ -88,8 +90,22 @@ def _readme_block(needle: str, *, exclude: str | None = None) -> str:
     return matching[0]
 
 
+@functools.cache
+def _snapshot_registry() -> Registry:
+    """The captured ffmpeg 7.1 filter set: offline, machine-independent, complete.
+
+    RFC-007 made the registry the WHOLE function surface, so even a lowering
+    test that says nothing about ffmpeg needs one to resolve `gblur` or
+    `volume`. `tests/data/reference_registry.json` IS that registry -- no
+    subprocess, no PATH lookup, identical answers on every machine. Tests that
+    want a deliberately SMALL, or absent, filter set build their own instead
+    (`_registry` / `_dyn`, further down).
+    """
+    return load_reference(SNAPSHOT_PATH)
+
+
 def _lower(sql: str, probes: dict[str, ProbeResult | None] | None = None) -> Graph:
-    return lower(resolve(parse(sql)), probes or {})
+    return lower(resolve(parse(sql)), probes or {}, registry=_snapshot_registry())
 
 
 def _serialized_sinks(d: dict[str, object]) -> list[dict[str, object]]:
@@ -563,7 +579,7 @@ def test_scalar_broadcast_makes_one_node_per_element() -> None:
 def test_nested_broadcasts_compose() -> None:
     """`volume(reverb(a.audio, 0.3), 0.5)` : the inner array flows outward."""
     g = _lower(
-        "SELECT volume(reverb(a.audio, 0.3), 0.5) FROM input('x.mp4') a",
+        "SELECT volume(aecho(a.audio, 0.8, 0.9, 60, 0.3), 0.5) FROM input('x.mp4') a",
         {"a": _probe_result(audios=2)},
     )
     assert _filters(g) == ["aecho", "aecho", "volume", "volume"]
@@ -626,7 +642,7 @@ def test_an_array_argument_still_type_checks_by_element() -> None:
         "SELECT hflip(a.audio) FROM input('x.mp4') a", {"a": _probe_result(audios=2)}
     )
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "got hflip(audio)" in err.message
+    assert "it takes video as its stream input, got (audio)" in err.message
 
 
 def test_broadcast_composes_with_the_input_seek() -> None:
@@ -636,7 +652,7 @@ def test_broadcast_composes_with_the_input_seek() -> None:
     calls consume the raw stream refs and the whole input is seeked once.
     """
     g = _lower(
-        "SELECT volume(a.audio, 0.5), reverb(a.audio, 0.3) FROM input('x.mp4') a "
+        "SELECT volume(a.audio, 0.5), aecho(a.audio, 0.8, 0.9, 60, 0.3) FROM input('x.mp4') a "
         "WHERE a.t BETWEEN 1 AND 2",
         {"a": _probe_result(audios=2)},
     )
@@ -657,7 +673,7 @@ def test_broadcast_composes_with_the_input_seek() -> None:
 
 def test_broadcast_outputs_carry_their_own_source_metadata() -> None:
     g = _lower(
-        "SELECT reverb(a.audio, 0.3) FROM input('x.mp4') a",
+        "SELECT aecho(a.audio, 0.8, 0.9, 60, 0.3) FROM input('x.mp4') a",
         {
             "a": _probe_result(
                 audios=2, per_audio_tags=[{"language": "eng"}, {"language": "fra"}]
@@ -669,7 +685,7 @@ def test_broadcast_outputs_carry_their_own_source_metadata() -> None:
 
 def test_provenance_survives_a_chain_of_single_stream_calls() -> None:
     g = _lower(
-        "SELECT volume(reverb(a.audio[1], 0.3), 0.5) FROM input('x.mp4') a",
+        "SELECT volume(aecho(a.audio[1], 0.8, 0.9, 60, 0.3), 0.5) FROM input('x.mp4') a",
         {"a": _probe_result(audio_tags={"language": "fra", "title": "VF"})},
     )
     assert g.outputs[0].metadata == {"language": "fra", "title": "VF"}
@@ -1133,7 +1149,7 @@ def test_a_scalar_cte_column_cannot_be_subscripted() -> None:
 
 def test_cte_array_column_splats_in_the_outer_select() -> None:
     g = _lower(
-        "WITH c AS (SELECT reverb(a.audio, 0.3) AS snd FROM input('x.mp4') a) "
+        "WITH c AS (SELECT aecho(a.audio, 0.8, 0.9, 60, 0.3) AS snd FROM input('x.mp4') a) "
         "SELECT c.snd FROM c",
         {"a": _probe_result(audios=2)},
     )
@@ -1156,7 +1172,7 @@ def test_cte_array_column_broadcasts_again() -> None:
 
 def test_cte_array_column_is_subscriptable_one_based() -> None:
     g = _lower(
-        "WITH c AS (SELECT reverb(a.audio, 0.3) AS snd FROM input('x.mp4') a) "
+        "WITH c AS (SELECT aecho(a.audio, 0.8, 0.9, 60, 0.3) AS snd FROM input('x.mp4') a) "
         "SELECT c.snd[2] FROM c",
         {"a": _probe_result(audios=2)},
     )
@@ -1180,7 +1196,7 @@ def test_cte_array_subscript_bounds_are_static() -> None:
 
 def test_cte_array_column_provenance_reaches_the_outer_output() -> None:
     g = _lower(
-        "WITH c AS (SELECT reverb(a.audio, 0.3) AS snd FROM input('x.mp4') a) "
+        "WITH c AS (SELECT aecho(a.audio, 0.8, 0.9, 60, 0.3) AS snd FROM input('x.mp4') a) "
         "SELECT c.snd FROM c",
         {
             "a": _probe_result(
@@ -1369,7 +1385,7 @@ def test_union_all_column_order_mismatch_is_a_concat_mismatch() -> None:
 
 
 def test_nested_calls_chain_bottom_up() -> None:
-    g = _lower("SELECT blur(hflip(vflip(a.frame)), 4) FROM input('x.mp4') a")
+    g = _lower("SELECT gblur(hflip(vflip(a.frame)), 4) FROM input('x.mp4') a")
     assert _filters(g) == ["vflip", "hflip", "gblur"]
     assert g.nodes["n1"].inputs == ["src:a:v:0"]
     assert g.nodes["n2"].inputs == ["n1"]
@@ -1378,7 +1394,7 @@ def test_nested_calls_chain_bottom_up() -> None:
 
 
 def test_audio_calls_chain_bottom_up() -> None:
-    g = _lower("SELECT volume(reverb(a.audio[1], 0.3), 0.5) FROM input('x.mp4') a")
+    g = _lower("SELECT volume(aecho(a.audio[1], 0.8, 0.9, 60, 0.3), 0.5) FROM input('x.mp4') a")
     assert _filters(g) == ["aecho", "volume"]
     assert g.nodes["n1"].inputs == ["src:a:a:0"]
     assert g.nodes["n1"].outputs == ["audio"]
@@ -1398,11 +1414,11 @@ def test_macro_expands_to_several_nodes() -> None:
 
 def test_negative_numeric_literals_survive() -> None:
     g = _lower("SELECT scale(a.frame, -2, 720) FROM input('x.mp4') a")
-    assert g.nodes["n1"].args == {"w": -2, "h": 720}
+    assert g.nodes["n1"].args == {"width": -2, "height": 720}
 
 
 def test_string_literal_argument() -> None:
-    g = _lower("SELECT draw_box(a.frame, 1, 2, 3, 4, 'red') FROM input('x.mp4') a")
+    g = _lower("SELECT drawbox(a.frame, 1, 2, 3, 4, 'red') FROM input('x.mp4') a")
     assert g.nodes["n1"].args["color"] == "red"
 
 
@@ -1413,69 +1429,73 @@ def test_unknown_function_suggests_a_close_match() -> None:
     assert err.hint is not None and "scale()" in err.hint
 
 
-def test_unknown_function_without_a_match_lists_the_stdlib() -> None:
+def test_unknown_function_without_a_match_names_the_filter_set() -> None:
     err = _reject("SELECT zzzz(a.frame) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "blur_regions" in err.hint
+    assert err.hint is not None and "filter of your installed ffmpeg" in err.hint
 
 
-def test_unknown_nested_function_beats_the_outer_arity_check() -> None:
-    err = _reject("SELECT blur(a.frame, nope(a.frame)) FROM input('x.mp4') a")
-    assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert "nope()" in err.message
+
+def test_a_call_with_no_options_at_all_is_legal() -> None:
+    """Every option has an ffmpeg default, so passing none is a complete call
+    -- there is no arity to satisfy beyond the pad signature."""
+    g = _lower("SELECT scale(a.frame) FROM input('x.mp4') a")
+    assert g.nodes["n1"].filter == "scale"
+    assert g.nodes["n1"].args == {}
 
 
-def test_arity_error_lists_every_signature() -> None:
-    err = _reject("SELECT scale(a.frame) FROM input('x.mp4') a")
-    assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "scale(video, num)" in err.message
-    assert "scale(video, expr, expr)" in err.message
-    assert "got scale(video)" in err.message
-
-
-def test_argument_kind_mismatch_is_typed() -> None:
-    err = _reject("SELECT blur(a.frame, 'lots') FROM input('x.mp4') a")
-    assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "got blur(video, str)" in err.message
+def test_argument_kind_mismatch_is_the_options_own_rejection() -> None:
+    """RFC-007 consolidation: a badly-typed POSITIONAL is an option problem,
+    reported against the option it landed on -- not a signature mismatch."""
+    err = _reject("SELECT gblur(a.frame, 'lots') FROM input('x.mp4') a")
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "'sigma' of filter 'gblur' expects a number, got 'lots'" in err.message
 
 
 def test_audio_stream_where_video_is_expected() -> None:
     err = _reject("SELECT hflip(a.audio[1]) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "hflip(video)" in err.message
-    assert "got hflip(audio)" in err.message
+    assert "hflip() is an ffmpeg filter" in err.message
+    assert "it takes video as its stream input, got (audio)" in err.message
 
 
 def test_video_stream_where_audio_is_expected() -> None:
     err = _reject("SELECT amix(a.video[1], a.audio[1]) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "amix(audio, audio)" in err.message
-    assert "got amix(video, audio)" in err.message
+    assert "its stream inputs are all audio" in err.message
+    assert "(video, audio)" in err.message
 
 
 def test_video_result_where_audio_is_expected() -> None:
-    """The kind of a nested call comes from its FuncSpec.returns."""
+    """The kind of a nested call comes from its output PAD type."""
     err = _reject("SELECT volume(hflip(a.frame), 2) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "got volume(video, num)" in err.message
+    assert "it takes audio as its stream input, got (video)" in err.message
 
 
-def test_stream_argument_where_a_number_is_expected() -> None:
-    err = _reject("SELECT blur(a.frame, hflip(a.frame)) FROM input('x.mp4') a")
-    assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "got blur(video, video)" in err.message
+def test_stream_argument_where_an_option_value_is_expected() -> None:
+    err = _reject("SELECT gblur(a.frame, hflip(a.frame)) FROM input('x.mp4') a")
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "'sigma' of filter 'gblur' takes a value, got a video stream" in err.message
+
+
+def test_an_unknown_nested_call_in_an_option_slot_still_names_it() -> None:
+    """Classifying the argument first is what keeps the typo readable."""
+    err = _reject("SELECT gblur(a.frame, nope(a.frame)) FROM input('x.mp4') a")
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert "nope()" in err.message
 
 
 def test_non_literal_scalar_argument_is_rejected() -> None:
-    err = _reject("SELECT blur(a.frame, 1 + 2) FROM input('x.mp4') a")
-    assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "got blur(video, <expr>)" in err.message
+    err = _reject("SELECT gblur(a.frame, 1 + 2) FROM input('x.mp4') a")
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "'sigma' of filter 'gblur' expects a number" in err.message
 
 
 def test_malformed_numeric_literal_is_a_typed_rejection() -> None:
     """sqlglot tokenizes `1e` as a number but ``to_py()`` raises on it."""
-    err = _reject("SELECT blur(a.frame, 1e) FROM input('x.mp4') a")
-    assert err.code is ErrorCode.UDF_ARG_TYPE
+    err = _reject("SELECT gblur(a.frame, 1e) FROM input('x.mp4') a")
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "1e" in err.message
 
 
@@ -1495,10 +1515,20 @@ def test_overlay_keeps_its_four_positional_arguments() -> None:
     assert node.inputs == ["src:a:v:0", "src:b:v:0"]
 
 
-def test_overlay_arity_error_is_still_typed() -> None:
-    err = _reject("SELECT overlay(a.frame, b.frame, 20) FROM input('x.mp4') a, input('y.mp4') b")
-    assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "overlay(video, video, expr, expr)" in err.message
+def test_overlay_takes_its_options_positionally_despite_the_builtin() -> None:
+    """Postgres claims the NAME `overlay`, so `=>` inside it is a parse error --
+    but positional options work, and x/y are ffmpeg's first two."""
+    g = _lower(
+        "SELECT overlay(a.frame, b.frame, 20, 30) FROM input('x.mp4') a, input('y.mp4') b"
+    )
+    assert g.nodes["n1"].args == {"x": 20, "y": 30}
+
+
+def test_a_partial_overlay_option_list_is_still_legal() -> None:
+    g = _lower(
+        "SELECT overlay(a.frame, b.frame, 20) FROM input('x.mp4') a, input('y.mp4') b"
+    )
+    assert g.nodes["n1"].args == {"x": 20}
 
 
 def test_overlay_keeps_the_agreed_video_tag() -> None:
@@ -2068,7 +2098,7 @@ def test_node_ids_are_sequential_across_ctes_and_branches() -> None:
     g = _lower(
         "WITH c AS (SELECT hflip(a.frame) FROM input('x.mp4') a) "
         "SELECT vflip(c.frame) FROM c "
-        "UNION ALL SELECT blur(b.frame, 2) FROM input('y.mp4') b"
+        "UNION ALL SELECT gblur(b.frame, 2) FROM input('y.mp4') b"
     )
     assert list(g.nodes) == ["n1", "n2", "n3", "n4"]
     assert _filters(g) == ["hflip", "vflip", "gblur", "concat"]
@@ -2380,6 +2410,9 @@ Filters:
  .S. acrossover        A->N       Split audio into per-bands streams.
  ... aecho             A->A       Add echoing to the audio.
  ... amerge            N->A       Merge two or more audio streams into a single multi-channel stream.
+ ..C amix              N->A       Audio mixing.
+ .S. hstack            N->V       Stack video inputs horizontally.
+ .S. vstack            N->V       Stack video inputs vertically.
  ... channelsplit      A->N       Split audio into per-channel streams.
  ..C crop              V->V       Crop the input video.
  T.C feedback          VV->VV     Apply feedback video filter.
@@ -2390,6 +2423,7 @@ Filters:
  ... split             V->N       Pass on the input to N video outputs.
  ... testsrc           |->V       Generate test pattern.
  ... trim              V->V       Pick one continuous section from the input, drop the rest.
+ ..C volume            A->A       Change input volume.
  TS. unsharp           V->V       Sharpen or blur the input video.
  .S. xfade             VV->V      Cross fade one video with another video.
  ... anullsrc          |->A       Null audio source, return empty audio frames.
@@ -2404,6 +2438,38 @@ Filters:
 # and, for xfade, to the first 16 of its 59 transition constants, which is
 # still more than a message lists before it starts counting.
 _HELP_FIXTURES: dict[str, str] = {
+    "volume": """volume AVOptions:
+   volume            <string>     ..F.A....T. set volume adjustment expression (default "1.0")
+   precision         <int>        ..F.A...... select mathematical precision (from 0 to 2) (default float)
+     fixed           0            ..F.A...... select 8-bit fixed-point
+     float           1            ..F.A...... select 32-bit floating-point
+     double          2            ..F.A...... select 64-bit floating-point
+   eval              <int>        ..F.A...... specify when to evaluate expressions (from 0 to 1) (default once)
+     once            0            ..F.A...... eval volume expression once
+     frame           1            ..F.A...... eval volume expression per-frame
+
+""",
+    "amix": """amix AVOptions:
+   inputs            <int>        ..F.A...... Number of inputs. (from 1 to 32767) (default 2)
+   duration          <int>        ..F.A...... How to determine the end-of-stream. (from 0 to 2) (default longest)
+     longest         0            ..F.A...... Duration of longest input.
+     shortest        1            ..F.A...... Duration of shortest input.
+     first           2            ..F.A...... Duration of first input.
+   dropout_transition <float>      ..F.A...... Transition time, in seconds, for volume renormalization when an input stream ends. (from 0 to INT_MAX) (default 2)
+   weights           <string>     ..F.A....T. Set weight for each input. (default "1 1")
+   normalize         <boolean>    ..F.A....T. Scale inputs (default true)
+
+""",
+    "hstack": """(h|v)stack AVOptions:
+   inputs            <int>        ..FV....... set number of inputs (from 2 to INT_MAX) (default 2)
+   shortest          <boolean>    ..FV....... force termination when the shortest input terminates (default false)
+
+""",
+    "vstack": """(h|v)stack AVOptions:
+   inputs            <int>        ..FV....... set number of inputs (from 2 to INT_MAX) (default 2)
+   shortest          <boolean>    ..FV....... force termination when the shortest input terminates (default false)
+
+""",
     "gblur": """\
 gblur AVOptions:
    sigma             <float>      ..FV.....T. set sigma (from 0 to 1024) (default 0.5)
@@ -2444,6 +2510,8 @@ crop AVOptions:
    w                 <string>     ..FV.....T. set the width crop area expression (default "iw")
    out_h             <string>     ..FV.....T. set the height crop area expression (default "ih")
    h                 <string>     ..FV.....T. set the height crop area expression (default "ih")
+   x                 <string>     ..FV.....T. set the x crop area expression (default "(in_w-out_w)/2")
+   y                 <string>     ..FV.....T. set the y crop area expression (default "(in_h-out_h)/2")
    keep_aspect       <boolean>    ..FV....... keep aspect ratio (default false)
    exact             <boolean>    ..FV....... do exact cropping (default false)
 
@@ -2589,21 +2657,17 @@ def _dyn(
     sql: str,
     registry: Registry | None,
     probes: dict[str, ProbeResult | None] | None = None,
-    *,
-    portable: bool = False,
 ) -> Graph:
-    return lower(resolve(parse(sql)), probes or {}, registry=registry, portable=portable)
+    return lower(resolve(parse(sql)), probes or {}, registry=registry)
 
 
 def _reject_dyn(
     sql: str,
     registry: Registry | None,
     probes: dict[str, ProbeResult | None] | None = None,
-    *,
-    portable: bool = False,
 ) -> SqlmpegError:
     with pytest.raises(SqlmpegError) as excinfo:
-        _dyn(sql, registry, probes, portable=portable)
+        _dyn(sql, registry, probes)
     return _anchored(excinfo.value)
 
 
@@ -2637,23 +2701,130 @@ def test_dynamic_options_keep_their_written_order(_registry: Registry) -> None:
     assert "unsharp=luma_amount=1.5:luma_msize_x=7" in emit(insert_splits(g)).filter_complex
 
 
-def test_dynamic_filter_takes_only_its_pads_positionally(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT gblur(a.frame, 5) FROM input('x.mp4') a", _registry)
+def test_a_positional_after_the_pads_binds_to_the_first_option(
+    _registry: Registry,
+) -> None:
+    """RFC-007's heart: `gblur(f, 5)` IS `gblur=5`, because `sigma` is the
+    option ffmpeg declares first."""
+    g = _dyn("SELECT gblur(a.frame, 5) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].args == {"sigma": 5}
+
+
+def test_positionals_bind_in_the_filters_own_option_order(
+    _registry: Registry,
+) -> None:
+    g = _dyn("SELECT gblur(a.frame, 5, 2, 1) FROM input('x.mp4') a", _registry)
+    assert list(g.nodes["n1"].args.items()) == [("sigma", 5), ("steps", 2), ("planes", 1)]
+
+
+def test_crops_positionals_are_ffmpegs_order_not_the_old_stdlibs(
+    _registry: Registry,
+) -> None:
+    """The documented ARG-ORDER CHANGE: ffmpeg declares out_w, out_h, x, y."""
+    g = _dyn("SELECT crop(a.frame, 100, 50, 10, 20) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].args == {"out_w": 100, "out_h": 50, "x": 10, "y": 20}
+
+
+def test_a_positional_option_is_validated_as_the_option_it_lands_on(
+    _registry: Registry,
+) -> None:
+    """Slot 2 of gblur is `steps`, an int from 1 to 6 -- so 99 is that option's
+    own range rejection, not a generic arity complaint."""
+    err = _reject_dyn("SELECT gblur(a.frame, 5, 99) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "'steps' of filter 'gblur'" in err.message
+    assert "from 1 to 6" in err.message
+
+
+def test_a_positional_enum_option_takes_its_constant_names(
+    _registry: Registry,
+) -> None:
+    g = _dyn(
+        "SELECT xfade(a.frame, b.frame, 'wipeleft', 1) "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    assert g.nodes["n1"].args == {"transition": "wipeleft", "duration": 1}
+
+
+def test_a_bad_positional_enum_value_is_the_options_own_rejection(
+    _registry: Registry,
+) -> None:
+    err = _reject_dyn(
+        "SELECT xfade(a.frame, b.frame, 'nope') FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "'transition' of filter 'xfade'" in err.message
+
+
+def test_more_positionals_than_the_filter_has_options(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT gblur(a.frame, 1, 1, 1, 1, 1) FROM input('x.mp4') a", _registry
+    )
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "gblur(video), got gblur(video, num)" in err.message
-    assert err.hint is not None and "options by name" in err.hint
+    assert "got 5 positional options" in err.message
+    assert "'gblur' filter has 4" in err.message
+    assert err.hint is not None and "sigma" in err.hint
+
+
+def test_positionals_on_a_filter_with_no_options_at_all(_registry: Registry) -> None:
+    """`trim` has no -help block in this fixture, so its option table is empty
+    -- every positional past its pad is one too many."""
+    err = _reject_dyn("SELECT ffmpeg.trim(a.frame, 1) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "has 0" in err.message
+    assert err.hint is not None and "no options sqlmpeg can set" in err.hint
+
+
+def test_positionals_then_named_is_the_documented_mix(_registry: Registry) -> None:
+    g = _dyn("SELECT gblur(a.frame, 5, planes => 1) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].args == {"sigma": 5, "planes": 1}
+
+
+def test_a_positional_after_a_named_is_unsupported_sql(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT gblur(a.frame, sigma => 5, 2) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "positional arguments must come before named arguments" in err.message
+
+
+def test_a_named_option_already_bound_positionally_conflicts(
+    _registry: Registry,
+) -> None:
+    err = _reject_dyn(
+        "SELECT gblur(a.frame, 5, sigma => 2) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "'sigma' of filter 'gblur' is already set positionally" in err.message
+    assert err.hint is not None and "drop one of the two spellings" in err.hint
+
+
+def test_a_named_option_that_no_positional_claimed_is_fine(
+    _registry: Registry,
+) -> None:
+    g = _dyn("SELECT gblur(a.frame, 5, 2, sigmaV => 3) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].args == {"sigma": 5, "steps": 2, "sigmaV": 3}
+
+
+def test_enable_can_never_be_reached_positionally(_registry: Registry) -> None:
+    """`enable` is framework-level and in no option table, so nothing binds to
+    it by position -- gblur's four slots are sigma, steps, planes, sigmaV."""
+    g = _dyn("SELECT gblur(a.frame, 1, 1, 1, 1) FROM input('x.mp4') a", _registry)
+    assert "enable" not in g.nodes["n1"].args
 
 
 def test_dynamic_filter_checks_its_pad_types(_registry: Registry) -> None:
     err = _reject_dyn("SELECT gblur(a.audio[1], sigma => 1) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "got gblur(audio)" in err.message
+    assert "it takes video as its stream input, got (audio)" in err.message
 
 
 def test_two_pad_dynamic_filter_needs_both_inputs(_registry: Registry) -> None:
     err = _reject_dyn("SELECT xfade(a.frame) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "xfade(video, video), got xfade(video)" in err.message
+    assert "it takes video, video as its stream inputs, got (video)" in err.message
 
 
 def test_two_pad_dynamic_filter_lowers_both_inputs(_registry: Registry) -> None:
@@ -2682,23 +2853,27 @@ def test_excluded_filters_are_not_callable(_registry: Registry) -> None:
         assert _reject_dyn(sql, _registry).code is ErrorCode.UNKNOWN_FUNCTION
 
 
-def test_the_stdlib_wins_a_name_collision(_registry: Registry) -> None:
-    """`scale` and `crop` are both stdlib functions and real ffmpeg filters:
-    the stdlib's argument order and remapping are what a query gets."""
-    g = _dyn("SELECT scale(a.frame, 0.5) FROM input('x.mp4') a", _registry)
-    assert g.nodes["n1"].args == {"w": "iw*0.5", "h": "-2"}
-    g = _dyn("SELECT crop(a.frame, 1, 2, 3, 4) FROM input('x.mp4') a", _registry)
-    assert g.nodes["n1"].args == {"w": 3, "h": 4, "x": 1, "y": 2}
+def test_there_is_no_name_collision_left_to_win(_registry: Registry) -> None:
+    """`scale` and `crop` used to be curated functions shadowing real filters.
+    They are the filters now -- ffmpeg's option NAMES and ffmpeg's option
+    ORDER, with no remapping layer in between."""
+    g = _dyn("SELECT scale(a.frame, 'iw/2', -2) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].args == {"width": "iw/2", "height": -2}
+    g = _dyn("SELECT crop(a.frame, 3, 4, 1, 2) FROM input('x.mp4') a", _registry)
+    assert g.nodes["n1"].args == {"out_w": 3, "out_h": 4, "x": 1, "y": 2}
 
 
-def test_a_builtin_that_is_also_a_filter_resolves_to_tier_two(_registry: Registry) -> None:
+def test_a_builtin_that_is_also_a_filter_still_resolves_to_the_filter(
+    _registry: Registry,
+) -> None:
     """sqlglot parses `trim(...)` with its own TRIM grammar, which parks the
     argument under `this` rather than in the argument list -- so the call
     resolves to ffmpeg's trim filter but arrives with NO positional args. The
     rejection is typed (and names the pad signature), not a panic."""
     err = _reject_dyn("SELECT trim(a.frame) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "trim(video), got trim()" in err.message
+    assert "trim() is an ffmpeg filter" in err.message
+    assert "got (nothing)" in err.message
 
 
 def test_a_dynamic_call_nests_inside_a_stdlib_call(_registry: Registry) -> None:
@@ -2871,7 +3046,7 @@ def test_option_rejection_anchors_on_the_value(_registry: Registry) -> None:
 def test_stdlib_named_extra_reaches_the_underlying_filter(_registry: Registry) -> None:
     """blur's named_target is gblur, so `planes` is validated against gblur's
     options and merged AFTER the positionally-mapped sigma."""
-    g = _dyn("SELECT blur(a.frame, 5, planes => 1) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT gblur(a.frame, 5, planes => 1) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].filter == "gblur"
     assert list(g.nodes["n1"].args.items()) == [("sigma", 5), ("planes", 1)]
 
@@ -2891,11 +3066,11 @@ def test_stdlib_named_extras_keep_their_written_order(_registry: Registry) -> No
 
 
 def test_stdlib_named_extra_is_validated_like_a_dynamic_one(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT blur(a.frame, 5, planes => 99) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT gblur(a.frame, 5, planes => 99) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "from 0 to 15" in err.message
 
-    err = _reject_dyn("SELECT blur(a.frame, 5, planez => 1) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT gblur(a.frame, 5, planez => 1) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
     assert "filter 'gblur'" in err.message
 
@@ -2965,15 +3140,14 @@ def test_a_macro_rejects_named_extras(_registry: Registry) -> None:
         assert "more than one ffmpeg filter" in err.message
 
 
-def test_named_extras_on_a_filter_this_ffmpeg_lacks(_registry: Registry) -> None:
-    """subtitles is a stdlib function whose named_target is not in this
-    (fixture) ffmpeg's filter set: typed, not a crash and not a guess."""
+def test_a_filter_this_ffmpeg_lacks_is_an_unknown_function(_registry: Registry) -> None:
+    """`subtitles` is not in this (fixture) ffmpeg's filter set, so the NAME is
+    what fails -- there is no curated entry left to resolve it first."""
     err = _reject_dyn(
         "SELECT subtitles(a.frame, 'subs.srt', force_style => 'x') FROM input('x.mp4') a",
         _registry,
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "does not provide" in err.message
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
 
 
 # -- broadcasting is tier-agnostic -----------------------------------------
@@ -3047,75 +3221,64 @@ def test_a_dynamic_node_is_split_like_any_other(_registry: Registry) -> None:
     assert [node.filter for node in g.nodes.values()] == ["gblur", "split", "hstack"]
 
 
-# -- no registry at all: no ffmpeg, or --portable ---------------------------
+# -- no registry at all: no ffmpeg ------------------------------------------
+#
+# RFC-007 deleted --portable along with the tier system: there is no portable
+# subset left to compile against, because every function IS a filter of the
+# installed ffmpeg. A None/empty registry is now exactly one situation -- no
+# ffmpeg -- and every call name in it is UNKNOWN_FUNCTION.
 
 
 def test_without_a_registry_a_filter_name_is_an_unknown_function() -> None:
-    """`deband` is close to no stdlib name, so the hint has room to say WHY the
-    filter set is missing rather than a did-you-mean."""
     err = _reject_dyn("SELECT deband(a.frame, range => 8) FROM input('x.mp4') a", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "ffmpeg on PATH" in err.hint
-
-
-def test_a_close_stdlib_name_still_wins_the_hint() -> None:
-    """gblur is what blur() expands to, so the stdlib suggestion is the useful
-    one even though the reason it did not resolve is the missing filter set."""
-    err = _reject_dyn("SELECT gblur(a.frame, sigma => 5) FROM input('x.mp4') a", None)
-    assert err.hint is not None and "blur()" in err.hint
-
-
-def test_portable_says_so_instead() -> None:
-    err = _reject_dyn(
-        "SELECT deband(a.frame, range => 8) FROM input('x.mp4') a", None, portable=True
-    )
-    assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "--portable" in err.hint
-
-
-def test_named_extras_need_an_ffmpeg() -> None:
-    err = _reject_dyn("SELECT blur(a.frame, 5, planes => 1) FROM input('x.mp4') a", None)
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "ffmpeg was not found" in err.message
     assert err.hint is not None and "install ffmpeg" in err.hint
 
 
-def test_portable_rejects_named_extras_the_same_way() -> None:
-    """One rule: named arguments ARE your installed ffmpeg. --portable rejects
-    exactly what a machine without ffmpeg rejects, so a portable query compiles
-    everywhere."""
-    err = _reject_dyn(
-        "SELECT blur(a.frame, 5, planes => 1) FROM input('x.mp4') a", None, portable=True
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "--portable" in err.message
+def test_without_a_registry_every_name_is_unknown_including_common_ones() -> None:
+    """No name is privileged any more -- there is no curated list to fall back
+    on, so `scale` fails exactly the way `deband` does."""
+    for name in ("scale", "crop", "gblur", "volume", "amix"):
+        err = _reject_dyn(f"SELECT {name}(a.frame) FROM input('x.mp4') a", None)
+        assert err.code is ErrorCode.UNKNOWN_FUNCTION, name
 
 
-def test_portable_leaves_the_stdlib_alone() -> None:
-    g = _dyn("SELECT blur(a.frame, 5) FROM input('x.mp4') a", None, portable=True)
-    assert g.nodes["n1"].args == {"sigma": 5}
+def test_without_a_registry_the_namespace_is_unknown_too() -> None:
+    err = _reject_dyn("SELECT ffmpeg.gblur(a.frame) FROM input('x.mp4') a", None)
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.hint is not None and "ffmpeg was not found" in err.hint
 
 
-def test_did_you_mean_spans_both_tiers(_registry: Registry) -> None:
+def test_did_you_mean_over_the_registry(_registry: Registry) -> None:
     err = _reject_dyn("SELECT gblu(a.frame) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert err.hint is not None and "gblur()" in err.hint
 
 
-def test_did_you_mean_still_prefers_the_stdlib_list(_registry: Registry) -> None:
+def test_did_you_mean_can_suggest_an_n_input_filter(_registry: Registry) -> None:
+    """The N_INPUT names are callable, so they are candidates for the hint even
+    though the registry's own tables fence them out."""
+    err = _reject_dyn("SELECT amixx(a.audio[1], a.audio[2]) FROM input('x.mp4') a", _registry)
+    assert err.hint is not None and "amix()" in err.hint
+
+
+def test_no_match_says_the_surface_is_the_filter_set(_registry: Registry) -> None:
     err = _reject_dyn("SELECT zzzz(a.frame) FROM input('x.mp4') a", _registry)
-    assert err.hint is not None and "blur_regions" in err.hint
+    assert err.hint is not None and "filter of your installed ffmpeg" in err.hint
 
 
-def test_compile_sql_portable_skips_the_registry(monkeypatch: pytest.MonkeyPatch) -> None:
-    """--portable (plan 032's CLI flag) must not even build a registry: the
-    point is a compile that behaves like a machine with no ffmpeg."""
-    def boom() -> Registry:
-        raise AssertionError("registry.load() must not be called with portable=True")
+def test_compile_sql_always_builds_a_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """There is no flag that skips it any more: the registry IS the surface."""
+    calls: list[int] = []
+    real = compiler.registry_module.load
 
-    monkeypatch.setattr(compiler.registry_module, "load", boom)
-    g = compile_sql("SELECT blur(a.frame, 5) FROM input('x.mp4') a", portable=True)
-    assert g.nodes["n1"].filter == "gblur"
+    def counted() -> Registry:
+        calls.append(1)
+        return real()
+
+    monkeypatch.setattr(compiler.registry_module, "load", counted)
+    compile_sql("SELECT gblur(a.frame, 5) FROM input('x.mp4') a")
+    assert calls, "compile_sql must consult the registry"
 
 
 # ---------------------------------------------------------------------------
@@ -3190,7 +3353,7 @@ def test_empty_stream_array_is_a_typed_error(_fixtures: None) -> None:
 @pytest.mark.exec
 def test_reverb_over_every_language_track(_av2_fixture: str) -> None:
     """The headline case: one aecho per language track, each output still tagged."""
-    g = compile_sql(f"SELECT reverb(a.audio, 0.3) AS dubbed FROM input('{_av2_fixture}') a")
+    g = compile_sql(f"SELECT aecho(a.audio, 0.8, 0.9, 60, 0.3) AS dubbed FROM input('{_av2_fixture}') a")
     assert _filters(g) == ["aecho", "aecho"]
     assert g.nodes["n1"].inputs == ["src:a:a:0"]
     assert g.nodes["n2"].inputs == ["src:a:a:1"]
@@ -3461,18 +3624,24 @@ def test_a_namespaced_call_lowers_to_an_ordinary_node(_registry: Registry) -> No
     assert _outputs(g) == [("n1", "video", None)]
 
 
-def test_the_namespace_resolves_past_the_stdlib(_registry: Registry) -> None:
-    """`scale` is both a stdlib function and a real filter. The bare name is
-    the stdlib's, forever; the namespaced one is the filter's."""
-    raw = _dyn(
+def test_the_namespace_and_the_bare_name_are_the_same_call(_registry: Registry) -> None:
+    """RFC-007: there is no tier to resolve past. `scale` and `ffmpeg.scale`
+    are one filter, one option set, one argument order -- the namespace only
+    changes what Postgres's parser does with the NAME."""
+    named = _dyn(
         "SELECT ffmpeg.scale(a.frame, width => 640) FROM input('x.mp4') a", _registry
     )
-    assert raw.nodes["n1"].filter == "scale"
-    # ffmpeg's own option names, not the stdlib's w=iw*<factor>, h=-2 mapping.
-    assert raw.nodes["n1"].args == {"width": 640}
+    assert named.nodes["n1"].filter == "scale"
+    assert named.nodes["n1"].args == {"width": 640}
 
-    stdlib = _dyn("SELECT scale(a.frame, 0.5) FROM input('x.mp4') a", _registry)
-    assert stdlib.nodes["n1"].args == {"w": "iw*0.5", "h": "-2"}
+    bare = _dyn("SELECT scale(a.frame, 640, 480) FROM input('x.mp4') a", _registry)
+    assert bare.nodes["n1"].filter == "scale"
+    assert bare.nodes["n1"].args == {"width": 640, "height": 480}
+
+    qualified = _dyn(
+        "SELECT ffmpeg.scale(a.frame, 640, 480) FROM input('x.mp4') a", _registry
+    )
+    assert qualified.nodes["n1"].args == bare.nodes["n1"].args
 
 
 def test_the_namespace_reaches_a_name_postgres_claimed(_registry: Registry) -> None:
@@ -3480,7 +3649,7 @@ def test_the_namespace_reaches_a_name_postgres_claimed(_registry: Registry) -> N
     positional arguments; the namespaced spelling keeps them."""
     err = _reject_dyn("SELECT trim(a.frame) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "got trim()" in err.message
+    assert "got (nothing)" in err.message
 
     g = _dyn("SELECT ffmpeg.trim(a.frame) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].filter == "trim"
@@ -3495,7 +3664,7 @@ def test_the_namespace_qualifier_folds_like_any_identifier(_registry: Registry) 
 def test_a_namespaced_call_checks_its_pad_signature(_registry: Registry) -> None:
     err = _reject_dyn("SELECT ffmpeg.gblur(a.audio[1]) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "ffmpeg.gblur(video), got ffmpeg.gblur(audio)" in err.message
+    assert "it takes video as its stream input, got (audio)" in err.message
 
 
 def test_a_namespaced_option_is_validated_the_ordinary_way(_registry: Registry) -> None:
@@ -3517,21 +3686,26 @@ def test_a_namespaced_unknown_name_suggests_the_namespaced_spelling(
     assert err.hint == "did you mean ffmpeg.gblur()?"
 
 
-def test_a_namespaced_did_you_mean_never_reaches_into_the_stdlib(
+def test_a_namespaced_did_you_mean_stays_in_the_namespace(
     _registry: Registry,
 ) -> None:
-    """`reverb` is a stdlib name and no filter of this ffmpeg. The bare
-    spelling's did-you-mean spans both tiers and finds it; the namespace's
-    spans the registry alone, so it must not offer a tier-1 name."""
-    assert _reject_dyn(
-        "SELECT reverbb(a.audio[1]) FROM input('x.mp4') a", _registry
-    ).hint == "did you mean reverb()?"
+    """Both spellings suggest out of the same set now (there is no other set),
+    but the namespaced one keeps the `ffmpeg.` prefix on its suggestion --
+    which is the spelling that works whatever Postgres thinks of the name."""
+    assert (
+        _reject_dyn("SELECT aech(a.audio[1]) FROM input('x.mp4') a", _registry).hint
+        == "did you mean aecho()?"
+    )
+    assert (
+        _reject_dyn(
+            "SELECT ffmpeg.aech(a.audio[1]) FROM input('x.mp4') a", _registry
+        ).hint
+        == "did you mean ffmpeg.aecho()?"
+    )
 
     err = _reject_dyn("SELECT ffmpeg.reverb(a.audio[1]) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None
-    assert "reverb" not in err.hint.replace("ffmpeg.<filter>", "")
-    assert "not one of them" in err.hint
+    assert err.hint is not None and "not one of them" in err.hint
 
 
 def test_the_scope_fence_applies_to_the_namespace_too(_registry: Registry) -> None:
@@ -3576,12 +3750,10 @@ def test_without_a_registry_the_namespace_is_an_unknown_function() -> None:
     assert err.hint is not None and "ffmpeg was not found on PATH" in err.hint
 
 
-def test_portable_says_so_for_the_namespace_too() -> None:
-    err = _reject_dyn(
-        "SELECT ffmpeg.gblur(a.frame) FROM input('x.mp4') a", None, portable=True
-    )
+def test_no_ffmpeg_turns_the_namespace_off() -> None:
+    err = _reject_dyn("SELECT ffmpeg.gblur(a.frame) FROM input('x.mp4') a", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "--portable" in err.hint
+    assert err.hint is not None and "ffmpeg was not found" in err.hint
 
 
 def test_ffmpeg_is_reserved_as_an_input_alias() -> None:
@@ -3890,15 +4062,29 @@ def test_an_array_call_checks_its_input_pad_type(_registry: Registry) -> None:
         "SELECT ffmpeg.channelsplit(a.frame) FROM input('x.mp4') a", _registry
     )
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "expects ffmpeg.channelsplit(audio), got ffmpeg.channelsplit(video)" in err.message
+    assert "it takes audio as its stream input, got (video)" in err.message
 
 
-def test_an_array_call_takes_only_its_pad_positionally(_registry: Registry) -> None:
+def test_an_array_call_takes_positional_options_like_any_other(
+    _registry: Registry,
+) -> None:
+    """RFC-007 is uniform: the pad comes first, then channelsplit's own options
+    in ffmpeg's order (channel_layout, channels)."""
+    g = _dyn(
+        "SELECT ffmpeg.channelsplit(a.audio[1], '5.1') FROM input('x.mp4') a", _registry
+    )
+    assert g.nodes["n1"].args == {"channel_layout": "5.1"}
+    assert g.nodes["n1"].outputs == ["audio"] * 6
+
+
+def test_an_array_calls_positional_option_is_validated_as_that_option(
+    _registry: Registry,
+) -> None:
     err = _reject_dyn(
         "SELECT ffmpeg.channelsplit(a.audio[1], 2) FROM input('x.mp4') a", _registry
     )
-    assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "got ffmpeg.channelsplit(audio, num)" in err.message
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "'channel_layout' of filter 'channelsplit'" in err.message
 
 
 def test_an_array_call_rejects_an_unknown_option(_registry: Registry) -> None:
@@ -3942,14 +4128,14 @@ def test_an_array_call_needs_a_registry() -> None:
     assert err.hint is not None and "ffmpeg was not found on PATH" in err.hint
 
 
-def test_portable_turns_the_array_table_off_too() -> None:
+def test_no_ffmpeg_turns_the_array_table_off_too() -> None:
+    """The table says what SHAPE the call has; the registry says whether the
+    filter exists at all, and with no ffmpeg it cannot say yes."""
     err = _reject_dyn(
-        "SELECT ffmpeg.channelsplit(a.audio[1]) FROM input('x.mp4') a",
-        None,
-        portable=True,
+        "SELECT ffmpeg.channelsplit(a.audio[1]) FROM input('x.mp4') a", None
     )
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "--portable" in err.hint
+    assert err.hint is not None and "ffmpeg was not found" in err.hint
 
 
 def test_an_array_call_emits_one_label_per_pad(_registry: Registry) -> None:
@@ -3960,6 +4146,278 @@ def test_an_array_call_emits_one_label_per_pad(_registry: Registry) -> None:
     assert emit(insert_splits(g)).filter_complex == (
         "[0:a:0]channelsplit[n10][n11];[n10]volume=volume=2[out0];[n11]volume=volume=2[out1]"
     )
+
+
+# ---------------------------------------------------------------------------
+# plan 051: everything still works OFFLINE, through the captured snapshot
+# ---------------------------------------------------------------------------
+#
+# RFC-007 deleted --portable: there is no curated subset to fall back on, so
+# "does this compile without ffmpeg" is answered by handing lowering a registry
+# built from `tests/data/reference_registry.json` instead of from PATH. These
+# pin that the four surfaces the wave had to preserve -- generated sources, the
+# timeline `enable` option, the array-returning trio and broadcasting -- are
+# all reachable that way, with `shutil.which` stubbed to None and
+# `subprocess.run` booby-trapped so a single introspection call would fail
+# loudly rather than silently rescue the test.
+
+
+@pytest.fixture
+def _offline(monkeypatch: pytest.MonkeyPatch) -> Registry:
+    def no_ffmpeg(name: str) -> str | None:
+        return None
+
+    def boom(*args: object, **kwargs: object) -> object:
+        raise AssertionError("an offline compile must never spawn a subprocess")
+
+    monkeypatch.setattr(registry_module.shutil, "which", no_ffmpeg)
+    monkeypatch.setattr(registry_module.subprocess, "run", boom)
+    return load_reference(SNAPSHOT_PATH)
+
+
+def test_a_source_compiles_offline(_offline: Registry) -> None:
+    g = lower(
+        resolve(parse("SELECT t.frame FROM ffmpeg.testsrc(duration => 2, size => '320x240') t")),
+        {},
+        registry=_offline,
+    )
+    node = g.nodes["n1"]
+    assert node.filter == "testsrc"
+    assert node.inputs == []
+    assert node.args == {"duration": 2, "size": "320x240"}
+
+
+def test_enable_compiles_offline(_offline: Registry) -> None:
+    g = lower(
+        resolve(parse("SELECT gblur(a.frame, 5, enable => 'between(t,2,5)') FROM input('x.mp4') a")),
+        {},
+        registry=_offline,
+    )
+    assert g.nodes["n1"].args == {"sigma": 5, "enable": "between(t,2,5)"}
+
+
+def test_enable_is_still_gated_on_the_timeline_flag_offline(_offline: Registry) -> None:
+    """scale is not T-flagged, and the snapshot carries that flag verbatim."""
+    with pytest.raises(SqlmpegError) as excinfo:
+        lower(
+            resolve(parse("SELECT scale(a.frame, 640, enable => 'gt(t,1)') FROM input('x.mp4') a")),
+            {},
+            registry=_offline,
+        )
+    assert excinfo.value.code is ErrorCode.UNKNOWN_FILTER_OPTION
+
+
+def test_the_array_returning_trio_compiles_offline(_offline: Registry) -> None:
+    g = lower(
+        resolve(parse("SELECT ffmpeg.channelsplit(a.audio[1]) FROM input('x.mp4') a")),
+        {},
+        registry=_offline,
+    )
+    assert g.nodes["n1"].filter == "channelsplit"
+    assert g.nodes["n1"].outputs == ["audio", "audio"]
+
+
+def test_the_n_input_trio_compiles_offline(_offline: Registry) -> None:
+    g = lower(
+        resolve(parse("SELECT amix(a.audio[1], a.audio[2]) FROM input('x.mp4') a")),
+        {},
+        registry=_offline,
+    )
+    assert g.nodes["n1"].args == {"inputs": 2}
+
+
+def test_broadcasting_still_works_offline(_offline: Registry) -> None:
+    g = lower(
+        resolve(parse("SELECT volume(a.audio, 0.5) FROM input('x.mp4') a")),
+        {"a": _probe_result(audios=2)},
+        registry=_offline,
+    )
+    assert _filters(g) == ["volume", "volume"]
+    assert g.nodes["n1"].inputs == ["src:a:a:0"]
+    assert g.nodes["n2"].inputs == ["src:a:a:1"]
+
+
+def test_positional_options_bind_offline_exactly_as_they_do_live(
+    _offline: Registry,
+) -> None:
+    """The snapshot preserves ffmpeg's option ORDER, not just its content."""
+    g = lower(
+        resolve(parse("SELECT crop(a.frame, 100, 50, 10, 20) FROM input('x.mp4') a")),
+        {},
+        registry=_offline,
+    )
+    assert g.nodes["n1"].args == {"out_w": 100, "out_h": 50, "x": 10, "y": 20}
+
+
+# ---------------------------------------------------------------------------
+# plan 051: fixed-count N-INPUT filters (amix / hstack / vstack)
+# ---------------------------------------------------------------------------
+#
+# The mirror of the array-RETURNING trio: `N->1` filters whose INPUT pad count
+# is fixed by their `inputs` option, so the v1 pad fence excludes them from the
+# registry's tables even though the count is statically knowable. Reachable
+# under BOTH spellings -- no Postgres grammar claims these three names.
+
+
+def test_amix_is_callable_bare_with_two_streams(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT amix(a.audio[1], a.audio[2]) FROM input('x.mp4') a", _registry
+    )
+    node = g.nodes["n1"]
+    assert node.filter == "amix"
+    assert node.inputs == ["src:a:a:0", "src:a:a:1"]
+    assert node.outputs == ["audio"]
+    assert node.args == {"inputs": 2}
+
+
+def test_hstack_and_vstack_are_callable_bare(_registry: Registry) -> None:
+    for name in ("hstack", "vstack"):
+        g = _dyn(
+            f"SELECT {name}(a.frame, b.frame) FROM input('x.mp4') a, input('y.mp4') b",
+            _registry,
+        )
+        assert g.nodes["n1"].filter == name
+        assert g.nodes["n1"].outputs == ["video"]
+        assert g.nodes["n1"].args == {"inputs": 2}
+
+
+def test_an_n_input_filter_is_reachable_through_the_namespace_too(
+    _registry: Registry,
+) -> None:
+    g = _dyn(
+        "SELECT ffmpeg.amix(a.audio[1], a.audio[2]) FROM input('x.mp4') a", _registry
+    )
+    assert g.nodes["n1"].filter == "amix"
+
+
+def test_more_streams_need_the_count_option_to_agree(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT amix(a.audio[1], a.audio[2], a.audio[3], inputs => 3) "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    node = g.nodes["n1"]
+    assert node.args == {"inputs": 3}
+    assert node.inputs == ["src:a:a:0", "src:a:a:1", "src:a:a:2"]
+
+
+def test_the_count_option_can_be_positional_too(_registry: Registry) -> None:
+    """`inputs` is amix's FIRST option, so it is also its first positional slot
+    -- the same uniform rule every other filter follows."""
+    g = _dyn(
+        "SELECT amix(a.audio[1], a.audio[2], a.audio[3], 3) FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].args == {"inputs": 3}
+
+
+def test_a_count_that_disagrees_with_the_streams_is_udf_arg_type(
+    _registry: Registry,
+) -> None:
+    err = _reject_dyn(
+        "SELECT amix(a.audio[1], a.audio[2], a.audio[3]) FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "was given 3 streams" in err.message
+    assert "'inputs' option says 2" in err.message
+
+
+def test_a_count_larger_than_the_streams_is_also_rejected(
+    _registry: Registry,
+) -> None:
+    err = _reject_dyn(
+        "SELECT amix(a.audio[1], a.audio[2], inputs => 5) FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "was given 2 streams" in err.message
+    assert "says 5" in err.message
+
+
+def test_an_n_input_filter_type_checks_every_stream(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT amix(a.audio[1], a.frame) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "its stream inputs are all audio" in err.message
+
+
+def test_an_n_input_filter_needs_at_least_one_stream(_registry: Registry) -> None:
+    err = _reject_dyn("SELECT amix(2) FROM input('x.mp4') a", _registry)
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "no streams" in err.message
+
+
+def test_an_n_input_filter_takes_its_other_options_too(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT amix(a.audio[1], a.audio[2], duration => 'shortest') "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].args == {"duration": "shortest", "inputs": 2}
+
+
+def test_an_n_input_option_is_validated_like_any_other(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT amix(a.audio[1], a.audio[2], duration => 'nope') FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "'duration' of filter 'amix'" in err.message
+
+
+def test_an_n_input_filter_broadcasts_like_any_other(_registry: Registry) -> None:
+    """`a.audio` is a 2-element array, `b.audio[1]` a scalar that repeats."""
+    g = _dyn(
+        "SELECT amix(a.audio, b.audio[1]) FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+        {"a": _probe_result(audios=2), "b": _probe_result(audios=1)},
+    )
+    assert _filters(g) == ["amix", "amix"]
+    assert g.nodes["n1"].inputs == ["src:a:a:0", "src:b:a:0"]
+    assert g.nodes["n2"].inputs == ["src:a:a:1", "src:b:a:0"]
+
+
+def test_an_n_input_filter_nests(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT volume(amix(a.audio[1], a.audio[2]), 0.5) FROM input('x.mp4') a",
+        _registry,
+    )
+    assert _filters(g) == ["amix", "volume"]
+    assert g.nodes["n2"].inputs == ["n1"]
+
+
+def test_an_n_input_filter_this_ffmpeg_lacks_is_unknown(
+    _registry: Registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The table says what SHAPE the call has, never that the filter exists."""
+    monkeypatch.delitem(_HELP_FIXTURES, "amix")
+    err = _reject_dyn(
+        "SELECT amix(a.audio[1], a.audio[2]) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+
+
+def test_an_n_input_filter_has_no_timeline_support(_registry: Registry) -> None:
+    """None of the three is T-flagged in `ffmpeg -filters`."""
+    err = _reject_dyn(
+        "SELECT amix(a.audio[1], a.audio[2], enable => 'gte(t,1)') "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+
+
+def test_an_n_input_node_is_split_like_any_other(_registry: Registry) -> None:
+    g = insert_splits(
+        _dyn(
+            "WITH c AS (SELECT gblur(a.frame, sigma => 2) AS f FROM input('x.mp4') a) "
+            "SELECT hstack(c.f, c.f) FROM c",
+            _registry,
+        )
+    )
+    assert _filters(g) == ["gblur", "split", "hstack"]
 
 
 # ---------------------------------------------------------------------------
@@ -4170,12 +4628,10 @@ def test_a_source_needs_a_registry() -> None:
     assert err.hint is not None and "ffmpeg was not found on PATH" in err.hint
 
 
-def test_portable_turns_the_source_namespace_off() -> None:
-    err = _reject_dyn(
-        "SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t", None, portable=True
-    )
+def test_no_ffmpeg_turns_the_source_namespace_off() -> None:
+    err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "--portable" in err.hint
+    assert err.hint is not None and "ffmpeg was not found" in err.hint
 
 
 def test_where_on_a_source_alias_points_at_duration(_registry: Registry) -> None:
@@ -4321,7 +4777,7 @@ def test_enable_is_rejected_on_a_filter_without_timeline_support(
 def test_enable_reaches_through_a_stdlib_call_to_its_filter(_registry: Registry) -> None:
     """Tier-1 named extra: `blur` expands to `gblur`, which has the T flag."""
     g = _dyn(
-        "SELECT blur(a.frame, 5, enable => 'between(t,0.5,1.5)') FROM input('x.mp4') a",
+        "SELECT gblur(a.frame, 5, enable => 'between(t,0.5,1.5)') FROM input('x.mp4') a",
         _registry,
     )
     node = g.nodes["n1"]
@@ -4399,22 +4855,13 @@ def test_enable_is_case_sensitive_like_every_option_name(_registry: Registry) ->
     assert "'ENABLE'" in err.message
 
 
-def test_enable_without_a_registry_is_the_named_argument_policy() -> None:
-    """No ffmpeg, or --portable: `enable` is a named argument like any other,
-    so it is rejected before anything asks about timeline support."""
+def test_enable_without_a_registry_never_gets_that_far() -> None:
+    """No ffmpeg means no filter named `gblur` at all, so the call is unknown
+    before anything asks about timeline support."""
     err = _reject_dyn(
-        "SELECT blur(a.frame, 5, enable => 'gt(t,1)') FROM input('x.mp4') a", None
+        "SELECT gblur(a.frame, 5, enable => 'gt(t,1)') FROM input('x.mp4') a", None
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "ffmpeg was not found" in err.message
-
-    err = _reject_dyn(
-        "SELECT blur(a.frame, 5, enable => 'gt(t,1)') FROM input('x.mp4') a",
-        None,
-        portable=True,
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "--portable" in err.message
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
 
 
 def test_enable_broadcasts_onto_every_element(_registry: Registry) -> None:
@@ -4492,7 +4939,7 @@ def test_a_num_slot_still_refuses_a_string() -> None:
     for query, expected in (
         ("SELECT rotate(a.frame, '45')", "rotate(video, num)"),
         ("SELECT scale(a.frame, '0.5')", "scale(video, num)"),
-        ("SELECT blur(a.frame, '5')", "blur(video, num)"),
+        ("SELECT gblur(a.frame, '5')", "gblur(video, num)"),
     ):
         err = _reject(f"{query} FROM input('x.mp4') a")
         assert err.code is ErrorCode.UDF_ARG_TYPE, query
@@ -4643,7 +5090,7 @@ def test_a_real_unknown_option_lists_the_real_ones(_av_fixture: str) -> None:
 def test_a_tier_one_named_extra_runs(_av_fixture: str, tmp_path: Path) -> None:
     """blur() reaches through to gblur's full option set: `planes` is not in any
     sqlmpeg table, it was read out of this ffmpeg."""
-    query = f"SELECT blur(a.frame, 5, planes => 1) FROM input('{_av_fixture}') a"
+    query = f"SELECT gblur(a.frame, 5, planes => 1) FROM input('{_av_fixture}') a"
     assert compile_sql(query).nodes["n1"].args == {"sigma": 5, "planes": 1}
     _run_compiled(query, tmp_path / "blur-planes.mp4")
 
@@ -4676,6 +5123,154 @@ def test_did_you_mean_reaches_into_the_real_filter_set(_av_fixture: str) -> None
     err = _reject(f"SELECT gblu(a.frame) FROM input('{_av_fixture}') a")
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert err.hint is not None and "gblur()" in err.hint
+
+
+# ---------------------------------------------------------------------------
+# plan 051: POSITIONAL-BINDING FIDELITY, measured against the REAL ffmpeg
+# ---------------------------------------------------------------------------
+#
+# The claim positional options rest on: the registry's deduped, insertion-
+# ordered option list IS ffmpeg's own positional binding order. That is not
+# something sqlmpeg can decide -- it is a property of the binary -- so it is
+# measured here rather than asserted from a table.
+#
+# Two independent proofs per filter:
+#
+#  (a) BEHAVIOURAL. Compile a positional sqlmpeg call, and separately hand
+#      ffmpeg the equivalent all-NAMED filtergraph. Decode both to `-f md5`.
+#      Identical digests mean the positional slots landed on the same options.
+#  (b) STRUCTURAL. Feed a value that option cannot take and check ffmpeg's own
+#      diagnostic names the option the registry put in that slot.
+#
+# `scale` is the one to watch: the registry keeps the LONG alias (`width`,
+# `height`) while ffmpeg's positional walk consumes the SHORT one (`w`, `h`).
+# They are the same AVOption -- same struct offset -- which is exactly what
+# (a) proves and what no amount of reading the option list could.
+
+_FIDELITY_CASES: list[tuple[str, str, str, list[str]]] = [
+    # (filter, "v"|"a", pad spelling in SQL, positional values)
+    ("scale", "v", "a.frame", ["160", "120", "'lanczos'"]),
+    ("gblur", "v", "a.frame", ["5", "2", "1"]),
+    ("crop", "v", "a.frame", ["100", "50", "10", "20"]),
+    ("volume", "a", "a.audio[1]", ["0.5"]),
+    ("eq", "v", "a.frame", ["1.2", "0.1", "1.5"]),
+    ("hqdn3d", "v", "a.frame", ["4", "3", "6"]),
+]
+
+
+def _md5_of(argv: list[str]) -> str:
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=120.0)
+    assert result.returncode == 0, result.stderr
+    lines = [line for line in result.stdout.splitlines() if line.startswith("MD5=")]
+    assert lines, result.stdout + result.stderr
+    return lines[-1]
+
+
+@pytest.mark.exec
+@pytest.mark.parametrize("case", _FIDELITY_CASES, ids=lambda c: str(c[0]))
+def test_positional_options_bind_the_way_ffmpeg_binds_them(
+    case: tuple[str, str, str, list[str]], _av_fixture: str
+) -> None:
+    """(a) behavioural: our positional compile == ffmpeg's named filtergraph."""
+    name, kind, pad, values = case
+    options = registry_module.load().options(name)
+    assert options is not None
+    slots = list(options)[: len(values)]
+
+    query = f"SELECT {name}({pad}, {', '.join(values)}) FROM input('{_av_fixture}') a"
+    compiled = emit(compile_sql(query)).filter_complex
+
+    # The same options, written by NAME, straight into ffmpeg -- built from the
+    # registry's slot list, which is the thing under test.
+    unquoted = [v.strip("'") for v in values]
+    named = f"{name}=" + ":".join(f"{o}={v}" for o, v in zip(slots, unquoted))
+    stream = "0:v:0" if kind == "v" else "0:a:0"
+
+    ours = _md5_of(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", _av_fixture,
+         "-filter_complex", compiled, "-map", "[out0]", "-f", "md5", "-"]
+    )
+    theirs = _md5_of(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", _av_fixture,
+         "-filter_complex", f"[{stream}]{named}[o]", "-map", "[o]", "-f", "md5", "-"]
+    )
+    assert ours == theirs, f"{compiled!r} != {named!r}"
+
+
+@pytest.mark.exec
+@pytest.mark.parametrize("case", _FIDELITY_CASES, ids=lambda c: str(c[0]))
+def test_ffmpeg_names_the_option_the_registry_put_in_each_slot(
+    case: tuple[str, str, str, list[str]], _av_fixture: str
+) -> None:
+    """(b) structural: junk in slot i, and ffmpeg's diagnostic for the
+    positional spelling matches its diagnostic for the named one.
+
+    Comparing the two DIAGNOSTICS rather than grepping for a name keeps this
+    honest for string/expression options, which ffmpeg accepts at set time and
+    only rejects later at config time (no "Error applying option" line at all).
+    """
+    name, kind, _pad, values = case
+    options = registry_module.load().options(name)
+    assert options is not None
+    order = list(options)
+    stream = "0:v:0" if kind == "v" else "0:a:0"
+    junk = "@@sqlmpeg-not-a-value@@"
+
+    def diagnostic(graph: str) -> str:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", _av_fixture,
+             "-filter_complex", f"[{stream}]{graph}[o]", "-map", "[o]",
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120.0,
+        )
+        # ffmpeg echoes the whole graph text in one line, which of course
+        # differs between the two spellings and carries no binding information.
+        text = re.sub(r"^Failed to set value '.*' for option '.*': ", "", result.stderr, flags=re.M)
+        text = re.sub(r"@ [0-9a-fA-F]+", "@ X", text)
+        return re.sub(r"Parsed_\w+_\d+", "P", text).strip()
+
+    for index in range(len(values)):
+        filler = [v.strip("'") for v in values[:index]]
+        positional = f"{name}=" + ":".join([*filler, junk])
+        by_name = f"{name}=" + ":".join(
+            [f"{order[j]}={v}" for j, v in enumerate(filler)] + [f"{order[index]}={junk}"]
+        )
+        assert diagnostic(positional) == diagnostic(by_name), (
+            f"slot {index + 1} of {name} does not bind to {order[index]!r}"
+        )
+
+
+@pytest.mark.exec
+def test_a_positionally_compiled_call_runs(_av_fixture: str, tmp_path: Path) -> None:
+    """The whole convention, end to end: streams, positionals, then a named."""
+    out = tmp_path / "positional.mp4"
+    query = (
+        f"SELECT gblur(crop(a.frame, 160, 120, 10, 20), 3, 2), "
+        f"volume(a.audio[1], 0.5) FROM input('{_av_fixture}') a"
+    )
+    _run_compiled(query, out)
+
+
+@pytest.mark.exec
+def test_an_n_input_call_runs(_av_fixture: str, tmp_path: Path) -> None:
+    """amix is fenced out of the registry's tables; N_INPUT is what makes it
+    callable, and the command it builds is one ffmpeg accepts."""
+    out = tmp_path / "amix.mp4"
+    query = (
+        f"SELECT amix(a.audio[1], a.audio[1]) FROM input('{_av_fixture}') a"
+    )
+    g = compile_sql(query)
+    assert g.nodes["n1"].args["inputs"] == 2
+    _run_compiled(query, out)
+
+
+@pytest.mark.exec
+def test_the_snapshot_agrees_with_the_installed_ffmpeg_on_option_order() -> None:
+    """The committed fixture is only a stand-in if its ORDER matches too."""
+    live = registry_module.load()
+    ref = load_reference(SNAPSHOT_PATH)
+    for name in live.names():
+        assert list(ref.options(name) or {}) == list(live.options(name) or {}), name
 
 
 # ---------------------------------------------------------------------------
@@ -4855,13 +5450,13 @@ def test_the_real_trim_filter_runs_through_the_namespace(
 _VIEW_SCRIPT = (
     "CREATE VIEW master AS\n"
     "  SELECT scale(a.frame, 1280, -2) AS v FROM input('film.mkv') a;\n"
-    "COPY (SELECT blur(master.v, 2) FROM master) TO 'out.mp4' WITH (crf 20);"
+    "COPY (SELECT gblur(master.v, 2) FROM master) TO 'out.mp4' WITH (crf 20);"
 )
 
 _CTE_EQUIVALENT = (
     "COPY (WITH master AS (\n"
     "  SELECT scale(a.frame, 1280, -2) AS v FROM input('film.mkv') a\n"
-    ") SELECT blur(master.v, 2) FROM master) TO 'out.mp4' WITH (crf 20);"
+    ") SELECT gblur(master.v, 2) FROM master) TO 'out.mp4' WITH (crf 20);"
 )
 
 
@@ -4882,7 +5477,7 @@ def test_a_view_script_keeps_its_sink() -> None:
 def test_a_view_script_compiles_to_one_ffmpeg_command() -> None:
     args = build_ffmpeg_args(emit(compile_sql(_VIEW_SCRIPT, probe=False)), None)
     assert args.count("-i") == 1
-    assert "scale=w=1280:h=-2" in " ".join(args)
+    assert "scale=width=1280:height=-2" in " ".join(args)
     assert args[-1] == "out.mp4"
 
 
@@ -4890,7 +5485,7 @@ def test_a_view_is_split_across_its_consumers() -> None:
     """Two reads of one view pad go through a split, exactly like a CTE's."""
     g = compile_sql(
         "CREATE VIEW m AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
-        "COPY (SELECT blur(m.v, 1), blur(m.v, 2) FROM m) TO 'out.mp4';",
+        "COPY (SELECT gblur(m.v, 1), gblur(m.v, 2) FROM m) TO 'out.mp4';",
         probe=False,
     )
     assert any(node.filter == "split" for node in g.nodes.values())
@@ -4910,7 +5505,7 @@ def test_a_view_referencing_a_view_lowers() -> None:
     g = compile_sql(
         "CREATE VIEW one AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
         "CREATE VIEW two AS SELECT scale(one.v, 0.5) AS v FROM one;\n"
-        "COPY (SELECT blur(two.v, 3) FROM two) TO 'out.mp4';",
+        "COPY (SELECT gblur(two.v, 3) FROM two) TO 'out.mp4';",
         probe=False,
     )
     assert _filters(g) == ["scale", "gblur"]
@@ -4951,7 +5546,7 @@ def test_the_parser_and_the_ir_agree_on_the_sink_list() -> None:
 
 _LADDER_SCRIPT = (
     "CREATE VIEW master AS\n"
-    "  SELECT blur(a.video[1], 2) AS v, volume(a.audio[1], 0.9) AS a\n"
+    "  SELECT gblur(a.video[1], 2) AS v, volume(a.audio[1], 0.9) AS a\n"
     "  FROM input('film.mkv') a;\n"
     "COPY (SELECT scale(m.v, 1280, -2), m.a FROM master m) TO '720.mp4';\n"
     "COPY (SELECT scale(m.v, 640, -2), m.a FROM master m) TO '360.mp4';\n"
@@ -4995,7 +5590,8 @@ def test_a_view_based_query_runs(_av_fixture: str, tmp_path: Path) -> None:
     out = tmp_path / "view.mp4"
     query = (
         "CREATE VIEW half AS\n"
-        f"  SELECT scale(a.video[1], 0.5) AS v, a.audio[1] AS a FROM input('{_av_fixture}') a;\n"
+        f"  SELECT scale(a.video[1], 'iw/2', -2) AS v, a.audio[1] AS a "
+        f"FROM input('{_av_fixture}') a;\n"
         f"COPY (SELECT half.v, half.a FROM half) TO '{out.as_posix()}' WITH (crf 30);"
     )
     args = build_ffmpeg_args(emit(compile_sql(query)), None)

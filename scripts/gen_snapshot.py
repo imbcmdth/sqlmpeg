@@ -1,11 +1,11 @@
-"""Generate ``sqlmpeg/reference_registry.json`` from the ffmpeg on PATH.
+"""Generate ``tests/data/reference_registry.json`` from the ffmpeg on PATH.
 
-RFC-007 "Offline compile" (plan 050): the reference snapshot is the vendored,
-committed replacement for the deleted ``--portable`` flag. It ships as
-package data and lets ``sqlmpeg.registry.load_reference()`` build a fully
-populated :class:`~sqlmpeg.registry.Registry` with NO ffmpeg on PATH and NO
+The reference snapshot is a committed TEST FIXTURE (plan 051): it lets the
+test suite build a fully populated :class:`~sqlmpeg.registry.Registry` via
+``sqlmpeg.registry.load_reference(path)`` with NO ffmpeg on PATH and NO
 subprocess call, ever -- the same parsed ``-filters``/``-help`` shapes the
-live disk cache uses, just captured ahead of time and shipped in the wheel.
+live disk cache uses, just captured ahead of time. It is NOT package data
+and is not shipped in the wheel; nothing in the installed package reads it.
 
 Unlike ``sqlmpeg.registry.load()``, which parses ``-help filter=X`` lazily
 per filter on first reference, this script force-loads EVERY name's
@@ -20,6 +20,10 @@ options up front:
     filters/sources tables by the v1 pad fence, so ``options()`` cannot
     reach them; ``fenced_options()`` is the only door, see
     ``sqlmpeg/lower.py``'s ``ARRAY_RETURNING``)
+  - the fixed-count N-input trio's options, for exactly the same reason:
+    ``amix``/``hstack``/``vstack`` are ``N->1`` and equally fenced out, and
+    their ``inputs`` option is what makes them callable at all (see
+    ``sqlmpeg/lower.py``'s ``N_INPUT``)
   - the eleven "collision census" names (``Registry.fenced_options()`` too
     -- they are ordinary in-fence filters already covered by the
     ``options()`` pass above, so this adds no new data, but it exercises
@@ -28,19 +32,28 @@ options up front:
     tests/test_lower.py's ``_KNOWN_COLLISIONS``)
 
 Output is deterministic given the same ffmpeg binary and ``--stamp`` value:
-JSON keys are sorted (``sort_keys=True``), the only wall-clock-ish value is
-whatever ``--stamp`` the caller passes (never ``datetime.now()``), and the
-file is written LF-only (``sqlmpeg/*.json`` is pinned in .gitattributes) so
+every dict is written in INSERTION order (the only wall-clock-ish value is
+whatever ``--stamp`` the caller passes, never ``datetime.now()``), and the
+file is written LF-only (``tests/data/*.json`` is pinned in .gitattributes) so
 regenerating on any platform reproduces byte-identical output.
+
+Insertion order, NOT ``sort_keys=True`` (plan 051): an option table's ORDER is
+load-bearing data, not presentation. It is ffmpeg's AVOption declaration
+order, which is what positional filter arguments bind against
+(``crop(f, 100, 50, 10, 20)``), so alphabetising it -- as this script did when
+the snapshot was only ever read for its CONTENT -- silently rewrites every
+positional call compiled against the snapshot. Insertion order is just as
+deterministic here: it comes from parsing the same ffmpeg's ``-filters`` /
+``-help`` output, in the order that output prints.
 
 Usage::
 
     python scripts/gen_snapshot.py --stamp 2026-08-16
 
-The generated file is COMMITTED (it is package data, not a build artifact)
--- rerun this after any ffmpeg upgrade this project pins against, or after
-any change to ``sqlmpeg/registry.py``'s parsing rules that would change the
-captured shapes. ``tests/test_gen_snapshot.py`` asserts (under
+The generated file is COMMITTED (it is a checked-in fixture, not a build
+artifact) -- rerun this after any ffmpeg upgrade this project pins against,
+or after any change to ``sqlmpeg/registry.py``'s parsing rules that would
+change the captured shapes. ``tests/test_gen_snapshot.py`` asserts (under
 ``@pytest.mark.exec``, since it requires the real binary) that regenerating
 with the committed file's own ``generated`` stamp reproduces it exactly.
 """
@@ -51,11 +64,11 @@ import argparse
 import json
 from pathlib import Path
 
-from sqlmpeg.lower import ARRAY_RETURNING
+from sqlmpeg.lower import ARRAY_RETURNING, N_INPUT
 from sqlmpeg.registry import Registry
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_OUTPUT_PATH = _REPO_ROOT / "sqlmpeg" / "reference_registry.json"
+_OUTPUT_PATH = _REPO_ROOT / "tests" / "data" / "reference_registry.json"
 
 # The eleven names docs/dynamic-filters.md "The collision census" and
 # tests/test_lower.py's `_KNOWN_COLLISIONS` document as colliding with
@@ -102,6 +115,8 @@ def build_registry() -> Registry:
         registry.options(name)
     for name in ARRAY_RETURNING:
         registry.fenced_options(name)
+    for name in N_INPUT:
+        registry.fenced_options(name)
     for name in _CENSUS_NAMES:
         registry.fenced_options(name)
     return registry
@@ -124,12 +139,12 @@ def render(stamp: str, registry: Registry | None = None) -> str:
     payload = dict(payload)
     payload["snapshot_of"] = payload["version_line"]
     payload["generated"] = stamp
-    return json.dumps(payload, sort_keys=True, indent=2) + "\n"
+    return json.dumps(payload, indent=2) + "\n"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate sqlmpeg/reference_registry.json from the ffmpeg on PATH."
+        description="Generate tests/data/reference_registry.json from the ffmpeg on PATH."
     )
     parser.add_argument(
         "--stamp",

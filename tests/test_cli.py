@@ -21,7 +21,7 @@ import pytest
 from sqlmpeg import cli
 from sqlmpeg.ir import Graph, Output, SinkUnit
 
-VALID_QUERY = "SELECT scale(a.frame, 0.5) FROM input('x.mp4') a"
+VALID_QUERY = "SELECT scale(a.frame, 640, 480) FROM input('x.mp4') a"
 BAD_QUERY = "SELECT nope(a.frame) FROM input('x.mp4') a"
 
 
@@ -140,7 +140,7 @@ def test_compile_uses_sink_path_when_no_dash_o(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(
-        cli, "compile_sql", lambda text, probe=True, portable=False: _sinked_graph("sink.mkv")
+        cli, "compile_sql", lambda text, probe=True: _sinked_graph("sink.mkv")
     )
     code = cli.main(["compile", VALID_QUERY])
     out = capsys.readouterr().out
@@ -153,7 +153,7 @@ def test_compile_dash_o_overrides_sink_path(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(
-        cli, "compile_sql", lambda text, probe=True, portable=False: _sinked_graph("sink.mkv")
+        cli, "compile_sql", lambda text, probe=True: _sinked_graph("sink.mkv")
     )
     code = cli.main(["compile", VALID_QUERY, "-o", "override.mp4"])
     out = capsys.readouterr().out
@@ -169,7 +169,7 @@ def test_compile_prints_every_sink_path_of_a_script(
     monkeypatch.setattr(
         cli,
         "compile_sql",
-        lambda text, probe=True, portable=False: _multi_sink_graph(
+        lambda text, probe=True: _multi_sink_graph(
             ("720.mp4", {}), ("360.mp4", {})
         ),
     )
@@ -187,7 +187,7 @@ def test_compile_dash_o_against_a_multi_sink_script_is_a_usage_error(
     monkeypatch.setattr(
         cli,
         "compile_sql",
-        lambda text, probe=True, portable=False: _multi_sink_graph(
+        lambda text, probe=True: _multi_sink_graph(
             ("720.mp4", {}), ("360.mp4", {})
         ),
     )
@@ -206,7 +206,7 @@ def test_compile_graph_only_still_works_for_a_multi_sink_script(
     monkeypatch.setattr(
         cli,
         "compile_sql",
-        lambda text, probe=True, portable=False: _multi_sink_graph(
+        lambda text, probe=True: _multi_sink_graph(
             ("720.mp4", {}), ("360.mp4", {})
         ),
     )
@@ -237,54 +237,27 @@ def test_compile_no_probe_skips_probing(
 
 
 # ---------------------------------------------------------------------------
-# --portable (compile/explain/validate only, RFC-003 / plan 032)
+# --portable is GONE (RFC-007, plan 051)
 # ---------------------------------------------------------------------------
 
-# A tier-2-only call: no stdlib entry named `unsharp` exists, so this is
-# UNKNOWN_FUNCTION under --portable regardless of whether ffmpeg happens to
-# be installed on the machine running the test -- --portable never even
-# constructs the registry.
-DYNAMIC_QUERY = "SELECT unsharp(a.frame, luma_amount => 1.5) FROM input('x.mp4') a"
+# There is no portable subset any more: every function is a filter of the
+# installed ffmpeg, so the flag had nothing left to select. `--no-probe`
+# survives, because probing is about FILES, not filters.
 
 
-def test_compile_portable_rejects_a_dynamic_filter(capsys: pytest.CaptureFixture[str]) -> None:
-    code = cli.main(["compile", "--portable", DYNAMIC_QUERY])
-    captured = capsys.readouterr()
-    assert code == 1
-    assert "UNKNOWN_FUNCTION" in captured.err
-
-
-def test_compile_portable_still_accepts_the_stdlib(capsys: pytest.CaptureFixture[str]) -> None:
-    code = cli.main(["compile", "--portable", VALID_QUERY])
-    out = capsys.readouterr().out
-    assert code == 0
-    assert "-filter_complex" in out
-
-
-def test_explain_portable_rejects_a_dynamic_filter(capsys: pytest.CaptureFixture[str]) -> None:
-    code = cli.main(["explain", "--portable", DYNAMIC_QUERY])
-    captured = capsys.readouterr()
-    assert code == 1
-    assert "UNKNOWN_FUNCTION" in captured.err
-
-
-def test_validate_portable_rejects_a_dynamic_filter(capsys: pytest.CaptureFixture[str]) -> None:
-    code = cli.main(["validate", "--json", "--portable", DYNAMIC_QUERY])
-    captured = capsys.readouterr()
-    assert code == 1
-
-    import json
-
-    data = json.loads(captured.out)
-    assert data["code"] == "UNKNOWN_FUNCTION"
-
-
-def test_run_has_no_portable_flag() -> None:
-    """--portable is compile/explain/validate only -- run always needs ffmpeg
-    to execute against, so there is no offline escape hatch for it."""
+@pytest.mark.parametrize("command", ["compile", "explain", "validate", "run"])
+def test_portable_flag_is_gone_from_every_subcommand(command: str) -> None:
     with pytest.raises(SystemExit) as exc_info:
-        cli.main(["run", VALID_QUERY, "--portable"])
+        cli.main([command, VALID_QUERY, "--portable"])
     assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize("command", ["compile", "explain", "validate"])
+def test_no_probe_still_works_on_every_offline_subcommand(
+    command: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main([command, "--no-probe", VALID_QUERY]) == 0
+    capsys.readouterr()
 
 
 # ---------------------------------------------------------------------------
