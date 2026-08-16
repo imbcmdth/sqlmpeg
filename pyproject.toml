@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "sqlmpeg"
 version = "0.9.0"
 description = "SQL frontend for FFmpeg filtergraphs"
+readme = "README.md"
 keywords = ["ffmpeg", "sql", "filter", "filtergraphs"]
 requires-python = ">=3.10"
 dependencies = [
