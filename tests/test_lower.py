@@ -1487,7 +1487,7 @@ def test_arity_error_lists_every_signature() -> None:
     err = _reject("SELECT scale(a.frame) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "scale(video, num)" in err.message
-    assert "scale(video, num, num)" in err.message
+    assert "scale(video, expr, expr)" in err.message
     assert "got scale(video)" in err.message
 
 
@@ -1527,7 +1527,7 @@ def test_stream_argument_where_a_number_is_expected() -> None:
 def test_non_literal_scalar_argument_is_rejected() -> None:
     err = _reject("SELECT blur(a.frame, 1 + 2) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "got blur(video, expr)" in err.message
+    assert "got blur(video, <expr>)" in err.message
 
 
 def test_malformed_numeric_literal_is_a_typed_rejection() -> None:
@@ -1556,7 +1556,7 @@ def test_overlay_keeps_its_four_positional_arguments() -> None:
 def test_overlay_arity_error_is_still_typed() -> None:
     err = _reject("SELECT overlay(a.frame, b.frame, 20) FROM input('x.mp4') a, input('y.mp4') b")
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "overlay(video, video, num, num)" in err.message
+    assert "overlay(video, video, expr, expr)" in err.message
 
 
 def test_overlay_keeps_the_agreed_video_tag() -> None:
@@ -3920,6 +3920,286 @@ def test_an_unknown_alias_hint_lists_source_aliases(_registry: Registry) -> None
     )
     assert err.code is ErrorCode.UNKNOWN_ALIAS
     assert err.hint == "known names: t"
+
+
+# ---------------------------------------------------------------------------
+# RFC-005 SS2 (plan 043): the timeline `enable` named argument
+# ---------------------------------------------------------------------------
+#
+# Offline again, and the fixture `-filters` block is what makes it possible:
+# `gblur`/`deband`/`unsharp` carry the T flag, `crop`/`scale`/`xfade`/`aecho`
+# do not, and `testsrc`/`anullsrc` are sources (no flag at all). `enable` is in
+# NO filter's option table -- it is framework-level -- so every one of these
+# goes through the special case rather than the registry lookup.
+
+
+def test_enable_is_accepted_on_a_timeline_capable_tier_two_filter(
+    _registry: Registry,
+) -> None:
+    g = _dyn(
+        "SELECT gblur(a.frame, sigma => 5, enable => 'between(t,0.5,1.5)') "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].args == {"sigma": 5, "enable": "between(t,0.5,1.5)"}
+
+
+def test_enable_is_an_ordinary_node_arg_in_written_order(_registry: Registry) -> None:
+    """It renders like any other option -- nothing downstream knows it is
+    special (emit sees a plain `enable=...` in the node's args)."""
+    g = _dyn(
+        "SELECT gblur(a.frame, enable => 'gt(t,1)', sigma => 2) FROM input('x.mp4') a",
+        _registry,
+    )
+    assert list(g.nodes["n1"].args.items()) == [("enable", "gt(t,1)"), ("sigma", 2)]
+
+
+def test_enable_works_through_the_namespace_spelling(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT ffmpeg.gblur(a.frame, enable => 'lt(t,1)') FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].args == {"enable": "lt(t,1)"}
+
+
+def test_enable_is_rejected_on_a_filter_without_timeline_support(
+    _registry: Registry,
+) -> None:
+    """`scale` is `..C` in the fixture AND in real ffmpeg 7.1: no T."""
+    err = _reject_dyn(
+        "SELECT ffmpeg.scale(a.frame, enable => 'gt(t,1)') FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+    assert "filter 'scale' has no option 'enable'" in err.message
+    assert "timeline" in err.message
+    assert err.hint is not None and "T column" in err.hint
+
+
+def test_enable_reaches_through_a_stdlib_call_to_its_filter(_registry: Registry) -> None:
+    """Tier-1 named extra: `blur` expands to `gblur`, which has the T flag."""
+    g = _dyn(
+        "SELECT blur(a.frame, 5, enable => 'between(t,0.5,1.5)') FROM input('x.mp4') a",
+        _registry,
+    )
+    node = g.nodes["n1"]
+    assert node.filter == "gblur"
+    assert node.args == {"sigma": 5, "enable": "between(t,0.5,1.5)"}
+
+
+def test_enable_on_a_stdlib_call_follows_the_underlying_filters_flag(
+    _registry: Registry,
+) -> None:
+    """The flag consulted is the TARGET filter's, not the function's name:
+    `crop` and `scale` are both non-T, so neither stdlib call takes it."""
+    for query, filter_name in (
+        ("SELECT crop(a.frame, 0, 0, 10, 10, enable => 'gt(t,1)')", "crop"),
+        ("SELECT scale(a.frame, 640, 360, enable => 'gt(t,1)')", "scale"),
+    ):
+        err = _reject_dyn(f"{query} FROM input('x.mp4') a", _registry)
+        assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION, filter_name
+        assert f"filter '{filter_name}' has no option 'enable'" in err.message
+
+
+def test_enable_on_a_macro_is_still_the_macro_rejection(_registry: Registry) -> None:
+    """`blur_regions` has no single filter to set anything on, and that check
+    comes first -- `enable` is not a way around it."""
+    err = _reject_dyn(
+        "SELECT blur_regions(a.frame, 0, 0, 10, 10, 5, enable => 'gt(t,1)') "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "expands to more than one ffmpeg filter" in err.message
+
+
+def test_enable_on_a_generated_source_is_rejected(_registry: Registry) -> None:
+    """A source MAKES frames; there is no upstream frame to switch off, and
+    SourceFilter carries no timeline field at all, so this can never pass."""
+    err = _reject_dyn(
+        "SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2, enable => 'gt(t,1)') t",
+        _registry,
+    )
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+    assert "filter 'testsrc' has no option 'enable'" in err.message
+
+
+def test_enable_needs_a_string_expression(_registry: Registry) -> None:
+    for value, got in (("1", "1"), ("true", "true"), ("-2.5", "-2.5")):
+        err = _reject_dyn(
+            f"SELECT gblur(a.frame, enable => {value}) FROM input('x.mp4') a",
+            _registry,
+        )
+        assert err.code is ErrorCode.FILTER_OPTION_TYPE, value
+        assert "expects an ffmpeg timeline expression" in err.message
+        assert got in err.message
+        assert err.hint is not None and "between(t,2,5)" in err.hint
+
+
+def test_enable_expression_content_is_not_validated(_registry: Registry) -> None:
+    """RFC-005's non-goal, stated as a test: the variable vocabulary is
+    per-filter and not introspectable, so nonsense compiles and it is ffmpeg
+    that rejects it at run time."""
+    g = _dyn(
+        "SELECT gblur(a.frame, enable => 'wat(zzz,1)') FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].args == {"enable": "wat(zzz,1)"}
+
+
+def test_enable_is_case_sensitive_like_every_option_name(_registry: Registry) -> None:
+    """`ENABLE` is not `enable`; it falls through to the ordinary lookup and
+    gblur has no such option."""
+    err = _reject_dyn(
+        "SELECT gblur(a.frame, ENABLE => 'gt(t,1)') FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+    assert "'ENABLE'" in err.message
+
+
+def test_enable_without_a_registry_is_the_named_argument_policy() -> None:
+    """No ffmpeg, or --portable: `enable` is a named argument like any other,
+    so it is rejected before anything asks about timeline support."""
+    err = _reject_dyn(
+        "SELECT blur(a.frame, 5, enable => 'gt(t,1)') FROM input('x.mp4') a", None
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "ffmpeg was not found" in err.message
+
+    err = _reject_dyn(
+        "SELECT blur(a.frame, 5, enable => 'gt(t,1)') FROM input('x.mp4') a",
+        None,
+        portable=True,
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "--portable" in err.message
+
+
+def test_enable_broadcasts_onto_every_element(_registry: Registry) -> None:
+    """A named extra is validated once and merged into each element's node
+    (RFC-003); `enable` is no different."""
+    g = _dyn(
+        "SELECT gblur(a.video, enable => 'gt(t,1)') FROM input('x.mp4') a",
+        _registry,
+        {"a": _probe_result(videos=2)},
+    )
+    assert [node.args for node in g.nodes.values()] == [
+        {"enable": "gt(t,1)"},
+        {"enable": "gt(t,1)"},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# RFC-005 SS3 (plan 043): the `expr` parameter kind
+# ---------------------------------------------------------------------------
+#
+# No registry anywhere in this section: which stdlib slots take an expression
+# is a property of the FUNCTIONS table, so it compiles portably. (What keeps
+# that table honest against the real option types is the faithfulness test in
+# tests/exec/test_exec.py.)
+
+
+def test_an_expr_slot_takes_a_quoted_expression() -> None:
+    """The motivating case: centering, without knowing either size."""
+    g = _lower(
+        "SELECT overlay(a.frame, b.frame, '(W-w)/2', '(H-h)/2') "
+        "FROM input('x.mp4') a, input('y.mp4') b"
+    )
+    assert g.nodes["n1"].args == {"x": "(W-w)/2", "y": "(H-h)/2"}
+
+
+def test_an_expr_slot_still_takes_a_bare_number_as_a_number() -> None:
+    """Numbers stay numbers into the IR -- no golden moves, nothing downstream
+    has to parse a number back out of a string."""
+    g = _lower("SELECT crop(a.frame, 1, 2, 3, 4) FROM input('x.mp4') a")
+    assert g.nodes["n1"].args == {"w": 3, "h": 4, "x": 1, "y": 2}
+    assert all(isinstance(v, int) for v in g.nodes["n1"].args.values())
+
+
+def test_expr_and_num_arguments_mix_in_one_call() -> None:
+    g = _lower("SELECT crop(a.frame, 0, 0, 'iw/2', 'ih') FROM input('x.mp4') a")
+    assert g.nodes["n1"].args == {"w": "iw/2", "h": "ih", "x": 0, "y": 0}
+
+
+def test_expr_slots_cover_the_migrated_functions() -> None:
+    """One compile per migrated slot set, quoted throughout."""
+    cases = (
+        ("SELECT scale(a.frame, 'iw/2', '-2')", {"w": "iw/2", "h": "-2"}),
+        (
+            "SELECT draw_box(a.frame, 'iw/4', 'ih/4', 'iw/2', 'ih/2', 'red')",
+            {"x": "iw/4", "y": "ih/4", "w": "iw/2", "h": "ih/2", "color": "red"},
+        ),
+        (
+            "SELECT text(a.frame, 'hi', '(w-text_w)/2', 'h-th-10', 'h/10')",
+            {
+                "text": "hi",
+                "x": "(w-text_w)/2",
+                "y": "h-th-10",
+                "fontsize": "h/10",
+            },
+        ),
+    )
+    for query, expected in cases:
+        g = _lower(f"{query} FROM input('x.mp4') a")
+        assert g.nodes["n1"].args == expected, query
+
+
+def test_a_num_slot_still_refuses_a_string() -> None:
+    """The kind was split, not widened: `rotate`'s degrees is ours (we build
+    `<degrees>*PI/180` out of it) and `scale`'s factor is arithmetic we do."""
+    for query, expected in (
+        ("SELECT rotate(a.frame, '45')", "rotate(video, num)"),
+        ("SELECT scale(a.frame, '0.5')", "scale(video, num)"),
+        ("SELECT blur(a.frame, '5')", "blur(video, num)"),
+    ):
+        err = _reject(f"{query} FROM input('x.mp4') a")
+        assert err.code is ErrorCode.UDF_ARG_TYPE, query
+        assert expected in err.message
+
+
+def test_an_expr_slot_still_refuses_a_non_literal() -> None:
+    """The classifier's own fallback label is `<expr>`, deliberately unspellable
+    as a ParamKind -- so `1 + 2` matches the `expr` kind no more than it ever
+    matched `num`."""
+    for value in ("1 + 2", "NULL", "TRUE"):
+        err = _reject(
+            f"SELECT crop(a.frame, {value}, 0, 10, 10) FROM input('x.mp4') a"
+        )
+        assert err.code is ErrorCode.UDF_ARG_TYPE, value
+
+
+def test_an_expr_slot_refuses_a_stream() -> None:
+    err = _reject("SELECT crop(a.frame, a.frame, 0, 10, 10) FROM input('x.mp4') a")
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "got crop(video, video, num, num, num)" in err.message
+
+
+def test_an_expr_argument_broadcasts_as_a_scalar() -> None:
+    """Deliverable 5: expr args are scalar literals, so the zip/element paths
+    are untouched -- one node per element, the same expression on each."""
+    g = _lower(
+        "SELECT crop(a.video, 0, 0, 'iw/2', 'ih') FROM input('x.mp4') a",
+        {"a": _probe_result(videos=2)},
+    )
+    assert [node.args for node in g.nodes.values()] == [
+        {"w": "iw/2", "h": "ih", "x": 0, "y": 0},
+        {"w": "iw/2", "h": "ih", "x": 0, "y": 0},
+    ]
+    assert [node.inputs for node in g.nodes.values()] == [
+        ["src:a:v:0"],
+        ["src:a:v:1"],
+    ]
+
+
+def test_expr_arguments_compile_under_portable() -> None:
+    """Nothing about `expr` consults the registry."""
+    g = _dyn(
+        "SELECT overlay(a.frame, b.frame, '(W-w)/2', '(H-h)/2') "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        None,
+        portable=True,
+    )
+    assert g.nodes["n1"].args == {"x": "(W-w)/2", "y": "(H-h)/2"}
 
 
 # ---------------------------------------------------------------------------

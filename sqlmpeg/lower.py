@@ -294,7 +294,14 @@ _PASSTHROUGH_ONLY: frozenset[StreamType] = frozenset({"subtitle", "data"})
 
 # Kind label used in UDF_ARG_TYPE "got" lists for anything that is neither a
 # literal nor a stream-typed subexpression (e.g. `1 + 2`, NULL, TRUE).
-_EXPR_KIND = "expr"
+#
+# The angle brackets are load-bearing (RFC-005 SS3): this label is compared
+# against `Param.kind` by :func:`_match_variant`, and `ParamKind` now HAS an
+# ``"expr"`` member (a num literal or a quoted ffmpeg expression). A bare
+# ``"expr"`` here would make every un-lowerable expression match those
+# parameters silently. No ParamKind can ever spell itself with brackets, so
+# the two can never be confused again.
+_UNSUPPORTED_KIND = "<expr>"
 
 # Provenance tags copied onto a passthrough Output. "und" is what mp4 muxers
 # stamp on untagged streams; it carries no information, so it is not copied.
@@ -336,6 +343,24 @@ _CAPTION_TRIM_HINT = (
     "trim the video/audio without selecting the subtitle/data columns, or select "
     "them in a query without a WHERE time range; to caption a trimmed clip, join "
     "an external subtitle file whose cues are timed for the cut"
+)
+
+# -- timeline `enable` (RFC-005 SS2) ---------------------------------------
+#
+# `enable` is FRAMEWORK-level: ffmpeg implements it in the filter framework,
+# not in any filter, so it never appears in a filter's `-help` AVOptions and
+# no options table can ever contain it. Which filters honour it is the `T`
+# column of `ffmpeg -filters`, captured as DynamicFilter.timeline (plan 040),
+# and that flag is what admits the name here.
+_ENABLE = "enable"
+_ENABLE_HINT = (
+    "enable takes a single-quoted ffmpeg timeline expression over t (seconds), "
+    "n (frame number) or pos, e.g. enable => 'between(t,2,5)'"
+)
+_NO_TIMELINE_HINT = (
+    "enable is only accepted by filters your ffmpeg flags with timeline support "
+    "(the T column of `ffmpeg -filters`: gblur has it, scale does not); drop it, "
+    "or express the timing with a WHERE window over the input"
 )
 
 # Longest option/constant list a hint or message renders before it stops
@@ -431,6 +456,20 @@ class _NamedArg:
 
     name: str
     value: exp.Expr
+
+
+@dataclass(frozen=True)
+class _NamedTarget:
+    """The ffmpeg filter a stdlib call's trailing named args reach through to.
+
+    Everything :meth:`_Lowerer._check_named_args` needs about it, resolved once
+    per call: its name, its introspected option table, and whether ffmpeg flags
+    it as timeline-capable (which is what admits ``enable``).
+    """
+
+    filter: str
+    options: dict[str, FilterOption]
+    timeline: bool
 
 
 @dataclass(frozen=True)
@@ -568,6 +607,22 @@ def _string(node: exp.Expr) -> str:
     if not isinstance(node, exp.Literal) or not node.is_string:
         raise _error(ErrorCode.UDF_ARG_TYPE, "expected a string literal", node)
     return str(node.this)
+
+
+def _expression(node: exp.Expr) -> object:
+    """An ``expr``-kind argument: a number as a number, a string as a string.
+
+    The two shapes stay distinct all the way into the IR (RFC-005 SS3):
+    ``crop(f, 10, ...)`` still carries the int ``10``, not ``"10"``, so no
+    golden moves and nothing downstream has to re-parse a number out of a
+    string. A quoted argument passes through verbatim as the ffmpeg expression
+    it is -- its VARIABLES are per-filter and are checked by ffmpeg at run
+    time, never here (RFC-005 non-goals).
+    """
+    inner = _unwrap(node)
+    if isinstance(inner, exp.Literal) and inner.is_string:
+        return _string(node)
+    return _number(node)
 
 
 @dataclass(frozen=True)
@@ -1280,6 +1335,9 @@ class _Lowerer:
         options = (
             self._filter_options(raw.name, raw.call_node, select) if named else {}
         )
+        # No `timeline=`: SourceFilter has no such field, because a generator
+        # is never timeline-capable -- there is no upstream frame to switch
+        # on/off. `enable => ...` on a source rejects unconditionally.
         args = self._check_named_args(
             raw.name,
             options,
@@ -2077,16 +2135,16 @@ class _Lowerer:
             ref = impl.expand(self.ctx, values)
             if target is None:
                 return ref
-            filter_name, options = target
-            produced = self._expanded_node(name, filter_name, ref, node, select)
+            produced = self._expanded_node(name, target.filter, ref, node, select)
             if not validated:
                 checked = self._check_named_args(
-                    filter_name,
-                    options,
+                    target.filter,
+                    target.options,
                     call.named,
                     node,
                     owner=name,
                     occupied=set(produced.args),
+                    timeline=target.timeline,
                 )
                 validated = True
             produced.args.update(checked)
@@ -2107,8 +2165,8 @@ class _Lowerer:
 
     def _named_extras_target(
         self, name: str, impl: VariantImpl, call: _Call, node: exp.Expr
-    ) -> tuple[str, dict[str, FilterOption]] | None:
-        """``(filter, its options)`` the trailing named args of a stdlib call target.
+    ) -> _NamedTarget | None:
+        """The filter the trailing named args of a stdlib call target, with its facts.
 
         None when the call has no named args at all. An overload whose
         ``named_target`` is None is a MACRO over several filters
@@ -2117,6 +2175,13 @@ class _Lowerer:
         outright. Per-OVERLOAD, not per-function: ``delay(a.audio[1], 1,
         all => false)`` still reaches ``adelay``, because that overload is one
         filter.
+
+        ``timeline`` comes from the registry entry for that same filter name,
+        which is what lets a tier-1 call take ``enable`` exactly where the
+        underlying filter honours it (RFC-005 SS2). A named_target the registry
+        has no ENTRY for — the v1 pad fence excludes ``amix``, ``hstack``,
+        ``vstack``, whose options still load fine — reads as no timeline
+        support, which is what ``ffmpeg -filters`` says of all three anyway.
         """
         if not call.named:
             return None
@@ -2130,7 +2195,14 @@ class _Lowerer:
                 fallback=node,
                 hint=_MACRO_HINT,
             )
-        return impl.named_target, self._filter_options(impl.named_target, anchor, node)
+        target = impl.named_target
+        options = self._filter_options(target, anchor, node)
+        entry = self.registry.get(target) if self.registry is not None else None
+        return _NamedTarget(
+            filter=target,
+            options=options,
+            timeline=entry is not None and entry.timeline,
+        )
 
     def _expanded_node(
         self, name: str, filter_name: str, ref: FrameRef, node: exp.Expr, select: exp.Select
@@ -2194,7 +2266,13 @@ class _Lowerer:
             )
         options = self._filter_options(name, node, select) if call.named else {}
         args = self._check_named_args(
-            name, options, call.named, node, owner=call.display, occupied=set()
+            name,
+            options,
+            call.named,
+            node,
+            owner=call.display,
+            occupied=set(),
+            timeline=dynamic.timeline,
         )
         streams = {
             position: self._lower_expr(arg, env, select)
@@ -2271,6 +2349,8 @@ class _Lowerer:
                 streams[position] = self._lower_expr(arg, env, select)
             elif param.kind == "num":
                 literals[position] = _number(arg)
+            elif param.kind == "expr":
+                literals[position] = _expression(arg)
             else:
                 literals[position] = _string(arg)
         return streams, literals
@@ -2378,6 +2458,7 @@ class _Lowerer:
         *,
         owner: str,
         occupied: set[str],
+        timeline: bool = False,
     ) -> dict[str, object]:
         """Validate every named argument against `options`, in written order.
 
@@ -2392,6 +2473,15 @@ class _Lowerer:
         The collision check comes FIRST so that ``crop(f, 0, 0, 10, 10, w => 5)``
         reads as the conflict it is — ffmpeg's own name for that option is
         ``out_w``, so a registry check would otherwise call ``w`` unknown.
+
+        `timeline` is the target's ``DynamicFilter.timeline`` flag, and it is a
+        PARAMETER because this method cannot look filters up: every caller
+        already holds the registry entry (or, for a generated source, knows
+        there is no such field to hold — a source is never timeline-capable, so
+        the default rejects). It admits ``enable`` BEFORE `options` is consulted
+        (RFC-005 SS2): ffmpeg implements ``enable`` in the filter framework, so
+        it is in no filter's option table and a registry lookup would always
+        call it unknown.
         """
         checked: dict[str, object] = {}
         for arg in named:
@@ -2405,6 +2495,9 @@ class _Lowerer:
                     hint="a named argument never overrides what the call itself "
                     "set; drop it, or use the overload that takes it positionally",
                 )
+            if arg.name == _ENABLE:
+                checked[_ENABLE] = _enable_value(filter_name, arg, call, timeline)
+                continue
             option = options.get(arg.name)
             if option is None:
                 raise _error(
@@ -2529,7 +2622,7 @@ class _Lowerer:
         if isinstance(node, exp.Bracket | exp.Column):
             return self._base_stream(node, env, select)[1].type
         if isinstance(node, exp.Cast):
-            return _EXPR_KIND
+            return _UNSUPPORTED_KIND
         call = _call_parts(node)
         if call is not None:
             name = call.name.lower()
@@ -2548,7 +2641,7 @@ class _Lowerer:
                     else self._unknown_function_hint(name),
                 )
             return dynamic.output
-        return _EXPR_KIND
+        return _UNSUPPORTED_KIND
 
     def _stdlib_returns(
         self, spec: FuncSpec, call: _Call, env: _Env, select: exp.Select
@@ -2756,6 +2849,44 @@ def _option_error(
     )
 
 
+def _enable_value(
+    filter_name: str, arg: _NamedArg, call: exp.Expr, timeline: bool
+) -> str:
+    """The timeline ``enable`` expression, or the rejection for this filter.
+
+    Two ways it fails. The filter has no timeline support at all, which is a
+    property of the FILTER and so reads as an unknown option on it — flavoured
+    with the reason, because "gblur has no option 'enable'" would be a lie
+    about gblur. Or the value is not a string: an ffmpeg timeline expression is
+    text, and a bare number would silently mean "always on"/"never on" rather
+    than the window the writer had in mind.
+
+    The expression's CONTENT is deliberately unchecked (RFC-005 non-goals): the
+    variable vocabulary is per-filter and is not introspectable, so it is
+    ffmpeg's to validate at run time.
+    """
+    if not timeline:
+        raise _error(
+            ErrorCode.UNKNOWN_FILTER_OPTION,
+            f"filter '{filter_name}' has no option 'enable': your ffmpeg does "
+            f"not flag '{filter_name}' as supporting timeline editing",
+            arg.value,
+            fallback=call,
+            hint=_NO_TIMELINE_HINT,
+        )
+    value = _literal_value(arg.value)
+    if not isinstance(value, str):
+        raise _error(
+            ErrorCode.FILTER_OPTION_TYPE,
+            f"option 'enable' of filter '{filter_name}' expects an ffmpeg "
+            f"timeline expression, got {_option_got(arg.value, value)}",
+            arg.value,
+            fallback=call,
+            hint=_ENABLE_HINT,
+        )
+    return value
+
+
 def _option_value(
     filter_name: str, option: FilterOption, arg: _NamedArg, call: exp.Expr
 ) -> object:
@@ -2864,6 +2995,22 @@ def _stream_count(count: int) -> str:
     return f"{count} stream" + ("" if count == 1 else "s")
 
 
+# What each ParamKind accepts out of :meth:`_Lowerer._classify`. Explicit
+# membership rather than equality (RFC-005 SS3): ``expr`` is the one kind that
+# takes two classifier answers, a bare number or a quoted expression string.
+# Stating the whole table -- rather than special-casing ``expr`` against an
+# otherwise-equality rule -- is also what keeps the classifier's own
+# `_UNSUPPORTED_KIND` fallback and the passthrough stream types (`subtitle`,
+# `data`) matching NOTHING, by construction.
+_KIND_ACCEPTS: dict[str, frozenset[str]] = {
+    "video": frozenset({"video"}),
+    "audio": frozenset({"audio"}),
+    "num": frozenset({"num"}),
+    "str": frozenset({"str"}),
+    "expr": frozenset({"num", "str"}),
+}
+
+
 def _match_variant(
     variants: Iterable[tuple[Param, ...]], kinds: list[str]
 ) -> int | None:
@@ -2876,7 +3023,9 @@ def _match_variant(
     for index, variant in enumerate(variants):
         if len(variant) != len(kinds):
             continue
-        if all(param.kind == kind for param, kind in zip(variant, kinds)):
+        if all(
+            kind in _KIND_ACCEPTS[param.kind] for param, kind in zip(variant, kinds)
+        ):
             return index
     return None
 

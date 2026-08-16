@@ -272,6 +272,14 @@ _DIALECT_TAIL = """\
   yourself and write the literal.
 - `str` is a single-quoted literal; double a quote to escape it (`'it''s'`).
   In Postgres double quotes mean identifier, never string.
+- `expr` is a number, OR a single-quoted ffmpeg expression that ffmpeg
+  evaluates per frame: `overlay(f.frame, p.frame, '(W-w)/2', '(H-h)/2')`
+  centers the overlay, `crop(f.frame, 0, 0, 'iw/2', 'ih')` keeps the left
+  half. The variable vocabulary is per-filter (`iw`/`ih` input size, `W`/`H`
+  and `w`/`h` in `overlay`, `t` for time, ...) and is checked by ffmpeg at
+  RUN time, not at compile time -- a bad variable name compiles and then
+  fails when the command runs, so only use variables you are sure of. Still
+  a literal either way: `'(W-w)/2'` is quoted text, not SQL arithmetic.
 - Function names are case-insensitive.
 
 ### Named arguments
@@ -288,6 +296,17 @@ _DIALECT_TAIL = """\
 - A named argument may not set something the call already sets: the positional
   form wins, and `crop(a.frame, 0, 0, 10, 10, w => 5)` is rejected rather than
   silently overridden. Use the overload that takes the value positionally.
+- `enable => '<expression>'` is the one named argument that is not an option of
+  the filter: it is ffmpeg's TIMELINE switch, and it turns the filter on and
+  off as the stream plays. `blur(a.frame, 5, enable => 'between(t,0.5,1.5)')`
+  blurs only that one second; outside it the frames pass through untouched.
+  The expression is over `t` (seconds), `n` (frame number) or `pos`, and its
+  content is checked by ffmpeg at run time. Only filters your ffmpeg flags
+  with timeline support take it -- `gblur`, `drawbox`, `drawtext`, `overlay`,
+  `eq` do; `scale`, `pad`, `fps`, `xfade` do not, and asking is
+  `UNKNOWN_FILTER_OPTION` saying so. It is never valid on a generated source
+  (there is no upstream frame to switch), and, like every named argument, it
+  needs the installed ffmpeg.
 - A call that expands to more than one ffmpeg filter takes no named arguments
   at all, because there is no single filter to set them on: `blur_regions`,
   and `delay` on a VIDEO stream. `delay` on an AUDIO stream is one filter and
@@ -433,9 +452,10 @@ _FUNCTIONS_HEADER = """\
 The complete stdlib. A `video` parameter takes `<alias>.video[k]`,
 `<alias>.frame`, a bare array to broadcast over, or a nested call that
 returns `video`; an `audio` parameter takes `<alias>.audio[k]`, a bare array,
-or a nested call that returns `audio`. `num` and `str` take literals only.
-Overloads are separated by `|` -- match one exactly, on both arity and
-argument kinds."""
+or a nested call that returns `audio`. `num`, `str` and `expr` take literals
+only -- `expr` accepting either a number or a quoted ffmpeg expression (see
+Dialect > Arguments). Overloads are separated by `|` -- match one exactly, on
+both arity and argument kinds."""
 
 
 def _render_signature(name: str, variant: tuple[Param, ...]) -> str:
@@ -509,6 +529,13 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
         "TAKE 3 at (60, 70) in 36pt.",
         "SELECT text(draw_box(a.frame, 40, 40, 300, 120, 'red'), 'TAKE 3', 60, 70, 36)\n"
         "FROM input('clip.mp4') a",
+    ),
+    (
+        "Center watermark.png over film.mp4, whatever size either of them is.",
+        # `expr` slots: ffmpeg evaluates (W-w)/2 against the real frame sizes,
+        # so this needs no probe and works for any pair of inputs.
+        "SELECT overlay(f.frame, logo.frame, '(W-w)/2', '(H-h)/2')\n"
+        "FROM input('film.mp4') f, input('watermark.png') logo",
     ),
     (
         "Play intro.mp4 and then main.mp4 as one video.",

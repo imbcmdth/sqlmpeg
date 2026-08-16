@@ -749,12 +749,12 @@ def test_areverse() -> None:
 
 
 def test_signatures_single_variant() -> None:
-    assert signatures("overlay") == "overlay(video, video, num, num)"
+    assert signatures("overlay") == "overlay(video, video, expr, expr)"
 
 
 def test_signatures_multi_variant() -> None:
     sig = signatures("scale")
-    assert sig == "scale(video, num) | scale(video, num, num)"
+    assert sig == "scale(video, num) | scale(video, expr, expr)"
 
 
 def test_signatures_audio_variant() -> None:
@@ -947,3 +947,76 @@ def test_every_single_filter_overload_produces_its_named_target() -> None:
 
 def test_delay_signature_lists_both_overloads() -> None:
     assert signatures("delay") == "delay(audio, num) | delay(video, num)"
+
+
+# ---------------------------------------------------------------------------
+# RFC-005 SS3 (plan 043): the `expr` parameter kind
+# ---------------------------------------------------------------------------
+#
+# The census below is the CLAIM the stdlib makes about which slots ffmpeg
+# types as string expressions. It is pinned here, against the table alone, and
+# checked against the installed ffmpeg's real option types by the faithfulness
+# test in tests/exec/test_exec.py -- the table is data, so a slot cannot be
+# widened without both files agreeing.
+
+EXPECTED_EXPR_SLOTS: dict[str, set[str]] = {
+    "scale": {"w", "h"},  # the 3-arg overload; `factor` stays num
+    "crop": {"x", "y", "w", "h"},
+    "overlay": {"x", "y"},
+    "draw_box": {"x", "y", "w", "h"},
+    "text": {"x", "y", "size"},  # `size` -> drawtext's <string> fontsize
+    "pad": {"w", "h", "x", "y"},
+}
+
+
+def test_expr_slots_are_exactly_the_migrated_ones() -> None:
+    found: dict[str, set[str]] = {}
+    for name, spec in FUNCTIONS.items():
+        params = {p.name for variant in spec.variants for p in variant if p.kind == "expr"}
+        if params:
+            found[name] = params
+    assert found == EXPECTED_EXPR_SLOTS
+
+
+def test_scale_factor_and_rotate_degrees_stay_num() -> None:
+    """We own the arithmetic in both (`iw*<factor>`, `<degrees>*PI/180`), so a
+    raw expression there is `ffmpeg.scale` / `ffmpeg.rotate` territory."""
+    assert FUNCTIONS["scale"].variants[0][1].kind == "num"
+    assert FUNCTIONS["rotate"].variants[0][1].kind == "num"
+
+
+def test_blur_regions_stays_num_because_it_is_a_macro() -> None:
+    """It has no named_target to check an expression claim against, and its
+    x/y feed two different filters (crop AND overlay)."""
+    assert all(p.kind != "expr" for p in FUNCTIONS["blur_regions"].variants[0])
+
+
+def test_pad_overloads_still_differ_by_arity_and_trailing_colour() -> None:
+    """Widening w/h/x/y to `expr` must not make the colour overloads
+    ambiguous: the trailing `str` is what tells 4 from 4 and 6 from 6."""
+    assert [tuple(p.kind for p in variant) for variant in FUNCTIONS["pad"].variants] == [
+        ("video", "expr", "expr"),
+        ("video", "expr", "expr", "str"),
+        ("video", "expr", "expr", "expr", "expr"),
+        ("video", "expr", "expr", "expr", "expr", "str"),
+    ]
+
+
+def test_every_expr_slot_is_passed_through_to_one_filter_option() -> None:
+    """Table-level half of the faithfulness check: every `expr` parameter
+    lands VERBATIM as the value of a node arg (so the exec test can resolve
+    which option it is by looking for its sentinel)."""
+    for name, spec in FUNCTIONS.items():
+        for index, variant in enumerate(spec.variants):
+            positions = [i for i, p in enumerate(variant) if p.kind == "expr"]
+            if not positions:
+                continue
+            ctx = FakeCtx()
+            args: list[object] = [
+                "src:a" if p.kind in ("video", "audio") else f"<{i}>"
+                for i, p in enumerate(variant)
+            ]
+            spec.impl(index).expand(ctx, args)
+            values = {v for _, _, node_args, _, _ in ctx.nodes for v in node_args.values()}
+            for position in positions:
+                assert f"<{position}>" in values, (name, index, variant[position].name)

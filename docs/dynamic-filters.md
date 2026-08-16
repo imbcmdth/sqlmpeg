@@ -38,6 +38,28 @@ Values follow the dialect's usual literal rules: a bare number, `true`/`false`, 
 
 Since named arguments are checked against the installed ffmpeg, they carry the same machine-dependence as tier 2 itself. One rule for the whole feature: **named arguments are your installed ffmpeg.** A query that compiles under `--portable` compiles everywhere.
 
+### `enable`: turning a filter on and off as the stream plays
+
+One named argument is not an option of any filter. `enable` is ffmpeg's *timeline* switch, implemented in the filter framework rather than in the filters themselves, and it takes an expression that ffmpeg evaluates per frame: while it is true the filter runs, while it is false the frame passes through untouched.
+
+```sql
+SELECT blur(a.frame, 12, enable => 'between(t,0.5,1.5)')
+FROM input('clip.mp4') a
+```
+
+That blurs exactly one second in the middle of the clip and leaves the rest sharp — with no trim, no branch, and no concat. It is accepted on both tiers, positionally identical to any other named argument: on a tier-2 call (`ffmpeg.drawbox(a.frame, x => 10, y => 10, w => 40, h => 40, enable => 'gt(t,1)')`) and as a tier-1 named extra, where it reaches through to the filter the stdlib function expands to.
+
+Because `enable` is framework-level it appears in no filter's `-help` output, so the option validator special-cases the name rather than looking it up. What decides whether a given filter accepts it is the `T` flag in the first column of `ffmpeg -filters` — the same introspection everything else in this document is built on:
+
+```
+ TSC gblur             V->V       Apply Gaussian Blur filter.
+ ..C scale             V->V       Scale the input video size and/or convert the image format.
+```
+
+So `blur(a.frame, 5, enable => '...')` compiles and `scale(a.frame, 640, 360, enable => '...')` is `UNKNOWN_FILTER_OPTION`, saying that *this* ffmpeg does not flag `scale` as timeline-capable. A generated source never takes it either: `ffmpeg.testsrc` makes frames rather than transforming them, so there is nothing to switch off.
+
+The expression's vocabulary is `t` (timestamp in seconds), `n` (frame number) and `pos`, wrapped in ffmpeg's expression functions (`between(t,a,b)`, `gt(t,x)`, `lt`, `if`, ...). Its *content* is not validated at compile time and deliberately so: the variables available differ per filter and ffmpeg exposes no way to enumerate them, so a typo inside the expression surfaces when the command runs, not when it compiles. That is the same line RFC-005 draws for expression arguments generally (see `expr` parameters in [docs/stdlib.md](stdlib.md)).
+
 ## `--portable`
 
 `compile`, `explain`, and `validate` all take `--portable`: stdlib only, no registry constructed, nothing introspected, nothing shells out. The compile sees exactly what a machine with no ffmpeg would see. A tier-2 filter name becomes `UNKNOWN_FUNCTION`; any named argument becomes `UNSUPPORTED_SQL`. Run it before handing a query to someone whose machine you don't control.
@@ -50,7 +72,7 @@ Not everything ffmpeg reports is callable:
 
 - Only filters with a static pad signature and exactly one output make the cut: `V->V`, `A->A`, `AA->A`, `VV->V`, and friends. Variable pad counts (`N`: `split`, `concat`), multiple outputs (`scale2ref`, `feedback`), and sources/sinks (`|`: `testsrc`, `anullsink`) are excluded, and calling one gets an `UNSUPPORTED_SQL` naming the limitation rather than a partial guess.
 - Options typed `binary` or `dictionary` have no representation in the dialect; setting one is `FILTER_OPTION_TYPE`. The filter's other options still work.
-- The `enable` timeline expression and ffmpeg's runtime filter commands are out of scope entirely.
+- ffmpeg's runtime filter commands (`sendcmd`, `zmq`) are out of scope entirely.
 
 ## The introspection cache
 

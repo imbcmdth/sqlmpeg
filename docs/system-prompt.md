@@ -205,6 +205,14 @@ statement is not. `--` and `/* */` comments are allowed.
   yourself and write the literal.
 - `str` is a single-quoted literal; double a quote to escape it (`'it''s'`).
   In Postgres double quotes mean identifier, never string.
+- `expr` is a number, OR a single-quoted ffmpeg expression that ffmpeg
+  evaluates per frame: `overlay(f.frame, p.frame, '(W-w)/2', '(H-h)/2')`
+  centers the overlay, `crop(f.frame, 0, 0, 'iw/2', 'ih')` keeps the left
+  half. The variable vocabulary is per-filter (`iw`/`ih` input size, `W`/`H`
+  and `w`/`h` in `overlay`, `t` for time, ...) and is checked by ffmpeg at
+  RUN time, not at compile time -- a bad variable name compiles and then
+  fails when the command runs, so only use variables you are sure of. Still
+  a literal either way: `'(W-w)/2'` is quoted text, not SQL arithmetic.
 - Function names are case-insensitive.
 
 ### Named arguments
@@ -221,6 +229,17 @@ statement is not. `--` and `/* */` comments are allowed.
 - A named argument may not set something the call already sets: the positional
   form wins, and `crop(a.frame, 0, 0, 10, 10, w => 5)` is rejected rather than
   silently overridden. Use the overload that takes the value positionally.
+- `enable => '<expression>'` is the one named argument that is not an option of
+  the filter: it is ffmpeg's TIMELINE switch, and it turns the filter on and
+  off as the stream plays. `blur(a.frame, 5, enable => 'between(t,0.5,1.5)')`
+  blurs only that one second; outside it the frames pass through untouched.
+  The expression is over `t` (seconds), `n` (frame number) or `pos`, and its
+  content is checked by ffmpeg at run time. Only filters your ffmpeg flags
+  with timeline support take it -- `gblur`, `drawbox`, `drawtext`, `overlay`,
+  `eq` do; `scale`, `pad`, `fps`, `xfade` do not, and asking is
+  `UNKNOWN_FILTER_OPTION` saying so. It is never valid on a generated source
+  (there is no upstream frame to switch), and, like every named argument, it
+  needs the installed ffmpeg.
 - A call that expands to more than one ffmpeg filter takes no named arguments
   at all, because there is no single filter to set them on: `blur_regions`,
   and `delay` on a VIDEO stream. `delay` on an AUDIO stream is one filter and
@@ -342,15 +361,16 @@ These are typed errors, never a best-effort graph. Do not reach for them.
 The complete stdlib. A `video` parameter takes `<alias>.video[k]`,
 `<alias>.frame`, a bare array to broadcast over, or a nested call that
 returns `video`; an `audio` parameter takes `<alias>.audio[k]`, a bare array,
-or a nested call that returns `audio`. `num` and `str` take literals only.
-Overloads are separated by `|` -- match one exactly, on both arity and
-argument kinds.
+or a nested call that returns `audio`. `num`, `str` and `expr` take literals
+only -- `expr` accepting either a number or a quoted ffmpeg expression (see
+Dialect > Arguments). Overloads are separated by `|` -- match one exactly, on
+both arity and argument kinds.
 
-- `scale(f: video, factor: num) | scale(f: video, w: num, h: num)`
+- `scale(f: video, factor: num) | scale(f: video, w: expr, h: expr)`
   Resize a frame by a scale factor, or to explicit width/height.
-- `crop(f: video, x: num, y: num, w: num, h: num)`
+- `crop(f: video, x: expr, y: expr, w: expr, h: expr)`
   Crop a frame to a w x h rectangle at (x, y).
-- `overlay(base: video, top: video, x: num, y: num)`
+- `overlay(base: video, top: video, x: expr, y: expr)`
   Composite top over base at position (x, y).
 - `hflip(f: video)`
   Flip a frame horizontally.
@@ -360,9 +380,9 @@ argument kinds.
   Apply a Gaussian blur with the given sigma.
 - `blur_regions(f: video, x: num, y: num, w: num, h: num, sigma: num)`
   Blur a w x h rectangle at (x, y) and composite it back over the frame.
-- `draw_box(f: video, x: num, y: num, w: num, h: num, color: str)`
+- `draw_box(f: video, x: expr, y: expr, w: expr, h: expr, color: str)`
   Draw an outlined box at (x, y) sized w x h in the given color.
-- `text(f: video, s: str, x: num, y: num, size: num)`
+- `text(f: video, s: str, x: expr, y: expr, size: expr)`
   Draw text s at (x, y) with the given font size.
 - `speed(f: video, factor: num)`
   Change a video stream's playback speed by factor (use atempo for audio).
@@ -384,7 +404,7 @@ argument kinds.
   Approximate reverb via a single-tap echo (aecho); not a true convolution reverb, but a cheap, dependency-free stand-in.
 - `rotate(f: video, degrees: num)`
   Rotate a frame degrees clockwise (ffmpeg evaluates the angle expression).
-- `pad(f: video, w: num, h: num) | pad(f: video, w: num, h: num, color: str) | pad(f: video, w: num, h: num, x: num, y: num) | pad(f: video, w: num, h: num, x: num, y: num, color: str)`
+- `pad(f: video, w: expr, h: expr) | pad(f: video, w: expr, h: expr, color: str) | pad(f: video, w: expr, h: expr, x: expr, y: expr) | pad(f: video, w: expr, h: expr, x: expr, y: expr, color: str)`
   Pad a frame to w x h; with just (w, h) the original is centered on a black background, (x, y) place it explicitly, and a trailing color string sets the background.
 - `hstack(a: video, b: video)`
   Stack two frames side by side horizontally (inputs should share height).
@@ -496,6 +516,13 @@ Outline a red 300x120 box at (40, 40) on clip.mp4 and label it TAKE 3 at (60, 70
 ```sql
 SELECT text(draw_box(a.frame, 40, 40, 300, 120, 'red'), 'TAKE 3', 60, 70, 36)
 FROM input('clip.mp4') a
+```
+
+Center watermark.png over film.mp4, whatever size either of them is.
+
+```sql
+SELECT overlay(f.frame, logo.frame, '(W-w)/2', '(H-h)/2')
+FROM input('film.mp4') f, input('watermark.png') logo
 ```
 
 Play intro.mp4 and then main.mp4 as one video.

@@ -14,7 +14,15 @@ from typing import Literal, Protocol
 
 from sqlmpeg.ir import FrameRef, StreamType
 
-ParamKind = Literal["video", "audio", "num", "str"]
+# ``expr`` (RFC-005 SS3) is the one kind that accepts two literal shapes: a
+# bare number, or a single-quoted ffmpeg EXPRESSION passed through verbatim
+# (`'(W-w)/2'`, `'iw/2'`). It is used for exactly those slots whose underlying
+# AVOption the installed ffmpeg types as a string -- tests/test_stdlib.py's
+# faithfulness test checks that claim against the live registry, so the stdlib
+# can never advertise expression support ffmpeg does not have. Everything else
+# stays `num`: `rotate`'s degrees, for instance, is OURS (we map it to
+# `a=<degrees>*PI/180`), so a raw expression there belongs to `ffmpeg.rotate`.
+ParamKind = Literal["video", "audio", "num", "str", "expr"]
 
 
 @dataclass(frozen=True)
@@ -106,6 +114,11 @@ def _num(name: str) -> Param:
 
 def _str(name: str) -> Param:
     return Param(name, "str")
+
+
+def _expr(name: str) -> Param:
+    """A slot ffmpeg types as a string expression: a number OR a quoted expr."""
+    return Param(name, "expr")
 
 
 def _as_stream(value: object) -> FrameRef:
@@ -453,7 +466,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         name="scale",
         variants=(
             (_video("f"), _num("factor")),
-            (_video("f"), _num("w"), _num("h")),
+            (_video("f"), _expr("w"), _expr("h")),
         ),
         doc="Resize a frame by a scale factor, or to explicit width/height.",
         expand=_expand_scale,
@@ -462,7 +475,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
     ),
     "crop": FuncSpec(
         name="crop",
-        variants=((_video("f"), _num("x"), _num("y"), _num("w"), _num("h")),),
+        variants=((_video("f"), _expr("x"), _expr("y"), _expr("w"), _expr("h")),),
         doc="Crop a frame to a w x h rectangle at (x, y).",
         expand=_expand_crop,
         returns="video",
@@ -470,7 +483,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
     ),
     "overlay": FuncSpec(
         name="overlay",
-        variants=((_video("base"), _video("top"), _num("x"), _num("y")),),
+        variants=((_video("base"), _video("top"), _expr("x"), _expr("y")),),
         doc="Composite top over base at position (x, y).",
         expand=_expand_overlay,
         returns="video",
@@ -522,10 +535,10 @@ FUNCTIONS: dict[str, FuncSpec] = {
         variants=(
             (
                 _video("f"),
-                _num("x"),
-                _num("y"),
-                _num("w"),
-                _num("h"),
+                _expr("x"),
+                _expr("y"),
+                _expr("w"),
+                _expr("h"),
                 _str("color"),
             ),
         ),
@@ -536,7 +549,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
     ),
     "text": FuncSpec(
         name="text",
-        variants=((_video("f"), _str("s"), _num("x"), _num("y"), _num("size")),),
+        variants=((_video("f"), _str("s"), _expr("x"), _expr("y"), _expr("size")),),
         doc="Draw text s at (x, y) with the given font size.",
         expand=_expand_text,
         returns="video",
@@ -645,10 +658,10 @@ FUNCTIONS: dict[str, FuncSpec] = {
     "pad": FuncSpec(
         name="pad",
         variants=(
-            (_video("f"), _num("w"), _num("h")),
-            (_video("f"), _num("w"), _num("h"), _str("color")),
-            (_video("f"), _num("w"), _num("h"), _num("x"), _num("y")),
-            (_video("f"), _num("w"), _num("h"), _num("x"), _num("y"), _str("color")),
+            (_video("f"), _expr("w"), _expr("h")),
+            (_video("f"), _expr("w"), _expr("h"), _str("color")),
+            (_video("f"), _expr("w"), _expr("h"), _expr("x"), _expr("y")),
+            (_video("f"), _expr("w"), _expr("h"), _expr("x"), _expr("y"), _str("color")),
         ),
         doc=(
             "Pad a frame to w x h; with just (w, h) the original is centered on a "

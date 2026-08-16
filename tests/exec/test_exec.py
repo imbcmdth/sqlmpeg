@@ -22,9 +22,12 @@ import imagehash
 import pytest
 from PIL import Image
 
+from sqlmpeg import registry as registry_module
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.emit import build_ffmpeg_args, emit
 from sqlmpeg.errors import SqlmpegError
+from sqlmpeg.ir import FrameRef, StreamType
+from sqlmpeg.stdlib import FUNCTIONS
 
 pytestmark = pytest.mark.exec
 
@@ -1032,3 +1035,300 @@ def test_a_sine_tone_is_a_whole_query_with_no_input_file(tmp_path: Path) -> None
     streams = _ffprobe_streams(out_path)
     assert [s["codec_type"] for s in streams] == ["audio"]
     assert _ffprobe_duration(out_path) == pytest.approx(1.0, abs=0.2)
+
+
+# ---------------------------------------------------------------------------
+# RFC-005 SS2 (plan 043): the timeline `enable` argument, RUN
+# ---------------------------------------------------------------------------
+#
+# The claim `enable` makes is about individual FRAMES, so it is checked the way
+# plan 038's transparency test checks its canvas: render the query, pull one
+# frame from inside the window and one from either side, and diff each against
+# the untouched fixture. The fixture is 2s at 15fps, so 0.2 / 1.0 / 1.8 sit
+# comfortably clear of the 0.5 and 1.5 edges.
+
+# A region well inside the 320x240 frame, so an edge effect cannot decide it.
+_ENABLE_BOX = (40, 40, 280, 200)
+
+# Mean per-channel difference over the sampled region, in 0..255. The filtered
+# output has been re-encoded and the fixture has not, so "untouched" is a small
+# number rather than zero. Measured against ffmpeg 7.1: 0.74 / 48.86 / 0.71 for
+# the blur, 0.69 / 17.96 / 0.26 for the box.
+_ENABLE_OFF = 5.0
+_ENABLE_ON = 10.0
+
+
+def _region_difference(left: Path, right: Path, box: tuple[int, int, int, int]) -> float:
+    with Image.open(left) as first, Image.open(right) as second:
+        a = first.convert("RGB").crop(box).tobytes()
+        b = second.convert("RGB").crop(box).tobytes()
+    assert len(a) == len(b) > 0
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+
+def _assert_enable_window(
+    tmp_path: Path,
+    rendered: Path,
+    source: Path,
+    box: tuple[int, int, int, int],
+    label: str,
+) -> None:
+    """Untouched outside 0.5..1.5, visibly filtered inside it."""
+    for moment, expected in ((0.2, "off"), (1.0, "on"), (1.8, "off")):
+        rendered_png = tmp_path / f"{label}-out-{moment}.png"
+        source_png = tmp_path / f"{label}-src-{moment}.png"
+        _extract_frame(rendered, moment, rendered_png)
+        _extract_frame(source, moment, source_png)
+        difference = _region_difference(rendered_png, source_png, box)
+        if expected == "off":
+            assert difference < _ENABLE_OFF, (
+                f"t={moment}: {label} ran outside its enable window ({difference})"
+            )
+        else:
+            assert difference > _ENABLE_ON, (
+                f"t={moment}: {label} did not run inside its enable window ({difference})"
+            )
+
+
+def test_enable_blurs_only_inside_its_timeline_window(tmp_path: Path) -> None:
+    """The RFC-005 SS2 headline, measured frame by frame.
+
+    One filter, one named argument, no trim and no branch: the clip is sharp,
+    then blurred for a second, then sharp again.
+    """
+    _require_fixture(_TESTSRC)
+    out_path = tmp_path / "enable-blur.mp4"
+    query = (
+        "SELECT blur(a.frame, 12, enable => 'between(t,0.5,1.5)') "
+        f"FROM input('{_sql_path(_TESTSRC)}') a"
+    )
+
+    graph = compile_sql(query)
+    assert graph.nodes["n1"].filter == "gblur"
+    assert graph.nodes["n1"].args == {"sigma": 12, "enable": "between(t,0.5,1.5)"}
+    # The commas inside the expression are the filtergraph's own separator, so
+    # emit has to escape them -- this is a real command, not just a real graph.
+    assert "gblur=sigma=12:enable=between(t\\,0.5\\,1.5)" in emit(graph).filter_complex
+
+    _compile_and_run(query, out_path)
+    _assert_enable_window(tmp_path, out_path, _TESTSRC, _ENABLE_BOX, "blur")
+
+
+def test_a_tier_two_filter_takes_enable_through_the_namespace(tmp_path: Path) -> None:
+    """The other admitting path: a raw `ffmpeg.<filter>` call, whose timeline
+    flag comes from the same `-filters` line the registry parsed. `drawbox` is
+    `T.C` in ffmpeg 7.1."""
+    _require_fixture(_TESTSRC)
+    out_path = tmp_path / "enable-box.mp4"
+    query = (
+        "SELECT ffmpeg.drawbox(a.frame, x => 20, y => 20, width => 120, "
+        "height => 90, color => 'red', thickness => 8, "
+        "enable => 'between(t,0.5,1.5)') "
+        f"FROM input('{_sql_path(_TESTSRC)}') a"
+    )
+
+    graph = compile_sql(query)
+    assert graph.nodes["n1"].filter == "drawbox"
+    assert graph.nodes["n1"].args["enable"] == "between(t,0.5,1.5)"
+
+    _compile_and_run(query, out_path)
+    _assert_enable_window(tmp_path, out_path, _TESTSRC, (16, 16, 148, 118), "drawbox")
+
+
+def test_enable_is_rejected_where_this_ffmpeg_reports_no_timeline_flag() -> None:
+    """Against the REAL registry, not a fixture: `scale` is `..C` in ffmpeg 7.1,
+    and a generated source has no timeline at all."""
+    with pytest.raises(SqlmpegError) as excinfo:
+        compile_sql(
+            "SELECT scale(a.frame, 640, 360, enable => 'gt(t,1)') "
+            f"FROM input('{_sql_path(_TESTSRC)}') a"
+        )
+    assert excinfo.value.code.value == "UNKNOWN_FILTER_OPTION"
+    assert "no option 'enable'" in excinfo.value.message
+
+    with pytest.raises(SqlmpegError) as excinfo:
+        compile_sql(
+            "SELECT t.video[1] "
+            "FROM ffmpeg.testsrc2(duration => 1, enable => 'gt(t,1)') t"
+        )
+    assert excinfo.value.code.value == "UNKNOWN_FILTER_OPTION"
+
+
+# ---------------------------------------------------------------------------
+# RFC-005 SS3 (plan 043): `expr` slots, RUN, and checked against ffmpeg's types
+# ---------------------------------------------------------------------------
+
+
+def test_a_centered_overlay_runs_without_knowing_either_size(tmp_path: Path) -> None:
+    """The motivating case of RFC-005 SS3. `(W-w)/2` is ffmpeg's arithmetic over
+    the real pad sizes, so nothing here had to probe anything: a 320x240 clip
+    lands dead centre of a 640x480 matte, which the edge samples prove (the clip
+    must start at x=160 and end at x=480)."""
+    _require_fixture(_TESTSRC)
+    out_path = tmp_path / "centered.mp4"
+    query = (
+        "SELECT overlay(m.frame, v.frame, '(W-w)/2', '(H-h)/2') "
+        "FROM ffmpeg.color(color => 'navy', size => '640x480', rate => 15, "
+        "duration => 2) m, "
+        f"input('{_sql_path(_TESTSRC)}') v"
+    )
+
+    graph = compile_sql(query)
+    assert graph.nodes["n2"].args == {"x": "(W-w)/2", "y": "(H-h)/2"}
+    assert "overlay=x=(W-w)/2:y=(H-h)/2" in emit(graph).filter_complex
+
+    _compile_and_run(query, out_path)
+
+    stream = _ffprobe_video_stream(out_path)
+    assert (stream["width"], stream["height"]) == (640, 480)
+
+    png = tmp_path / "centered.png"
+    _extract_frame(out_path, 1.0, png)
+    with Image.open(png) as image:
+        pixels = image.convert("RGB")
+
+        def rgb(x: int) -> tuple[int, int, int]:
+            value = pixels.getpixel((x, 240))
+            assert isinstance(value, tuple) and len(value) == 3
+            return value
+
+        # navy is 000080; the mp4 round trip lands within a couple of levels.
+        for x in (5, 155, 485, 635):
+            red, green, blue = rgb(x)
+            assert (red, green) == (0, 0) and 120 < blue < 135, x
+        for x in (170, 470):
+            assert rgb(x)[:2] != (0, 0), x
+
+
+def test_expression_crop_and_scale_run(tmp_path: Path) -> None:
+    """Two more expr slots end to end: crop to the left half by expression,
+    then stretch it back to full width by expression. Both filters get a string
+    where a bare number used to be the only thing that fit."""
+    _require_fixture(_TESTSRC)
+    out_path = tmp_path / "expr-crop.mp4"
+    query = (
+        "SELECT scale(crop(a.frame, 0, 0, 'iw/2', 'ih'), 'iw*2', 'ih') "
+        f"FROM input('{_sql_path(_TESTSRC)}') a"
+    )
+
+    _compile_and_run(query, out_path)
+
+    stream = _ffprobe_video_stream(out_path)
+    assert (stream["width"], stream["height"]) == (_SRC_WIDTH, _SRC_HEIGHT)
+
+
+class _ArgCollector:
+    """An ExpandCtx that records `(filter, args)` per node -- no graph."""
+
+    def __init__(self) -> None:
+        self.nodes: list[tuple[str, dict[str, object]]] = []
+
+    def node(
+        self,
+        filter: str,
+        args: dict[str, object],
+        inputs: list[FrameRef],
+        outputs: list[StreamType],
+    ) -> FrameRef:
+        self.nodes.append((filter, dict(args)))
+        return f"n{len(self.nodes)}"
+
+
+# ffmpeg gives several of these options two spellings (`w`/`width`,
+# `h`/`out_h`), and the registry keeps only the longer one of each pair while
+# the expansions write the shorter -- both are accepted on the command line, so
+# this is the "where the names differ" table the mapping needs, keyed by
+# (filter, the key the expansion actually wrote).
+_OPTION_ALIASES: dict[tuple[str, str], str] = {
+    ("scale", "w"): "width",
+    ("scale", "h"): "height",
+    ("crop", "w"): "out_w",
+    ("crop", "h"): "out_h",
+    ("pad", "w"): "width",
+    ("pad", "h"): "height",
+    ("drawbox", "w"): "width",
+    ("drawbox", "h"): "height",
+}
+
+_EXPR_SLOT_CENSUS = {
+    ("scale", "w"),
+    ("scale", "h"),
+    ("crop", "x"),
+    ("crop", "y"),
+    ("crop", "w"),
+    ("crop", "h"),
+    ("overlay", "x"),
+    ("overlay", "y"),
+    ("draw_box", "x"),
+    ("draw_box", "y"),
+    ("draw_box", "w"),
+    ("draw_box", "h"),
+    ("text", "x"),
+    ("text", "y"),
+    ("text", "size"),
+    ("pad", "w"),
+    ("pad", "h"),
+    ("pad", "x"),
+    ("pad", "y"),
+}
+
+
+def test_every_expr_slot_maps_to_a_string_typed_ffmpeg_option() -> None:
+    """THE faithfulness test (RFC-005 SS3): the stdlib may not claim expression
+    support ffmpeg does not have.
+
+    For every `expr` parameter of every overload, expand that overload with a
+    sentinel in its position, find which option of the overload's
+    ``named_target`` the sentinel landed in, and ask the INSTALLED ffmpeg what
+    that option's type is. Anything but `str` means the slot really takes a
+    number and the table is lying about it. The parameter -> option mapping is
+    DERIVED from the expansion rather than tabulated, so `text`'s `size` finds
+    `drawtext`'s `fontsize` without anyone writing that pair down.
+    """
+    registry = registry_module.load()
+    if not registry.available():
+        pytest.skip("no ffmpeg filter registry available")
+
+    checked: list[tuple[str, str, str]] = []
+    for name, spec in FUNCTIONS.items():
+        for index, variant in enumerate(spec.variants):
+            positions = [i for i, p in enumerate(variant) if p.kind == "expr"]
+            if not positions:
+                continue
+            impl = spec.impl(index)
+            target = impl.named_target
+            assert target is not None, f"{name}: an expr slot needs a named_target"
+            options = registry.options(target)
+            assert options is not None, f"{name}: this ffmpeg has no '{target}' filter"
+
+            ctx = _ArgCollector()
+            impl.expand(
+                ctx,
+                [
+                    "src:a" if p.kind in ("video", "audio") else f"<{i}>"
+                    for i, p in enumerate(variant)
+                ],
+            )
+            for position in positions:
+                sentinel = f"<{position}>"
+                keys = [
+                    key
+                    for filter_name, args in ctx.nodes
+                    if filter_name == target
+                    for key, value in args.items()
+                    if value == sentinel
+                ]
+                assert len(keys) == 1, (name, index, variant[position].name, keys)
+                written = keys[0]
+                introspected = _OPTION_ALIASES.get((target, written), written)
+                option = options.get(introspected)
+                assert option is not None, (name, target, written)
+                assert option.type == "str", (
+                    f"{name}({variant[position].name}) is declared expr, but this "
+                    f"ffmpeg types '{target}.{introspected}' as {option.type}"
+                )
+                checked.append((name, variant[position].name, introspected))
+
+    assert {(f, p) for f, p, _ in checked} == _EXPR_SLOT_CENSUS
+    # The one pair whose names differ -- and the reason the mapping is derived.
+    assert ("text", "size", "fontsize") in checked

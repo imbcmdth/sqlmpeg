@@ -15,9 +15,9 @@ For each function, the ffmpeg filter(s) it lowers to are discovered by
 actually calling ``spec.expand`` against a throwaway :class:`ExpandCtx`
 that just records the filter name of every node it creates (mirroring the
 ``FakeCtx`` pattern in ``tests/test_stdlib.py``), passing dummy arguments
-per parameter kind: ``"f"`` for ``frame``, ``1`` for ``num``, ``"x"`` for
-``str``. This keeps the doc's filter list honest against the real
-expansion code instead of being transcribed by hand.
+per parameter kind: ``"f"`` for ``frame``, ``1`` for ``num`` and ``expr``,
+``"x"`` for ``str``. This keeps the doc's filter list honest against the
+real expansion code instead of being transcribed by hand.
 """
 
 from __future__ import annotations
@@ -30,7 +30,16 @@ from sqlmpeg.stdlib import FUNCTIONS, FuncSpec, Param
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _OUTPUT_PATH = _REPO_ROOT / "docs" / "stdlib.md"
 
-_DUMMY_ARGS: dict[str, object] = {"video": "f", "audio": "f", "num": 1, "str": "x"}
+# `expr` takes a number OR an expression string; the number is the shape that
+# keeps the rendered filter list identical to what `num` produced before the
+# kind was split out (RFC-005 SS3).
+_DUMMY_ARGS: dict[str, object] = {
+    "video": "f",
+    "audio": "f",
+    "num": 1,
+    "str": "x",
+    "expr": 1,
+}
 
 _HEADER = """\
 # sqlmpeg stdlib

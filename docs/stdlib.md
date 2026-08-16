@@ -11,7 +11,7 @@ Regenerate with:
 
 `scale(f: video, factor: num)`
 
-`scale(f: video, w: num, h: num)`
+`scale(f: video, w: expr, h: expr)`
 
 Resize a frame by a scale factor, or to explicit width/height.
 
@@ -19,7 +19,7 @@ FFmpeg filter(s): `scale`
 
 ## crop
 
-`crop(f: video, x: num, y: num, w: num, h: num)`
+`crop(f: video, x: expr, y: expr, w: expr, h: expr)`
 
 Crop a frame to a w x h rectangle at (x, y).
 
@@ -27,7 +27,7 @@ FFmpeg filter(s): `crop`
 
 ## overlay
 
-`overlay(base: video, top: video, x: num, y: num)`
+`overlay(base: video, top: video, x: expr, y: expr)`
 
 Composite top over base at position (x, y).
 
@@ -67,7 +67,7 @@ FFmpeg filter(s): `crop`, `gblur`, `overlay`
 
 ## draw_box
 
-`draw_box(f: video, x: num, y: num, w: num, h: num, color: str)`
+`draw_box(f: video, x: expr, y: expr, w: expr, h: expr, color: str)`
 
 Draw an outlined box at (x, y) sized w x h in the given color.
 
@@ -75,7 +75,7 @@ FFmpeg filter(s): `drawbox`
 
 ## text
 
-`text(f: video, s: str, x: num, y: num, size: num)`
+`text(f: video, s: str, x: expr, y: expr, size: expr)`
 
 Draw text s at (x, y) with the given font size.
 
@@ -167,13 +167,13 @@ FFmpeg filter(s): `rotate`
 
 ## pad
 
-`pad(f: video, w: num, h: num)`
+`pad(f: video, w: expr, h: expr)`
 
-`pad(f: video, w: num, h: num, color: str)`
+`pad(f: video, w: expr, h: expr, color: str)`
 
-`pad(f: video, w: num, h: num, x: num, y: num)`
+`pad(f: video, w: expr, h: expr, x: expr, y: expr)`
 
-`pad(f: video, w: num, h: num, x: num, y: num, color: str)`
+`pad(f: video, w: expr, h: expr, x: expr, y: expr, color: str)`
 
 Pad a frame to w x h; with just (w, h) the original is centered on a black background, (x, y) place it explicitly, and a trailing color string sets the background.
 
