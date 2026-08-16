@@ -1,10 +1,17 @@
-# 038 — ff_ aliases for every filter + video delay  (model: opus · main)
+# 038 — ffmpeg.* namespace + video delay  (model: opus · main)
 
-User direction (2026-08-15): (a) prefer composable primitives over bundled
-macros — the ad-insert use case is `overlay(...)` composed with a video
-`delay(...)`, not an `overlay_at`; (b) fix the Postgres-builtin name
-collisions once and for all: `ff_<filter>` is an alias for EVERY dynamic
-filter, so every collided name has a non-colliding spelling.
+User direction (2026-08-15, amended same day): (a) prefer composable
+primitives over bundled macros — the ad-insert use case is `overlay(...)`
+composed with a video `delay(...)`, not an `overlay_at`; (b) fix the
+Postgres-builtin name collisions once and for all via a NAMESPACE:
+`ffmpeg.<filter>(...)` reaches every dynamic filter and can never collide
+with SQL grammar (verified: all collision victims parse uniformly as
+Dot(Identifier(ffmpeg), Anonymous(name, args)) with args and kwargs intact,
+including ffmpeg.overlay(..., eof_action => 'pass') past the PLACING
+grammar). The ff_ prefix originally specified below is SUPERSEDED by the
+namespace — one spelling only; read the section that follows with
+`ffmpeg.<name>` substituted for `ff_<name>`, plus: reserve `ffmpeg` as an
+alias/CTE name in the parser.
 
 ## A. ff_ aliases (lower resolution)
 - In tier-2 resolution: a name starting with `ff_` strips the prefix and
