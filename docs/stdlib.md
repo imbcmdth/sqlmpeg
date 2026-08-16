@@ -156,3 +156,181 @@ FFmpeg filter(s): `afade`
 Approximate reverb via a single-tap echo (aecho); not a true convolution reverb, but a cheap, dependency-free stand-in.
 
 FFmpeg filter(s): `aecho`
+
+## rotate
+
+`rotate(f: video, degrees: num)`
+
+Rotate a frame degrees clockwise (ffmpeg evaluates the angle expression).
+
+FFmpeg filter(s): `rotate`
+
+## pad
+
+`pad(f: video, w: num, h: num)`
+
+`pad(f: video, w: num, h: num, color: str)`
+
+`pad(f: video, w: num, h: num, x: num, y: num)`
+
+`pad(f: video, w: num, h: num, x: num, y: num, color: str)`
+
+Pad a frame to w x h; with just (w, h) the original is centered on a black background, (x, y) place it explicitly, and a trailing color string sets the background.
+
+FFmpeg filter(s): `pad`
+
+## hstack
+
+`hstack(a: video, b: video)`
+
+Stack two frames side by side horizontally (inputs should share height).
+
+FFmpeg filter(s): `hstack`
+
+## vstack
+
+`vstack(a: video, b: video)`
+
+Stack two frames vertically (inputs should share width).
+
+FFmpeg filter(s): `vstack`
+
+## fps
+
+`fps(f: video, rate: num)`
+
+Force a constant output frame rate, duplicating or dropping frames as needed.
+
+FFmpeg filter(s): `fps`
+
+## sharpen
+
+`sharpen(f: video, amount: num)`
+
+Sharpen a frame by the given luma amount (ffmpeg unsharp, 5x5 matrix).
+
+FFmpeg filter(s): `unsharp`
+
+## deinterlace
+
+`deinterlace(f: video)`
+
+Deinterlace a frame (ffmpeg yadif, default mode/parity).
+
+FFmpeg filter(s): `yadif`
+
+## denoise
+
+`denoise(f: video, strength: num)`
+
+Denoise a frame by the given luma spatial strength (ffmpeg hqdn3d).
+
+FFmpeg filter(s): `hqdn3d`
+
+## brightness
+
+`brightness(f: video, v: num)`
+
+Adjust brightness by v (-1..1, 0 = unchanged; ffmpeg eq).
+
+FFmpeg filter(s): `eq`
+
+## contrast
+
+`contrast(f: video, v: num)`
+
+Adjust contrast by v (0..2, 1 = unchanged; ffmpeg eq).
+
+FFmpeg filter(s): `eq`
+
+## saturate
+
+`saturate(f: video, v: num)`
+
+Adjust saturation by v (0..3, 1 = unchanged; ffmpeg eq).
+
+FFmpeg filter(s): `eq`
+
+## grayscale
+
+`grayscale(f: video)`
+
+Desaturate a frame to grayscale (ffmpeg hue, s=0).
+
+FFmpeg filter(s): `hue`
+
+## crossfade
+
+`crossfade(a: video, b: video, dur: num, offset: num)`
+
+`crossfade(a: video, b: video, dur: num, offset: num, transition: str)`
+
+Cross fade from a to b over dur seconds, starting offset seconds into a (default transition 'fade'); inputs must share resolution and fps.
+
+FFmpeg filter(s): `xfade`
+
+## subtitles
+
+`subtitles(f: video, path: str)`
+
+Burn subtitles from path into a frame at run time (the file must exist then).
+
+FFmpeg filter(s): `subtitles`
+
+## reverse
+
+`reverse(f: video)`
+
+Reverse a video stream (buffers the entire stream in memory).
+
+FFmpeg filter(s): `reverse`
+
+## normalize
+
+`normalize(a: audio)`
+
+`normalize(a: audio, lufs: num)`
+
+Normalize loudness to EBU R128 (default -24 LUFS, or the given target).
+
+FFmpeg filter(s): `loudnorm`
+
+## highpass
+
+`highpass(a: audio, freq: num)`
+
+Attenuate frequencies below freq Hz (ffmpeg highpass).
+
+FFmpeg filter(s): `highpass`
+
+## lowpass
+
+`lowpass(a: audio, freq: num)`
+
+Attenuate frequencies above freq Hz (ffmpeg lowpass).
+
+FFmpeg filter(s): `lowpass`
+
+## delay
+
+`delay(a: audio, seconds: num)`
+
+Delay audio by seconds (converted to integer milliseconds; ffmpeg adelay).
+
+FFmpeg filter(s): `adelay`
+
+## acrossfade
+
+`acrossfade(a: audio, b: audio, dur: num)`
+
+Cross fade from a to b over dur seconds of audio.
+
+FFmpeg filter(s): `acrossfade`
+
+## areverse
+
+`areverse(a: audio)`
+
+Reverse an audio stream (buffers the entire stream in memory).
+
+FFmpeg filter(s): `areverse`

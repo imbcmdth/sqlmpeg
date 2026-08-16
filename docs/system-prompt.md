@@ -241,6 +241,48 @@ argument kinds.
   Fade audio out to silence over dur seconds starting at `at` seconds (without `at` the fade starts at t=0 and every later sample is silent; pass at = clip length - dur to fade at the end).
 - `reverb(a: audio, decay: num)`
   Approximate reverb via a single-tap echo (aecho); not a true convolution reverb, but a cheap, dependency-free stand-in.
+- `rotate(f: video, degrees: num)`
+  Rotate a frame degrees clockwise (ffmpeg evaluates the angle expression).
+- `pad(f: video, w: num, h: num) | pad(f: video, w: num, h: num, color: str) | pad(f: video, w: num, h: num, x: num, y: num) | pad(f: video, w: num, h: num, x: num, y: num, color: str)`
+  Pad a frame to w x h; with just (w, h) the original is centered on a black background, (x, y) place it explicitly, and a trailing color string sets the background.
+- `hstack(a: video, b: video)`
+  Stack two frames side by side horizontally (inputs should share height).
+- `vstack(a: video, b: video)`
+  Stack two frames vertically (inputs should share width).
+- `fps(f: video, rate: num)`
+  Force a constant output frame rate, duplicating or dropping frames as needed.
+- `sharpen(f: video, amount: num)`
+  Sharpen a frame by the given luma amount (ffmpeg unsharp, 5x5 matrix).
+- `deinterlace(f: video)`
+  Deinterlace a frame (ffmpeg yadif, default mode/parity).
+- `denoise(f: video, strength: num)`
+  Denoise a frame by the given luma spatial strength (ffmpeg hqdn3d).
+- `brightness(f: video, v: num)`
+  Adjust brightness by v (-1..1, 0 = unchanged; ffmpeg eq).
+- `contrast(f: video, v: num)`
+  Adjust contrast by v (0..2, 1 = unchanged; ffmpeg eq).
+- `saturate(f: video, v: num)`
+  Adjust saturation by v (0..3, 1 = unchanged; ffmpeg eq).
+- `grayscale(f: video)`
+  Desaturate a frame to grayscale (ffmpeg hue, s=0).
+- `crossfade(a: video, b: video, dur: num, offset: num) | crossfade(a: video, b: video, dur: num, offset: num, transition: str)`
+  Cross fade from a to b over dur seconds, starting offset seconds into a (default transition 'fade'); inputs must share resolution and fps.
+- `subtitles(f: video, path: str)`
+  Burn subtitles from path into a frame at run time (the file must exist then).
+- `reverse(f: video)`
+  Reverse a video stream (buffers the entire stream in memory).
+- `normalize(a: audio) | normalize(a: audio, lufs: num)`
+  Normalize loudness to EBU R128 (default -24 LUFS, or the given target).
+- `highpass(a: audio, freq: num)`
+  Attenuate frequencies below freq Hz (ffmpeg highpass).
+- `lowpass(a: audio, freq: num)`
+  Attenuate frequencies above freq Hz (ffmpeg lowpass).
+- `delay(a: audio, seconds: num)`
+  Delay audio by seconds (converted to integer milliseconds; ffmpeg adelay).
+- `acrossfade(a: audio, b: audio, dur: num)`
+  Cross fade from a to b over dur seconds of audio.
+- `areverse(a: audio)`
+  Reverse an audio stream (buffers the entire stream in memory).
 
 ## Examples
 

@@ -26,6 +26,28 @@ EXPECTED_NAMES = {
     "afade_in",
     "afade_out",
     "reverb",
+    # plan 029
+    "rotate",
+    "pad",
+    "hstack",
+    "vstack",
+    "fps",
+    "sharpen",
+    "deinterlace",
+    "denoise",
+    "brightness",
+    "contrast",
+    "saturate",
+    "grayscale",
+    "crossfade",
+    "subtitles",
+    "reverse",
+    "normalize",
+    "highpass",
+    "lowpass",
+    "delay",
+    "acrossfade",
+    "areverse",
 }
 
 
@@ -58,10 +80,11 @@ def _check_ctx_protocol(ctx: FakeCtx) -> ExpandCtx:
 
 def test_all_names_present() -> None:
     # Plan 003's table has video rows (the two `scale` arities share a row, as
-    # do `hflip`/`vflip`), and plan 015 adds the audio rows; every entry is
+    # do `hflip`/`vflip`), plan 015 adds the audio rows, and plan 029 promotes
+    # 21 more (15 video, 6 audio) from the dynamic long tail; every entry is
     # independently callable.
     assert set(FUNCTIONS.keys()) == EXPECTED_NAMES
-    assert len(FUNCTIONS) == len(EXPECTED_NAMES) == 18
+    assert len(FUNCTIONS) == len(EXPECTED_NAMES) == 39
 
 
 def test_names_match_spec_name_field() -> None:
@@ -83,8 +106,36 @@ def test_returns_video_or_audio() -> None:
         "speed",
         "fade_in",
         "fade_out",
+        "rotate",
+        "pad",
+        "hstack",
+        "vstack",
+        "fps",
+        "sharpen",
+        "deinterlace",
+        "denoise",
+        "brightness",
+        "contrast",
+        "saturate",
+        "grayscale",
+        "crossfade",
+        "subtitles",
+        "reverse",
     }
-    audio_names = {"volume", "amix", "atempo", "afade_in", "afade_out", "reverb"}
+    audio_names = {
+        "volume",
+        "amix",
+        "atempo",
+        "afade_in",
+        "afade_out",
+        "reverb",
+        "normalize",
+        "highpass",
+        "lowpass",
+        "delay",
+        "acrossfade",
+        "areverse",
+    }
     for name in video_names:
         assert FUNCTIONS[name].returns == "video"
     for name in audio_names:
@@ -112,6 +163,27 @@ def test_returns_video_or_audio() -> None:
         ("afade_in", {2}),
         ("afade_out", {2, 3}),
         ("reverb", {2}),
+        ("rotate", {2}),
+        ("pad", {3, 4, 5, 6}),
+        ("hstack", {2}),
+        ("vstack", {2}),
+        ("fps", {2}),
+        ("sharpen", {2}),
+        ("deinterlace", {1}),
+        ("denoise", {2}),
+        ("brightness", {2}),
+        ("contrast", {2}),
+        ("saturate", {2}),
+        ("grayscale", {1}),
+        ("crossfade", {4, 5}),
+        ("subtitles", {2}),
+        ("reverse", {1}),
+        ("normalize", {1, 2}),
+        ("highpass", {2}),
+        ("lowpass", {2}),
+        ("delay", {2}),
+        ("acrossfade", {3}),
+        ("areverse", {1}),
     ],
 )
 def test_arities(name: str, arities: set[int]) -> None:
@@ -374,6 +446,300 @@ def test_reverb() -> None:
         "delays": 60,
         "decays": 0.4,
     }
+    assert inputs == ["src:a"]
+    assert outputs == ["audio"]
+
+
+# --------------------------------------------------------------------------
+# plan 029: tier-1 promotions
+# --------------------------------------------------------------------------
+
+
+def test_rotate_degrees_expression() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["rotate"].expand(ctx, ["src:a", 90])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "rotate"
+    assert args == {"a": "90*PI/180"}
+    assert inputs == ["src:a"]
+    assert outputs == ["video"]
+
+
+def test_pad_centered_variant() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["pad"].expand(ctx, ["src:a", 640, 480])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "pad"
+    assert args == {"w": 640, "h": 480, "x": "(ow-iw)/2", "y": "(oh-ih)/2"}
+    assert inputs == ["src:a"]
+    assert outputs == ["video"]
+
+
+def test_pad_centered_with_color_variant() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["pad"].expand(ctx, ["src:a", 640, 480, "blue"])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "pad"
+    assert args == {
+        "w": 640,
+        "h": 480,
+        "x": "(ow-iw)/2",
+        "y": "(oh-ih)/2",
+        "color": "blue",
+    }
+
+
+def test_pad_explicit_xy_variant() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["pad"].expand(ctx, ["src:a", 640, 480, 10, 20])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "pad"
+    assert args == {"w": 640, "h": 480, "x": 10, "y": 20}
+
+
+def test_pad_explicit_xy_with_color_variant() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["pad"].expand(ctx, ["src:a", 640, 480, 10, 20, "red"])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "pad"
+    assert args == {"w": 640, "h": 480, "x": 10, "y": 20, "color": "red"}
+
+
+def test_hstack() -> None:
+    ctx = FakeCtx()
+    out = FUNCTIONS["hstack"].expand(ctx, ["src:a", "src:b"])
+    assert len(ctx.nodes) == 1
+    node_id, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "hstack"
+    assert args == {"inputs": 2}
+    assert inputs == ["src:a", "src:b"]
+    assert outputs == ["video"]
+    assert out == node_id
+
+
+def test_vstack() -> None:
+    ctx = FakeCtx()
+    out = FUNCTIONS["vstack"].expand(ctx, ["src:a", "src:b"])
+    assert len(ctx.nodes) == 1
+    node_id, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "vstack"
+    assert args == {"inputs": 2}
+    assert inputs == ["src:a", "src:b"]
+    assert outputs == ["video"]
+    assert out == node_id
+
+
+def test_fps() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["fps"].expand(ctx, ["src:a", 30])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "fps"
+    assert args == {"fps": 30}
+    assert inputs == ["src:a"]
+    assert outputs == ["video"]
+
+
+def test_sharpen() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["sharpen"].expand(ctx, ["src:a", 1.5])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "unsharp"
+    assert args == {"luma_msize_x": 5, "luma_msize_y": 5, "luma_amount": 1.5}
+    assert inputs == ["src:a"]
+    assert outputs == ["video"]
+
+
+def test_deinterlace() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["deinterlace"].expand(ctx, ["src:a"])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "yadif"
+    assert args == {}
+    assert inputs == ["src:a"]
+    assert outputs == ["video"]
+
+
+def test_denoise() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["denoise"].expand(ctx, ["src:a", 4])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "hqdn3d"
+    assert args == {"luma_spatial": 4}
+    assert inputs == ["src:a"]
+    assert outputs == ["video"]
+
+
+def test_brightness() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["brightness"].expand(ctx, ["src:a", 0.2])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "eq"
+    assert args == {"brightness": 0.2}
+
+
+def test_contrast() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["contrast"].expand(ctx, ["src:a", 1.2])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "eq"
+    assert args == {"contrast": 1.2}
+
+
+def test_saturate() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["saturate"].expand(ctx, ["src:a", 1.5])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "eq"
+    assert args == {"saturation": 1.5}
+
+
+def test_grayscale() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["grayscale"].expand(ctx, ["src:a"])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "hue"
+    assert args == {"s": 0}
+    assert inputs == ["src:a"]
+    assert outputs == ["video"]
+
+
+def test_crossfade_default_transition() -> None:
+    ctx = FakeCtx()
+    out = FUNCTIONS["crossfade"].expand(ctx, ["src:a", "src:b", 1.0, 5.0])
+    assert len(ctx.nodes) == 1
+    node_id, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "xfade"
+    assert args == {"transition": "fade", "duration": 1.0, "offset": 5.0}
+    assert inputs == ["src:a", "src:b"]
+    assert outputs == ["video"]
+    assert out == node_id
+
+
+def test_crossfade_explicit_transition() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["crossfade"].expand(ctx, ["src:a", "src:b", 1.0, 5.0, "wipeleft"])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "xfade"
+    assert args == {"transition": "wipeleft", "duration": 1.0, "offset": 5.0}
+
+
+def test_subtitles() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["subtitles"].expand(ctx, ["src:a", "subs.srt"])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "subtitles"
+    assert args == {"filename": "subs.srt"}
+    assert inputs == ["src:a"]
+    assert outputs == ["video"]
+
+
+def test_reverse() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["reverse"].expand(ctx, ["src:a"])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "reverse"
+    assert args == {}
+    assert inputs == ["src:a"]
+    assert outputs == ["video"]
+
+
+def test_normalize_default() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["normalize"].expand(ctx, ["src:a"])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "loudnorm"
+    assert args == {}
+    assert inputs == ["src:a"]
+    assert outputs == ["audio"]
+
+
+def test_normalize_with_target() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["normalize"].expand(ctx, ["src:a", -16.0])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "loudnorm"
+    assert args == {"I": -16.0}
+
+
+def test_highpass() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["highpass"].expand(ctx, ["src:a", 200])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "highpass"
+    assert args == {"f": 200}
+    assert inputs == ["src:a"]
+    assert outputs == ["audio"]
+
+
+def test_lowpass() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["lowpass"].expand(ctx, ["src:a", 3000])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "lowpass"
+    assert args == {"f": 3000}
+    assert inputs == ["src:a"]
+    assert outputs == ["audio"]
+
+
+def test_delay_converts_seconds_to_milliseconds() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["delay"].expand(ctx, ["src:a", 0.25])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "adelay"
+    assert args == {"delays": 250, "all": 1}
+    assert inputs == ["src:a"]
+    assert outputs == ["audio"]
+
+
+def test_delay_rounds_to_nearest_millisecond() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["delay"].expand(ctx, ["src:a", 1.2346])
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "adelay"
+    assert args == {"delays": 1235, "all": 1}
+    assert isinstance(args["delays"], int)
+
+
+def test_acrossfade() -> None:
+    ctx = FakeCtx()
+    out = FUNCTIONS["acrossfade"].expand(ctx, ["src:a", "src:b", 2.0])
+    assert len(ctx.nodes) == 1
+    node_id, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "acrossfade"
+    assert args == {"d": 2.0}
+    assert inputs == ["src:a", "src:b"]
+    assert outputs == ["audio"]
+    assert out == node_id
+
+
+def test_areverse() -> None:
+    ctx = FakeCtx()
+    FUNCTIONS["areverse"].expand(ctx, ["src:a"])
+    assert len(ctx.nodes) == 1
+    _, filt, args, inputs, outputs = ctx.nodes[0]
+    assert filt == "areverse"
+    assert args == {}
     assert inputs == ["src:a"]
     assert outputs == ["audio"]
 

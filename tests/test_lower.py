@@ -1818,3 +1818,29 @@ def test_union_of_disagreeing_tracks_drops_the_language(
         f"UNION ALL SELECT b.audio[2] FROM input('{_av3_fixture}') b"
     )
     assert [o.metadata for o in g.outputs] == [{}]
+
+
+# ---------------------------------------------------------------------------
+# plan 029: crossfade of two WHERE-trimmed segments (compile-only)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.exec
+def test_crossfade_of_two_trimmed_segments_compiles(
+    _av2_fixture: str, _av3_fixture: str
+) -> None:
+    """Each side is trimmed to a 2s window via WHERE, then crossfaded over 1s
+    starting 1s into the first segment -- exercises xfade as a real multi-input
+    tier-1 call against two independently trimmed/setpts-reset video streams."""
+    g = compile_sql(
+        f"SELECT crossfade(a.frame, b.frame, 1, 1) "
+        f"FROM input('{_av2_fixture}') a, input('{_av3_fixture}') b "
+        f"WHERE a.t BETWEEN 0 AND 2 AND b.t BETWEEN 0 AND 2"
+    )
+    assert _filters(g) == ["trim", "setpts", "trim", "setpts", "xfade"]
+    xfade = g.nodes["n5"]
+    assert xfade.filter == "xfade"
+    assert xfade.args == {"transition": "fade", "duration": 1, "offset": 1}
+    assert xfade.inputs == ["n2", "n4"]
+    assert xfade.outputs == ["video"]
+    assert _outputs(g) == [("n5", "video", None)]

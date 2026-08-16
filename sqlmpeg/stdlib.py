@@ -205,6 +205,168 @@ def _expand_reverb(ctx: ExpandCtx, args: list[object]) -> FrameRef:
 
 
 # --------------------------------------------------------------------------
+# expand implementations - video (plan 029)
+# --------------------------------------------------------------------------
+
+
+def _expand_rotate(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    f = _as_stream(args[0])
+    degrees = args[1]
+    return ctx.node("rotate", {"a": f"{degrees}*PI/180"}, [f], ["video"])
+
+
+def _expand_pad(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    f = _as_stream(args[0])
+    w, h = args[1], args[2]
+    if len(args) == 3:
+        pad_args: dict[str, object] = {"w": w, "h": h, "x": "(ow-iw)/2", "y": "(oh-ih)/2"}
+    elif len(args) == 4:
+        color = args[3]
+        pad_args = {"w": w, "h": h, "x": "(ow-iw)/2", "y": "(oh-ih)/2", "color": color}
+    elif len(args) == 5:
+        x, y = args[3], args[4]
+        pad_args = {"w": w, "h": h, "x": x, "y": y}
+    else:
+        x, y, color = args[3], args[4], args[5]
+        pad_args = {"w": w, "h": h, "x": x, "y": y, "color": color}
+    return ctx.node("pad", pad_args, [f], ["video"])
+
+
+def _expand_hstack(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    a = _as_stream(args[0])
+    b = _as_stream(args[1])
+    return ctx.node("hstack", {"inputs": 2}, [a, b], ["video"])
+
+
+def _expand_vstack(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    a = _as_stream(args[0])
+    b = _as_stream(args[1])
+    return ctx.node("vstack", {"inputs": 2}, [a, b], ["video"])
+
+
+def _expand_fps(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    f = _as_stream(args[0])
+    rate = args[1]
+    return ctx.node("fps", {"fps": rate}, [f], ["video"])
+
+
+def _expand_sharpen(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    f = _as_stream(args[0])
+    amount = args[1]
+    return ctx.node(
+        "unsharp",
+        {"luma_msize_x": 5, "luma_msize_y": 5, "luma_amount": amount},
+        [f],
+        ["video"],
+    )
+
+
+def _expand_deinterlace(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    f = _as_stream(args[0])
+    return ctx.node("yadif", {}, [f], ["video"])
+
+
+def _expand_denoise(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    # Only luma_spatial is set; hqdn3d derives chroma_spatial/luma_tmp/chroma_tmp
+    # from it when they are left at their defaults (ffmpeg docs: "hqdn3d").
+    f = _as_stream(args[0])
+    strength = args[1]
+    return ctx.node("hqdn3d", {"luma_spatial": strength}, [f], ["video"])
+
+
+def _expand_brightness(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    f = _as_stream(args[0])
+    v = args[1]
+    return ctx.node("eq", {"brightness": v}, [f], ["video"])
+
+
+def _expand_contrast(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    f = _as_stream(args[0])
+    v = args[1]
+    return ctx.node("eq", {"contrast": v}, [f], ["video"])
+
+
+def _expand_saturate(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    f = _as_stream(args[0])
+    v = args[1]
+    return ctx.node("eq", {"saturation": v}, [f], ["video"])
+
+
+def _expand_grayscale(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    f = _as_stream(args[0])
+    return ctx.node("hue", {"s": 0}, [f], ["video"])
+
+
+def _expand_crossfade(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    a = _as_stream(args[0])
+    b = _as_stream(args[1])
+    dur, offset = args[2], args[3]
+    transition = args[4] if len(args) == 5 else "fade"
+    return ctx.node(
+        "xfade",
+        {"transition": transition, "duration": dur, "offset": offset},
+        [a, b],
+        ["video"],
+    )
+
+
+def _expand_subtitles(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    f = _as_stream(args[0])
+    path = args[1]
+    return ctx.node("subtitles", {"filename": path}, [f], ["video"])
+
+
+def _expand_reverse(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    f = _as_stream(args[0])
+    return ctx.node("reverse", {}, [f], ["video"])
+
+
+# --------------------------------------------------------------------------
+# expand implementations - audio (plan 029)
+# --------------------------------------------------------------------------
+
+
+def _expand_normalize(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    a = _as_stream(args[0])
+    if len(args) == 2:
+        lufs = args[1]
+        return ctx.node("loudnorm", {"I": lufs}, [a], ["audio"])
+    return ctx.node("loudnorm", {}, [a], ["audio"])
+
+
+def _expand_highpass(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    a = _as_stream(args[0])
+    freq = args[1]
+    return ctx.node("highpass", {"f": freq}, [a], ["audio"])
+
+
+def _expand_lowpass(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    a = _as_stream(args[0])
+    freq = args[1]
+    return ctx.node("lowpass", {"f": freq}, [a], ["audio"])
+
+
+def _expand_delay(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    a = _as_stream(args[0])
+    seconds = args[1]
+    assert isinstance(seconds, (int, float))
+    ms = round(seconds * 1000)
+    return ctx.node("adelay", {"delays": ms, "all": 1}, [a], ["audio"])
+
+
+def _expand_acrossfade(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    a = _as_stream(args[0])
+    b = _as_stream(args[1])
+    dur = args[2]
+    return ctx.node("acrossfade", {"d": dur}, [a, b], ["audio"])
+
+
+def _expand_areverse(ctx: ExpandCtx, args: list[object]) -> FrameRef:
+    a = _as_stream(args[0])
+    return ctx.node("areverse", {}, [a], ["audio"])
+
+
+# --------------------------------------------------------------------------
 # THE function table (guardrail #4: single source of truth)
 # --------------------------------------------------------------------------
 
@@ -371,6 +533,174 @@ FUNCTIONS: dict[str, FuncSpec] = {
             "convolution reverb, but a cheap, dependency-free stand-in."
         ),
         expand=_expand_reverb,
+        returns="audio",
+    ),
+    # ----------------------------------------------------------------------
+    # plan 029: tier-1 promotions
+    # ----------------------------------------------------------------------
+    "rotate": FuncSpec(
+        name="rotate",
+        variants=((_video("f"), _num("degrees")),),
+        doc="Rotate a frame degrees clockwise (ffmpeg evaluates the angle expression).",
+        expand=_expand_rotate,
+        returns="video",
+    ),
+    "pad": FuncSpec(
+        name="pad",
+        variants=(
+            (_video("f"), _num("w"), _num("h")),
+            (_video("f"), _num("w"), _num("h"), _str("color")),
+            (_video("f"), _num("w"), _num("h"), _num("x"), _num("y")),
+            (_video("f"), _num("w"), _num("h"), _num("x"), _num("y"), _str("color")),
+        ),
+        doc=(
+            "Pad a frame to w x h; with just (w, h) the original is centered on a "
+            "black background, (x, y) place it explicitly, and a trailing color "
+            "string sets the background."
+        ),
+        expand=_expand_pad,
+        returns="video",
+    ),
+    "hstack": FuncSpec(
+        name="hstack",
+        variants=((_video("a"), _video("b")),),
+        doc="Stack two frames side by side horizontally (inputs should share height).",
+        expand=_expand_hstack,
+        returns="video",
+    ),
+    "vstack": FuncSpec(
+        name="vstack",
+        variants=((_video("a"), _video("b")),),
+        doc="Stack two frames vertically (inputs should share width).",
+        expand=_expand_vstack,
+        returns="video",
+    ),
+    "fps": FuncSpec(
+        name="fps",
+        variants=((_video("f"), _num("rate")),),
+        doc="Force a constant output frame rate, duplicating or dropping frames as needed.",
+        expand=_expand_fps,
+        returns="video",
+    ),
+    "sharpen": FuncSpec(
+        name="sharpen",
+        variants=((_video("f"), _num("amount")),),
+        doc="Sharpen a frame by the given luma amount (ffmpeg unsharp, 5x5 matrix).",
+        expand=_expand_sharpen,
+        returns="video",
+    ),
+    "deinterlace": FuncSpec(
+        name="deinterlace",
+        variants=((_video("f"),),),
+        doc="Deinterlace a frame (ffmpeg yadif, default mode/parity).",
+        expand=_expand_deinterlace,
+        returns="video",
+    ),
+    "denoise": FuncSpec(
+        name="denoise",
+        variants=((_video("f"), _num("strength")),),
+        doc="Denoise a frame by the given luma spatial strength (ffmpeg hqdn3d).",
+        expand=_expand_denoise,
+        returns="video",
+    ),
+    "brightness": FuncSpec(
+        name="brightness",
+        variants=((_video("f"), _num("v")),),
+        doc="Adjust brightness by v (-1..1, 0 = unchanged; ffmpeg eq).",
+        expand=_expand_brightness,
+        returns="video",
+    ),
+    "contrast": FuncSpec(
+        name="contrast",
+        variants=((_video("f"), _num("v")),),
+        doc="Adjust contrast by v (0..2, 1 = unchanged; ffmpeg eq).",
+        expand=_expand_contrast,
+        returns="video",
+    ),
+    "saturate": FuncSpec(
+        name="saturate",
+        variants=((_video("f"), _num("v")),),
+        doc="Adjust saturation by v (0..3, 1 = unchanged; ffmpeg eq).",
+        expand=_expand_saturate,
+        returns="video",
+    ),
+    "grayscale": FuncSpec(
+        name="grayscale",
+        variants=((_video("f"),),),
+        doc="Desaturate a frame to grayscale (ffmpeg hue, s=0).",
+        expand=_expand_grayscale,
+        returns="video",
+    ),
+    "crossfade": FuncSpec(
+        name="crossfade",
+        variants=(
+            (_video("a"), _video("b"), _num("dur"), _num("offset")),
+            (_video("a"), _video("b"), _num("dur"), _num("offset"), _str("transition")),
+        ),
+        doc=(
+            "Cross fade from a to b over dur seconds, starting offset seconds into a "
+            "(default transition 'fade'); inputs must share resolution and fps."
+        ),
+        expand=_expand_crossfade,
+        returns="video",
+    ),
+    "subtitles": FuncSpec(
+        name="subtitles",
+        variants=((_video("f"), _str("path")),),
+        doc="Burn subtitles from path into a frame at run time (the file must exist then).",
+        expand=_expand_subtitles,
+        returns="video",
+    ),
+    "reverse": FuncSpec(
+        name="reverse",
+        variants=((_video("f"),),),
+        doc="Reverse a video stream (buffers the entire stream in memory).",
+        expand=_expand_reverse,
+        returns="video",
+    ),
+    "normalize": FuncSpec(
+        name="normalize",
+        variants=(
+            (_audio("a"),),
+            (_audio("a"), _num("lufs")),
+        ),
+        doc="Normalize loudness to EBU R128 (default -24 LUFS, or the given target).",
+        expand=_expand_normalize,
+        returns="audio",
+    ),
+    "highpass": FuncSpec(
+        name="highpass",
+        variants=((_audio("a"), _num("freq")),),
+        doc="Attenuate frequencies below freq Hz (ffmpeg highpass).",
+        expand=_expand_highpass,
+        returns="audio",
+    ),
+    "lowpass": FuncSpec(
+        name="lowpass",
+        variants=((_audio("a"), _num("freq")),),
+        doc="Attenuate frequencies above freq Hz (ffmpeg lowpass).",
+        expand=_expand_lowpass,
+        returns="audio",
+    ),
+    "delay": FuncSpec(
+        name="delay",
+        variants=((_audio("a"), _num("seconds")),),
+        doc="Delay audio by seconds (converted to integer milliseconds; ffmpeg adelay).",
+        expand=_expand_delay,
+        returns="audio",
+    ),
+    "acrossfade": FuncSpec(
+        name="acrossfade",
+        variants=((_audio("a"), _audio("b"), _num("dur")),),
+        doc="Cross fade from a to b over dur seconds of audio.",
+        expand=_expand_acrossfade,
+        returns="audio",
+    ),
+    "areverse": FuncSpec(
+        name="areverse",
+        variants=((_audio("a"),),),
+        doc="Reverse an audio stream (buffers the entire stream in memory).",
+        expand=_expand_areverse,
         returns="audio",
     ),
 }

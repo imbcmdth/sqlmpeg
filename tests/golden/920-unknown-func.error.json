@@ -2,6 +2,6 @@
   "line": 1,
   "col": 8,
   "code": "UNKNOWN_FUNCTION",
-  "message": "unknown function sharpen()",
-  "hint": "known functions: afade_in, afade_out, amix, atempo, blur, blur_regions, crop, draw_box, fade_in, fade_out, hflip, overlay, reverb, scale, speed, text, vflip, volume"
+  "message": "unknown function xyzzyplugh()",
+  "hint": "known functions: acrossfade, afade_in, afade_out, amix, areverse, atempo, blur, blur_regions, brightness, contrast, crop, crossfade, deinterlace, delay, denoise, draw_box, fade_in, fade_out, fps, grayscale, hflip, highpass, hstack, lowpass, normalize, overlay, pad, reverb, reverse, rotate, saturate, scale, sharpen, speed, subtitles, text, vflip, volume, vstack"
 }
