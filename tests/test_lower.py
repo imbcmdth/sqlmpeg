@@ -1467,6 +1467,135 @@ def test_pipeline_output_survives_a_round_trip_through_dicts(_fixtures: None) ->
 
 
 # ---------------------------------------------------------------------------
+# COPY ... TO ... WITH (...) -- the sink (RFC-002, plan 026)
+# ---------------------------------------------------------------------------
+
+SINK_QUERY = "SELECT a.frame FROM input('x.mp4') a"
+
+
+def _sink_of(options: str) -> dict[str, object]:
+    """The lowered sink of `SINK_QUERY` wrapped in a COPY with `options`."""
+    with_clause = f" WITH ({options})" if options else ""
+    g = _lower(f"COPY ({SINK_QUERY}) TO 'out.mkv'{with_clause}")
+    assert g.sink is not None
+    assert g.sink.path == "out.mkv"
+    return g.sink.options
+
+
+def test_bare_select_has_no_sink() -> None:
+    g = _lower(SINK_QUERY)
+    assert g.sink is None
+    assert "sink" not in g.to_dict()
+
+
+def test_copy_lowers_to_a_sink() -> None:
+    assert _sink_of("video_codec 'libx264', crf 20, faststart true") == {
+        "video_codec": "libx264",
+        "crf": 20,
+        "faststart": True,
+    }
+
+
+def test_sink_options_keep_their_written_order() -> None:
+    assert list(_sink_of("crf 20, preset 'slow', audio_codec 'aac'")) == [
+        "crf",
+        "preset",
+        "audio_codec",
+    ]
+
+
+def test_copy_without_options_lowers_to_an_empty_sink() -> None:
+    assert _sink_of("") == {}
+
+
+@pytest.mark.parametrize("written, value", [("true", True), ("false", False)])
+def test_faststart_takes_a_bool(written: str, value: bool) -> None:
+    assert _sink_of(f"faststart {written}") == {"faststart": value}
+
+
+def test_sink_option_values_are_normalized_python_scalars() -> None:
+    """The IR only ever carries str/int/bool -- no sqlglot nodes, no Decimal."""
+    options = _sink_of("video_codec 'libx264', sample_rate 48000, faststart true")
+    assert [type(v) for v in options.values()] == [str, int, bool]
+
+
+def test_sink_survives_the_split_pass_and_serializes() -> None:
+    g = compile_sql(
+        "COPY (SELECT a.frame, a.frame FROM input('x.mp4') a) "
+        "TO 'out.mp4' WITH (video_codec 'libx264', crf 18, faststart true)"
+    )
+    # the projection is used twice, so the split pass rebuilt the graph
+    assert "split" in _filters(g)
+    assert g.to_dict()["sink"] == {
+        "path": "out.mp4",
+        "options": {"video_codec": "libx264", "crf": 18, "faststart": True},
+    }
+    assert Graph.from_dict(g.to_dict()).to_dict() == g.to_dict()
+
+
+def test_unknown_sink_option_is_anchored_on_its_own_line() -> None:
+    err = _reject(
+        f"COPY (\n  {SINK_QUERY}\n) TO 'out.mkv' WITH (\n"
+        f"  crf 20,\n  bogus_option 'x'\n)"
+    )
+    assert err.code is ErrorCode.UNKNOWN_SINK_OPTION
+    assert "unknown sink option 'bogus_option'" in err.message
+    assert err.line == 5
+
+
+def test_unknown_sink_option_suggests_the_near_miss() -> None:
+    err = _reject(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH (crff 20)")
+    assert err.code is ErrorCode.UNKNOWN_SINK_OPTION
+    assert err.hint == "did you mean 'crf'?"
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [
+        ("crf 'high'", "expects an int, got 'high'"),
+        ("crf 1.5", "expects an int, got 1.5"),
+        ("crf true", "expects an int, got True"),
+        ("faststart 1", "expects a bool, got 1"),
+        ("faststart 'yes'", "expects a bool, got 'yes'"),
+        ("faststart NULL", "expects a bool, got NULL"),
+        # a bare word and a double-quoted word are neither a string nor a bool
+        ("preset slow", "expects a str, got the bare word slow"),
+        ('preset "slow"', 'expects a str, got the identifier "slow"'),
+        ("video_codec 42", "expects a str, got 42"),
+        ("video_codec true", "expects a str, got True"),
+    ],
+)
+def test_bad_sink_option_value_is_a_type_error(options: str, message: str) -> None:
+    err = _reject(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH ({options})")
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert message in err.message
+    assert err.hint is not None
+
+
+def test_an_invalid_inner_query_beats_the_sink_options() -> None:
+    """The COPY wrapper never masks (or is masked by) the query's own errors."""
+    err = _reject(
+        "COPY (SELECT a.frame FROM input('x.mp4') a GROUP BY a.frame) "
+        "TO 'out.mkv' WITH (bogus_option 1)"
+    )
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+
+    err = _reject(
+        "COPY (SELECT nosuchfilter(a.frame) FROM input('x.mp4') a) "
+        "TO 'out.mkv' WITH (bogus_option 1)"
+    )
+    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+
+
+def test_sink_does_not_change_the_graph_shape() -> None:
+    """Wrapping a query in a COPY adds a sink and touches nothing else."""
+    plain = compile_sql(SINK_QUERY).to_dict()
+    wrapped = compile_sql(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH (crf 20)").to_dict()
+    assert wrapped.pop("sink") == {"path": "out.mkv", "options": {"crf": 20}}
+    assert wrapped == plain
+
+
+# ---------------------------------------------------------------------------
 # real probing against a generated fixture
 # ---------------------------------------------------------------------------
 

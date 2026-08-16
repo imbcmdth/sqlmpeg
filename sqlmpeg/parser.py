@@ -21,6 +21,11 @@ Notes for downstream passes (lower):
 * The SELECT list may hold MORE THAN ONE projection (RFC-001: one column = one
   output stream). ``SINGLE_OUTPUT_ONLY`` is retired; the parser only rejects an
   empty projection list.
+* A statement may be wrapped in ``COPY (<query>) TO '<path>' WITH (<options>)``
+  (RFC-002). The COPY is peeled off into ``Resolved.sink`` and the query it
+  wraps goes through the EXACT same validation a bare SELECT does; a bare
+  SELECT leaves ``sink`` None. Only the shape is checked here — option NAMES
+  and VALUES are validated against ``sqlmpeg.sink.SINK_OPTIONS`` by lower.
 * Stream subscripts (``a.video[1]``) arrive as ``exp.Bracket`` wrapping the
   ``exp.Column``. **sqlglot rebases the index at parse time**: under
   ``read="postgres"`` (``INDEX_OFFSET = 1``) it rewrites the single subscript
@@ -41,7 +46,15 @@ from sqlglot.errors import ParseError, SqlglotError
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 
-__all__ = ["Resolved", "parse", "resolve", "subscript_index", "union_branches"]
+__all__ = [
+    "RawSink",
+    "RawSinkOption",
+    "Resolved",
+    "parse",
+    "resolve",
+    "subscript_index",
+    "union_branches",
+]
 
 # A top-level (or CTE-level) query: a plain SELECT, or a UNION ALL of them.
 QueryExpr = exp.Select | exp.Union
@@ -70,6 +83,10 @@ _SELECT_ALLOWED = frozenset({"with_", "expressions", "from_", "joins", "where"})
 _UNION_ALLOWED = frozenset({"with_", "this", "expression", "distinct"})
 _SUBQUERY_ALLOWED = frozenset({"this"})
 _BRACKET_ALLOWED = frozenset({"this", "expressions"})
+# Every arg sqlglot 30.17 puts on an exp.Copy. `kind` and `credentials` are
+# whitelisted here only so the generic check does not fire on them — each has
+# its own explicit rejection below.
+_COPY_ALLOWED = frozenset({"this", "kind", "credentials", "files", "params"})
 
 # The only column names an INPUT alias exposes. A CTE alias exposes whatever its
 # body named with AS, so the whitelist does not apply there (lower checks those).
@@ -90,6 +107,8 @@ _SUBSCRIPT_HINT = (
     "stream subscripts are 1-based integer literals: a.video[1] is the first "
     "video stream"
 )
+_SINK_HINT = "the only sink form is COPY (<query>) TO '<path>' WITH (<options>)"
+_OPTION_HINT = "sink options are name/value pairs, e.g. crf 20 or video_codec 'libx264'"
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +277,41 @@ def parse(text: str) -> exp.Expression:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class RawSinkOption:
+    """One ``WITH (name value)`` pair, still as sqlglot nodes (RFC-002).
+
+    `name` is folded lowercase the Postgres way. `value` is the raw sqlglot
+    node — lower turns it into a python str/int/bool and checks it against
+    ``sqlmpeg.sink.SINK_OPTIONS``; the parser deliberately knows nothing about
+    which options exist.
+
+    `name_node` is the ``exp.Var`` the name came from. VERIFIED (sqlglot
+    30.17): sqlglot records NO token position on it, nor on a ``Boolean`` /
+    ``Var`` / ``Null`` value, so it is kept only as a future-proof anchor —
+    what actually carries a line/col today is a ``Literal`` `value`, with
+    ``RawSink.path_node`` as the fallback.
+    """
+
+    name: str
+    value: exp.Expr
+    name_node: exp.Expr
+
+
+@dataclass(frozen=True)
+class RawSink:
+    """``COPY (query) TO 'path' WITH (...)`` as the parser saw it (RFC-002).
+
+    Shape only: the path is known to be a single string literal and the option
+    names to be unique, but nothing here has been checked against the option
+    table yet. ``sqlmpeg.lower`` turns this into ``sqlmpeg.ir.Sink``.
+    """
+
+    path: str
+    path_node: exp.Expr
+    options: tuple[RawSinkOption, ...] = ()
+
+
 @dataclass
 class Resolved:
     """Output of the resolve pass — the validated query plus its input table."""
@@ -276,6 +330,9 @@ class Resolved:
 
     branches: list[exp.Select] = field(default_factory=list)
     """``select`` flattened into UNION ALL branches; a single element if not a union."""
+
+    sink: RawSink | None = None
+    """The ``COPY ... TO ...`` wrapper, if there was one. None for a bare SELECT."""
 
 
 def _unwrap(node: exp.Expr) -> exp.Expr:
@@ -384,6 +441,135 @@ def union_branches(query: exp.Expr) -> list[exp.Select]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# COPY ... TO ... WITH (...)  — the sink wrapper (RFC-002)
+# ---------------------------------------------------------------------------
+
+
+def _sink(copy: exp.Copy) -> tuple[RawSink, exp.Expr]:
+    """Validate a top-level COPY and split it into ``(sink, wrapped query)``.
+
+    Shape only — the option table is lower's business. VERIFIED shapes under
+    sqlglot 30.17 ``read="postgres"``:
+
+    * ``kind`` is a plain bool: True for ``COPY ... FROM`` (loading), False for
+      ``COPY ... TO``. It is NOT an expression, so it has no position.
+    * ``files`` is a list — ``TO 'a', 'b'`` gives two entries, and ``TO STDOUT``
+      / ``TO x`` / ``TO PROGRAM 'cat'`` give an ``exp.Identifier`` rather than a
+      ``Literal``. All of those are rejected here.
+    * ``credentials`` is always an EMPTY ``exp.Credentials()`` — writing an
+      actual ``CREDENTIALS (...)`` clause makes sqlglot fall back to
+      ``exp.Command`` for the whole statement, which resolve rejects anyway.
+    """
+    if copy.args.get("kind"):
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "COPY FROM loads data and has no ffmpeg equivalent",
+            fallback=copy,
+            hint=_SINK_HINT,
+        )
+    _check_query_args(copy, _COPY_ALLOWED, "COPY")
+
+    credentials = copy.args.get("credentials")
+    if isinstance(credentials, exp.Expr) and credentials.args:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "COPY CREDENTIALS are not supported",
+            credentials,
+            fallback=copy,
+            hint=_SINK_HINT,
+        )
+
+    files = copy.args.get("files") or []
+    if len(files) != 1:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "COPY writes exactly one file",
+            _first_expression(files[1:]),
+            fallback=copy,
+            hint=_SINK_HINT,
+        )
+    target = files[0]
+    if not (isinstance(target, exp.Literal) and target.is_string):
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "COPY target must be a single-quoted file path",
+            target if isinstance(target, exp.Expr) else None,
+            fallback=copy,
+            hint=_SINK_HINT,
+        )
+
+    query = copy.this
+    if not isinstance(query, exp.Subquery | exp.Select | exp.Union):
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "COPY source must be a parenthesized query",
+            query if isinstance(query, exp.Expr) else None,
+            fallback=copy,
+            hint=_SINK_HINT,
+        )
+
+    sink = RawSink(
+        path=str(target.this), path_node=target, options=_sink_options(copy, target)
+    )
+    return sink, query
+
+
+def _sink_options(copy: exp.Copy, target: exp.Expr) -> tuple[RawSinkOption, ...]:
+    """The ``WITH (...)`` pairs, names folded and deduplicated.
+
+    Each is an ``exp.CopyParameter(this=Var(name), expression=<value>)``; a
+    value-less entry (``WITH (freeze)``, and both halves of ``WITH (faststart
+    on)``, which sqlglot splits into TWO bare parameters) has no ``expression``
+    at all and is rejected here.
+
+    Nothing in a ``CopyParameter`` but a ``Literal`` value carries a token
+    position, so `target` — the path literal, which sits on the ``TO`` line
+    just above the ``WITH`` block — is the fallback anchor.
+    """
+    options: list[RawSinkOption] = []
+    seen: set[str] = set()
+    for param in copy.args.get("params") or []:
+        if not isinstance(param, exp.CopyParameter):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "malformed sink option",
+                param if isinstance(param, exp.Expr) else None,
+                fallback=target,
+                hint=_OPTION_HINT,
+            )
+        name_node = param.this
+        name = _ident_name(name_node) if isinstance(name_node, exp.Expr) else ""
+        if not name or not isinstance(name_node, exp.Expr):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "malformed sink option",
+                param,
+                fallback=target,
+                hint=_OPTION_HINT,
+            )
+        value = param.args.get("expression")
+        if not isinstance(value, exp.Expr):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"sink option '{name}' has no value",
+                param,
+                fallback=target,
+                hint=_OPTION_HINT,
+            )
+        if name in seen:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"duplicate sink option '{name}'",
+                value,
+                fallback=target,
+                hint="each sink option may be set at most once",
+            )
+        seen.add(name)
+        options.append(RawSinkOption(name=name, value=value, name_node=name_node))
+    return tuple(options)
+
+
 class _Resolver:
     def __init__(self) -> None:
         self.input_paths: list[str] = []
@@ -400,6 +586,12 @@ class _Resolver:
                 tree,
                 hint="remove the trailing statements",
             )
+        # RFC-002: peel a COPY wrapper off first; what it wraps is validated
+        # exactly like a bare SELECT from here on.
+        sink: RawSink | None = None
+        if isinstance(tree, exp.Copy):
+            sink, tree = _sink(tree)
+
         query = _unwrap(tree)
         if not isinstance(query, exp.Select | exp.Union):
             raise _error(
@@ -421,6 +613,7 @@ class _Resolver:
             sources=self.sources,
             ctes=self.ctes,
             branches=branches,
+            sink=sink,
         )
 
     # -- CTEs -------------------------------------------------------------

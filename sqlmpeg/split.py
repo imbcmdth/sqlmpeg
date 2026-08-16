@@ -123,4 +123,7 @@ def insert_splits(g: Graph) -> Graph:
         sources=dict(g.sources),
         nodes=new_nodes,
         outputs=new_outputs,
+        # This pass rewrites the graph's SHAPE; the sink is a property of the
+        # whole job and passes through untouched (it is already validated).
+        sink=g.sink,
     )

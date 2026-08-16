@@ -14,6 +14,9 @@ SELECT overlay(a.frame, pip.frame, 20, 20)
 FROM input('game.mp4') a, pip
 """
 
+# The simplest query that resolves cleanly, for wrapping in a COPY sink.
+SINK_QUERY = "SELECT a.frame FROM input('x.mp4') a"
+
 
 def _resolve(sql: str) -> Resolved:
     return resolve(parse(sql))
@@ -584,6 +587,157 @@ def test_outside_the_surface(sql: str) -> None:
 def test_cte_body_must_be_a_select() -> None:
     err = _reject("WITH c AS (INSERT INTO t VALUES (1)) SELECT c.frame FROM c")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+# ---------------------------------------------------------------------------
+# COPY ... TO ... WITH (...)  — the sink wrapper (RFC-002, plan 026)
+# ---------------------------------------------------------------------------
+
+
+def test_bare_select_has_no_sink() -> None:
+    assert _resolve(SINK_QUERY).sink is None
+
+
+def test_copy_populates_the_sink() -> None:
+    res = _resolve(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH (video_codec 'libx264', crf 20)")
+    sink = res.sink
+    assert sink is not None
+    assert sink.path == "out.mkv"
+    assert [option.name for option in sink.options] == ["video_codec", "crf"]
+    # Values stay raw sqlglot nodes here: lower owns the option table.
+    assert [option.value.sql() for option in sink.options] == ["'libx264'", "20"]
+
+
+def test_copy_leaves_the_inner_query_untouched() -> None:
+    """The wrapped query resolves exactly like the same query written bare."""
+    bare = _resolve(SINK_QUERY)
+    wrapped = _resolve(f"COPY ({SINK_QUERY}) TO 'out.mkv'")
+    assert wrapped.input_paths == bare.input_paths == ["x.mp4"]
+    assert wrapped.sources == bare.sources == {"a": 0}
+    assert wrapped.select.sql() == bare.select.sql()
+
+
+def test_copy_without_with_has_no_options() -> None:
+    sink = _resolve(f"COPY ({SINK_QUERY}) TO 'out.mkv'").sink
+    assert sink is not None
+    assert sink.options == ()
+
+
+def test_copy_with_empty_option_list_has_no_options() -> None:
+    sink = _resolve(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH ()").sink
+    assert sink is not None
+    assert sink.options == ()
+
+
+def test_copy_option_names_are_folded_lowercase() -> None:
+    """sqlglot drops the quoting of an option name, so "CRF" folds like CRF."""
+    for written in ("CRF 20", '"CRF" 20'):
+        sink = _resolve(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH ({written})").sink
+        assert sink is not None
+        assert [option.name for option in sink.options] == ["crf"]
+
+
+def test_copy_wraps_a_cte_query() -> None:
+    res = _resolve(
+        "COPY (WITH c AS (SELECT a.frame AS f FROM input('x.mp4') a) "
+        "SELECT c.f FROM c) TO 'out.mkv'"
+    )
+    assert list(res.ctes) == ["c"]
+    assert res.sink is not None and res.sink.path == "out.mkv"
+
+
+def test_copy_wraps_a_union_all() -> None:
+    res = _resolve(
+        "COPY (SELECT a.frame FROM input('x') a UNION ALL "
+        "SELECT b.frame FROM input('y') b) TO 'out.mkv'"
+    )
+    assert len(res.branches) == 2
+    assert res.sink is not None
+
+
+def test_copy_keeps_no_streaming_equivalent_of_the_inner_query() -> None:
+    """A COPY wrapper never widens the surface: the inner error still wins."""
+    err = _reject(
+        "COPY (SELECT a.frame FROM input('x.mp4') a GROUP BY a.frame) "
+        "TO 'out.mkv' WITH (crf 20)"
+    )
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "COPY (SELECT frame FROM input('x.mp4') a) TO 'out.mkv'",
+        "COPY (SELECT a.frame FROM input('x.mp4')) TO 'out.mkv'",
+        "COPY (SELECT * FROM input('x.mp4') a) TO 'out.mkv'",
+        "COPY (SELECT a.frame FROM input('x.mp4') a LIMIT 1) TO 'out.mkv'",
+    ],
+)
+def test_copy_does_not_relax_inner_validation(sql: str) -> None:
+    assert _reject(sql).code in (
+        ErrorCode.UNSUPPORTED_SQL,
+        ErrorCode.NO_STREAMING_EQUIVALENT,
+    )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # COPY FROM loads data; there is no ffmpeg equivalent.
+        "COPY t FROM 'in.csv'",
+        "COPY t FROM 'in.csv' WITH (format 'csv')",
+        # not a parenthesized query
+        "COPY t TO 'out.csv'",
+        # more than one target
+        f"COPY ({SINK_QUERY}) TO 'a.mkv', 'b.mkv'",
+        # non-literal targets
+        f"COPY ({SINK_QUERY}) TO STDOUT",
+        f"COPY ({SINK_QUERY}) TO x",
+        f"COPY ({SINK_QUERY}) TO PROGRAM 'cat'",
+        # option with no value at all
+        f"COPY ({SINK_QUERY}) TO 'o.mkv' WITH (faststart)",
+        f"COPY ({SINK_QUERY}) TO 'o.mkv' WITH (faststart on)",
+        # duplicate option, folded name included
+        f"COPY ({SINK_QUERY}) TO 'o.mkv' WITH (crf 20, crf 21)",
+        f"COPY ({SINK_QUERY}) TO 'o.mkv' WITH (crf 20, CRF 21)",
+        # several statements
+        f"COPY ({SINK_QUERY}) TO 'a.mkv'; COPY ({SINK_QUERY}) TO 'b.mkv'",
+    ],
+)
+def test_bad_copy_is_rejected(sql: str) -> None:
+    assert _reject(sql).code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_copy_from_names_the_supported_form() -> None:
+    err = _reject("COPY t FROM 'in.csv'")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.hint is not None and "COPY (<query>) TO" in err.hint
+
+
+def test_duplicate_option_is_anchored_on_the_second_one() -> None:
+    err = _reject(
+        f"COPY ({SINK_QUERY})\nTO 'out.mkv' WITH (\n  crf 20,\n  crf 21\n)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "duplicate sink option 'crf'" in err.message
+    assert err.line == 4
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # sqlglot refuses a CTE in front of COPY outright ...
+        f"WITH c AS ({SINK_QUERY}) COPY (SELECT c.frame FROM c) TO 'o.mkv'",
+        # ... and a nested COPY, and a parenthesized one.
+        f"COPY (COPY ({SINK_QUERY}) TO 'a.mkv') TO 'b.mkv'",
+        f"(COPY ({SINK_QUERY}) TO 'o.mkv')",
+        # a negative or computed option value is not COPY syntax at all
+        f"COPY ({SINK_QUERY}) TO 'o.mkv' WITH (crf -3)",
+        f"COPY ({SINK_QUERY}) TO 'o.mkv' WITH (crf 20 + 1)",
+    ],
+)
+def test_copy_shapes_sqlglot_itself_refuses(sql: str) -> None:
+    assert _reject(sql).code is ErrorCode.PARSE_ERROR
 
 
 # ---------------------------------------------------------------------------

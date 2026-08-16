@@ -85,6 +85,12 @@ sqlglot notes that matter here
 * ``exp.Literal.to_py()`` returns ``decimal.Decimal`` for non-integer numbers,
   which neither ``emit`` nor JSON can render, so numeric literals are coerced
   to ``int``/``float`` here. ``-1.5`` parses as ``exp.Neg(Literal)``.
+* A COPY option value (``WITH (crf 20)``) is NOT always a ``Literal``: ``true``
+  / ``false`` arrive as ``exp.Boolean``, a bare word as ``exp.Var``, a
+  double-quoted word as ``exp.Identifier``, ``NULL`` as ``exp.Null``.
+  :func:`_sink_value` normalizes the first three shapes to python values and
+  hands everything else to the option table as an unrepresentable value, so
+  the SINK_OPTION_TYPE message and hint still come from the table.
 """
 
 from __future__ import annotations
@@ -96,10 +102,11 @@ from dataclasses import dataclass, field
 from sqlglot import exp
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import FrameRef, Graph, Node, Output, StreamType
-from sqlmpeg.parser import Resolved, _pos, subscript_index, union_branches
+from sqlmpeg.ir import FrameRef, Graph, Node, Output, Sink, StreamType
+from sqlmpeg.parser import RawSink, Resolved, _pos, subscript_index, union_branches
 from sqlmpeg.parser import _ident_name as _fold
 from sqlmpeg.probe import ProbeResult, StreamMeta
+from sqlmpeg.sink import validate_option
 from sqlmpeg.stdlib import FUNCTIONS, ExpandCtx, Param, signatures
 
 __all__ = ["lower"]
@@ -274,6 +281,56 @@ def _string(node: exp.Expr) -> str:
     return str(node.this)
 
 
+@dataclass(frozen=True)
+class _Unrepresentable:
+    """A COPY option value that is no python scalar at all (``NULL``, a bare word).
+
+    Handed to :func:`sqlmpeg.sink.validate_option` AS the value: it is never a
+    ``str``/``int``/``bool``, so every declared option type rejects it and the
+    SINK_OPTION_TYPE message plus its per-type hint still come from the option
+    table — guardrail #4, no option knowledge is duplicated here. ``__repr__``
+    is what the message interpolates, so it reads back as what the user wrote.
+    """
+
+    text: str
+
+    def __repr__(self) -> str:
+        return self.text
+
+
+def _sink_describe(node: exp.Expr) -> str:
+    if isinstance(node, exp.Var):
+        return f"the bare word {node.name}"
+    if isinstance(node, exp.Identifier):
+        return f'the identifier "{node.name}"'
+    return _describe(node)
+
+
+def _sink_value(node: exp.Expr) -> object:
+    """One ``COPY ... WITH (name value)`` value as a python scalar.
+
+    Never raises and never validates: an unusable shape comes back as an
+    :class:`_Unrepresentable`, and a well-formed value of the WRONG type (a
+    float for ``crf``, a string for ``faststart``) comes back as itself. The
+    option table decides in both cases.
+    """
+    if isinstance(node, exp.Boolean):
+        return bool(node.this)
+    if isinstance(node, exp.Literal):
+        if node.is_string:
+            return str(node.this)
+        try:
+            value = node.to_py()
+        except (ArithmeticError, TypeError, ValueError):
+            return _Unrepresentable(repr(str(node.this)))
+        if isinstance(value, bool):  # sqlglot never does this; be explicit anyway
+            return _Unrepresentable(repr(value))
+        # Decimal renders neither to JSON nor to an ffmpeg arg; float does, and
+        # a float is a type error for every v1 option anyway.
+        return value if isinstance(value, int) else float(value)
+    return _Unrepresentable(_sink_describe(node))
+
+
 # ---------------------------------------------------------------------------
 # typed values, bindings, per-branch environment
 # ---------------------------------------------------------------------------
@@ -435,7 +492,28 @@ class _Lowerer:
             for column in columns
             for stream in column.value.streams
         ]
+        if self.res.sink is not None:
+            self.graph.sink = self._lower_sink(self.res.sink)
         return self.graph
+
+    # -- the COPY sink (RFC-002) -------------------------------------------
+
+    def _lower_sink(self, raw: RawSink) -> Sink:
+        """Validate the COPY options against the table and normalize them.
+
+        Anchoring, VERIFIED against sqlglot 30.17: the option NAME (an
+        ``exp.Var``) carries no token position, and neither does a ``Boolean``
+        / ``Var`` / ``Null`` value, so the anchor falls back through the name
+        node to the value node to the path literal — which at least keeps
+        every rejection on (or just above) the ``WITH`` block.
+        """
+        options: dict[str, object] = {}
+        for option in raw.options:
+            line, col = _pos(option.name_node, option.value, raw.path_node)
+            options[option.name] = validate_option(
+                option.name, _sink_value(option.value), line=line, col=col
+            )
+        return Sink(path=raw.path, options=options)
 
     # -- a query (one SELECT, or a UNION ALL of them) ----------------------
 
