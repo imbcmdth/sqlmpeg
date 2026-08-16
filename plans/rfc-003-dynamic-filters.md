@@ -38,11 +38,39 @@ SELECT unsharp(a.frame, luma_msize_x => 7, luma_amount => 1.5) FROM ...
 SELECT compand(a.audio[1], attacks => '0.3', decays => '0.8') FROM ...
 ```
 
-Tier 1 keeps positional-only (its signatures are the documented contract).
-Named args on a tier-1 function → UDF_ARG_TYPE with a hint. Unknown names
-search both tiers for did-you-mean; a tier-2 match when ffmpeg is ABSENT gets
-a dedicated hint ("filter exists in ffmpeg but compile-time introspection
-needs ffmpeg on PATH").
+### Tier-1 named extras (amended 2026-08-15)
+
+Tier-1 functions ALSO accept trailing named args, reaching through to the
+underlying filter's full option set — the ergonomic positional signature
+covers the common case, named extras cover the long tail without new
+variants:
+
+```sql
+blur(a.frame, 5, planes => 1)                    -- gblur, planes named
+scale(a.frame, 1280, 720, flags => 'lanczos')
+crossfade(a, b, 1, 8, transition => 'wipeleft')
+```
+
+- `FuncSpec` gains `named_target: str | None` — the ffmpeg filter whose
+  introspected options validate the named args (blur→gblur, fade_in→fade).
+  `None` (macros like blur_regions, or targets with no useful options) →
+  named args rejected with a typed error naming the underlying filters.
+- Validation is the SAME path as tier-2 options: UNKNOWN_FILTER_OPTION /
+  FILTER_OPTION_TYPE, registry-backed. Therefore named extras require ffmpeg
+  at compile time and are rejected by `--portable` — one rule: "named args =
+  your installed ffmpeg". Positional-only tier-1 stays portable forever.
+- A named arg that collides with an option the positional signature already
+  sets (`crop(f, 0, 0, 10, 10, w => 5)`) → UDF_ARG_TYPE ("'w' is already set
+  by the positional signature"), never a silent override.
+- Rendering: validated extras merge into the produced node's args AFTER the
+  positional-mapped args, in written order (emit renders insertion order).
+  Mechanism note for implementation: lower injects extras into the expanded
+  node whose filter == named_target; specs are single-filter by construction
+  when named_target is set.
+
+Unknown names search both tiers for did-you-mean; a tier-2 match when ffmpeg
+is ABSENT gets a dedicated hint ("filter exists in ffmpeg but compile-time
+introspection needs ffmpeg on PATH").
 
 ## Registry mechanics (mirrors the probe pattern)
 
