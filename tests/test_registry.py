@@ -32,7 +32,7 @@ from pathlib import Path
 import pytest
 
 from sqlmpeg import registry as registry_mod
-from sqlmpeg.registry import DynamicFilter, FilterOption, clear_cache, load
+from sqlmpeg.registry import DynamicFilter, FilterOption, SourceFilter, clear_cache, load
 
 VERSION_LINE = "ffmpeg version 7.1-full_build-www.gyan.dev Copyright (c) 2000-2024 the FFmpeg developers"
 
@@ -58,6 +58,13 @@ Filters:
  ... aecho             A->A       Add echoing to the audio.
  ..C concat            N->N       Concatenate audio and video streams.
  ... testsrc           |->V       Generate test pattern.
+ ... testsrc2          |->V       Generate another test pattern.
+ ..C color             |->V       Provide an uniformly colored input.
+ ... nullsrc           |->V       Null video source, return unprocessed video frames.
+ ... anullsrc          |->A       Null audio source, return empty audio frames.
+ ... sine              |->A       Generate sine wave audio signal.
+ ..C avsynctest        |->AV      Generate an Audio Video Sync Test.
+ ..C amovie            |->N       Read audio from a movie source.
  ... anullsink         A->|       Do absolutely nothing with the input audio.
  ... nullsink          V->|       Do absolutely nothing with the input video.
  .S. xfade             VV->V      Cross fade one video with another video.
@@ -73,15 +80,26 @@ INCLUDED_NAMES = {
     "aap", "abench", "gblur", "overlay", "scale", "subtitles", "aecho",
     "xfade", "hqdn3d", "colormap", "threshold", "a3dscope",
 }
+# Sources: single V/A output, |->V or |->A. Excluded from `get()`/`names()`
+# same as before (v1 scope fence for column-function lookup), but now
+# retained and reachable via `get_source()`/`source_names()`.
+SOURCE_NAMES = {"testsrc", "testsrc2", "color", "nullsrc", "anullsrc", "sine"}
 EXCLUDED_NAMES = {
     "acrossover",  # A->N: dynamic pads
     "split",       # V->N: dynamic pads
     "concat",      # N->N: dynamic pads
-    "testsrc",     # |->V: source
+    "testsrc",     # |->V: source (now in SOURCE_NAMES, still excluded from get()/names())
+    "testsrc2",    # |->V: source
+    "color",       # |->V: source
+    "nullsrc",     # |->V: source
+    "anullsrc",    # |->A: source
+    "sine",        # |->A: source
+    "avsynctest",  # |->AV: multi-output source -- excluded from get_source() too
     "anullsink",   # A->|: sink
     "nullsink",    # V->|: sink
     "feedback",    # VV->VV: multi-output
     "movie",       # |->N: source + dynamic pads
+    "amovie",      # |->N: source + dynamic pads -- excluded from get_source() too
 }
 
 HELP_GBLUR = """\
@@ -258,10 +276,13 @@ aecho AVOptions:
 
 """
 
-# testsrc is a SOURCE filter (|->V) -- excluded from the registry per the
-# v1 scope fence, so its options are only reachable by calling the private
-# parser directly. Its short/long alias pairs (size/s, rate/r, duration/d,
-# decimals/n) are the clearest real example of alias dedup.
+# testsrc is a SOURCE filter (|->V) -- retained (plan 040) and reachable
+# through the normal `Registry.options()` lazy path since testsrc IS a
+# known name (self._sources), unlike sinks/multi-output/dynamic sources
+# which stay fully excluded. Its short/long alias pairs (size/s, rate/r,
+# duration/d, decimals/n) are the clearest real example of alias dedup;
+# "Inputs: none (source filter)" (vs. "#0: ...") is never parsed by this
+# module (only the AVOptions block matters), so it needs no special code.
 HELP_TESTSRC = """\
 Filter testsrc
   Generate test pattern.
@@ -279,6 +300,98 @@ testsrc AVOptions:
    sar               <rational>   ..FV....... set video sample aspect ratio (from 0 to INT_MAX) (default 1/1)
    decimals          <int>        ..FV....... set number of decimals to show (from 0 to 17) (default 0)
    n                 <int>        ..FV....... set number of decimals to show (from 0 to 17) (default 0)
+
+"""
+
+# anullsrc: another real short/long alias set (channel_layout/cl,
+# sample_rate/r, nb_samples/n, duration/d), long name first, and a
+# <channel_layout>-typed option (falls through the type map to "str").
+HELP_ANULLSRC = """\
+Filter anullsrc
+  Null audio source, return empty audio frames.
+    Inputs:
+        none (source filter)
+    Outputs:
+       #0: default (audio)
+anullsrc AVOptions:
+   channel_layout    <channel_layout> ..F.A...... set channel_layout (default "stereo")
+   cl                <channel_layout> ..F.A...... set channel_layout (default "stereo")
+   sample_rate       <int>        ..F.A...... set sample rate (from 1 to INT_MAX) (default 44100)
+   r                 <int>        ..F.A...... set sample rate (from 1 to INT_MAX) (default 44100)
+   nb_samples        <int>        ..F.A...... set the number of samples per requested frame (from 1 to 65535) (default 1024)
+   n                 <int>        ..F.A...... set the number of samples per requested frame (from 1 to 65535) (default 1024)
+   duration          <duration>   ..F.A...... set the audio duration (default -0.000001)
+   d                 <duration>   ..F.A...... set the audio duration (default -0.000001)
+
+"""
+
+HELP_SINE = """\
+Filter sine
+  Generate sine wave audio signal.
+    Inputs:
+        none (source filter)
+    Outputs:
+       #0: default (audio)
+sine AVOptions:
+   frequency         <double>     ..F.A...... set the sine frequency (from 0 to DBL_MAX) (default 440)
+   f                 <double>     ..F.A...... set the sine frequency (from 0 to DBL_MAX) (default 440)
+   beep_factor       <double>     ..F.A...... set the beep frequency factor (from 0 to DBL_MAX) (default 0)
+   b                 <double>     ..F.A...... set the beep frequency factor (from 0 to DBL_MAX) (default 0)
+   sample_rate       <int>        ..F.A...... set the sample rate (from 1 to INT_MAX) (default 44100)
+   r                 <int>        ..F.A...... set the sample rate (from 1 to INT_MAX) (default 44100)
+   duration          <duration>   ..F.A...... set the audio duration (default 0)
+   d                 <duration>   ..F.A...... set the audio duration (default 0)
+   samples_per_frame <string>     ..F.A...... set the number of samples per frame (default "1024")
+
+"""
+
+# color: the "color"/"c" option's own per-OPTION flags string ends in
+# ".....T." -- but that is NOT the filter-level timeline flag (this
+# module never parses per-option flags at all, see registry.py's module
+# docstring). color's OWN `-filters` flag column is "..C" (no T), and its
+# `-help` output correspondingly has no trailing "This filter has support
+# for timeline..." sentence -- confirmed empirically, not a T-flag filter.
+HELP_COLOR = """\
+Filter color
+  Provide an uniformly colored input.
+    Inputs:
+        none (source filter)
+    Outputs:
+       #0: default (video)
+color AVOptions:
+   color             <color>      ..FV.....T. set color (default "black")
+   c                 <color>      ..FV.....T. set color (default "black")
+   size              <image_size> ..FV....... set video size (default "320x240")
+   s                 <image_size> ..FV....... set video size (default "320x240")
+   rate              <video_rate> ..FV....... set video rate (default "25")
+   r                 <video_rate> ..FV....... set video rate (default "25")
+   duration          <duration>   ..FV....... set video duration (default -0.000001)
+   d                 <duration>   ..FV....... set video duration (default -0.000001)
+   sar               <rational>   ..FV....... set video sample aspect ratio (from 0 to INT_MAX) (default 1/1)
+
+"""
+
+# nullsrc's AVOptions header is "nullsrc/yuvtestsrc AVOptions:" -- shared
+# implementation with yuvtestsrc, NOT "nullsrc AVOptions:". Same
+# header-name-mismatch quirk as split/(a)split and overlay/framesync,
+# now confirmed on a source too (nullsrc is |->V, single output, so it's
+# a real included source, not merely excluded-and-reachable-via-private-
+# -parser like the others below).
+HELP_NULLSRC = """\
+Filter nullsrc
+  Null video source, return unprocessed video frames.
+    Inputs:
+        none (source filter)
+    Outputs:
+       #0: default (video)
+nullsrc/yuvtestsrc AVOptions:
+   size              <image_size> ..FV....... set video size (default "320x240")
+   s                 <image_size> ..FV....... set video size (default "320x240")
+   rate              <video_rate> ..FV....... set video rate (default "25")
+   r                 <video_rate> ..FV....... set video rate (default "25")
+   duration          <duration>   ..FV....... set video duration (default -0.000001)
+   d                 <duration>   ..FV....... set video duration (default -0.000001)
+   sar               <rational>   ..FV....... set video sample aspect ratio (from 0 to INT_MAX) (default 1/1)
 
 """
 
@@ -406,7 +519,11 @@ def _loaded_registry(monkeypatch: pytest.MonkeyPatch, **kwargs: object) -> regis
 def test_v_to_v_signature(monkeypatch: pytest.MonkeyPatch) -> None:
     reg = _loaded_registry(monkeypatch)
     assert reg.get("gblur") == DynamicFilter(
-        name="gblur", inputs=("video",), output="video", doc="Apply Gaussian Blur filter."
+        name="gblur",
+        inputs=("video",),
+        output="video",
+        doc="Apply Gaussian Blur filter.",
+        timeline=True,  # FILTERS_SNIPPET's gblur line is "TSC"
     )
 
 
@@ -455,6 +572,89 @@ def test_excluded_specs_absent_from_registry(monkeypatch: pytest.MonkeyPatch) ->
 def test_names_returns_exactly_the_included_set(monkeypatch: pytest.MonkeyPatch) -> None:
     reg = _loaded_registry(monkeypatch)
     assert set(reg.names()) == INCLUDED_NAMES
+
+
+# --- -filters parsing: sources --------------------------------------------
+
+
+def test_source_names_returns_exactly_the_single_output_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reg = _loaded_registry(monkeypatch)
+    assert set(reg.source_names()) == SOURCE_NAMES
+    # None of the sources leak into the regular-filter set (get()/names()).
+    assert SOURCE_NAMES.isdisjoint(set(reg.names()))
+
+
+def test_get_source_video_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    reg = _loaded_registry(monkeypatch)
+    f = reg.get_source("testsrc")
+    assert f == SourceFilter(name="testsrc", output="video", doc="Generate test pattern.")
+
+
+def test_get_source_audio_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    reg = _loaded_registry(monkeypatch)
+    f = reg.get_source("anullsrc")
+    assert f is not None
+    assert f.output == "audio"
+    assert f.doc == "Null audio source, return empty audio frames."
+
+
+def test_get_source_unknown_name_is_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    reg = _loaded_registry(monkeypatch)
+    assert reg.get_source("nope_not_a_filter") is None
+
+
+def test_get_source_excludes_multi_output_and_dynamic(monkeypatch: pytest.MonkeyPatch) -> None:
+    # avsynctest (|->AV, 2-char output) and amovie/movie (|->N, dynamic) are
+    # source-shaped but excluded, same v1 scope fence as regular filters.
+    reg = _loaded_registry(monkeypatch)
+    assert reg.get_source("avsynctest") is None
+    assert reg.get_source("amovie") is None
+    assert reg.get_source("movie") is None
+    for name in ("avsynctest", "amovie", "movie"):
+        assert name not in reg.source_names()
+
+
+def test_get_source_excludes_sinks(monkeypatch: pytest.MonkeyPatch) -> None:
+    reg = _loaded_registry(monkeypatch)
+    assert reg.get_source("anullsink") is None
+    assert reg.get_source("nullsink") is None
+
+
+def test_get_still_none_for_source_names_unchanged_column_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Deliverable #2: get() (column-function lookup) is UNCHANGED for
+    # sources -- a source is not callable as a column function.
+    reg = _loaded_registry(monkeypatch)
+    for name in SOURCE_NAMES:
+        assert reg.get(name) is None, name
+
+
+# --- -filters parsing: timeline (T) flag ----------------------------------
+
+
+def test_timeline_flag_true_for_t_prefixed_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    reg = _loaded_registry(monkeypatch)
+    # FILTERS_SNIPPET flag columns: "TSC gblur", "TSC overlay", "TSC hqdn3d",
+    # "TSC colormap", "TSC threshold", "TSC aap" -- all T-prefixed.
+    for name in ("gblur", "overlay", "hqdn3d", "colormap", "threshold", "aap"):
+        f = reg.get(name)
+        assert f is not None, name
+        assert f.timeline is True, name
+
+
+def test_timeline_flag_false_for_non_t_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    reg = _loaded_registry(monkeypatch)
+    # FILTERS_SNIPPET flag columns: "..C scale", "... subtitles",
+    # "... aecho", "..C a3dscope", ".S. xfade" -- none T-prefixed. xfade in
+    # particular has the S flag set but NOT T, proving the parser checks
+    # only the first character, not "any flag set".
+    for name in ("scale", "subtitles", "aecho", "a3dscope", "xfade"):
+        f = reg.get(name)
+        assert f is not None, name
+        assert f.timeline is False, name
 
 
 # --- -help option parsing: numeric range + default (gblur) --------------
@@ -559,10 +759,89 @@ def test_aecho_string_type_for_delays_and_decays(monkeypatch: pytest.MonkeyPatch
     assert opts["in_gain"].maximum == 1.0
 
 
+# --- -help option parsing: sources through Registry.options() -----------
+# Sources use the SAME lazy Registry.options() path as regular filters
+# (deliverable #1: "Registry.options(name) must work for sources too").
+
+
+def test_testsrc_options_via_registry_alias_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
+    reg = _loaded_registry(monkeypatch, help_map={"testsrc": HELP_TESTSRC})
+    opts = reg.options("testsrc")
+    assert opts is not None
+    assert "size" in opts and "s" not in opts
+    assert "rate" in opts and "r" not in opts
+    assert "duration" in opts and "d" not in opts
+    assert opts["sar"].type == "num"
+
+
+def test_anullsrc_options_via_registry_channel_layout_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reg = _loaded_registry(monkeypatch, help_map={"anullsrc": HELP_ANULLSRC})
+    opts = reg.options("anullsrc")
+    assert opts is not None
+    assert "channel_layout" in opts and "cl" not in opts
+    assert opts["channel_layout"].type == "str"  # <channel_layout> -- permissive fallback
+    assert "sample_rate" in opts and "r" not in opts
+    assert opts["sample_rate"].type == "num"
+
+
+def test_sine_options_via_registry_double_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    reg = _loaded_registry(monkeypatch, help_map={"sine": HELP_SINE})
+    opts = reg.options("sine")
+    assert opts is not None
+    assert "frequency" in opts and "f" not in opts
+    assert opts["frequency"].type == "num"
+    assert opts["frequency"].minimum == 0.0
+    assert opts["frequency"].maximum is None  # DBL_MAX unparseable
+    assert opts["samples_per_frame"].type == "str"
+
+
+def test_color_options_via_registry_color_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    reg = _loaded_registry(monkeypatch, help_map={"color": HELP_COLOR})
+    opts = reg.options("color")
+    assert opts is not None
+    assert "color" in opts and "c" not in opts
+    assert opts["color"].type == "str"  # <color> -- permissive fallback
+    assert opts["color"].default == '"black"'
+
+
+def test_nullsrc_options_via_registry_header_name_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # nullsrc's AVOptions header reads "nullsrc/yuvtestsrc AVOptions:" --
+    # must still parse via Registry.options(), not just the private helper.
+    reg = _loaded_registry(monkeypatch, help_map={"nullsrc": HELP_NULLSRC})
+    opts = reg.options("nullsrc")
+    assert opts is not None
+    assert "size" in opts and "s" not in opts
+    assert opts["sar"].type == "num"
+
+
+def test_source_options_lazy_and_memoized_like_regular_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _fake_run(monkeypatch, help_map={"testsrc": HELP_TESTSRC})
+    _fake_ffmpeg_present(monkeypatch)
+    reg = load()
+
+    def help_calls_for(name: str) -> int:
+        return sum(1 for c in calls if f"filter={name}" in c)
+
+    assert help_calls_for("testsrc") == 0
+    reg.options("testsrc")
+    reg.options("testsrc")  # memoized
+    assert help_calls_for("testsrc") == 1
+
+
 # --- alias dedup / header quirks, tested via the private help parser ----
-# (testsrc/split/anullsink are excluded filters -- source/sink/dynamic --
-# so their -help output is only reachable directly, not through
-# Registry.options(), which only serves known/included filters.)
+# split/anullsink are excluded (dynamic-pad regular filter / sink), so
+# their -help output is only reachable directly, not through
+# Registry.options(), which only serves known/included names. testsrc is
+# ALSO exercised directly here (this test predates plan 040's sources
+# support and still pins the private parser's behavior in isolation) --
+# it is additionally covered through the public Registry.options() path
+# above (test_testsrc_options_via_registry_alias_dedup).
 
 
 def test_testsrc_alias_dedup_keeps_longer_name(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -826,6 +1105,41 @@ def test_wrong_shape_cache_file_rebuilds_silently(
     assert sum(1 for c in calls if "-filters" in c) == 1
 
 
+def test_pre_040_cache_shape_rebuilds_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A plausible PRE-040 cache payload: valid JSON, right top-level shape,
+    # but missing "format_version" (didn't exist yet) and "sources"
+    # (didn't exist yet), and filter entries missing "timeline" (didn't
+    # exist yet). This is the exact shape _write_disk_cache produced
+    # before this plan. Must rebuild from -filters/-help, not raise and
+    # not silently return stale/incomplete data.
+    _fake_ffmpeg_present(monkeypatch)
+    calls = _fake_run(monkeypatch, help_map={"gblur": HELP_GBLUR})
+    cache_path = registry_mod._cache_path(VERSION_LINE)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    old_shape = {
+        "version_line": VERSION_LINE,
+        "filters": {
+            "gblur": {"inputs": ["video"], "output": "video", "doc": "Apply Gaussian Blur filter."}
+        },
+        "options": {},
+    }
+    cache_path.write_text(json.dumps(old_shape), encoding="utf-8")
+
+    reg = load()
+    assert reg.available() is True
+    # Rebuilt via a fresh -filters call, not read from the stale-shape file.
+    assert sum(1 for c in calls if "-filters" in c) == 1
+    f = reg.get("gblur")
+    assert f is not None
+    assert f.timeline is True  # only present because it was freshly parsed
+    opts = reg.options("gblur")
+    assert opts is not None and "sigma" in opts
+    # The rebuilt cache file is now current-format and includes sources.
+    assert set(reg.source_names()) == SOURCE_NAMES
+
+
 def test_clear_cache_removes_disk_file_and_forces_refetch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -883,9 +1197,15 @@ def test_filter_option_is_frozen() -> None:
 
 
 def test_dynamic_filter_is_frozen() -> None:
-    f = DynamicFilter(name="x", inputs=("video",), output="video", doc="d")
+    f = DynamicFilter(name="x", inputs=("video",), output="video", doc="d", timeline=False)
     with pytest.raises(Exception):
         f.name = "y"  # type: ignore[misc]
+
+
+def test_source_filter_is_frozen() -> None:
+    s = SourceFilter(name="x", output="video", doc="d")
+    with pytest.raises(Exception):
+        s.name = "y"  # type: ignore[misc]
 
 
 # --- real ffmpeg (exec) ---------------------------------------------------
@@ -933,9 +1253,78 @@ def test_real_split_and_asplit_absent_dynamic_pads() -> None:
 
 
 @pytest.mark.exec
-def test_real_testsrc_absent_source_filter() -> None:
+def test_real_testsrc_absent_from_column_function_lookup() -> None:
+    # get()/names() (column-function lookup) is UNCHANGED for sources --
+    # testsrc is a real source (see test_real_source_names_over_20 etc.
+    # below) but is not callable as a column function.
     reg = load()
     assert reg.get("testsrc") is None
+    assert "testsrc" not in reg.names()
+
+
+@pytest.mark.exec
+def test_real_source_names_over_20() -> None:
+    reg = load()
+    assert len(reg.source_names()) > 20
+
+
+@pytest.mark.exec
+def test_real_testsrc_anullsrc_sine_color_present_with_correct_types() -> None:
+    reg = load()
+    testsrc = reg.get_source("testsrc")
+    assert testsrc is not None and testsrc.output == "video"
+    anullsrc = reg.get_source("anullsrc")
+    assert anullsrc is not None and anullsrc.output == "audio"
+    sine = reg.get_source("sine")
+    assert sine is not None and sine.output == "audio"
+    color = reg.get_source("color")
+    assert color is not None and color.output == "video"
+
+
+@pytest.mark.exec
+def test_real_source_options_load_via_registry() -> None:
+    reg = load()
+    testsrc_opts = reg.options("testsrc")
+    assert testsrc_opts is not None and "size" in testsrc_opts
+    anullsrc_opts = reg.options("anullsrc")
+    assert anullsrc_opts is not None and "sample_rate" in anullsrc_opts
+    sine_opts = reg.options("sine")
+    assert sine_opts is not None and "frequency" in sine_opts
+    color_opts = reg.options("color")
+    assert color_opts is not None and "color" in color_opts
+
+
+@pytest.mark.exec
+def test_real_multi_output_and_dynamic_sources_absent() -> None:
+    reg = load()
+    # avsynctest is |->AV (2-char output); amovie/movie are |->N (dynamic).
+    assert reg.get_source("avsynctest") is None
+    assert reg.get_source("amovie") is None
+    assert reg.get_source("movie") is None
+
+
+@pytest.mark.exec
+def test_real_sinks_absent_from_sources() -> None:
+    reg = load()
+    assert reg.get_source("anullsink") is None
+    assert reg.get_source("nullsink") is None
+    assert reg.get_source("abuffersink") is None
+    assert reg.get_source("buffersink") is None
+
+
+@pytest.mark.exec
+def test_real_timeline_flags_pinned() -> None:
+    reg = load()
+    gblur = reg.get("gblur")
+    assert gblur is not None and gblur.timeline is True
+    drawbox = reg.get("drawbox")
+    assert drawbox is not None and drawbox.timeline is True
+    overlay = reg.get("overlay")
+    assert overlay is not None and overlay.timeline is True
+    null = reg.get("null")
+    assert null is not None and null.timeline is False
+    fmt = reg.get("format")
+    assert fmt is not None and fmt.timeline is False
 
 
 @pytest.mark.exec

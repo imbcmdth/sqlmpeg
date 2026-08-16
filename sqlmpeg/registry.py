@@ -99,6 +99,52 @@ fixtures this was verified against:
     explicit type map degrades to `"str"`, matching the "unparseable
     option lines degrade to str" policy for option TYPES as well as whole
     lines).
+
+Plan 040 additions (RFC-005 SS1-2), verified against the same ffmpeg 7.1
+build:
+
+  - The flag column's FIRST character (`T` vs `.`) is now retained as
+    `DynamicFilter.timeline`. It reflects the FILTER's own timeline
+    ('enable' option) support, which is independent of any per-OPTION
+    trailing flag character that also happens to be `T` in the `-help`
+    option-flags string (e.g. `color`'s `color`/`c` option prints
+    `..FV.....T.` even though `color` itself is NOT a timeline filter --
+    its `-filters` line is `..C`, and its `-help` output has no trailing
+    "This filter has support for timeline through the 'enable' option."
+    sentence). Only the `-filters` flag column is used; the per-option
+    flag string is still discarded entirely, as before.
+  - A full scan of ffmpeg 7.1's `-filters` output found 43 source lines
+    (`|->`) and 4 sink lines (`->|`), NONE of which carry the `T` flag --
+    timeline support was not observed on any source or sink in this build.
+  - Source pad shapes seen: 40 single-output sources -- 29 `|->V`
+    (testsrc, testsrc2, color, nullsrc, allrgb, mandelbrot, ...) and 11
+    `|->A` (anullsrc, sine, aevalsrc, sinc, flite, ...). One multi-output
+    source was observed, `avsynctest` (`|->AV`, two output pads), and two
+    dynamic-count sources, `movie` and `amovie` (`|->N`). Multi-output and
+    dynamic sources are excluded the same way multi-output/dynamic regular
+    filters are: `|->AV`'s 2-char output fails the single-char check,
+    `|->N`'s output char isn't a recognized V/A pad letter. All 4 sinks
+    are single-input (`A->|`, `V->|`) and stay excluded unconditionally
+    (RFC scope fence -- no SinkFilter type exists).
+  - Source `-help filter=X` option blocks parse via the SAME
+    `_parse_filter_help` used for regular filters (same lazy, per-name,
+    memoized path via `Registry.options()`) -- no separate code path.
+    Verified against `testsrc`, `testsrc2`, `anullsrc`, `sine`, `color`:
+    all list short/long alias pairs with the long name FIRST in the file
+    (size/s, rate/r, duration/d, decimals/n, channel_layout/cl,
+    sample_rate/r, nb_samples/n, frequency/f, beep_factor/b) -- the
+    existing "keep the longer name" dedup rule applies unchanged.
+  - The header-name-mismatch quirk (documented above for `split`/`(a)split`
+    and `overlay`/`framesync`) also affects sources: `nullsrc`'s header is
+    `"nullsrc/yuvtestsrc AVOptions:"` and `allrgb`'s is
+    `"allyuv/allrgb AVOptions:"` (shared implementation, and note the name
+    order is NOT the queried filter first in either case) -- the
+    take-the-first-"AVOptions:"-line rule already handles this with no
+    source-specific logic needed.
+  - Sources have no "Inputs:" pads in `-help` output (it prints
+    `Inputs:\n        none (source filter)` instead of `#0: ...`), but
+    this module never parses that section (only the option block after
+    "AVOptions:"), so it required no code change.
 """
 
 from __future__ import annotations
@@ -139,9 +185,25 @@ class DynamicFilter:
     inputs: tuple[StreamType, ...]  # from the pad spec, e.g. ("video", "video")
     output: StreamType
     doc: str
+    timeline: bool  # `-filters` flag column's leading `T`/`.` char (RFC-005 S2)
     # Options are NOT stored here -- Registry.options() loads and caches
     # them lazily, per-filter, on first reference (never all ~460 filters
     # upfront, per the RFC's "-help parsed lazily on first REFERENCE").
+
+
+@dataclass(frozen=True)
+class SourceFilter:
+    """A zero-input (`|->V` / `|->A`) filter -- RFC-005 S1's `ffmpeg.<source>()`.
+
+    Multi-output (`|->AV`) and dynamic-count (`|->N`) sources, and all
+    sinks (`->|`), are excluded per the v1 scope fence (see module
+    docstring) and never produce a SourceFilter. Options load lazily via
+    the same `Registry.options()` path as regular filters.
+    """
+
+    name: str
+    output: StreamType
+    doc: str
 
 
 # --- subprocess plumbing (guardrail #6: argv lists, timeout, never raise) --
@@ -174,30 +236,47 @@ def _get_version_line(ffmpeg: str) -> str | None:
 
 # --- `-filters` parsing ------------------------------------------------------
 
-# One space, then the 3-char flag column (each of T/S/C is either its
-# letter or '.'), then the name, the pad spec, and the rest of the line as
-# the description. This intentionally does NOT match the two-space-indented
-# legend lines ("  T.. = Timeline support") or the "Filters:" banner line,
-# so no separate header-skipping logic is needed.
-_FILTER_LINE_RE = re.compile(r"^ [T.][S.][C.] (\S+)\s+(\S+)\s+(.*)$")
+# One space, then the 3-char flag column captured as its own group (each of
+# T/S/C is either its letter or '.'), then the name, the pad spec, and the
+# rest of the line as the description. This intentionally does NOT match
+# the two-space-indented legend lines ("  T.. = Timeline support") or the
+# "Filters:" banner line, so no separate header-skipping logic is needed.
+_FILTER_LINE_RE = re.compile(r"^ ([T.][S.][C.]) (\S+)\s+(\S+)\s+(.*)$")
 
 _PAD_CHARS: dict[str, StreamType] = {"V": "video", "A": "audio"}
 
 
-def _parse_filters_list(ffmpeg: str) -> dict[str, DynamicFilter] | None:
+def _parse_filters_list(
+    ffmpeg: str,
+) -> tuple[dict[str, DynamicFilter], dict[str, SourceFilter]] | None:
     out = _run([ffmpeg, "-hide_banner", "-filters"])
     if out is None:
         return None
     filters: dict[str, DynamicFilter] = {}
+    sources: dict[str, SourceFilter] = {}
     for line in out.splitlines():
         m = _FILTER_LINE_RE.match(line)
         if not m:
             continue
-        name, spec, doc = m.groups()
+        flags, name, spec, doc = m.groups()
         if "->" not in spec:
             continue
         inp, _, outp = spec.partition("->")
-        # v1 scope fence: exclude dynamic pad count (N), source/sink (|),
+        timeline = flags[0] == "T"
+        doc_text = doc.strip()
+        if inp == "|":
+            # Zero-input (source) filter. Single V/A output pad only --
+            # multi-output (e.g. avsynctest's `|->AV`) and dynamic-count
+            # (e.g. movie/amovie's `|->N`) sources stay excluded, same v1
+            # scope fence as for regular filters.
+            if len(outp) != 1:
+                continue
+            stream = _PAD_CHARS.get(outp)
+            if stream is None:
+                continue
+            sources[name] = SourceFilter(name=name, output=stream, doc=doc_text)
+            continue
+        # v1 scope fence: exclude dynamic pad count (N), sink (output '|'),
         # multi-output, and (defensively) zero-input specs.
         if not inp or "N" in spec or "|" in spec or len(outp) != 1:
             continue
@@ -206,8 +285,10 @@ def _parse_filters_list(ffmpeg: str) -> dict[str, DynamicFilter] | None:
             output = _PAD_CHARS[outp]
         except KeyError:
             continue
-        filters[name] = DynamicFilter(name=name, inputs=inputs, output=output, doc=doc.strip())
-    return filters
+        filters[name] = DynamicFilter(
+            name=name, inputs=inputs, output=output, doc=doc_text, timeline=timeline
+        )
+    return filters, sources
 
 
 # --- `-help filter=X` parsing ------------------------------------------------
@@ -351,6 +432,14 @@ def _parse_filter_help(ffmpeg: str, name: str) -> dict[str, FilterOption]:
 
 # --- disk cache: ~/.cache/sqlmpeg/, keyed by hash of `ffmpeg -version` -------
 
+# Bumped whenever the cached payload shape changes (e.g. plan 040 added
+# DynamicFilter.timeline and the sources table). A mismatch -- including
+# the key being entirely absent, as in every pre-040 cache file -- is
+# treated exactly like corrupt/wrong-shape JSON: silently discarded and
+# rebuilt from a fresh `-filters`/`-help` pass, via the same
+# `_read_disk_cache` return-None path already used for corrupt caches.
+_CACHE_FORMAT_VERSION = 2
+
 
 def _cache_dir() -> Path:
     try:
@@ -417,6 +506,7 @@ def _require_stream_type(v: object) -> StreamType:
 @dataclass
 class _DiskCache:
     filters: dict[str, DynamicFilter]
+    sources: dict[str, SourceFilter]
     options: dict[str, dict[str, FilterOption]]
 
 
@@ -431,7 +521,23 @@ def _decode_filters(raw: object) -> dict[str, DynamicFilter]:
         inputs = tuple(_require_stream_type(x) for x in inputs_raw)
         output = _require_stream_type(entry["output"])
         doc = _require_str(entry["doc"])
-        result[name] = DynamicFilter(name=name, inputs=inputs, output=output, doc=doc)
+        timeline = _require_bool(entry["timeline"])
+        result[name] = DynamicFilter(
+            name=name, inputs=inputs, output=output, doc=doc, timeline=timeline
+        )
+    return result
+
+
+def _decode_sources(raw: object) -> dict[str, SourceFilter]:
+    if not isinstance(raw, dict):
+        raise ValueError("sources not a dict")
+    result: dict[str, SourceFilter] = {}
+    for name, entry in raw.items():
+        if not isinstance(name, str) or not isinstance(entry, dict):
+            raise ValueError("bad source entry")
+        output = _require_stream_type(entry["output"])
+        doc = _require_str(entry["doc"])
+        result[name] = SourceFilter(name=name, output=output, doc=doc)
     return result
 
 
@@ -475,11 +581,16 @@ def _read_disk_cache(version_line: str) -> _DiskCache | None:
         data = json.loads(raw_text)
         if not isinstance(data, dict):
             return None
+        if data.get("format_version") != _CACHE_FORMAT_VERSION:
+            # Missing entirely (pre-040 cache) or a future/older version --
+            # either way, rebuild rather than guess at a payload shape.
+            return None
         if data.get("version_line") != version_line:
             return None
         filters = _decode_filters(data["filters"])
+        sources = _decode_sources(data["sources"])
         options = _decode_options(data["options"])
-        return _DiskCache(filters=filters, options=options)
+        return _DiskCache(filters=filters, sources=sources, options=options)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
 
@@ -487,13 +598,23 @@ def _read_disk_cache(version_line: str) -> _DiskCache | None:
 def _write_disk_cache(
     version_line: str,
     filters: dict[str, DynamicFilter],
+    sources: dict[str, SourceFilter],
     options: dict[str, dict[str, FilterOption]],
 ) -> None:
     data: dict[str, object] = {
+        "format_version": _CACHE_FORMAT_VERSION,
         "version_line": version_line,
         "filters": {
-            name: {"inputs": list(f.inputs), "output": f.output, "doc": f.doc}
+            name: {
+                "inputs": list(f.inputs),
+                "output": f.output,
+                "doc": f.doc,
+                "timeline": f.timeline,
+            }
             for name, f in filters.items()
+        },
+        "sources": {
+            name: {"output": s.output, "doc": s.doc} for name, s in sources.items()
         },
         "options": {
             filter_name: {
@@ -538,10 +659,10 @@ class Registry:
     """Lazily-loaded view of the installed ffmpeg's filter set.
 
     `-filters` is parsed at most once per process, on first call to any of
-    `available()`, `get()`, `options()`, or `names()`. Per-filter
-    `-help filter=X` is parsed at most once per filter, on first call to
-    `options(name)` for that filter -- never for all filters upfront.
-    NEVER raises.
+    `available()`, `get()`, `names()`, `get_source()`, `source_names()`, or
+    `options()`. Per-filter `-help filter=X` is parsed at most once per
+    filter (regular OR source), on first call to `options(name)` for that
+    filter -- never for all filters upfront. NEVER raises.
     """
 
     def __init__(self) -> None:
@@ -549,6 +670,7 @@ class Registry:
         self._version_line: str | None = None
         self._loaded = False
         self._filters: dict[str, DynamicFilter] = {}
+        self._sources: dict[str, SourceFilter] = {}
         self._options: dict[str, dict[str, FilterOption]] = {}
 
     def _ensure_loaded(self) -> None:
@@ -568,34 +690,63 @@ class Registry:
         disk = _read_disk_cache(version_line)
         if disk is not None:
             self._filters = disk.filters
+            self._sources = disk.sources
             self._options = disk.options
             return
 
-        filters = _parse_filters_list(ffmpeg)
-        if not filters:
+        parsed = _parse_filters_list(ffmpeg)
+        if parsed is None:
+            return
+        filters, sources = parsed
+        if not filters and not sources:
             return
         self._filters = filters
-        _write_disk_cache(version_line, self._filters, self._options)
+        self._sources = sources
+        _write_disk_cache(version_line, self._filters, self._sources, self._options)
 
     def available(self) -> bool:
         """True if ffmpeg was found on PATH and `-filters` parsed."""
         self._ensure_loaded()
-        return bool(self._filters)
+        return bool(self._filters) or bool(self._sources)
 
     def names(self) -> list[str]:
-        """All included (non-excluded) filter names, ffmpeg's own order."""
+        """All included (non-excluded) regular filter names, ffmpeg's own order.
+
+        Sources are NOT included here (use `source_names()`) -- this list
+        drives column-function lookup (`get`), and a source is not callable
+        as a column function (RFC-005 S1; plan 042 wires `FROM`).
+        """
         self._ensure_loaded()
         return list(self._filters)
 
     def get(self, name: str) -> DynamicFilter | None:
-        """None if `name` is unknown to this ffmpeg OR was excluded (v1 scope fence)."""
+        """None if `name` is unknown to this ffmpeg OR was excluded (v1 scope fence).
+
+        This also returns None for a known SOURCE name -- unchanged from
+        pre-040 behavior: a source is not a column function, use
+        `get_source()` instead.
+        """
         self._ensure_loaded()
         return self._filters.get(name)
 
-    def options(self, name: str) -> dict[str, FilterOption] | None:
-        """None if `name` is unknown; {} if known but has no (parseable) options."""
+    def get_source(self, name: str) -> SourceFilter | None:
+        """None if `name` is unknown, a sink, a multi-output, or a dynamic-pad source."""
         self._ensure_loaded()
-        if name not in self._filters:
+        return self._sources.get(name)
+
+    def source_names(self) -> list[str]:
+        """All included (single V/A output) source names, ffmpeg's own order."""
+        self._ensure_loaded()
+        return list(self._sources)
+
+    def options(self, name: str) -> dict[str, FilterOption] | None:
+        """None if `name` is unknown; {} if known but has no (parseable) options.
+
+        Works for both regular filters and sources (same lazy, memoized
+        `-help filter=X` path either way).
+        """
+        self._ensure_loaded()
+        if name not in self._filters and name not in self._sources:
             return None
         cached = self._options.get(name)
         if cached is not None:
@@ -605,7 +756,7 @@ class Registry:
         opts = _parse_filter_help(self._ffmpeg, name)
         self._options[name] = opts
         if self._version_line is not None:
-            _write_disk_cache(self._version_line, self._filters, self._options)
+            _write_disk_cache(self._version_line, self._filters, self._sources, self._options)
         return opts
 
 
