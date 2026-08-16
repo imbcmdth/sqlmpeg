@@ -89,6 +89,19 @@ prompt rewritten (much shorter: the rule, the namespaces, the macro trio);
 dynamic-filters.md largely absorbed into a new docs/filters.md; trimming/
 errors touched where spellings appear. All prose in-session.
 
+## Accepted follow-on: bundled ffmpeg extra (wave 055, post-merge)
+
+`pip install "sqlmpeg[ffmpeg]"` pulls an optional provider package that
+supplies static ffmpeg+ffprobe binaries, making install one-and-done for
+non-video-engineers. Core install stays lean. Discovery order everywhere:
+system PATH first, provider fallback — via a single `sqlmpeg/binaries.py`
+helper replacing the scattered shutil.which calls (registry, probe, cli
+run). Every "needs ffmpeg" error gains the hint naming the extra. Provider
+choice vetted empirically at implementation time (MUST ship ffprobe too;
+win/mac/linux; embedded-in-wheel vs first-use-download documented either
+way). No version-drift concern: introspection adapts to whatever build the
+provider pins.
+
 ## Non-goals
 
 Variadic array-consuming calls (still queued separately); multi-output
