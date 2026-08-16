@@ -55,7 +55,7 @@ Measured against `tests/fixtures/testsrc.mp4`: 30 frames, 15 fps, 2.000s, and ex
 | path | `ffmpeg` | measured output duration |
 |---|---|---|
 | stream-copied (`SELECT a.frame`, nothing filters it) | `-ss 0.5 -to 1.5 -i ... -c copy` | **1.367s**. Not 1.000s. Snapped all the way back to the file's only keyframe, at t=0 |
-| decoded (wrapped in any filter, e.g. `scale(a.frame, 1)`) | `-ss 0.5 -to 1.5 -i ... -c:v libx264 ...` | **1.000s** exactly |
+| decoded (wrapped in any filter, e.g. `hflip(a.frame)`) | `-ss 0.5 -to 1.5 -i ... -c:v libx264 ...` | **1.000s** exactly |
 
 A normally-encoded file with keyframes every couple of seconds snaps by at most one GOP, not the whole clip, but the mechanism is identical. If the exact cut point matters more than a fast remux, wrap the column in a filter and accept the re-encode. There is no third option: any tool that offers a fast, frame-accurate copy-trim is re-encoding somewhere.
 

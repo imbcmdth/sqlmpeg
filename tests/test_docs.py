@@ -1,20 +1,15 @@
-"""Tests for plan 011 (docs/errors.md, docs/error-schema.json, docs/stdlib.md).
+"""Tests for plan 011 (docs/errors.md, docs/error-schema.json).
 
-(a) docs/stdlib.md is up to date -- regenerating it via scripts/gen_docs.py
-    produces byte-identical output to the committed file (it is generated,
-    not hand-written: guardrail #4, the function table drives the docs).
-(b) every ErrorCode value appears as a heading in docs/errors.md.
-(c) docs/error-schema.json validates the dicts SqlmpegError.to_dict()
+(a) every ErrorCode value appears as a heading in docs/errors.md.
+(b) docs/error-schema.json validates the dicts SqlmpegError.to_dict()
     actually produces. jsonschema is not a project dependency, so the
     check is hand-rolled rather than using a full validator library.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
-from types import ModuleType
 
 import pytest
 
@@ -22,58 +17,10 @@ from sqlmpeg.errors import ErrorCode, SqlmpegError
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DOCS_DIR = _REPO_ROOT / "docs"
-_GEN_DOCS_PATH = _REPO_ROOT / "scripts" / "gen_docs.py"
-
-
-def _load_gen_docs() -> ModuleType:
-    """Load scripts/gen_docs.py as a module without scripts/ being a package."""
-    spec = importlib.util.spec_from_file_location("gen_docs", _GEN_DOCS_PATH)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 # ---------------------------------------------------------------------------
-# (a) docs/stdlib.md is generated and up to date
-# ---------------------------------------------------------------------------
-
-
-def test_stdlib_md_is_up_to_date() -> None:
-    gen_docs = _load_gen_docs()
-    regenerated: str = gen_docs.render()
-    # newline="" so CRLF would survive and fail the comparison (LF-only contract).
-    # (Path.read_text only grew a newline= parameter in 3.13; open() works everywhere.)
-    with (_DOCS_DIR / "stdlib.md").open(encoding="utf-8", newline="") as fh:
-        committed = fh.read()
-    assert regenerated == committed, (
-        "docs/stdlib.md is stale -- run `python scripts/gen_docs.py` to regenerate"
-    )
-
-
-def test_stdlib_md_generation_is_idempotent() -> None:
-    gen_docs = _load_gen_docs()
-    first: str = gen_docs.render()
-    second: str = gen_docs.render()
-    assert first == second
-
-
-def test_stdlib_md_uses_lf_newlines_only() -> None:
-    data = (_DOCS_DIR / "stdlib.md").read_bytes()
-    assert b"\r" not in data
-
-
-def test_stdlib_md_mentions_every_function() -> None:
-    from sqlmpeg.stdlib import FUNCTIONS
-
-    text = (_DOCS_DIR / "stdlib.md").read_text(encoding="utf-8")
-    for name in FUNCTIONS:
-        assert f"## {name}" in text
-
-
-# ---------------------------------------------------------------------------
-# (b) every ErrorCode appears as a heading in docs/errors.md
+# (a) every ErrorCode appears as a heading in docs/errors.md
 # ---------------------------------------------------------------------------
 
 
@@ -103,7 +50,7 @@ def test_errors_md_uses_lf_newlines_only() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (c) error-schema.json validates SqlmpegError.to_dict() output
+# (b) error-schema.json validates SqlmpegError.to_dict() output
 # ---------------------------------------------------------------------------
 
 _JSON_TYPE_MAP: dict[str, type] = {

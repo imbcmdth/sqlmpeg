@@ -342,7 +342,7 @@ _TIME_HINT = (
     "<alias>.t is only usable as WHERE <alias>.t BETWEEN <start> AND <end>, "
     "<alias>.t >= <start>, or <alias>.t <= <end>"
 )
-_STREAM_HINT = "a SELECT column must be a stream, e.g. a.video[1] or scale(a.frame, 0.5)"
+_STREAM_HINT = "a SELECT column must be a stream, e.g. a.video[1] or scale(a.frame, 640, -2)"
 _SUBSCRIPT_HINT = "stream subscripts are 1-based: a.video[1] is the first video stream"
 _ZIP_HINT = (
     "broadcast arrays zip elementwise, one output per element; "

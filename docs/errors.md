@@ -34,9 +34,9 @@ SELECT a.video[1] FROM input('x.mp4' a
 
 ## UNKNOWN_FUNCTION
 
-**Meaning:** A call names a function that is neither in the stdlib table (`sqlmpeg.stdlib.FUNCTIONS`, rendered in full in [docs/stdlib.md](stdlib.md)) nor a filter the installed ffmpeg reports (`sqlmpeg/registry.py`, see [docs/dynamic-filters.md](dynamic-filters.md)). Checked for the outer call and for nested calls used as arguments.
+**Meaning:** A call names a function that is not a filter the installed ffmpeg reports (`sqlmpeg/registry.py`, see [docs/filters.md](filters.md)) and not one of the three `sqlmpeg.<name>` macros. Checked for the outer call and for nested calls used as arguments.
 
-**Fires when:** the name resolves in neither tier.
+**Fires when:** the name resolves nowhere - a typo, a filter your ffmpeg build doesn't ship, or no ffmpeg on `PATH` to ask (an empty registry makes every filter name unknown; the hint says so).
 
 **Example query:**
 
@@ -45,14 +45,13 @@ SELECT gblu(a.video[1])
 FROM input('x.mp4') a
 ```
 
-**Error JSON** (against ffmpeg 7.1; the near match crosses BOTH tiers --
-`gblu` is closer to the dynamic filter `gblur` than to any stdlib name):
+**Error JSON** (against ffmpeg 7.1; the candidate list is that binary's):
 
 ```json
 {"line": 1, "col": 8, "code": "UNKNOWN_FUNCTION", "message": "unknown function gblu()", "hint": "did you mean gblur()?"}
 ```
 
-The hint is a did-you-mean match against the stdlib plus, when available, every name the installed ffmpeg reports. Without a near match it falls back to an alphabetical listing of the stdlib alone (the dynamic list runs to ~460 entries, far too many to be a useful inline hint), suffixed with why the short list might not be the whole story on another machine: `"(dynamic ffmpeg filters need ffmpeg on PATH)"` when there is no ffmpeg to ask, or `"(dynamic ffmpeg filters are disabled by --portable)"` when `--portable` was passed.
+The hint is a did-you-mean match against every filter name the installed ffmpeg reports. A `sqlmpeg.<name>` call matches against the three macros the same way (`sqlmpeg.dela()` suggests `sqlmpeg.delay()`). With no ffmpeg on `PATH` the hint states the real problem instead of guessing: the function surface IS your installed ffmpeg's filter set, so install one or put it on `PATH`.
 
 ## UNKNOWN_ALIAS
 
@@ -74,21 +73,33 @@ SELECT b.video[1] FROM input('x.mp4') a
 
 ## UDF_ARG_TYPE
 
-**Meaning:** A stdlib call's argument count and/or kinds (`video`/`audio`/`num`/`str`) match none of that function's declared variants in the function table.
+**Meaning:** A call's *stream* arguments don't match. For a filter, that is the pad signature: `gblur` is `V->V`, so exactly one video in; `xfade` is `VV->V`, so two. For a `sqlmpeg.<name>` macro it is the macro's own signature. Option problems are never this code - a positional option validates as the option it binds to, so those are `UNKNOWN_FILTER_OPTION`/`FILTER_OPTION_TYPE` below. The two exceptions: more positional options than the filter has options at all, and an N-input filter's `inputs` option disagreeing with the stream count you actually passed - both arity statements, both here.
 
-**Fires when:** a known function gets the wrong arity, or a stream where a number/string belongs (or vice versa). `blur(a.video[1])` when `blur` wants `(video, num)`, that sort of thing.
+**Fires when:** a stream is missing, one too many, or the wrong type - `gblur(a.audio[1], 5)` hands audio to a video filter, that sort of thing.
 
 **Example query:**
 
 ```sql
-SELECT blur(a.video[1])
+SELECT gblur(a.audio[1], 5)
 FROM input('x.mp4') a
 ```
 
 **Error JSON:**
 
 ```json
-{"line": 1, "col": 8, "code": "UDF_ARG_TYPE", "message": "blur() expects blur(video, num), got blur(video)", "hint": "arguments are stream expressions or literals, in the order shown"}
+{"line": 1, "col": 8, "code": "UDF_ARG_TYPE", "message": "gblur() is an ffmpeg filter: it takes video as its stream input, got (audio)", "hint": "stream inputs come first, then options in the filter's own order, then named options: gblur(video, <option>, <option> => <value>)"}
+```
+
+The arity flavor, captured too - the hint lists the filter's options in the order positionals bind, which is usually what you were trying to remember:
+
+```json
+{"line": 1, "col": 30, "code": "UDF_ARG_TYPE", "message": "setsar() got 3 positional options, but the 'setsar' filter has 2", "hint": "its options, in the order they bind: ratio, max"}
+```
+
+And the macro flavor, whose hint can afford to be specific because there are only three macros:
+
+```json
+{"line": 1, "col": 22, "code": "UDF_ARG_TYPE", "message": "sqlmpeg.delay() takes a video stream as its 'f' argument, got audio", "hint": "sqlmpeg.delay() is the video (transparent-canvas) macro; delay an audio stream with the bare filter directly, in milliseconds, e.g. adelay(a.audio[1], delays => '2000')"}
 ```
 
 ## SINGLE_OUTPUT_ONLY
@@ -139,9 +150,13 @@ FROM input('y.mp4') b
 
 ## UNSUPPORTED_SQL
 
-**Meaning:** The catch-all for syntactically valid SQL outside the dialect that isn't one of the more specific codes above. No streaming-vs-batch philosophy involved; the surface just doesn't include it. This is the most common code in practice. Most of `sqlmpeg/parser.py`'s rejections use it: multiple statements, unsupported clause keys, explicit `JOIN` syntax (comma cross-joins only), aliased or nested subqueries, `WITH RECURSIVE`, malformed or duplicate CTE/alias names, an empty `WHERE`, a non-positive or non-literal array subscript, or a top-level statement that isn't a `SELECT`/`UNION ALL`. (`SELECT *` and `<alias>.*` compile now, so they are off this list; see [docs/dynamic-filters.md](dynamic-filters.md) for the two named-argument rejections below and [docs/trimming.md](trimming.md) for the caption one.)
+**Meaning:** The catch-all for syntactically valid SQL outside the dialect that isn't one of the more specific codes above. No streaming-vs-batch philosophy involved; the surface just doesn't include it. This is the most common code in practice. Most of `sqlmpeg/parser.py`'s rejections use it: multiple statements, unsupported clause keys, explicit `JOIN` syntax (comma cross-joins only), aliased or nested subqueries, `WITH RECURSIVE`, malformed or duplicate CTE/alias names, an empty `WHERE`, a non-positive or non-literal array subscript, or a top-level statement that isn't a `SELECT`/`UNION ALL`. (`SELECT *` and `<alias>.*` compile now, so they are off this list; see [docs/trimming.md](trimming.md) for the caption rejections below.)
 
-Two named-argument rejections land here: a named argument written out of place (a positional after a named one, or the same name twice), and a named argument with no ffmpeg to validate it against, whether because none was found or because `--portable` deliberately turned introspection off. The rule fits on one line: named arguments ARE your installed ffmpeg, so a query that compiles portably compiles everywhere.
+Two argument-shape rejections land here: a named argument written out of place (a positional after a named one, or the same name twice - standard Postgres rules), and a named argument on a `sqlmpeg.<name>` macro, whose signature is positional only:
+
+```json
+{"line": 1, "col": 42, "code": "UNSUPPORTED_SQL", "message": "sqlmpeg.delay() is a sqlmpeg macro: its arguments are positional only, in the documented order", "hint": "its signature is sqlmpeg.delay(f, seconds)"}
+```
 
 Three caption rejections land here too, all consequences of one measured fact: ffmpeg does not retime subtitle/data packets under an input seek (the receipts are in [docs/trimming.md](trimming.md)):
 
@@ -294,7 +309,7 @@ COPY (
 
 **Meaning:** A named argument (`<name> => <value>`) names an option the targeted ffmpeg filter doesn't have. The option set is read out of the installed ffmpeg (`ffmpeg -help filter=<name>`, see `sqlmpeg/registry.py`), so it is exactly what that binary supports, not a table somebody in this repo has to keep current.
 
-**Fires when:** the option name is misspelled or belongs to a different filter, on a dynamically-resolved call (`gblur(a.frame, sigmma => 5)`) or on a stdlib call's trailing named extras, which check against the filter that spec expands to (`blur` targets `gblur`).
+**Fires when:** the option name is misspelled or belongs to a different filter: `gblur(a.frame, sigmma => 5)`. A *positional* option can't reach this code (it binds by position, so there is no name to get wrong); its failure modes are `FILTER_OPTION_TYPE` for a bad value and `UDF_ARG_TYPE` for one option too many.
 
 **Example query:**
 
@@ -311,9 +326,9 @@ FROM input('x.mp4') a
 
 The anchor lands on the option's VALUE: sqlglot records no token position on the `exp.Var` holding a named argument's name (the same gap `COPY ... WITH` option names have), so `line`/`col` point at the `5`.
 
-Machine-dependence is the entire point of this code: a query using it compiles only where that ffmpeg does. See `UNSUPPORTED_SQL` for what happens when there is no ffmpeg to check against at all.
+Machine-dependence is the entire point of this code: a query using it compiles only where that ffmpeg does. With no ffmpeg at all the failure comes earlier, as `UNKNOWN_FUNCTION` on the filter name itself.
 
-**Also fires for `enable`:** `enable` is never a real option of any filter (it is framework-level, see [docs/dynamic-filters.md](dynamic-filters.md)), so the validator special-cases the name instead of looking it up — but it names this same code, worded to say so, when the target filter isn't one your ffmpeg flags as timeline-capable (the `T` column of `ffmpeg -filters`):
+**Also fires for `enable`:** `enable` is never a real option of any filter (it is framework-level, see [docs/filters.md](filters.md)), so the validator special-cases the name instead of looking it up — but it names this same code, worded to say so, when the target filter isn't one your ffmpeg flags as timeline-capable (the `T` column of `ffmpeg -filters`):
 
 ```sql
 SELECT scale(a.frame, 640, 360, enable => 'gt(t,1)')
@@ -326,7 +341,7 @@ FROM input('x.mp4') a
 
 ## FILTER_OPTION_TYPE
 
-**Meaning:** A named argument's value doesn't match the option's introspected type, declared range, or set of named constants.
+**Meaning:** An option's value doesn't match its introspected type, declared range, or set of named constants. Positional or named makes no difference: a positional binds to the option its slot lands on and validates as that option, so `gblur(a.frame, 5000)` and `gblur(a.frame, sigma => 5000)` fail identically.
 
 **Fires when:** a numeric option gets a string or a value outside its `(from A to B)` range, a boolean option gets anything but `true`/`false`, an enum option gets something that isn't one of its constants (or a bare number instead of a quoted constant name), or the option's ffmpeg type is one sqlmpeg cannot set at all (`binary`, `dictionary`).
 
@@ -345,10 +360,16 @@ FROM input('x.mp4') a
 
 Enum options quote their constant name (`transition => 'wipeleft'`), and the message lists the constants, truncated with a count when there are many (`xfade`'s `transition` alone has 59). Anchoring matches `UNKNOWN_FILTER_OPTION`: the value, not the name.
 
+**Also fires for the positional/named collision:** a named argument naming an option a positional already bound is this code, never a silent override:
+
+```json
+{"line": 1, "col": 35, "code": "FILTER_OPTION_TYPE", "message": "option 'sigma' of filter 'gblur' is already set positionally by gblur()", "hint": "a named argument never overrides what the call itself set; drop one of the two spellings"}
+```
+
 **Also fires for `enable`:** on a filter that does accept it, `enable`'s value must still be a single-quoted string (an ffmpeg timeline expression) — anything else is this code, not `UNKNOWN_FILTER_OPTION`, since the name itself was fine:
 
 ```sql
-SELECT blur(a.frame, 5, enable => 5)
+SELECT gblur(a.frame, 5, enable => 5)
 FROM input('x.mp4') a
 ```
 
@@ -356,7 +377,7 @@ FROM input('x.mp4') a
 {"line": 1, "col": 35, "code": "FILTER_OPTION_TYPE", "message": "option 'enable' of filter 'gblur' expects an ffmpeg timeline expression, got 5", "hint": "enable takes a single-quoted ffmpeg timeline expression over t (seconds), n (frame number) or pos, e.g. enable => 'between(t,2,5)'"}
 ```
 
-The expression's own *content* is never checked here (or anywhere at compile time) — see [docs/dynamic-filters.md](dynamic-filters.md). A stdlib `expr`-kind parameter (`overlay`'s x/y, `crop`'s x/y/w/h, and others — see [docs/stdlib.md](stdlib.md)) is a different mechanism: it is positional, not a named argument, so a bad value there is `UDF_ARG_TYPE`, never this code.
+The expression's own *content* is never checked here (or anywhere at compile time) — see [docs/filters.md](filters.md). The same goes for expressions in ordinary string-typed options (`scale(a.frame, 'iw/2', -2)`, `overlay(a.frame, b.frame, '(W-w)/2', '(H-h)/2')`): the string is accepted as the option's value, and a typo inside the quotes surfaces when the command runs.
 
 ## UNKNOWN_INPUT_OPTION
 
