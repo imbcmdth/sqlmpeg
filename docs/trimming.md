@@ -32,7 +32,7 @@ $ sqlmpeg compile --no-probe "SELECT a.video[1] FROM input('clip.mp4') a WHERE a
 ffmpeg -ss 120 -i clip.mp4 -map 0:v:0 -c:0 copy out.mp4
 ```
 
-This is what kills the old `BETWEEN 120 AND 3600`-style placeholder for "to the end of the file" -- a wart the ad-splice pattern used to need (see the README): a UNION ALL branch that used to end with a made-up, hopefully-large-enough upper bound now just writes `WHERE g.t >= 120` and means it exactly. The same works the other way for `<=`, and the two forms combine to build a closed window one bound at a time: `WHERE a.t >= 1 AND a.t <= 2` means exactly what `WHERE a.t BETWEEN 1 AND 2` means, merged into one seek.
+This is what kills the old `BETWEEN 120 AND 3600`-style placeholder for "to the end of the file" -- a wart the ad-splice pattern used to need (cookbook recipe 17 shows the full splice): a UNION ALL branch that used to end with a made-up, hopefully-large-enough upper bound now just writes `WHERE g.t >= 120` and means it exactly. The same works the other way for `<=`, and the two forms combine to build a closed window one bound at a time: `WHERE a.t >= 1 AND a.t <= 2` means exactly what `WHERE a.t BETWEEN 1 AND 2` means, merged into one seek.
 
 Two things stay firmly rejected:
 
@@ -113,6 +113,6 @@ Two things stay legal:
   The video and audio trim and rebase normally. The captions, unselected, are dropped with everything else the query didn't ask for.
 - **Selecting captions from an alias with no `WHERE` window.** Untouched passthrough, tags intact, business as usual.
 
-There is no way to get a trimmed, in-sync caption track out of the same seeked input, because there is no ffmpeg incantation under the hood that produces one. The working move is to join an external subtitle file whose cues are already timed for the cut, as a second `input()` alias (see the README's captions section; it needs no special join syntax, it's streams-as-columns plus an ordinary cross join).
+There is no way to get a trimmed, in-sync caption track out of the same seeked input, because there is no ffmpeg incantation under the hood that produces one. The working move is to join an external subtitle file whose cues are already timed for the cut, as a second `input()` alias ([cookbook recipe 10](examples.md#10-mux-external-subtitles-in-or-pull-them-back-out) shows the join; it needs no special syntax, it's streams-as-columns plus an ordinary cross join).
 
 A `WHERE` window on a **CTE** carrying a subtitle/data column is rejected unconditionally, selected or not: a CTE trim is a filtergraph trim, and a filtergraph cannot carry captions in the first place. The same constraint is why a subtitle column can't appear in a `UNION ALL` branch: `concat` has video and audio pads only.

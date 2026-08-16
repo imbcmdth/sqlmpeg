@@ -60,10 +60,8 @@ FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
 # an example up or down the page does not silently re-point a test. Both
 # examples name files nobody has; each is compiled against the real
 # two-language fixtures instead, which is exactly how its shown command was
-# produced. Two separate mappings (not one shared dict) because both examples
-# reuse the same two fixtures under different shown names -- a single
-# fixture->name mapping could not tell them apart in the reverse direction.
-_UNION_README_PATHS = {"episode1.mkv": "av2.mp4", "episode2.mkv": "av3.mp4"}
+# produced. (The union example moved to docs/examples.md in plan 049; its
+# pin now lives in tests/test_examples.py's generic harness.)
 _FLAGSHIP_README_PATHS = {"film.mkv": "av2.mp4", "commentary.mkv": "av3.mp4"}
 
 
@@ -88,20 +86,6 @@ def _readme_block(needle: str, *, exclude: str | None = None) -> str:
     ]
     assert len(matching) == 1, f"expected exactly one README ```sql block with {needle!r}"
     return matching[0]
-
-
-def _readme_union_sql() -> str:
-    """The headline UNION ALL splat, re-pointed at the real fixtures.
-
-    The example names 'episode1.mkv'/'episode2.mkv' for readability; av2.mp4
-    and av3.mp4 are what those stand in for -- two files with one video and two
-    audio tracks tagged eng/fra apiece -- and splatting an array needs a file
-    that can actually be probed for its stream count.
-    """
-    sql = _readme_block("episode1.mkv")
-    for shown, fixture in _UNION_README_PATHS.items():
-        sql = sql.replace(shown, (FIXTURES_DIR / fixture).as_posix())
-    return sql
 
 
 def _lower(sql: str, probes: dict[str, ProbeResult | None] | None = None) -> Graph:
@@ -221,54 +205,6 @@ def _layout_probe(
             )
         )
     return ProbeResult(streams=streams)
-
-
-# ---------------------------------------------------------------------------
-# the README headline: UNION ALL over splatted audio arrays
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.exec
-def test_readme_headline_concatenates_the_two_sources_pairwise(_fixtures: None) -> None:
-    """Both branches splat `<alias>.audio`, so the concat signature is derived,
-    not written: 1 video + 2 audio pads, inputs interleaved segment by segment."""
-    g = compile_sql(_readme_union_sql())
-    assert _filters(g) == ["concat"]
-    concat = g.nodes["n1"]
-    assert concat.args == {"n": 2, "v": 1, "a": 2}
-    assert concat.inputs == [
-        "src:a:v:0", "src:a:a:0", "src:a:a:1",
-        "src:b:v:0", "src:b:a:0", "src:b:a:1",
-    ]
-    assert concat.outputs == ["video", "audio", "audio"]
-    assert _outputs(g) == [
-        ("n1:0", "video", None),
-        ("n1:1", "audio", None),
-        ("n1:2", "audio", None),
-    ]
-
-
-@pytest.mark.exec
-def test_readme_headline_keeps_the_agreed_language_tags(_fixtures: None) -> None:
-    """Both segments tag their tracks eng/fra, so the concat outputs keep them;
-    the video pads' mp4-stamped `und` says nothing and is dropped."""
-    g = compile_sql(_readme_union_sql())
-    assert [o.metadata for o in g.outputs] == [
-        {},
-        {"language": "eng"},
-        {"language": "fra"},
-    ]
-
-
-@pytest.mark.exec
-def test_readme_headline_command_is_the_real_compilation(_fixtures: None) -> None:
-    """The command shown under the headline is what sqlmpeg actually prints for
-    that query, with only the fixture paths written back to the shown names."""
-    args = build_ffmpeg_args(emit(compile_sql(_readme_union_sql())), "season.mkv")
-    shown = shlex.join(args)
-    for name, fixture in _UNION_README_PATHS.items():
-        shown = shown.replace((FIXTURES_DIR / fixture).as_posix(), name)
-    assert shown in _readme_text(), shown
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +346,7 @@ def test_readme_encoding_command_is_the_real_compilation(_fixtures: None) -> Non
 #
 # Explicit subscripts only (`f.video[1]`, `f.audio[1]`), so this compiles
 # fully symbolically -- no fixture substitution, no probe, no registry. Pinned
-# offline like `_readme_overlay_expr_sql`, not exec-marked.
+# offline, not exec-marked.
 
 
 def _readme_ladder_sql() -> str:
@@ -432,158 +368,6 @@ def test_readme_ladder_example_command_is_the_real_compilation() -> None:
     actually prints for that script -- no fixture path to substitute back,
     since the query names no file sqlmpeg can (or needs to) read."""
     args = build_ffmpeg_args(emit(compile_sql(_readme_ladder_sql(), probe=False)), None)
-    assert shlex.join(args) in _readme_text()
-
-
-# ---------------------------------------------------------------------------
-# the README "Any ffmpeg filter" example (plan 032, RFC-003)
-# ---------------------------------------------------------------------------
-
-_DYNAMIC_README_PATHS = {"clip.mp4": "av.mp4"}
-
-
-def _readme_dynamic_sql() -> str:
-    """The tier-2 example in the "Any ffmpeg filter" section, re-pointed at
-    the real fixture -- `unsharp` is not in any stdlib table, so compiling it
-    needs the installed ffmpeg to introspect, same as any other tier-2 call."""
-    sql = _readme_block("unsharp")
-    for shown, fixture in _DYNAMIC_README_PATHS.items():
-        sql = sql.replace(shown, (FIXTURES_DIR / fixture).as_posix())
-    return sql
-
-
-@pytest.mark.exec
-def test_readme_dynamic_filter_example_compiles(_fixtures: None) -> None:
-    """Name, pad signature and options all come from the installed ffmpeg;
-    the two named options render in the order they were written."""
-    g = compile_sql(_readme_dynamic_sql())
-    assert _filters(g) == ["unsharp"]
-    assert g.nodes["n1"].args == {"luma_msize_x": 7, "luma_amount": 1.5}
-    assert _outputs(g) == [("n1", "video", None), ("src:a:a:0", "audio", None)]
-
-
-@pytest.mark.exec
-def test_readme_dynamic_filter_command_is_the_real_compilation(_fixtures: None) -> None:
-    """The command shown under "Any ffmpeg filter" is what sqlmpeg actually
-    prints for that query, with only the fixture path written back to the
-    shown name."""
-    args = build_ffmpeg_args(emit(compile_sql(_readme_dynamic_sql())), "out.mp4")
-    shown = shlex.join(args)
-    for name, fixture in _DYNAMIC_README_PATHS.items():
-        shown = shown.replace((FIXTURES_DIR / fixture).as_posix(), name)
-    assert shown in _readme_text(), shown
-
-
-# ---------------------------------------------------------------------------
-# the README "Any ffmpeg filter" channelsplit round trip (RFC-006, plan 048)
-# ---------------------------------------------------------------------------
-#
-# ffmpeg.channelsplit(...) is a tier-2, array-returning call: it needs the
-# real installed ffmpeg's registry the same way the unsharp example above
-# does, so this is exec-pinned rather than offline like the ladder above it.
-
-_CHANNELSPLIT_README_PATHS = {"stereo.mp4": "stereo.mp4"}
-
-
-def _readme_channelsplit_sql() -> str:
-    """The round-trip one-liner -- the shown name IS the real fixture's name
-    already, so the substitution below is a same-name round trip, kept for
-    symmetry with every other README fixture-mapping helper."""
-    sql = _readme_block("channelsplit")
-    for shown, fixture in _CHANNELSPLIT_README_PATHS.items():
-        sql = sql.replace(shown, (FIXTURES_DIR / fixture).as_posix())
-    return sql
-
-
-@pytest.mark.exec
-def test_readme_channelsplit_example_compiles(_fixtures: None) -> None:
-    g = compile_sql(_readme_channelsplit_sql())
-    assert _filters(g) == ["channelsplit", "volume", "volume", "amix"]
-
-
-@pytest.mark.exec
-def test_readme_channelsplit_example_command_is_the_real_compilation(_fixtures: None) -> None:
-    args = build_ffmpeg_args(emit(compile_sql(_readme_channelsplit_sql())), "out.mp4")
-    shown = shlex.join(args)
-    for name, fixture in _CHANNELSPLIT_README_PATHS.items():
-        shown = shown.replace((FIXTURES_DIR / fixture).as_posix(), name)
-    assert shown in _readme_text(), shown
-
-
-# ---------------------------------------------------------------------------
-# the README "Generated sources" example (plan 044, RFC-005 SS1)
-# ---------------------------------------------------------------------------
-
-
-def _readme_sine_sql() -> str:
-    """A generated source names no file at all -- nothing to re-point at a
-    fixture, so this is exactly the ```sql block README.md shows."""
-    return _readme_block("ffmpeg.sine")
-
-
-@pytest.mark.exec
-def test_readme_sine_source_compiles() -> None:
-    """A zero-input filter node: no ``-i``, one ``audio`` output."""
-    g = compile_sql(_readme_sine_sql())
-    assert _filters(g) == ["sine"]
-    assert g.nodes["n1"].args == {"frequency": 440, "duration": 1}
-    assert _outputs(g) == [("n1", "audio", None)]
-
-
-@pytest.mark.exec
-def test_readme_sine_source_command_is_the_real_compilation() -> None:
-    """The command shown under "Generated sources" is what sqlmpeg actually
-    prints for that query -- no fixture path to substitute back, since the
-    query names no file at all."""
-    args = build_ffmpeg_args(emit(compile_sql(_readme_sine_sql())), "out.mp4")
-    assert shlex.join(args) in _readme_text()
-
-
-# ---------------------------------------------------------------------------
-# the README "Enable, and expressions" examples (plan 044, RFC-005 SS2/SS3)
-# ---------------------------------------------------------------------------
-
-
-def _readme_enable_sql() -> str:
-    """`enable`'s timeline (T-flag) check needs the real installed ffmpeg,
-    same as any other named argument -- the block names no real file."""
-    return _readme_block("enable => 'between")
-
-
-@pytest.mark.exec
-def test_readme_enable_example_compiles() -> None:
-    g = compile_sql(_readme_enable_sql())
-    assert _filters(g) == ["gblur"]
-    assert g.nodes["n1"].args == {"sigma": 12, "enable": "between(t,0.5,1.5)"}
-
-
-@pytest.mark.exec
-def test_readme_enable_example_command_is_the_real_compilation() -> None:
-    """The command shown under "Enable, and expressions" for the windowed
-    blur is what sqlmpeg actually prints for that query."""
-    args = build_ffmpeg_args(emit(compile_sql(_readme_enable_sql())), "out.mp4")
-    assert shlex.join(args) in _readme_text()
-
-
-def _readme_overlay_expr_sql() -> str:
-    """`expr` slots need neither probe nor registry -- pure stdlib, so this
-    example pins offline, unlike its two neighbors above."""
-    return _readme_block("(W-w)/2")
-
-
-def test_readme_overlay_expr_example_compiles() -> None:
-    g = compile_sql(_readme_overlay_expr_sql(), probe=False)
-    assert _filters(g) == ["overlay"]
-    assert g.nodes["n1"].args == {"x": "(W-w)/2", "y": "(H-h)/2"}
-
-
-def test_readme_overlay_expr_example_command_is_the_real_compilation() -> None:
-    """The command shown under "Enable, and expressions" for the centered
-    overlay is what sqlmpeg actually prints for that query, byte-identical
-    because ``--no-probe`` makes the compile fully symbolic."""
-    args = build_ffmpeg_args(
-        emit(compile_sql(_readme_overlay_expr_sql(), probe=False)), "out.mp4"
-    )
     assert shlex.join(args) in _readme_text()
 
 
