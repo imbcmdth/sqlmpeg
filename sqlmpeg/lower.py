@@ -906,8 +906,8 @@ class _Lowerer:
             for column in columns
             for stream in column.value.streams
         ]
-        if self.res.sink is not None:
-            self.graph.sink = self._lower_sink(self.res.sink)
+        if self.res.sinks:
+            self.graph.sink = self._lower_sink(self.res.sinks[0])
         self.graph.input_options = self._lower_input_options()
         return self.graph
 
@@ -3035,6 +3035,39 @@ def _match_variant(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# TEMPORARY (plan 045, RFC-006 wave 1) — DELETE THIS WHOLE SECTION IN PLAN 046
+# ---------------------------------------------------------------------------
+#
+# The parser contract is already multi-sink (`Resolved.sinks`, one entry per
+# COPY, each carrying its own validated query), but the IR is not: `Graph` has
+# one `sink` and one `outputs` list, which plan 046 replaces with
+# `Graph.sinks: list[SinkUnit]`. Until it does, a script that resolves cleanly
+# with more than one COPY is rejected HERE — after resolve, so the parser tests
+# can assert the resolution is clean — rather than silently compiling only the
+# first sink. Views are NOT affected: a script with views and exactly one COPY
+# compiles end to end, because a view lowers as a CTE bound before everything.
+#
+# To delete: drop `_reject_multiple_sinks` and its call in `lower()`, and the
+# tests marked `TEMPORARY (plan 045)` in tests/test_lower.py.
+
+
+def _reject_multiple_sinks(res: Resolved) -> None:
+    if len(res.sinks) < 2:
+        return
+    second = res.sinks[1]
+    line, col = _pos(second.path_node)
+    paths = ", ".join(repr(sink.path) for sink in res.sinks)
+    raise SqlmpegError(
+        ErrorCode.UNSUPPORTED_SQL,
+        f"a script writes exactly one file for now, got {len(res.sinks)} "
+        f"({paths}); multiple sinks land in the next wave",
+        line=line,
+        col=col,
+        hint="keep one COPY per script",
+    )
+
+
 def lower(
     res: Resolved,
     probes: dict[str, ProbeResult | None],
@@ -3061,6 +3094,7 @@ def lower(
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
+    _reject_multiple_sinks(res)
     try:
         return _Lowerer(res, probes, registry, portable).run()
     except SqlmpegError:

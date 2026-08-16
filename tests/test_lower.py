@@ -4576,3 +4576,130 @@ def test_the_real_trim_filter_runs_through_the_namespace(
     )
     assert compile_sql(query).nodes["n1"].args == {"starti": 0.5, "durationi": 1}
     _run_compiled(query, tmp_path / "ns-trim.mp4")
+
+
+# ---------------------------------------------------------------------------
+# scripts + CREATE VIEW (RFC-006, plan 045)
+# ---------------------------------------------------------------------------
+#
+# A view is to STATEMENTS what a CTE is to branches, and lower treats it as
+# exactly that: `Resolved.ctes` is one flat, ordered binding table holding
+# both, so nothing in this pass knows a view from a CTE. These tests pin that
+# equivalence rather than re-testing the CTE machinery through a new syntax.
+
+_VIEW_SCRIPT = (
+    "CREATE VIEW master AS\n"
+    "  SELECT scale(a.frame, 1280, -2) AS v FROM input('film.mkv') a;\n"
+    "COPY (SELECT blur(master.v, 2) FROM master) TO 'out.mp4' WITH (crf 20);"
+)
+
+_CTE_EQUIVALENT = (
+    "COPY (WITH master AS (\n"
+    "  SELECT scale(a.frame, 1280, -2) AS v FROM input('film.mkv') a\n"
+    ") SELECT blur(master.v, 2) FROM master) TO 'out.mp4' WITH (crf 20);"
+)
+
+
+def test_a_view_lowers_into_the_same_ir_a_cte_would() -> None:
+    """The whole design claim of RFC-006's first half, as one assertion."""
+    assert compile_sql(_VIEW_SCRIPT, probe=False).to_dict() == compile_sql(
+        _CTE_EQUIVALENT, probe=False
+    ).to_dict()
+
+
+def test_a_view_script_keeps_its_sink() -> None:
+    g = compile_sql(_VIEW_SCRIPT, probe=False)
+    assert g.sink is not None
+    assert g.sink.path == "out.mp4"
+    assert g.sink.options == {"crf": 20}
+
+
+def test_a_view_script_compiles_to_one_ffmpeg_command() -> None:
+    args = build_ffmpeg_args(emit(compile_sql(_VIEW_SCRIPT, probe=False)), None)
+    assert args.count("-i") == 1
+    assert "scale=w=1280:h=-2" in " ".join(args)
+    assert args[-1] == "out.mp4"
+
+
+def test_a_view_is_split_across_its_consumers() -> None:
+    """Two reads of one view pad go through a split, exactly like a CTE's."""
+    g = compile_sql(
+        "CREATE VIEW m AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
+        "COPY (SELECT blur(m.v, 1), blur(m.v, 2) FROM m) TO 'out.mp4';",
+        probe=False,
+    )
+    assert any(node.filter == "split" for node in g.nodes.values())
+
+
+def test_a_view_body_with_its_own_with_lowers() -> None:
+    g = compile_sql(
+        "CREATE VIEW v AS WITH c AS (SELECT a.frame AS f FROM input('x.mp4') a) "
+        "SELECT scale(c.f, 0.5) AS v FROM c;\n"
+        "COPY (SELECT v.v FROM v) TO 'out.mp4';",
+        probe=False,
+    )
+    assert _filters(g) == ["scale"]
+
+
+def test_a_view_referencing_a_view_lowers() -> None:
+    g = compile_sql(
+        "CREATE VIEW one AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
+        "CREATE VIEW two AS SELECT scale(one.v, 0.5) AS v FROM one;\n"
+        "COPY (SELECT blur(two.v, 3) FROM two) TO 'out.mp4';",
+        probe=False,
+    )
+    assert _filters(g) == ["scale", "gblur"]
+
+
+def test_a_view_column_error_still_names_the_view() -> None:
+    err = _reject(
+        "CREATE VIEW m AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
+        "COPY (SELECT m.nope FROM m) TO 'out.mp4';"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.line == 2
+
+
+# --- TEMPORARY (plan 045): the multi-sink rejection ------------------------
+#
+# Delete these three tests together with `lower._reject_multiple_sinks` when
+# plan 046 lands `Graph.sinks`.
+
+_TWO_SINKS = (
+    "CREATE VIEW m AS SELECT a.frame AS v FROM input('film.mkv') a;\n"
+    "COPY (SELECT scale(m.v, 1280, -2) FROM m) TO '720.mp4';\n"
+    "COPY (SELECT scale(m.v, 640, -2) FROM m) TO '360.mp4';"
+)
+
+
+def test_more_than_one_copy_is_rejected_for_now() -> None:
+    err = _reject(_TWO_SINKS)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "multiple sinks land in the next wave" in err.message
+    assert "'720.mp4', '360.mp4'" in err.message
+
+
+def test_the_multi_sink_rejection_is_anchored_on_the_second_copy() -> None:
+    assert _reject(_TWO_SINKS).line == 3
+
+
+def test_the_multi_sink_rejection_fires_after_a_clean_resolve() -> None:
+    """The parser contract is already multi-sink; only the IR is not."""
+    res = resolve(parse(_TWO_SINKS))
+    assert [sink.path for sink in res.sinks] == ["720.mp4", "360.mp4"]
+
+
+@pytest.mark.exec
+def test_a_view_based_query_runs(_av_fixture: str, tmp_path: Path) -> None:
+    """End to end through real ffmpeg: a view + one COPY is a usable script."""
+    out = tmp_path / "view.mp4"
+    query = (
+        "CREATE VIEW half AS\n"
+        f"  SELECT scale(a.video[1], 0.5) AS v, a.audio[1] AS a FROM input('{_av_fixture}') a;\n"
+        f"COPY (SELECT half.v, half.a FROM half) TO '{out.as_posix()}' WITH (crf 30);"
+    )
+    args = build_ffmpeg_args(emit(compile_sql(query)), None)
+    args.insert(1, "-y")
+    result = subprocess.run(args, capture_output=True, text=True, timeout=60.0)
+    assert result.returncode == 0, result.stderr
+    assert out.exists()

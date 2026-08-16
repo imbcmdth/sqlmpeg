@@ -1,0 +1,71 @@
+{
+  "inputs": [
+    "film.mp4"
+  ],
+  "sources": {
+    "f": 0
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "filter": "scale",
+      "args": {
+        "w": 1280,
+        "h": -2
+      },
+      "inputs": [
+        "src:f:v:0"
+      ],
+      "outputs": [
+        "video"
+      ]
+    },
+    {
+      "id": "n2",
+      "filter": "volume",
+      "args": {
+        "volume": 0.8
+      },
+      "inputs": [
+        "src:f:a:0"
+      ],
+      "outputs": [
+        "audio"
+      ]
+    },
+    {
+      "id": "n3",
+      "filter": "gblur",
+      "args": {
+        "sigma": 2
+      },
+      "inputs": [
+        "n1"
+      ],
+      "outputs": [
+        "video"
+      ]
+    }
+  ],
+  "outputs": [
+    {
+      "ref": "n3",
+      "type": "video",
+      "name": null,
+      "metadata": {}
+    },
+    {
+      "ref": "n2",
+      "type": "audio",
+      "name": null,
+      "metadata": {}
+    }
+  ],
+  "sink": {
+    "path": "720.mp4",
+    "options": {
+      "video_codec": "libx264",
+      "crf": 20
+    }
+  }
+}

@@ -6,6 +6,7 @@ from sqlglot import exp
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.parser import (
     RawInputOption,
+    RawSink,
     RawSource,
     Resolved,
     parse,
@@ -1116,14 +1117,19 @@ def test_overlay_cannot_take_named_arguments() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _sink(sql: str) -> RawSink:
+    """The single sink of a one-COPY statement (RFC-006 made `sinks` a list)."""
+    sinks = _resolve(sql).sinks
+    assert len(sinks) == 1
+    return sinks[0]
+
+
 def test_bare_select_has_no_sink() -> None:
-    assert _resolve(SINK_QUERY).sink is None
+    assert _resolve(SINK_QUERY).sinks == []
 
 
 def test_copy_populates_the_sink() -> None:
-    res = _resolve(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH (video_codec 'libx264', crf 20)")
-    sink = res.sink
-    assert sink is not None
+    sink = _sink(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH (video_codec 'libx264', crf 20)")
     assert sink.path == "out.mkv"
     assert [option.name for option in sink.options] == ["video_codec", "crf"]
     # Values stay raw sqlglot nodes here: lower owns the option table.
@@ -1140,32 +1146,28 @@ def test_copy_leaves_the_inner_query_untouched() -> None:
 
 
 def test_copy_without_with_has_no_options() -> None:
-    sink = _resolve(f"COPY ({SINK_QUERY}) TO 'out.mkv'").sink
-    assert sink is not None
-    assert sink.options == ()
+    assert _sink(f"COPY ({SINK_QUERY}) TO 'out.mkv'").options == ()
 
 
 def test_copy_with_empty_option_list_has_no_options() -> None:
-    sink = _resolve(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH ()").sink
-    assert sink is not None
-    assert sink.options == ()
+    assert _sink(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH ()").options == ()
 
 
 def test_copy_option_names_are_folded_lowercase() -> None:
     """sqlglot drops the quoting of an option name, so "CRF" folds like CRF."""
     for written in ("CRF 20", '"CRF" 20'):
-        sink = _resolve(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH ({written})").sink
-        assert sink is not None
+        sink = _sink(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH ({written})")
         assert [option.name for option in sink.options] == ["crf"]
 
 
 def test_copy_wraps_a_cte_query() -> None:
-    res = _resolve(
+    sql = (
         "COPY (WITH c AS (SELECT a.frame AS f FROM input('x.mp4') a) "
         "SELECT c.f FROM c) TO 'out.mkv'"
     )
+    res = _resolve(sql)
     assert list(res.ctes) == ["c"]
-    assert res.sink is not None and res.sink.path == "out.mkv"
+    assert [sink.path for sink in res.sinks] == ["out.mkv"]
 
 
 def test_copy_wraps_a_union_all() -> None:
@@ -1174,7 +1176,18 @@ def test_copy_wraps_a_union_all() -> None:
         "SELECT b.frame FROM input('y') b) TO 'out.mkv'"
     )
     assert len(res.branches) == 2
-    assert res.sink is not None
+    assert len(res.sinks) == 1
+
+
+def test_a_sink_carries_its_own_validated_query() -> None:
+    """RFC-006: one COPY is one output group, so a sink owns a whole query."""
+    res = _resolve(
+        "COPY (SELECT a.frame FROM input('x') a UNION ALL "
+        "SELECT b.frame FROM input('y') b) TO 'out.mkv'"
+    )
+    sink = res.sinks[0]
+    assert sink.query is res.select
+    assert list(sink.branches) == res.branches
 
 
 def test_copy_keeps_no_streaming_equivalent_of_the_inner_query() -> None:
@@ -1222,7 +1235,8 @@ def test_copy_does_not_relax_inner_validation(sql: str) -> None:
         # duplicate option, folded name included
         f"COPY ({SINK_QUERY}) TO 'o.mkv' WITH (crf 20, crf 21)",
         f"COPY ({SINK_QUERY}) TO 'o.mkv' WITH (crf 20, CRF 21)",
-        # several statements
+        # two COPYs re-declaring the same input alias: the flat namespace is
+        # script-wide (the multi-sink rejection itself lives in lower).
         f"COPY ({SINK_QUERY}) TO 'a.mkv'; COPY ({SINK_QUERY}) TO 'b.mkv'",
     ],
 )
@@ -1260,6 +1274,257 @@ def test_duplicate_option_is_anchored_on_the_second_one() -> None:
 )
 def test_copy_shapes_sqlglot_itself_refuses(sql: str) -> None:
     assert _reject(sql).code is ErrorCode.PARSE_ERROR
+
+
+# ---------------------------------------------------------------------------
+# scripts + CREATE VIEW (RFC-006, plan 045)
+# ---------------------------------------------------------------------------
+#
+# A script is `CREATE VIEW name AS <query>;`* followed by `COPY ...;`+. The
+# parser accepts any number of COPYs; lowering is still single-sink, and the
+# TEMPORARY rejection of a second one lives in `sqlmpeg.lower` (plan 046).
+
+VIEW_SCRIPT = """CREATE VIEW master AS
+  SELECT scale(a.frame, 1280, -2) AS v FROM input('film.mkv') a;
+
+COPY (SELECT master.v FROM master) TO 'out.mp4' WITH (crf 20);
+"""
+
+
+def test_a_script_parses_into_a_block() -> None:
+    """VERIFIED (sqlglot 30.17): parse_one wraps a multi-statement string in a
+    Block; a single statement, trailing semicolon and all, is returned bare."""
+    assert isinstance(parse(VIEW_SCRIPT), exp.Block)
+    assert isinstance(parse(SINK_QUERY + ";"), exp.Select)
+    assert isinstance(parse(SINK_QUERY + ";  \n"), exp.Select)
+
+
+def test_an_extra_semicolon_is_not_a_statement() -> None:
+    """`a;;` parses into a Block whose second entry is a literal None."""
+    res = _resolve(SINK_QUERY + ";;")
+    assert res.sinks == []
+    assert isinstance(res.select, exp.Select)
+
+
+def test_view_script_resolves() -> None:
+    res = _resolve(VIEW_SCRIPT)
+    assert list(res.views) == ["master"]
+    assert [sink.path for sink in res.sinks] == ["out.mp4"]
+    assert res.input_paths == ["film.mkv"]
+    assert res.sources == {"a": 0}
+
+
+def test_a_view_is_bound_exactly_like_a_cte() -> None:
+    """`ctes` is the flat, ordered binding table lower walks; a view is one."""
+    res = _resolve(VIEW_SCRIPT)
+    assert list(res.ctes) == ["master"]
+    assert res.ctes["master"] is res.views["master"]
+
+
+def test_a_view_may_reference_an_earlier_view() -> None:
+    res = _resolve(
+        "CREATE VIEW one AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
+        "CREATE VIEW two AS SELECT scale(one.v, 0.5) AS v FROM one;\n"
+        "COPY (SELECT two.v FROM two) TO 'out.mp4';"
+    )
+    assert list(res.views) == ["one", "two"]
+    assert list(res.ctes) == ["one", "two"]
+
+
+def test_a_view_may_not_reference_a_later_view() -> None:
+    err = _reject(
+        "CREATE VIEW one AS SELECT two.v AS v FROM two;\n"
+        "CREATE VIEW two AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
+        "COPY (SELECT one.v FROM one) TO 'out.mp4';"
+    )
+    assert err.code is ErrorCode.UNKNOWN_ALIAS
+
+
+def test_a_view_body_may_have_its_own_with() -> None:
+    """A view BODY is a whole statement, so the nested-WITH rejection (which
+    is CTE-body-only) does not apply to it. Its CTEs are hoisted into the flat
+    binding table AHEAD of the view, which is the order lower needs."""
+    res = _resolve(
+        "CREATE VIEW v AS WITH c AS (SELECT a.frame AS f FROM input('x.mp4') a) "
+        "SELECT c.f AS v FROM c;\n"
+        "COPY (SELECT v.v FROM v) TO 'out.mp4';"
+    )
+    assert list(res.ctes) == ["c", "v"]
+    assert list(res.views) == ["v"]
+
+
+def test_a_cte_body_still_may_not_have_its_own_with() -> None:
+    err = _reject(
+        "CREATE VIEW v AS WITH c AS (WITH d AS (SELECT a.frame AS f "
+        "FROM input('x.mp4') a) SELECT d.f AS f FROM d) SELECT c.f AS v FROM c;\n"
+        "COPY (SELECT v.v FROM v) TO 'out.mp4';"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "nested WITH" in err.message
+
+
+def test_a_view_body_may_be_a_union_all() -> None:
+    res = _resolve(
+        "CREATE VIEW v AS SELECT a.frame AS f FROM input('x') a UNION ALL "
+        "SELECT b.frame AS f FROM input('y') b;\n"
+        "COPY (SELECT v.f FROM v) TO 'out.mp4';"
+    )
+    assert isinstance(res.views["v"], exp.Union)
+    assert len(union_branches(res.views["v"])) == 2
+
+
+def test_a_copy_may_still_carry_its_own_with_in_a_script() -> None:
+    res = _resolve(
+        "CREATE VIEW v AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "COPY (WITH c AS (SELECT v.f AS g FROM v) SELECT c.g FROM c) TO 'out.mp4';"
+    )
+    assert list(res.ctes) == ["v", "c"]
+
+
+def test_several_copies_resolve_cleanly() -> None:
+    """Resolve is already multi-sink; only lowering is not (plan 046)."""
+    res = _resolve(
+        "CREATE VIEW m AS SELECT a.frame AS v FROM input('film.mkv') a;\n"
+        "COPY (SELECT scale(m.v, 1280, -2) FROM m) TO '720.mp4';\n"
+        "COPY (SELECT scale(m.v, 640, -2) FROM m) TO '360.mp4' WITH (crf 30);"
+    )
+    assert [sink.path for sink in res.sinks] == ["720.mp4", "360.mp4"]
+    assert [len(sink.branches) for sink in res.sinks] == [1, 1]
+    assert [option.name for option in res.sinks[1].options] == ["crf"]
+    # `select`/`branches` stay the FIRST sink's until plan 046 retires them.
+    assert res.select is res.sinks[0].query
+
+
+def test_a_view_must_precede_every_copy() -> None:
+    err = _reject(
+        "COPY (SELECT a.frame FROM input('x.mp4') a) TO 'out.mp4';\n"
+        "CREATE VIEW v AS SELECT b.frame AS f FROM input('y.mp4') b;"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "may not follow a COPY" in err.message
+    assert err.line == 2
+
+
+def test_a_bare_select_in_a_script_is_rejected() -> None:
+    err = _reject(
+        "CREATE VIEW v AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "SELECT v.f FROM v;"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.hint is not None and "COPY (<query>) TO" in err.hint
+
+
+def test_a_script_with_no_copy_is_rejected() -> None:
+    err = _reject("CREATE VIEW v AS SELECT a.frame AS f FROM input('x.mp4') a;")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "must write its output with COPY" in err.message
+
+
+def test_an_unused_view_is_rejected_at_its_create() -> None:
+    err = _reject(
+        "CREATE VIEW used AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "CREATE VIEW spare AS SELECT b.frame AS f FROM input('y.mp4') b;\n"
+        "COPY (SELECT used.f FROM used) TO 'out.mp4';"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "view 'spare' is never used" in err.message
+    assert err.line == 2
+
+
+def test_a_view_used_only_by_another_view_counts_as_used() -> None:
+    _resolve(
+        "CREATE VIEW one AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
+        "CREATE VIEW two AS SELECT scale(one.v, 0.5) AS v FROM one;\n"
+        "COPY (SELECT two.v FROM two) TO 'out.mp4';"
+    )
+
+
+def test_view_names_share_the_flat_namespace() -> None:
+    for sql in (
+        # view vs view
+        "CREATE VIEW v AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "CREATE VIEW v AS SELECT b.frame AS f FROM input('y.mp4') b;\n"
+        "COPY (SELECT v.f FROM v) TO 'out.mp4';",
+        # view vs an input alias declared inside it
+        "CREATE VIEW a AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "COPY (SELECT a.f FROM a) TO 'out.mp4';",
+        # view vs a CTE of its own body
+        "CREATE VIEW c AS WITH c AS (SELECT a.frame AS f FROM input('x.mp4') a) "
+        "SELECT c.f AS f FROM c;\n"
+        "COPY (SELECT c.f FROM c) TO 'out.mp4';",
+        # view vs a CTE of a later COPY
+        "CREATE VIEW v AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "COPY (WITH v AS (SELECT b.frame AS f FROM input('y.mp4') b) "
+        "SELECT v.f FROM v) TO 'out.mp4';",
+        # view vs a later input alias
+        "CREATE VIEW b AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "COPY (SELECT b.frame FROM b, input('y.mp4') b) TO 'out.mp4';",
+    ):
+        err = _reject(sql)
+        assert err.code is ErrorCode.UNSUPPORTED_SQL, sql
+
+
+def test_ffmpeg_is_reserved_as_a_view_name() -> None:
+    err = _reject(
+        "CREATE VIEW ffmpeg AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "COPY (SELECT ffmpeg.f FROM ffmpeg) TO 'out.mp4';"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "reserved for the filter namespace" in err.message
+
+
+def test_view_names_fold_the_postgres_way() -> None:
+    res = _resolve(
+        "CREATE VIEW Master AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "COPY (SELECT MASTER.f FROM mAsTeR) TO 'out.mp4';"
+    )
+    assert list(res.views) == ["master"]
+
+
+_VIEW_BODY = "SELECT a.frame AS f FROM input('x.mp4') a"
+_VIEW_COPY = "COPY (SELECT v.f FROM v) TO 'out.mp4';"
+
+
+@pytest.mark.parametrize(
+    ("label", "create"),
+    [
+        ("or replace", f"CREATE OR REPLACE VIEW v AS {_VIEW_BODY}"),
+        ("temp", f"CREATE TEMP VIEW v AS {_VIEW_BODY}"),
+        ("temporary", f"CREATE TEMPORARY VIEW v AS {_VIEW_BODY}"),
+        ("materialized", f"CREATE MATERIALIZED VIEW v AS {_VIEW_BODY}"),
+        ("if not exists", f"CREATE VIEW IF NOT EXISTS v AS {_VIEW_BODY}"),
+        ("column list", f"CREATE VIEW v (c1, c2) AS {_VIEW_BODY}"),
+        ("qualified name", f"CREATE VIEW s.v AS {_VIEW_BODY}"),
+        ("view options", f"CREATE VIEW v WITH (security_barrier=true) AS {_VIEW_BODY}"),
+        # sqlglot cannot parse RECURSIVE VIEW at all and falls back to
+        # exp.Command, which is not a statement sqlmpeg knows either.
+        ("recursive", f"CREATE RECURSIVE VIEW v (c) AS {_VIEW_BODY}"),
+        ("create table", f"CREATE TABLE v AS {_VIEW_BODY}"),
+        ("drop view", "DROP VIEW v"),
+        ("alter view", "ALTER VIEW v RENAME TO w"),
+    ],
+)
+def test_rejected_create_variants(label: str, create: str) -> None:
+    err = _reject(f"{create};\n{_VIEW_COPY}")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL, label
+    assert err.line == 1, label
+
+
+def test_a_bad_view_body_is_rejected_like_any_other_query() -> None:
+    """A view never widens the surface."""
+    err = _reject(
+        "CREATE VIEW v AS SELECT a.frame AS f FROM input('x.mp4') a GROUP BY a.frame;\n"
+        f"{_VIEW_COPY}"
+    )
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+
+
+def test_a_view_may_not_be_aliased_in_from() -> None:
+    """Same rule a CTE has had all along -- reference it by its own name."""
+    err = _reject(
+        f"CREATE VIEW v AS {_VIEW_BODY};\nCOPY (SELECT m.f FROM v m) TO 'out.mp4';"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
 # ---------------------------------------------------------------------------

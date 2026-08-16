@@ -22,10 +22,17 @@ Notes for downstream passes (lower):
   output stream). ``SINGLE_OUTPUT_ONLY`` is retired; the parser only rejects an
   empty projection list.
 * A statement may be wrapped in ``COPY (<query>) TO '<path>' WITH (<options>)``
-  (RFC-002). The COPY is peeled off into ``Resolved.sink`` and the query it
-  wraps goes through the EXACT same validation a bare SELECT does; a bare
-  SELECT leaves ``sink`` None. Only the shape is checked here — option NAMES
-  and VALUES are validated against ``sqlmpeg.sink.SINK_OPTIONS`` by lower.
+  (RFC-002). The COPY is peeled off into a ``Resolved.sinks`` entry and the
+  query it wraps goes through the EXACT same validation a bare SELECT does; a
+  bare SELECT leaves ``sinks`` empty. Only the shape is checked here — option
+  NAMES and VALUES are validated against ``sqlmpeg.sink.SINK_OPTIONS`` by lower.
+
+* Input text may be a SCRIPT: ``CREATE VIEW <name> AS <query>;``* followed by
+  ``COPY ...;``+ (RFC-006). See :func:`_statements` and :meth:`_Resolver._view`
+  for the VERIFIED sqlglot shapes. A view is to STATEMENTS what a CTE is to
+  branches, so it is stored as one: ``Resolved.ctes`` is the flat, ordered
+  binding table (views AND CTEs, in definition order) that lower walks, and
+  ``Resolved.views`` names the subset that came from a ``CREATE VIEW``.
 * Named function arguments (``gblur(a.frame, sigma => 5)``, RFC-003) are native
   Postgres syntax: sqlglot parses each into an ``exp.Kwarg(this=Var(name),
   expression=<value>)`` inside the call's ``expressions`` list. The resolver only
@@ -183,6 +190,11 @@ _STAR_HINT = (
     "it cannot be aliased, subscripted, or passed to a function"
 )
 _SINK_HINT = "the only sink form is COPY (<query>) TO '<path>' WITH (<options>)"
+_SCRIPT_HINT = (
+    "a script is CREATE VIEW ... ; statements followed by one or more "
+    "COPY (<query>) TO '<path>'; statements"
+)
+_VIEW_HINT = "write CREATE VIEW <name> AS <query>"
 _OPTION_HINT = "sink options are name/value pairs, e.g. crf 20 or video_codec 'libx264'"
 _KWARG_HINT = (
     "named arguments are written <name> => <value> and come last, "
@@ -445,6 +457,20 @@ def _parse_error_message(err: Exception) -> str:
 def parse(text: str) -> exp.Expression:
     """Parse SQL text into a sqlglot AST using the Postgres dialect.
 
+    ONE statement comes back as itself; a SCRIPT (RFC-006) comes back as an
+    ``exp.Block`` whose ``expressions`` are the statements. :func:`_statements`
+    is the only thing that should look at that distinction.
+
+    ``sqlglot.parse_one`` is deliberately kept over the plural
+    ``sqlglot.parse``. VERIFIED (sqlglot 30.17, ``read="postgres"``) they agree
+    on every script we accept — ``parse`` returns the same nodes as a flat list
+    that ``parse_one`` wraps in a ``Block`` — and differ only on degenerate
+    input: ``parse`` yields ``None`` list entries for empty statements
+    (``;``, a leading ``;``, ``a;;``) where ``parse_one`` either absorbs them
+    (a single trailing ``;``) or raises ``ParseError`` ("No expression was
+    parsed"). Keeping ``parse_one`` keeps that PARSE_ERROR, and every other
+    single-statement behavior, exactly as it was.
+
     Raises ``SqlmpegError(PARSE_ERROR)`` — and nothing else — on any failure.
     """
     if not text.strip():
@@ -476,6 +502,23 @@ def parse(text: str) -> exp.Expression:
     if not isinstance(tree, exp.Expression):
         raise SqlmpegError(ErrorCode.PARSE_ERROR, "no statement found", line=1, col=1)
     return tree
+
+
+def _statements(tree: exp.Expr) -> list[exp.Expr]:
+    """The statement list `tree` stands for, in script order.
+
+    VERIFIED (sqlglot 30.17, ``read="postgres"``): ``parse_one`` returns the
+    statement itself for one-statement text — a single trailing ``;`` and any
+    trailing whitespace are absorbed — and an ``exp.Block`` with one
+    ``expressions`` entry per statement for anything with an INTERNAL
+    separator. An EMPTY statement (the second ``;`` of ``SELECT ...;;``) lands
+    in that list as a literal ``None``, which ``Block.expressions``' own type
+    annotation does not admit, so it is filtered out here: an extra semicolon
+    is not a statement.
+    """
+    if not isinstance(tree, exp.Block):
+        return [tree]
+    return [statement for statement in tree.expressions if isinstance(statement, exp.Expr)]
 
 
 # ---------------------------------------------------------------------------
@@ -511,10 +554,18 @@ class RawSink:
     Shape only: the path is known to be a single string literal and the option
     names to be unique, but nothing here has been checked against the option
     table yet. ``sqlmpeg.lower`` turns this into ``sqlmpeg.ir.Sink``.
+
+    A sink carries the query it wraps (RFC-006): a script has one COPY per
+    OUTPUT GROUP, and each group is a whole query of its own. ``query`` and
+    ``branches`` are the same pair ``Resolved.select``/``Resolved.branches``
+    are for the single-sink case, fully validated — for a one-COPY statement
+    they ARE that pair.
     """
 
     path: str
     path_node: exp.Expr
+    query: QueryExpr
+    branches: tuple[exp.Select, ...]
     options: tuple[RawSinkOption, ...] = ()
 
 
@@ -591,7 +642,11 @@ class Resolved:
     """Output of the resolve pass — the validated query plus its input table."""
 
     select: QueryExpr
-    """Top-level query, CTEs still attached. An ``exp.Union`` for UNION ALL."""
+    """The query being compiled, CTEs still attached; ``exp.Union`` for UNION ALL.
+
+    For a script this is ``sinks[0].query``: lowering is single-sink until
+    plan 046, which retires this field in favour of walking ``sinks``.
+    """
 
     input_paths: list[str]
     """``-i`` order; the list index is the ffmpeg input index. May repeat paths."""
@@ -600,13 +655,33 @@ class Resolved:
     """Input alias -> index into ``input_paths``. One entry per distinct alias."""
 
     ctes: dict[str, QueryExpr] = field(default_factory=dict)
-    """CTE name -> its query, in definition order."""
+    """Named query binding -> its query, in DEFINITION order.
+
+    Both kinds of binding live here, because a view IS a CTE to everything
+    downstream (RFC-006): a script's ``CREATE VIEW``s, the CTEs of their
+    bodies, and the CTEs of each COPY's own ``WITH``, in the order they were
+    written. Lower walks this dict once and binds each entry by name, which is
+    why the order matters and why views need no machinery of their own.
+    """
 
     branches: list[exp.Select] = field(default_factory=list)
     """``select`` flattened into UNION ALL branches; a single element if not a union."""
 
-    sink: RawSink | None = None
-    """The ``COPY ... TO ...`` wrapper, if there was one. None for a bare SELECT."""
+    sinks: list[RawSink] = field(default_factory=list)
+    """One entry per ``COPY``, in script order; EMPTY for a bare SELECT.
+
+    RFC-006 replaced the single ``sink`` field with this list so the parser
+    contract is already multi-sink. Resolve accepts any number; ``lower``
+    TEMPORARILY rejects more than one until plan 046 builds the multi-sink
+    core.
+    """
+
+    views: dict[str, QueryExpr] = field(default_factory=dict)
+    """``CREATE VIEW`` name -> its body, in definition order.
+
+    A strict subset of ``ctes`` (same objects): this is the introspection
+    view, ``ctes`` is the one lower walks.
+    """
 
     input_options: dict[str, tuple[RawInputOption, ...]] = field(default_factory=dict)
     """Input alias -> its trailing named options (RFC-005). Only aliases that
@@ -729,8 +804,12 @@ def union_branches(query: exp.Expr) -> list[exp.Select]:
 # ---------------------------------------------------------------------------
 
 
-def _sink(copy: exp.Copy) -> tuple[RawSink, exp.Expr]:
-    """Validate a top-level COPY and split it into ``(sink, wrapped query)``.
+def _sink(copy: exp.Copy) -> tuple[str, exp.Expr, tuple[RawSinkOption, ...], exp.Expr]:
+    """Validate a top-level COPY into ``(path, path node, options, wrapped query)``.
+
+    The pieces rather than a :class:`RawSink`: a sink also carries its
+    VALIDATED query (RFC-006), and that validation is the resolver's job, so
+    the record is assembled there once the query has been through it.
 
     Shape only — the option table is lower's business. VERIFIED shapes under
     sqlglot 30.17 ``read="postgres"``:
@@ -792,10 +871,7 @@ def _sink(copy: exp.Copy) -> tuple[RawSink, exp.Expr]:
             hint=_SINK_HINT,
         )
 
-    sink = RawSink(
-        path=str(target.this), path_node=target, options=_sink_options(copy, target)
-    )
-    return sink, query
+    return str(target.this), target, _sink_options(copy, target), query
 
 
 def _sink_options(copy: exp.Copy, target: exp.Expr) -> tuple[RawSinkOption, ...]:
@@ -960,26 +1036,115 @@ class _Resolver:
         self.input_paths: list[str] = []
         self.sources: dict[str, int] = {}
         self.ctes: dict[str, QueryExpr] = {}
+        self.views: dict[str, QueryExpr] = {}
+        self.view_nodes: dict[str, exp.Expr] = {}
+        self.used: set[str] = set()
         self.input_options: dict[str, tuple[RawInputOption, ...]] = {}
         self.source_filters: dict[str, RawSource] = {}
 
     # -- entry point ------------------------------------------------------
 
     def run(self, tree: exp.Expr) -> Resolved:
-        if isinstance(tree, exp.Block):
+        """Resolve one statement, or a whole script (RFC-006).
+
+        Script rules, all of them typed rejections:
+
+        * every ``CREATE VIEW`` precedes every ``COPY`` (forward references are
+          already banned, so this only costs an ordering a Postgres script is
+          free to write either way, and buys a single left-to-right pass);
+        * a script writes its outputs with ``COPY`` — at least one, and a bare
+          ``SELECT`` among several statements has nowhere to go;
+        * a view nobody reads is a typo, not a no-op.
+
+        A SINGLE statement keeps its pre-script behavior exactly: a bare SELECT
+        (no sink) or one COPY.
+        """
+        statements = _statements(tree)
+        script = len(statements) > 1
+
+        sinks: list[RawSink] = []
+        select: QueryExpr | None = None
+        branches: list[exp.Select] = []
+
+        for statement in statements:
+            if isinstance(statement, exp.Create):
+                if sinks:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        "a CREATE VIEW may not follow a COPY",
+                        statement,
+                        hint="define every view before the first COPY",
+                    )
+                self._view(statement)
+                continue
+            if isinstance(statement, exp.Copy):
+                # RFC-002: peel the COPY wrapper off; what it wraps is
+                # validated exactly like a bare SELECT from here on.
+                path, path_node, options, wrapped = _sink(statement)
+                query, query_branches = self._resolve_query(wrapped)
+                sinks.append(
+                    RawSink(
+                        path=path,
+                        path_node=path_node,
+                        query=query,
+                        branches=tuple(query_branches),
+                        options=options,
+                    )
+                )
+                if select is None:
+                    select, branches = query, query_branches
+                continue
+            if script:
+                if isinstance(statement, exp.Select | exp.Union | exp.Subquery | exp.Paren):
+                    # Only COPY carries a destination, so a bare SELECT among
+                    # several statements has nowhere to send its streams.
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        "only COPY may appear alongside other statements",
+                        statement,
+                        hint="wrap it: COPY (<query>) TO '<path>'",
+                    )
+                # DROP / ALTER / anything else sqlglot recognized, including the
+                # exp.Command it falls back to for syntax it cannot parse.
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"unsupported statement: {statement.__class__.__name__.upper()}",
+                    statement,
+                    hint=_SCRIPT_HINT,
+                )
+            select, branches = self._resolve_query(statement)
+
+        if select is None:
+            # Reached only by a view-only script: nothing named a destination.
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                "only one statement per query is supported",
-                tree,
-                hint="remove the trailing statements",
+                "a script must write its output with COPY",
+                next(iter(self.view_nodes.values()), None),
+                fallback=tree,
+                hint=_SCRIPT_HINT,
             )
-        # RFC-002: peel a COPY wrapper off first; what it wraps is validated
-        # exactly like a bare SELECT from here on.
-        sink: RawSink | None = None
-        if isinstance(tree, exp.Copy):
-            sink, tree = _sink(tree)
+        self._check_views_are_used()
 
-        query = _unwrap(tree)
+        return Resolved(
+            select=select,
+            input_paths=self.input_paths,
+            sources=self.sources,
+            ctes=self.ctes,
+            branches=branches,
+            sinks=sinks,
+            views=self.views,
+            input_options=self.input_options,
+            source_filters=self.source_filters,
+        )
+
+    def _resolve_query(self, node: exp.Expr) -> tuple[QueryExpr, list[exp.Select]]:
+        """Validate one whole query — a view body, a COPY's, or a bare SELECT.
+
+        Its own ``WITH`` is resolved into the shared, ordered binding table
+        FIRST, so the names it defines are visible to it and to everything
+        written after it, and nothing else.
+        """
+        query = _unwrap(node)
         if not isinstance(query, exp.Select | exp.Union):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -987,23 +1152,169 @@ class _Resolver:
                 query,
                 hint="sqlmpeg accepts a single SELECT statement",
             )
-
         self._resolve_ctes(query)
         branches = union_branches(query)
         visible = set(self.ctes)
         for branch in branches:
             self._validate_select(branch, visible)
+        return query, branches
 
-        return Resolved(
-            select=query,
-            input_paths=self.input_paths,
-            sources=self.sources,
-            ctes=self.ctes,
-            branches=branches,
-            sink=sink,
-            input_options=self.input_options,
-            source_filters=self.source_filters,
+    # -- CREATE VIEW (RFC-006) --------------------------------------------
+
+    def _view(self, create: exp.Create) -> None:
+        """Validate one ``CREATE VIEW name AS <query>`` and bind it.
+
+        Shapes VERIFIED under sqlglot 30.17 ``read="postgres"`` — an
+        ``exp.Create`` with ``kind="VIEW"``, the name in ``this`` and the body
+        in ``expression``; ``replace``/``exists``/``refresh``/``unique``/
+        ``concurrently`` are plain bools that are present-and-False on the
+        plain form (which is why :func:`_check_query_args` skips them):
+
+        ======================================== ==================================
+        written                                  how it lands here
+        ======================================== ==================================
+        ``CREATE VIEW v AS <q>``                 ``this=Table(Identifier(v))``,
+                                                 ``expression=Select`` (``Union``
+                                                 for a ``UNION ALL`` body; a body
+                                                 ``WITH`` rides on the ``Select``)
+        ``CREATE OR REPLACE VIEW v AS <q>``      ``replace=True``
+        ``CREATE TEMP|TEMPORARY VIEW v AS <q>``  ``properties=[TemporaryProperty]``
+        ``CREATE MATERIALIZED VIEW v AS <q>``    ``properties=[MaterializedProperty]``
+        ``CREATE VIEW v WITH (k=v) AS <q>``      ``properties=[Property]``
+        ``CREATE VIEW IF NOT EXISTS v AS <q>``   ``exists=True``
+        ``CREATE VIEW v (c1, c2) AS <q>``        ``this=Schema(Table(v), [c1, c2])``
+        ``CREATE VIEW s.v AS <q>``               ``this=Table(v, db=s)``
+        ``CREATE TABLE t AS <q>``                ``kind="TABLE"``
+        ``CREATE RECURSIVE VIEW v (c) AS <q>``   sqlglot falls back to
+                                                 ``exp.Command`` -> never reaches
+                                                 here, rejected as a statement
+        ======================================== ==================================
+
+        ANCHORING: an ``exp.Create`` carries no token position of its own and
+        neither does the ``Table`` wrapper, but the view-NAME ``Identifier``
+        does, and it is the earliest positioned token in the subtree — so
+        ``_pos(create)`` already lands on the name. The name node is passed
+        explicitly anyway, so a rejection cannot drift onto the body.
+        """
+        kind = create.args.get("kind")
+        if not isinstance(kind, str) or kind.upper() != "VIEW":
+            written = kind.upper() if isinstance(kind, str) and kind else "?"
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"unsupported statement: CREATE {written}",
+                create,
+                hint=_VIEW_HINT,
+            )
+        if create.args.get("replace"):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "CREATE OR REPLACE VIEW is not supported",
+                create,
+                hint="a view exists only for the length of one script; "
+                "there is nothing to replace",
+            )
+        if create.args.get("exists"):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "CREATE VIEW IF NOT EXISTS is not supported",
+                create,
+                hint="a view exists only for the length of one script; "
+                "it never exists already",
+            )
+        self._check_view_properties(create)
+        _check_query_args(
+            create, frozenset({"this", "kind", "expression"}), "CREATE VIEW"
         )
+
+        name_node = create.this
+        if isinstance(name_node, exp.Schema):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "view column lists are not supported",
+                name_node,
+                fallback=create,
+                hint="name the view's columns with AS inside its SELECT",
+            )
+        if not isinstance(name_node, exp.Table):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, "view is missing a name", create, hint=_VIEW_HINT
+            )
+        if name_node.args.get("db") or name_node.args.get("catalog"):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "qualified view names are not supported",
+                name_node,
+                fallback=create,
+                hint="a view lives in one script, not in a schema",
+            )
+        identifier = name_node.this
+        if not isinstance(identifier, exp.Identifier):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, "view is missing a name", create, hint=_VIEW_HINT
+            )
+        name = _ident_name(identifier)
+        self._reserve(name, identifier)
+
+        body = create.args.get("expression")
+        if not isinstance(body, exp.Expr):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"view '{name}' has no query",
+                identifier,
+                fallback=create,
+                hint=_VIEW_HINT,
+            )
+        # A view BODY is a full query (RFC-006), so unlike a CTE body it may
+        # carry its own WITH: the nested-WITH rejection is CTE-body-only
+        # (`_resolve_ctes`) and branch-level (`_collect_branches`), and neither
+        # fires on a statement's own top-level one.
+        query, _ = self._resolve_query(body)
+        # Reserved a second time on purpose: the body's own WITH may have
+        # claimed the name in between, and that collision has to be caught
+        # before the binding below overwrites it.
+        self._reserve(name, identifier)
+        self.ctes[name] = query
+        self.views[name] = query
+        self.view_nodes[name] = identifier
+
+    def _check_view_properties(self, create: exp.Create) -> None:
+        """TEMP / MATERIALIZED / ``WITH (...)`` all land in ``properties``."""
+        properties = create.args.get("properties")
+        if not isinstance(properties, exp.Properties):
+            return
+        for prop in properties.expressions:
+            if isinstance(prop, exp.TemporaryProperty):
+                message = "TEMPORARY views are not supported"
+            elif isinstance(prop, exp.MaterializedProperty):
+                message = "MATERIALIZED views are not supported"
+            else:
+                message = "view options are not supported"
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                message,
+                prop if isinstance(prop, exp.Expr) else None,
+                fallback=create,
+                hint="a view exists only for the length of one script and is "
+                "always inlined; write CREATE VIEW <name> AS <query>",
+            )
+
+    def _check_views_are_used(self) -> None:
+        """A view nobody reads is a typo (RFC-006), anchored on its CREATE.
+
+        Deliberately views only: an unused CTE has always been legal, and a
+        script's whole point is that its views feed the COPYs, so one that
+        feeds nothing is a misspelled reference somewhere else.
+        """
+        for name, node in self.view_nodes.items():
+            if name in self.used:
+                continue
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"view '{name}' is never used",
+                node,
+                hint="every view must be read by a later view or COPY; "
+                "check the spelling of the name in its FROM clauses",
+            )
 
     # -- CTEs -------------------------------------------------------------
 
@@ -1077,7 +1388,8 @@ class _Resolver:
                 ErrorCode.UNSUPPORTED_SQL,
                 f"duplicate name '{name}'",
                 node,
-                hint="alias and CTE names must be unique across the whole query",
+                hint="view, CTE and alias names share one flat namespace and "
+                "must be unique across the whole script",
             )
 
     # -- selects ----------------------------------------------------------
@@ -1355,6 +1667,9 @@ class _Resolver:
                     hint="a name can appear only once per FROM clause; to consume "
                     "it twice, reference <name>.frame twice — reuse is automatic",
                 )
+            # Feeds the unused-VIEW check (RFC-006). CTE names land here too;
+            # only views are required to be read.
+            self.used.add(name)
             scope[name] = "cte"
             return
         raise _error(
