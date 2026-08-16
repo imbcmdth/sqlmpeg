@@ -1,8 +1,6 @@
-# Trimming (RFC-004: input-level seeking)
+# Trimming
 
-`WHERE <alias>.t BETWEEN <start> AND <end>` on an `input()` alias lowers to
-an INPUT seek — `-ss <start> -to <end>` immediately before that alias's own
-`-i` — not a filtergraph node:
+`WHERE <alias>.t BETWEEN <start> AND <end>` on an `input()` alias lowers to an input seek, `-ss <start> -to <end>` placed right before that alias's own `-i`. No filtergraph node involved:
 
 ```sql
 SELECT a.video[1]
@@ -15,63 +13,31 @@ $ sqlmpeg compile --no-probe "SELECT a.video[1] FROM input('clip.mp4') a WHERE a
 ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -c:0 copy out.mp4
 ```
 
-This is a change from earlier versions, which spliced `trim`/`atrim` filter
-nodes into the graph for every `WHERE`. Aliases are globally unique and each
-owns exactly one `-i`, so an alias can carry at most one time window in the
-whole query — that per-alias window maps 1:1 onto ffmpeg's per-input `-ss`/
-`-to`. The payoff: the seek trims and rebases EVERY stream of that input —
-video, audio, subtitle, data, selected or not — so a column nothing else
-filters can stay a plain stream copy instead of forcing a re-encode
-(`-c:0 copy`, not a `trim`+`setpts` pair). It is also faster (a demuxer seek,
-no decode-and-discard) and produces a smaller graph.
+Earlier versions spliced `trim`/`atrim` filter nodes into the graph for every `WHERE`. The seek is better on every axis we could measure. Every alias owns exactly one `-i` and can carry at most one time window in the whole query, so the per-alias window maps 1:1 onto ffmpeg's per-input `-ss`/`-to`. The seek trims and rebases every stream of that input at once (video, audio, subtitle, data, selected or not), the demuxer skips the front of the file instead of decoding it just to throw it away, the graph shrinks, and a column nothing else filters gets to stay a plain `-c:0 copy` instead of being dragged through an encoder for the crime of having a start time.
 
-A `WHERE` window on a CTE name is unaffected by any of this: a CTE's output
-is a filtergraph pad, not an `-i`, so its window still lowers to `trim`+
-`setpts` / `atrim`+`asetpts`, spliced lazily and shared across every consumer
-of that stream — exactly the pre-RFC-004 behavior, and video/audio only.
+A `WHERE` window on a CTE name still works the old way, because it has to: a CTE's output is a filtergraph pad, not an `-i`, so its window lowers to `trim`+`setpts` (or `atrim`+`asetpts`), spliced lazily and shared across every consumer. Video and audio only, down that path.
 
 ## Accuracy: decoded vs. stream-copied
 
-The trim point ffmpeg actually lands on depends on whether that stream ends
-up decoded or copied:
+Where the cut actually lands depends on whether the stream gets decoded:
 
-- **Decoded** (anything filtered or re-encoded): frame-accurate. Modern
-  ffmpeg decodes from the previous keyframe and discards frames up to the
-  requested point before anything downstream ever sees them.
-- **Stream-copied**: the cut snaps to the previous keyframe — it CANNOT be
-  frame-accurate, because copying means no decode happens at all, and a
-  keyframe is the only point a copied stream can validly start from. The
-  output may start up to one whole GOP early.
+- **Decoded** (filtered or re-encoded): frame-accurate. ffmpeg decodes from the previous keyframe and discards frames up to your requested point before anything downstream sees them.
+- **Stream-copied**: the cut snaps back to the previous keyframe. This is not ffmpeg being lazy; a copied stream has no decoder in the loop, and a keyframe is the only place a copied stream can validly begin. Your output may start up to one full GOP early. (A GOP, for anyone lucky enough never to have needed the term, is the run of frames between one keyframe and the next. Everything in it depends on the keyframe. You cannot start mid-GOP for the same reason you cannot start reading a sentence at its fourth pronoun.)
 
-Measured against `tests/fixtures/testsrc.mp4` (30 frames, 15 fps, 2.000s,
-exactly ONE keyframe at t=0 — i.e. the GOP is the whole file, the worst case
-for this effect):
+Measured against `tests/fixtures/testsrc.mp4`: 30 frames, 15 fps, 2.000s, and exactly one keyframe at t=0, which makes the whole file one GOP. This is the pathological worst case, chosen on purpose.
 
-`WHERE a.t BETWEEN 0.5 AND 1.5` (a 1.000s window):
+`WHERE a.t BETWEEN 0.5 AND 1.5`, a 1.000s window:
 
 | path | `ffmpeg` | measured output duration |
 |---|---|---|
-| stream-copied (`SELECT a.frame`, nothing filters it) | `-ss 0.5 -to 1.5 -i ... -c copy` | **1.367s** (not 1.000s — snapped back to the only keyframe, at t=0) |
+| stream-copied (`SELECT a.frame`, nothing filters it) | `-ss 0.5 -to 1.5 -i ... -c copy` | **1.367s**. Not 1.000s. Snapped all the way back to the file's only keyframe, at t=0 |
 | decoded (wrapped in any filter, e.g. `scale(a.frame, 1)`) | `-ss 0.5 -to 1.5 -i ... -c:v libx264 ...` | **1.000s** exactly |
 
-A file with keyframes every few seconds (a normal encode, not this
-single-GOP fixture) snaps by at most one GOP, not the whole clip — but the
-mechanism is the same, and worth knowing before reaching for `--no-probe`/
-stream-copy on a query where the exact cut point matters. There is no
-`strict`-style knob to force re-encoding for exactness; wrap the column in a
-filter (even a no-op-ish one) if frame accuracy matters more than a fast
-remux.
+A normally-encoded file with keyframes every couple of seconds snaps by at most one GOP, not the whole clip, but the mechanism is identical. If the exact cut point matters more than a fast remux, wrap the column in a filter and eat the re-encode; there is no magic third option, and any tool claiming to offer one is quietly re-encoding.
 
-### mkv: `format=duration` can lie about the trimmed length
+### mkv duration metadata: do not believe it
 
-For a Matroska (`.mkv`) output, do not trust `ffprobe -show_entries
-format=duration` to confirm a stream-copied trim actually worked — the
-container-level duration and each track's own `DURATION` tag are written
-from the muxer's own bookkeeping, not always recomputed to match what
-actually got copied, and different tracks can disagree with each other.
-Measured trimming `tests/fixtures/avs.mkv` (video+audio+subtitle, again a
-single-keyframe fixture) with `WHERE a.t BETWEEN 0.3 AND 0.9` (a 0.6s
-window), stream-copied:
+After a stream-copied trim to Matroska, `ffprobe -show_entries format=duration` is not evidence of anything. The container-level duration and each track's own `DURATION` tag come from the muxer's bookkeeping, are not recomputed to match what actually got copied, and are perfectly willing to disagree with reality and each other simultaneously. Measured on a copy-trim of `tests/fixtures/avs.mkv` (video+audio+subtitle, same single-keyframe fixture) with a nominal 0.6s window (`WHERE a.t BETWEEN 0.3 AND 0.9`):
 
 ```
 $ ffprobe -show_entries format=duration output.mkv
@@ -82,37 +48,20 @@ audio:    DURATION=00:00:00.905000000
 subtitle: DURATION=00:00:01.323000000
 ```
 
-Three different numbers, none of them 0.6s, and the container-level
-`format=duration` simply took the largest one (the subtitle track's, which
-per the section below is barely trimmed at all). Check the actual packet
-timestamps (`ffprobe -show_entries packet=pts_time`) if you need to verify a
-copy-trim's real extent, not the container's summary duration.
+Four numbers in play (0.6s requested, three reported), none of them agreeing, and `format=duration` turns out to just be the largest track tag. This is one measurement away from a wrong test assertion, a wrong monitoring alert, or a wrong invoice. When you need the real extent of a copy-trim, read the packet timestamps (`ffprobe -show_entries packet=pts_time`) and ignore the container's self-reported summary entirely.
 
-## Captions: why a selected, trimmed subtitle track is rejected
+## Captions: why trim + selected subtitles is rejected
 
-The input seek covers every stream of an alias, including subtitle/data
-ones — that is what makes a captioned file trimmable at all. But ffmpeg does
-**not** retime subtitle/data packets under an input `-ss`, on either the
-copy or the transcode path: cue timestamps stay close to their ORIGINAL,
-un-seeked values while the video (and audio) rebase to the new window.
-Measured on `tests/fixtures/avs.mkv`, whose original subtitle cues sit at
-0.023s / 0.723s / 1.423s, trimmed with `WHERE a.t BETWEEN 0.5 AND 1.5`:
+The seek covers every stream of the alias, subtitle and data streams included, which is what makes a captioned file trimmable at all. And then ffmpeg declines to finish the job: caption packets are not retimed under an input `-ss`, on either the copy or the transcode path. The cues keep roughly their original timestamps while the video and audio rebase to the new zero. Measured on `tests/fixtures/avs.mkv`, whose subtitle cues sit at 0.023s / 0.723s / 1.423s, seeking `WHERE a.t BETWEEN 0.5 AND 1.5`:
 
 | path | subtitle packet times in the output |
 |---|---|
-| stream-copied (video, audio, subtitle all `-c copy`) | 0.023 / 0.723 / 1.423 — unchanged from the source |
-| transcoded (video/audio re-encoded, subtitle `-c copy`) | 0.000 / 0.700 / 1.400 — still essentially the ORIGINAL spacing, not shifted to the seek |
+| stream-copied (everything `-c copy`) | 0.023 / 0.723 / 1.423, unchanged from the source |
+| transcoded (video/audio re-encoded) | 0.000 / 0.700 / 1.400, still the original spacing, not shifted by the seek |
 
-Either way, the cues never move to line up with the rebased video. A track
-seeked-and-selected in the same query would therefore play roughly `start`
-seconds ahead of where it belongs — for a 0.5s seek, a caption meant for
-0.723s plays back near 0.723s again, but the video it was timed against now
-begins at (video) t=0 instead of (source) t=0.5, so the caption is
-effectively `start` seconds too early throughout the clip.
+So the video now starts at what used to be 0.5s, and a caption written for the 0.723s moment still fires at ~0.7s of the new timeline, half a second before the moment it captions. Every cue, off by exactly your seek offset, for the whole clip. Also the cue from before the window survives the trim and shows up anyway, like a guest who didn't check which party.
 
-sqlmpeg does not ship a broken result: `WHERE <alias>.t BETWEEN ...` on an
-alias whose subtitle/data column is ALSO selected in that same query is a
-typed rejection, not a silent desync:
+sqlmpeg will not compile that. Trimming an alias and selecting its subtitle/data column in the same query is a typed rejection, not a deliverable with a latent sync bug:
 
 ```sql
 SELECT a.subtitle[1]
@@ -127,9 +76,7 @@ $ sqlmpeg validate --json "SELECT a.subtitle[1] FROM input('tests/fixtures/avs.m
 
 Two things stay legal:
 
-- **Trimming an input whose captions are NOT selected.** An unmapped stream
-  is seeked harmlessly — nothing reads its (wrong) timestamps, because it
-  never reaches the output:
+- **Trimming an input whose captions are not selected.** An unmapped stream is seeked harmlessly; its wrong timestamps never reach the output because the stream itself never does:
 
   ```sql
   SELECT a.video[1], a.audio[1]
@@ -137,22 +84,9 @@ Two things stay legal:
   WHERE a.t BETWEEN 5 AND 60
   ```
 
-  This trims and rebases the video/audio normally; `clip.mkv`'s captions,
-  simply not selected, are dropped along with everything else the query
-  didn't ask for.
-- **Selecting captions from an alias that carries no `WHERE` window at
-  all.** The captions come through untouched, exactly like today.
+  The video and audio trim and rebase normally. The captions, unselected, are dropped with everything else the query didn't ask for.
+- **Selecting captions from an alias with no `WHERE` window.** Untouched passthrough, tags intact, business as usual.
 
-There is no way to select a trimmed, in-sync caption track from the SAME
-seeked input — join an external subtitle file whose cues are already timed
-for the cut instead, as a second `input()` alias (see the README's
-"Streams" section and `docs/system-prompt.md`'s Columns section for the
-join syntax; it needs no special support, it falls out of streams-as-columns
-plus a normal cross join).
+There is no way to get a trimmed, in-sync caption track out of the same seeked input, because there is no ffmpeg incantation under the hood that produces one. The working move is to join an external subtitle file whose cues are already timed for the cut, as a second `input()` alias (see the README's captions section; it needs no special join syntax, it's streams-as-columns plus an ordinary cross join).
 
-A `WHERE` window on a **CTE** name that carries a subtitle/data column is
-rejected unconditionally, whether or not that column is selected — a CTE
-trim is a filtergraph trim (`trim`/`atrim`), and a filtergraph cannot carry
-captions at all, seeked or not (RFC-004's passthrough-only constraint). A
-subtitle/data column inside a `UNION ALL` branch is rejected too, for the
-same underlying reason: `concat` has video/audio pads only.
+A `WHERE` window on a **CTE** carrying a subtitle/data column is rejected unconditionally, selected or not: a CTE trim is a filtergraph trim, and a filtergraph cannot carry captions in the first place. Same reason a subtitle column can't appear in a `UNION ALL` branch: `concat` has video and audio pads, and no amount of asking politely adds a third kind.

@@ -1,13 +1,8 @@
 # sqlmpeg error contract
 
-Every rejection sqlmpeg produces is a `SqlmpegError`: a typed `code`, a
-human-readable `message`, an optional `line`/`col` anchor into the query
-text, and an optional `hint`. See the "Error contract" section of
-`sqlmpeg-project.md` for the design rationale (this is what makes the
-generate -> `validate --json` -> repair loop converge for an LLM caller).
+Every rejection sqlmpeg produces is a `SqlmpegError`: a typed `code`, a human-readable `message`, an optional `line`/`col` anchor into the query text, and an optional `hint`. Error quality is a feature here, with tests, because the errors are what make the generate, `validate --json`, repair loop converge when an LLM is writing the SQL (and what keeps a human from swearing at a compiler that only says "no").
 
-`code` is one of the `ErrorCode` enum values defined in `sqlmpeg/errors.py`.
-The JSON shape is formalized in `docs/error-schema.json`.
+`code` is one of the `ErrorCode` enum values in `sqlmpeg/errors.py`. The JSON shape is formalized in `docs/error-schema.json`.
 
 Get the structured form from the CLI:
 
@@ -15,28 +10,13 @@ Get the structured form from the CLI:
 sqlmpeg validate --json "<query>"
 ```
 
-(or `sqlmpeg validate --json -f query.sql` if the query is in a file). On
-success this prints nothing and exits 0. On rejection it prints one JSON
-object to stdout and exits 1. Every example below is real output captured by
-running that exact command against the example query — nothing here is
-invented. Errors that require reading the file (`STREAM_NOT_FOUND`,
-`BROADCAST_MISMATCH`, some `INPUT_NOT_FOUND` cases, the caption/trim example
-under `UNSUPPORTED_SQL`) were captured against the real fixtures in
-`tests/fixtures/` (`av.mp4`: one video stream, one audio stream; `av2.mp4`:
-one video stream, two audio streams tagged `language=eng`/`language=fra`;
-`avs.mkv`: one video stream, one audio stream, one subtitle stream tagged
-`language=eng`).
+(or `sqlmpeg validate --json -f query.sql` when the query lives in a file). Success prints nothing and exits 0. Rejection prints one JSON object to stdout and exits 1. Every example below is real output captured by running that exact command against the example query. Nothing in this document is invented, which is a sentence that should not need writing in compiler documentation and yet. Errors that require reading a file (`STREAM_NOT_FOUND`, `BROADCAST_MISMATCH`, some `INPUT_NOT_FOUND` cases, the caption/trim example under `UNSUPPORTED_SQL`) were captured against the real fixtures in `tests/fixtures/` (`av.mp4`: one video stream, one audio stream; `av2.mp4`: one video stream, two audio streams tagged `language=eng`/`language=fra`; `avs.mkv`: one video stream, one audio stream, one subtitle stream tagged `language=eng`).
 
 ## PARSE_ERROR
 
-**Meaning:** The query text is not valid SQL under sqlglot's `postgres`
-dialect (guardrail #2: sqlmpeg always parses Postgres dialect). This fires
-before any sqlmpeg-specific validation runs — it is whatever sqlglot itself
-rejects, plus sqlmpeg's own "empty query" / "no statement found" checks for
-degenerate input.
+**Meaning:** The query text is not valid SQL under sqlglot's `postgres` dialect (guardrail #2: sqlmpeg always parses Postgres dialect). This fires before any sqlmpeg-specific validation runs. It is whatever sqlglot itself rejects, plus sqlmpeg's own "empty query" and "no statement found" checks for degenerate input.
 
-**Fires when:** the text fails to tokenize or parse — missing parens,
-garbled keywords, truncated statements, or an empty/whitespace-only query.
+**Fires when:** the text fails to tokenize or parse. Missing parens, garbled keywords, truncated statements, an empty or whitespace-only query.
 
 **Example query:**
 
@@ -54,14 +34,9 @@ SELECT a.video[1] FROM input('x.mp4' a
 
 ## UNKNOWN_FUNCTION
 
-**Meaning:** A call in the query names a function that is neither in the
-stdlib table (`sqlmpeg.stdlib.FUNCTIONS`, rendered in full in
-[docs/stdlib.md](stdlib.md)) nor a filter the installed ffmpeg reports
-(`sqlmpeg/registry.py`, RFC-003 -- see [docs/dynamic-filters.md](dynamic-filters.md)).
-This is checked both for the outer call in a projection/WHERE expression and
-for nested calls used as an argument to another call.
+**Meaning:** A call names a function that is neither in the stdlib table (`sqlmpeg.stdlib.FUNCTIONS`, rendered in full in [docs/stdlib.md](stdlib.md)) nor a filter the installed ffmpeg reports (`sqlmpeg/registry.py`, see [docs/dynamic-filters.md](dynamic-filters.md)). Checked for the outer call and for nested calls used as arguments.
 
-**Fires when:** the query calls a name that resolves in neither tier.
+**Fires when:** the name resolves in neither tier.
 
 **Example query:**
 
@@ -77,25 +52,13 @@ FROM input('x.mp4') a
 {"line": 1, "col": 8, "code": "UNKNOWN_FUNCTION", "message": "unknown function gblu()", "hint": "did you mean gblur()?"}
 ```
 
-The hint is a "did you mean" match against the stdlib and, when available,
-every name the installed ffmpeg reports. Without a near match it falls back
-to a plain alphabetical listing of the stdlib alone (the dynamic list runs to
-~460 entries -- too long to be a useful inline hint), suffixed with why the
-short list might not be the whole story on another machine: `"(dynamic
-ffmpeg filters need ffmpeg on PATH)"` when there is no ffmpeg to ask, or
-`"(dynamic ffmpeg filters are disabled by --portable)"` when `--portable` was
-passed.
+The hint is a did-you-mean match against the stdlib plus, when available, every name the installed ffmpeg reports. Without a near match it falls back to an alphabetical listing of the stdlib alone (the dynamic list runs to ~460 entries, which stops being a "hint" and starts being a phone book), suffixed with why the short list might not be the whole story on another machine: `"(dynamic ffmpeg filters need ffmpeg on PATH)"` when there is no ffmpeg to ask, or `"(dynamic ffmpeg filters are disabled by --portable)"` when `--portable` was passed.
 
 ## UNKNOWN_ALIAS
 
-**Meaning:** A `<alias>.video`/`<alias>.audio`/`<alias>.frame` reference (or
-a bare table reference in `FROM`) names an alias or CTE that was never
-introduced by this query's `FROM`/CTE list.
+**Meaning:** A `<alias>.video`/`<alias>.audio`/`<alias>.frame` reference (or a bare table reference in `FROM`) names an alias or CTE this query never introduced.
 
-**Fires when:** you reference `b.video[1]` but only declared `FROM
-input('x.mp4') a` (no alias `b` in scope), or reference a CTE name that
-hasn't been defined (or isn't visible yet — CTEs only see earlier CTEs in
-the same `WITH`, no forward references).
+**Fires when:** you reference `b.video[1]` but only declared `FROM input('x.mp4') a`, or reference a CTE that hasn't been defined or isn't visible yet (CTEs see only earlier CTEs in the same `WITH`; no forward references).
 
 **Example query:**
 
@@ -111,13 +74,9 @@ SELECT b.video[1] FROM input('x.mp4') a
 
 ## UDF_ARG_TYPE
 
-**Meaning:** A stdlib function call's argument count and/or kinds
-(`video`/`audio`/`num`/`str`) don't match any of that function's declared
-variants in the function table.
+**Meaning:** A stdlib call's argument count and/or kinds (`video`/`audio`/`num`/`str`) match none of that function's declared variants in the function table.
 
-**Fires when:** you call a known function with the wrong arity, or pass a
-stream where a number/string is expected (or vice versa) — e.g. calling
-`blur(a.video[1])` when `blur` requires `(video, num)`.
+**Fires when:** a known function gets the wrong arity, or a stream where a number/string belongs (or vice versa). `blur(a.video[1])` when `blur` wants `(video, num)`, that sort of thing.
 
 **Example query:**
 
@@ -134,25 +93,13 @@ FROM input('x.mp4') a
 
 ## SINGLE_OUTPUT_ONLY
 
-**Reserved, not currently raised.** The SELECT list is the output stream
-list — every column is a separate `-map`, in order — so a multi-column
-SELECT is ordinary usage, not an error. This code is kept in the enum
-(and in `docs/error-schema.json`'s `code` enum) purely for wire-format
-stability; no code path in `sqlmpeg/*.py` raises it. No example JSON: it
-cannot be triggered from SQL.
+**Reserved, not currently raised.** The SELECT list is the output stream list (every column is its own `-map`, in order), so a multi-column SELECT is ordinary usage rather than an error. The code stays in the enum, and in `docs/error-schema.json`'s `code` enum, purely for wire-format stability. No code path in `sqlmpeg/*.py` raises it, and no example JSON exists because none can.
 
 ## NO_STREAMING_EQUIVALENT
 
-**Meaning:** The construct is valid SQL with well-defined relational
-semantics, but has no meaning in a single-pass streaming filtergraph
-(ffmpeg processes frames as a stream; it cannot look ahead, sort, or
-deduplicate across the whole input).
+**Meaning:** The construct is valid SQL with perfectly good relational semantics that simply cannot exist in a single-pass streaming filtergraph. ffmpeg processes frames as they arrive; it cannot look ahead, sort, or deduplicate across an input, and no amount of SQL optimism changes that.
 
-**Fires when:** the query uses `GROUP BY`, `HAVING`, `ORDER BY`, `SORT BY`,
-`CLUSTER BY`, `DISTRIBUTE BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `QUALIFY`,
-`WINDOW`, `CONNECT BY`, an aggregate function, a window function, a
-subquery predicate (`IN (SELECT ...)`, `EXISTS`, etc.), or `UNION` (as
-opposed to `UNION ALL`, which requires deduplication).
+**Fires when:** the query uses `GROUP BY`, `HAVING`, `ORDER BY`, `SORT BY`, `CLUSTER BY`, `DISTRIBUTE BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `QUALIFY`, `WINDOW`, `CONNECT BY`, an aggregate function, a window function, a subquery predicate (`IN (SELECT ...)`, `EXISTS`, etc.), or `UNION` without `ALL` (plain `UNION` requires deduplication, and deduplicating video frames is a philosophy seminar, not a filter).
 
 **Example query:**
 
@@ -170,17 +117,9 @@ GROUP BY a.video[1]
 
 ## CONCAT_MISMATCH
 
-**Meaning:** `UNION ALL` lowers to ffmpeg's `concat` filter, which requires
-every branch to produce the identical column signature: same count, same
-stream types, in the same order (array columns count each element, so
-`audio[2]` and `audio[1]` also mismatch). When every input in the query is
-probeable, this also catches real fps/resolution/sample-rate mismatches
-between branches at the ffmpeg-filter level; the type/count/order check
-above needs no probing at all and fires purely from the SQL shape.
+**Meaning:** `UNION ALL` lowers to ffmpeg's `concat` filter, which demands every branch produce the identical column signature: same count, same stream types, same order. Array columns count per element, so `audio[2]` against `audio[1]` mismatches too. When every input is probeable this also catches real fps/resolution/sample-rate disagreements at the filter level; the type/count/order check needs no probing and fires from the SQL shape alone.
 
-**Fires when:** two `UNION ALL` branches select a different number of
-columns, different stream types, columns in a different order, or
-differently-sized array columns.
+**Fires when:** two `UNION ALL` branches select a different number of columns, different stream types, a different order, or differently-sized arrays.
 
 **Example query:**
 
@@ -200,44 +139,17 @@ FROM input('y.mp4') b
 
 ## UNSUPPORTED_SQL
 
-**Meaning:** Catch-all for syntactically valid SQL that falls outside the
-dialect and isn't one of the more specific codes above (it has no
-streaming-vs-batch distinction to make; it's simply not part of the
-surface sqlmpeg accepts). This is by far the most common code in practice —
-most of `sqlmpeg/parser.py`'s rejections use it, for things like: multiple
-statements, unsupported clause keys, explicit `JOIN` syntax (only comma
-cross-joins are supported), aliased/nested subqueries, `WITH RECURSIVE`,
-malformed or duplicate CTE/alias names, an empty `WHERE` clause, a
-non-positive or non-literal array subscript, or a top-level statement that
-isn't a `SELECT`/`UNION ALL`. (`SELECT *` and `<alias>.*` compile now —
-RFC-004 — so they are no longer on this list; see
-[docs/dynamic-filters.md](dynamic-filters.md) for the two RFC-003 rejections
-below and [docs/trimming.md](trimming.md) for the caption one.)
+**Meaning:** The catch-all for syntactically valid SQL outside the dialect that isn't one of the more specific codes above. No streaming-vs-batch philosophy involved; the surface just doesn't include it. This is the most common code in practice. Most of `sqlmpeg/parser.py`'s rejections use it: multiple statements, unsupported clause keys, explicit `JOIN` syntax (comma cross-joins only), aliased or nested subqueries, `WITH RECURSIVE`, malformed or duplicate CTE/alias names, an empty `WHERE`, a non-positive or non-literal array subscript, or a top-level statement that isn't a `SELECT`/`UNION ALL`. (`SELECT *` and `<alias>.*` compile now, so they are off this list; see [docs/dynamic-filters.md](dynamic-filters.md) for the two named-argument rejections below and [docs/trimming.md](trimming.md) for the caption one.)
 
-Two RFC-003 rejections also land here: a named argument written out of place
-(a positional argument after a named one, or the same name twice), and a
-named argument when there is no ffmpeg to validate it against -- because it
-was not found, or because `--portable` deliberately turned the introspection
-off. The rule is one line: named arguments ARE your installed ffmpeg, so a
-query that compiles portably compiles everywhere.
+Two named-argument rejections land here: a named argument written out of place (a positional after a named one, or the same name twice), and a named argument with no ffmpeg to validate it against, whether because none was found or because `--portable` deliberately turned introspection off. The rule fits on one line: named arguments ARE your installed ffmpeg, so a query that compiles portably compiles everywhere.
 
-Three RFC-004 rejections land here too, all a consequence of the same
-measured fact — ffmpeg does not retime subtitle/data packets under an input
-seek (see [docs/trimming.md](trimming.md)):
+Three caption rejections land here too, all consequences of one measured fact: ffmpeg does not retime subtitle/data packets under an input seek (the receipts are in [docs/trimming.md](trimming.md)):
 
-- a `WHERE <alias>.t BETWEEN ...` window on an INPUT alias whose
-  subtitle/data column is ALSO selected in the same query — the seeked track
-  would play out of sync with the rebased video, so it is rejected rather
-  than shipped broken (captured example below);
-- a `WHERE` window on a CTE name whose columns include a subtitle/data
-  column — a CTE trim is a filtergraph trim (`trim`/`atrim`), which cannot
-  carry captions at all, so this is rejected unconditionally, not only when
-  the column happens to be selected;
-- a subtitle/data column inside a `UNION ALL` branch — ffmpeg's `concat`
-  filter has video/audio pads only.
+- a `WHERE <alias>.t BETWEEN ...` window on an input alias whose subtitle/data column is also selected in the same query. The seeked track would play out of sync with the rebased video, so it is rejected instead of shipped broken (captured example below);
+- a `WHERE` window on a CTE whose columns include a subtitle/data column. A CTE trim is a filtergraph trim (`trim`/`atrim`), and a filtergraph cannot carry captions at all, so this rejects unconditionally, selected or not;
+- a subtitle/data column inside a `UNION ALL` branch. `concat` has video and audio pads, full stop.
 
-**Fires when:** (one example among many) the query selects a subtitle stream
-that is also inside its own alias's `WHERE` time window.
+**Fires when:** (one example among many) the query selects a subtitle stream that sits inside its own alias's `WHERE` time window.
 
 **Example query** (`tests/fixtures/avs.mkv` has one subtitle stream):
 
@@ -255,18 +167,9 @@ WHERE a.t BETWEEN 1 AND 2
 
 ## STREAM_NOT_FOUND
 
-**Meaning:** A subscript (`<alias>.video[k]` / `<alias>.audio[k]`, or the
-equivalent bound recorded for a CTE array column) is out of range for the
-number of streams actually present. This is only reachable against a
-probed input (a local, readable file, with `ffprobe` on `PATH`, and
-`--no-probe` not passed) or against a CTE array column whose length was
-already recorded when it was lowered — an explicit subscript against an
-unprobed input compiles unchecked and lets ffmpeg fail at run time instead.
+**Meaning:** A subscript (`<alias>.video[k]` / `<alias>.audio[k]`, or the recorded bound of a CTE array column) is out of range for the streams actually present. Only reachable against a probed input (local, readable, `ffprobe` on `PATH`, `--no-probe` not passed) or against a CTE array column whose length was recorded when it lowered. An explicit subscript against an unprobed input compiles unchecked and lets ffmpeg deliver the bad news at run time instead.
 
-**Fires when:** the subscript is 1-based and positive but exceeds the
-actual per-type stream count of the probed file, or (the CTE case) exceeds
-the recorded length of an array-typed CTE column, or the whole array is
-empty (e.g. splatting `.audio` on a video-only file).
+**Fires when:** the subscript is positive and 1-based but exceeds the probed file's per-type stream count, exceeds a CTE array column's recorded length, or the whole array is empty (splatting `.audio` on a video-only file selects nothing, and a query that selects nothing is a strange thing to run a render farm on).
 
 **Example query** (`tests/fixtures/av.mp4` has exactly one video stream):
 
@@ -283,16 +186,9 @@ FROM input('tests/fixtures/av.mp4') a
 
 ## INPUT_NOT_FOUND
 
-**Meaning:** A bare array (`<alias>.video` / `<alias>.audio`, splatted in
-the SELECT list or handed to a function to broadcast over) needs to know
-how many streams the file has to expand, and the input could not be probed
-— the file does not exist, is unreadable, is a URL, or `--no-probe` was
-passed. "Cannot enumerate the streams of a file I cannot read" is reported
-as its own natural error rather than reusing a generic probing-failure
-code.
+**Meaning:** A bare array (`<alias>.video` / `<alias>.audio`, splatted into the SELECT list or broadcast through a function) needs the file's actual stream count to expand, and the input could not be probed: missing, unreadable, a URL, or `--no-probe` was passed. "Cannot enumerate the streams of a file I cannot read" gets its own honest error rather than hiding inside a generic probing-failure code.
 
-**Fires when:** a bare array appears (directly in the SELECT list or as a
-function argument) over an input that has no probe result.
+**Fires when:** a bare array appears over an input with no probe result.
 
 **Example query:**
 
@@ -309,13 +205,9 @@ FROM input('nope.mp4') a
 
 ## BROADCAST_MISMATCH
 
-**Meaning:** Broadcasting a function call over more than one array
-argument zips them elementwise (no cross products); every array argument
-to that call must be the same length. A scalar argument (including a
-single-subscripted stream) always broadcasts and never triggers this.
+**Meaning:** Broadcasting a call over more than one array argument zips them elementwise, no cross products, so every array argument must be the same length. A scalar argument (including a single subscripted stream) broadcasts freely and never triggers this.
 
-**Fires when:** two or more array arguments to the same call have
-different lengths.
+**Fires when:** two or more array arguments to one call have different lengths.
 
 **Example query** (`tests/fixtures/av2.mp4` has 2 audio streams,
 `tests/fixtures/av.mp4` has 1):
@@ -333,12 +225,9 @@ FROM input('tests/fixtures/av2.mp4') a, input('tests/fixtures/av.mp4') b
 
 ## UNKNOWN_SINK_OPTION
 
-**Meaning:** A `COPY (query) TO 'path' WITH (...)` option name (RFC-002) is
-not one of the entries in `sqlmpeg.sink.SINK_OPTIONS`.
+**Meaning:** A `COPY (query) TO 'path' WITH (...)` option name is not one of the entries in `sqlmpeg.sink.SINK_OPTIONS`.
 
-**Fires when:** an option in the `WITH (...)` list is misspelled or simply
-doesn't exist -- e.g. `video_codc 'libx264'` instead of `video_codec
-'libx264'`, or an option outside the v1 table entirely.
+**Fires when:** an option in the `WITH (...)` list is misspelled or doesn't exist. `video_codc 'libx264'` instead of `video_codec 'libx264'`, or an option outside the v1 table entirely.
 
 **Example query:**
 
@@ -357,22 +246,13 @@ COPY (
 {"line": 5, "col": 14, "code": "UNKNOWN_SINK_OPTION", "message": "unknown sink option 'video_codc'", "hint": "did you mean 'video_codec'?"}
 ```
 
-The anchor lands on the option's VALUE, not its name: sqlglot records no
-token position on a bare `WITH (...)` option name, only on a string/number
-literal value (see "Anchoring is coarse" in the parser notes) -- `line`/`col`
-here point at the `'libx264'` literal, one line below the misspelled name.
+The anchor lands on the option's VALUE, not its name: sqlglot records no token position on a bare `WITH (...)` option name, only on a string or number literal, so `line`/`col` here point at the `'libx264'` literal, one line below the misspelled name. Imperfect, deterministic, and documented, which beats two of the three alternatives.
 
 ## SINK_OPTION_TYPE
 
-**Meaning:** A `COPY (query) TO 'path' WITH (...)` option's value does not
-match the type declared for it in `sqlmpeg.sink.SINK_OPTIONS` (`str` / `int`
-/ `bool`).
+**Meaning:** A `COPY (query) TO 'path' WITH (...)` option's value doesn't match the type declared for it in `sqlmpeg.sink.SINK_OPTIONS` (`str` / `int` / `bool`).
 
-**Fires when:** a `str`-typed option is given a number or bool, an
-`int`-typed option is given a string or a float, or a `bool`-typed option is
-given anything other than `true`/`false` -- e.g. `crf '20'` (a string where
-`crf` wants an int) or `faststart 1` (an int where `faststart` wants a
-bool).
+**Fires when:** a `str`-typed option gets a number or bool, an `int`-typed option gets a string or float, or a `bool`-typed option gets anything but `true`/`false`. `crf 'high'` (a string where `crf` wants an int) or `faststart 1` (an int where `faststart` wants a bool).
 
 **Example query:**
 
@@ -393,15 +273,9 @@ COPY (
 
 ## UNKNOWN_FILTER_OPTION
 
-**Meaning:** A named argument (`<name> => <value>`, RFC-003) names an option
-the ffmpeg filter it targets does not have. The option set is read out of the
-installed ffmpeg (`ffmpeg -help filter=<name>`, see `sqlmpeg/registry.py`),
-so it is exactly what that binary supports -- not a table in sqlmpeg.
+**Meaning:** A named argument (`<name> => <value>`) names an option the targeted ffmpeg filter doesn't have. The option set is read out of the installed ffmpeg (`ffmpeg -help filter=<name>`, see `sqlmpeg/registry.py`), so it is exactly what that binary supports, not a table somebody in this repo has to keep current.
 
-**Fires when:** the option name is misspelled or belongs to a different
-filter -- either on a dynamically-resolved call (`gblur(a.frame, sigmma =>
-5)`) or on a stdlib call's trailing named extras, which are checked against
-the filter that spec expands to (`blur` -> `gblur`).
+**Fires when:** the option name is misspelled or belongs to a different filter, on a dynamically-resolved call (`gblur(a.frame, sigmma => 5)`) or on a stdlib call's trailing named extras, which check against the filter that spec expands to (`blur` targets `gblur`).
 
 **Example query:**
 
@@ -416,24 +290,15 @@ FROM input('x.mp4') a
 {"line": 1, "col": 33, "code": "UNKNOWN_FILTER_OPTION", "message": "filter 'gblur' has no option 'sigmma'", "hint": "did you mean sigma => ...?"}
 ```
 
-The anchor lands on the option's VALUE: sqlglot records no token position on
-the `exp.Var` holding a named argument's name (the same gap `COPY ... WITH`
-option names have), so `line`/`col` point at the `5`.
+The anchor lands on the option's VALUE: sqlglot records no token position on the `exp.Var` holding a named argument's name (the same gap `COPY ... WITH` option names have), so `line`/`col` point at the `5`.
 
-Machine-dependence is the point of this code -- a query using it compiles
-only where that ffmpeg does. See `UNSUPPORTED_SQL` for what happens when
-there is no ffmpeg to check against at all.
+Machine-dependence is the entire point of this code: a query using it compiles only where that ffmpeg does. See `UNSUPPORTED_SQL` for what happens when there is no ffmpeg to check against at all.
 
 ## FILTER_OPTION_TYPE
 
-**Meaning:** A named argument's value does not match the option's
-introspected type, declared range, or set of named constants.
+**Meaning:** A named argument's value doesn't match the option's introspected type, declared range, or set of named constants.
 
-**Fires when:** a numeric option gets a string or a number outside
-`(from A to B)`, a boolean option gets anything but `true`/`false`, an enum
-option gets something that is not one of its constants (or gets a bare
-number instead of a quoted constant name), or the option's ffmpeg type is
-one sqlmpeg cannot set at all (`binary`, `dictionary`).
+**Fires when:** a numeric option gets a string or a value outside its `(from A to B)` range, a boolean option gets anything but `true`/`false`, an enum option gets something that isn't one of its constants (or a bare number instead of a quoted constant name), or the option's ffmpeg type is one sqlmpeg cannot set at all (`binary`, `dictionary`).
 
 **Example query:**
 
@@ -448,21 +313,8 @@ FROM input('x.mp4') a
 {"line": 1, "col": 32, "code": "FILTER_OPTION_TYPE", "message": "option 'sigma' of filter 'gblur' accepts a number from 0 to 1024, got 5000", "hint": "pick a value from 0 to 1024"}
 ```
 
-Enum options quote their constant name (`transition => 'wipeleft'`), and the
-message lists the constants (truncated with a count when there are many --
-`xfade`'s `transition` has 59). Anchoring is the same as
-`UNKNOWN_FILTER_OPTION`'s: the value, not the name.
+Enum options quote their constant name (`transition => 'wipeleft'`), and the message lists the constants, truncated with a count when there are many (`xfade`'s `transition` has 59, because somebody at ffmpeg really likes wipes). Anchoring matches `UNKNOWN_FILTER_OPTION`: the value, not the name.
 
 ## INTERNAL
 
-**Bug backstop, not a user-input error.** Every compiler pass (`parse`,
-`lower`, `insert_splits` via `compile_sql`) wraps its body in a catch-all
-that converts any *unexpected* exception (a sqlglot internal bug, a
-`RecursionError` on a pathologically nested query, or a bug in sqlmpeg
-itself) into `ErrorCode.INTERNAL` instead of letting it propagate as a raw
-traceback (guardrail #7: no panics on user input). The fuzz corpus
-(`tests/test_fuzz.py`) asserts this code never fires across its mutated
-query corpus — if you see `INTERNAL` in the wild, it is a bug in sqlmpeg;
-please report the query that triggered it. No example JSON is included
-here because there is no known SQL input that reaches this path
-deliberately.
+**Bug backstop, not a user-input error.** Every compiler pass (`parse`, `lower`, `insert_splits`, via `compile_sql`) wraps its body in a catch-all that converts any unexpected exception (a sqlglot internal, a `RecursionError` on a pathologically nested query, or an actual bug in sqlmpeg) into `ErrorCode.INTERNAL` rather than letting a raw traceback escape (guardrail #7: no panics on user input, ever, including the input a fuzzer wrote at 3 a.m.). The fuzz corpus in `tests/test_fuzz.py` asserts this code never fires across its mutated queries. If you see `INTERNAL` in the wild, sqlmpeg has a bug and would genuinely like the query that triggered it. No example JSON here, because no known SQL input reaches this path on purpose, and we intend to keep it that way.
