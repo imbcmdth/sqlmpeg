@@ -1,6 +1,6 @@
 # sqlmpeg error contract
 
-Every rejection sqlmpeg produces is a `SqlmpegError`: a typed `code`, a human-readable `message`, an optional `line`/`col` anchor into the query text, and an optional `hint`. Error quality is a feature here, with tests, because the errors are what make the generate, `validate --json`, repair loop converge when an LLM is writing the SQL (and what keeps a human from swearing at a compiler that only says "no").
+Every rejection sqlmpeg produces is a `SqlmpegError`: a typed `code`, a human-readable `message`, an optional `line`/`col` anchor into the query text, and an optional `hint`. Error quality is a feature here, with tests, because the errors are what make the generate, `validate --json`, repair loop converge when an LLM is writing the SQL - and what make debugging pleasant when a human is.
 
 `code` is one of the `ErrorCode` enum values in `sqlmpeg/errors.py`. The JSON shape is formalized in `docs/error-schema.json`.
 
@@ -10,7 +10,7 @@ Get the structured form from the CLI:
 sqlmpeg validate --json "<query>"
 ```
 
-(or `sqlmpeg validate --json -f query.sql` when the query lives in a file). Success prints nothing and exits 0. Rejection prints one JSON object to stdout and exits 1. Every example below is real output captured by running that exact command against the example query. Nothing in this document is invented, which is a sentence that should not need writing in compiler documentation and yet. Errors that require reading a file (`STREAM_NOT_FOUND`, `BROADCAST_MISMATCH`, some `INPUT_NOT_FOUND` cases, the caption/trim example under `UNSUPPORTED_SQL`) were captured against the real fixtures in `tests/fixtures/` (`av.mp4`: one video stream, one audio stream; `av2.mp4`: one video stream, two audio streams tagged `language=eng`/`language=fra`; `avs.mkv`: one video stream, one audio stream, one subtitle stream tagged `language=eng`).
+(or `sqlmpeg validate --json -f query.sql` when the query lives in a file). Success prints nothing and exits 0. Rejection prints one JSON object to stdout and exits 1. Every example below is real output captured by running that exact command against the example query; nothing in this document is invented. Errors that require reading a file (`STREAM_NOT_FOUND`, `BROADCAST_MISMATCH`, some `INPUT_NOT_FOUND` cases, the caption/trim example under `UNSUPPORTED_SQL`) were captured against the real fixtures in `tests/fixtures/` (`av.mp4`: one video stream, one audio stream; `av2.mp4`: one video stream, two audio streams tagged `language=eng`/`language=fra`; `avs.mkv`: one video stream, one audio stream, one subtitle stream tagged `language=eng`).
 
 ## PARSE_ERROR
 
@@ -52,7 +52,7 @@ FROM input('x.mp4') a
 {"line": 1, "col": 8, "code": "UNKNOWN_FUNCTION", "message": "unknown function gblu()", "hint": "did you mean gblur()?"}
 ```
 
-The hint is a did-you-mean match against the stdlib plus, when available, every name the installed ffmpeg reports. Without a near match it falls back to an alphabetical listing of the stdlib alone (the dynamic list runs to ~460 entries, which stops being a "hint" and starts being a phone book), suffixed with why the short list might not be the whole story on another machine: `"(dynamic ffmpeg filters need ffmpeg on PATH)"` when there is no ffmpeg to ask, or `"(dynamic ffmpeg filters are disabled by --portable)"` when `--portable` was passed.
+The hint is a did-you-mean match against the stdlib plus, when available, every name the installed ffmpeg reports. Without a near match it falls back to an alphabetical listing of the stdlib alone (the dynamic list runs to ~460 entries, far too many to be a useful inline hint), suffixed with why the short list might not be the whole story on another machine: `"(dynamic ffmpeg filters need ffmpeg on PATH)"` when there is no ffmpeg to ask, or `"(dynamic ffmpeg filters are disabled by --portable)"` when `--portable` was passed.
 
 ## UNKNOWN_ALIAS
 
@@ -97,9 +97,9 @@ FROM input('x.mp4') a
 
 ## NO_STREAMING_EQUIVALENT
 
-**Meaning:** The construct is valid SQL with perfectly good relational semantics that simply cannot exist in a single-pass streaming filtergraph. ffmpeg processes frames as they arrive; it cannot look ahead, sort, or deduplicate across an input, and no amount of SQL optimism changes that.
+**Meaning:** The construct is valid SQL with perfectly good relational semantics that simply cannot exist in a single-pass streaming filtergraph. ffmpeg processes frames as they arrive; it cannot look ahead, sort, or deduplicate across an input.
 
-**Fires when:** the query uses `GROUP BY`, `HAVING`, `ORDER BY`, `SORT BY`, `CLUSTER BY`, `DISTRIBUTE BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `QUALIFY`, `WINDOW`, `CONNECT BY`, an aggregate function, a window function, a subquery predicate (`IN (SELECT ...)`, `EXISTS`, etc.), or `UNION` without `ALL` (plain `UNION` requires deduplication, and deduplicating video frames is a philosophy seminar, not a filter).
+**Fires when:** the query uses `GROUP BY`, `HAVING`, `ORDER BY`, `SORT BY`, `CLUSTER BY`, `DISTRIBUTE BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `QUALIFY`, `WINDOW`, `CONNECT BY`, an aggregate function, a window function, a subquery predicate (`IN (SELECT ...)`, `EXISTS`, etc.), or `UNION` without `ALL` (plain `UNION` requires deduplication, and there is no meaningful way to deduplicate a stream of frames).
 
 **Example query:**
 
@@ -169,7 +169,7 @@ WHERE a.t BETWEEN 1 AND 2
 
 **Meaning:** A subscript (`<alias>.video[k]` / `<alias>.audio[k]`, or the recorded bound of a CTE array column) is out of range for the streams actually present. Only reachable against a probed input (local, readable, `ffprobe` on `PATH`, `--no-probe` not passed) or against a CTE array column whose length was recorded when it lowered. An explicit subscript against an unprobed input compiles unchecked and lets ffmpeg deliver the bad news at run time instead.
 
-**Fires when:** the subscript is positive and 1-based but exceeds the probed file's per-type stream count, exceeds a CTE array column's recorded length, or the whole array is empty (splatting `.audio` on a video-only file selects nothing, and a query that selects nothing is a strange thing to run a render farm on).
+**Fires when:** the subscript is positive and 1-based but exceeds the probed file's per-type stream count, exceeds a CTE array column's recorded length, or the whole array is empty (splatting `.audio` on a video-only file would select nothing, which is never what was meant).
 
 **Example query** (`tests/fixtures/av.mp4` has exactly one video stream):
 
@@ -246,7 +246,7 @@ COPY (
 {"line": 5, "col": 14, "code": "UNKNOWN_SINK_OPTION", "message": "unknown sink option 'video_codc'", "hint": "did you mean 'video_codec'?"}
 ```
 
-The anchor lands on the option's VALUE, not its name: sqlglot records no token position on a bare `WITH (...)` option name, only on a string or number literal, so `line`/`col` here point at the `'libx264'` literal, one line below the misspelled name. Imperfect, deterministic, and documented, which beats two of the three alternatives.
+The anchor lands on the option's VALUE, not its name: sqlglot records no token position on a bare `WITH (...)` option name, only on a string or number literal, so `line`/`col` here point at the `'libx264'` literal, one line below the misspelled name. Imperfect, but deterministic and documented.
 
 ## SINK_OPTION_TYPE
 
@@ -313,8 +313,8 @@ FROM input('x.mp4') a
 {"line": 1, "col": 32, "code": "FILTER_OPTION_TYPE", "message": "option 'sigma' of filter 'gblur' accepts a number from 0 to 1024, got 5000", "hint": "pick a value from 0 to 1024"}
 ```
 
-Enum options quote their constant name (`transition => 'wipeleft'`), and the message lists the constants, truncated with a count when there are many (`xfade`'s `transition` has 59, because somebody at ffmpeg really likes wipes). Anchoring matches `UNKNOWN_FILTER_OPTION`: the value, not the name.
+Enum options quote their constant name (`transition => 'wipeleft'`), and the message lists the constants, truncated with a count when there are many (`xfade`'s `transition` alone has 59). Anchoring matches `UNKNOWN_FILTER_OPTION`: the value, not the name.
 
 ## INTERNAL
 
-**Bug backstop, not a user-input error.** Every compiler pass (`parse`, `lower`, `insert_splits`, via `compile_sql`) wraps its body in a catch-all that converts any unexpected exception (a sqlglot internal, a `RecursionError` on a pathologically nested query, or an actual bug in sqlmpeg) into `ErrorCode.INTERNAL` rather than letting a raw traceback escape (guardrail #7: no panics on user input, ever, including the input a fuzzer wrote at 3 a.m.). The fuzz corpus in `tests/test_fuzz.py` asserts this code never fires across its mutated queries. If you see `INTERNAL` in the wild, sqlmpeg has a bug and would genuinely like the query that triggered it. No example JSON here, because no known SQL input reaches this path on purpose, and we intend to keep it that way.
+**Bug backstop, not a user-input error.** Every compiler pass (`parse`, `lower`, `insert_splits`, via `compile_sql`) wraps its body in a catch-all that converts any unexpected exception (a sqlglot internal, a `RecursionError` on a pathologically nested query, or an actual bug in sqlmpeg) into `ErrorCode.INTERNAL` rather than letting a raw traceback escape (guardrail #7: no panics on user input, ever). The fuzz corpus in `tests/test_fuzz.py` asserts this code never fires across its mutated queries. If you see `INTERNAL` in the wild, sqlmpeg has a bug, and we would genuinely like the query that triggered it. No example JSON here, because no known SQL input reaches this path, and we intend to keep it that way.
