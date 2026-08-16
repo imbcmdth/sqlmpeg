@@ -8,7 +8,39 @@ defensive re-check.
 
 RFC-001 (stream-aware) shapes this pass: the top-level SELECT list IS the
 output stream list, and every value flowing through lowering is a *typed*
-stream (``video`` or ``audio``), never an untyped "frame".
+stream (``video``, ``audio``, ``subtitle`` or ``data``), never an untyped
+"frame".
+
+Passthrough-only stream types (RFC-004)
+---------------------------------------
+``subtitle`` and ``data`` streams get the exact same surface as video/audio —
+``a.subtitle[1]``, the bare array ``a.data``, a CTE column, a star expansion —
+but an ffmpeg filtergraph carries video and audio only, so they may never be a
+filter input. Three rejections enforce that, all keyed off ``_PASSTHROUGH_ONLY``:
+
+* as a function argument, in EITHER tier -> ``UDF_ARG_TYPE``
+  (:meth:`_Lowerer._reject_passthrough_args`);
+* under a WHERE time range that is actually consumed in that branch ->
+  ``UNSUPPORTED_SQL`` (:meth:`_Lowerer._access`; plan 035's input-level seek
+  lifts this for input aliases, never for CTEs);
+* as a UNION ALL branch column -> ``UNSUPPORTED_SQL``
+  (:meth:`_Lowerer._check_concat_columns`; ``concat`` has ``v``/``a`` pads only).
+
+Everything else about them is ordinary: they lower to ``"src:<alias>:s:<k>"`` /
+``"src:<alias>:d:<k>"`` refs, carry provenance (a caption track's ``language``
+tag rides the same passthrough metadata path an audio track's does), and become
+``Output`` rows that split and emit treat as bare ``-map``s.
+
+``SELECT *`` and ``<alias>.*`` (RFC-004)
+----------------------------------------
+A star is a column GENERATOR, not an expression: :meth:`_Lowerer._expand_star`
+turns it into one passthrough column per stream. A bare ``*`` covers every FROM
+alias in FROM order; ``<alias>.*`` covers one. Within an INPUT alias the order
+is FILE order (probe order, all four stream types interleaved as the container
+has them) and the expansion is splat tier — it needs a probe, so an unreadable
+input is ``INPUT_NOT_FOUND``, the same policy a bare ``a.audio`` has. Within a
+CTE it is column order, array columns splatting, and no probe is consulted at
+all: the CTE's shape was fixed when its body lowered.
 
 What lowering does, in order:
 
@@ -145,7 +177,15 @@ from sqlglot import exp
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.ir import FrameRef, Graph, Node, Output, Sink, StreamType
-from sqlmpeg.parser import RawSink, Resolved, _pos, kwarg_name, subscript_index, union_branches
+from sqlmpeg.parser import (
+    RawSink,
+    Resolved,
+    _pos,
+    kwarg_name,
+    star_qualifier,
+    subscript_index,
+    union_branches,
+)
 from sqlmpeg.parser import _ident_name as _fold
 from sqlmpeg.probe import ProbeResult, StreamMeta
 from sqlmpeg.registry import DynamicFilter, FilterOption, Registry
@@ -157,10 +197,27 @@ __all__ = ["lower"]
 _FRAME_COLUMN = "frame"
 _TIME_COLUMN = "t"
 
-# The two array-typed pseudo-columns an input exposes, and their element type.
-_ARRAY_COLUMNS: dict[str, StreamType] = {"video": "video", "audio": "audio"}
+# The array-typed pseudo-columns an input exposes, and their element type.
+# RFC-004 added subtitle/data: identical array/subscript/splat surface, but
+# passthrough-only (see `_PASSTHROUGH_ONLY` below).
+_ARRAY_COLUMNS: dict[str, StreamType] = {
+    "video": "video",
+    "audio": "audio",
+    "subtitle": "subtitle",
+    "data": "data",
+}
 
-_TYPE_MARKERS: dict[StreamType, str] = {"video": "v", "audio": "a"}
+_TYPE_MARKERS: dict[StreamType, str] = {
+    "video": "v",
+    "audio": "a",
+    "subtitle": "s",
+    "data": "d",
+}
+
+# Stream types an ffmpeg filtergraph cannot carry (RFC-004, "Passthrough-only"):
+# they may only ever become an Output (a bare `-map`), never a filter argument
+# and never the input of a WHERE trim.
+_PASSTHROUGH_ONLY: frozenset[StreamType] = frozenset({"subtitle", "data"})
 
 # Kind label used in UDF_ARG_TYPE "got" lists for anything that is neither a
 # literal nor a stream-typed subexpression (e.g. `1 + 2`, NULL, TRUE).
@@ -190,6 +247,14 @@ _NO_REGISTRY_HINT = (
 _PORTABLE_HINT = (
     "--portable keeps a query machine-independent: drop the named arguments, or "
     "compile without --portable"
+)
+_PASSTHROUGH_HINT = (
+    "subtitle and data streams can only be selected (and copied), never filtered; "
+    "drop them from the call and select them as their own column"
+)
+_CAPTION_TRIM_HINT = (
+    "select the subtitle/data columns without a WHERE time range, or keep the "
+    "WHERE and select only video/audio columns of that alias"
 )
 
 # Longest option/constant list a hint or message renders before it stops
@@ -645,8 +710,32 @@ class _Lowerer:
         # concat maps one input pad per column, so arrays are flattened to
         # one column per element BEFORE it sees them.
         flattened = [_flatten(columns) for columns in lowered]
+        self._check_concat_columns(branches, flattened)
         self._check_concat_signature(branches, lowered, flattened)
         return self._concat(flattened)
+
+    def _check_concat_columns(
+        self, branches: list[exp.Select], flattened: list[list[_Column]]
+    ) -> None:
+        """No UNION ALL branch may carry a subtitle/data column (RFC-004).
+
+        ``concat`` is a filtergraph filter and takes ``v`` video plus ``a``
+        audio pads — there is no ``s``/``d`` half — so a caption column in a
+        concatenated branch has nowhere to go. Checked before
+        :meth:`_check_concat_signature` so the rejection names the real reason
+        rather than a column-count mismatch.
+        """
+        for index, columns in enumerate(flattened):
+            for column in columns:
+                if column.value.type in _PASSTHROUGH_ONLY:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"UNION ALL concatenates video and audio only: branch "
+                        f"{index + 1} selects a {column.value.type} stream",
+                        branches[index],
+                        hint="select subtitle and data streams outside the UNION ALL "
+                        "(they are copied, never concatenated)",
+                    )
 
     def _check_concat_signature(
         self,
@@ -739,12 +828,123 @@ class _Lowerer:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL, "SELECT has no output column", fallback=select
             )
+        columns: list[_Column] = []
+        for projection in projections:
+            # RFC-004: a star is not an expression, it is a column GENERATOR --
+            # it contributes as many columns as the aliases it names have
+            # streams, so it is expanded here rather than in `_lower_expr`.
+            qualifier = star_qualifier(projection)
+            if qualifier is not None:
+                columns += self._expand_star(qualifier, projection, env, select)
+                continue
+            columns.append(
+                _Column(
+                    name=_projection_name(projection),
+                    value=self._lower_expr(projection, env, select),
+                )
+            )
+        return columns
+
+    # -- SELECT * / <alias>.* (RFC-004) ------------------------------------
+
+    def _expand_star(
+        self, qualifier: str, anchor: exp.Expr, env: _Env, select: exp.Select
+    ) -> list[_Column]:
+        """Every stream a star stands for, as passthrough columns.
+
+        A bare ``*`` takes every alias of the FROM clause in FROM order
+        (``_Env.bindings`` is insertion-ordered and built by `_scope` in exactly
+        that order); ``<alias>.*`` takes one. Within an alias: FILE order for an
+        input (probe order, all four stream types interleaved as the container
+        has them), COLUMN order for a CTE, with array columns splatting.
+
+        The WHERE trim of each alias still applies (`_access`), which is also
+        where a trimmed caption is rejected.
+        """
+        if qualifier:
+            binding = env.bindings.get(qualifier)
+            if binding is None:
+                raise _error(
+                    ErrorCode.UNKNOWN_ALIAS,
+                    f"unknown alias '{qualifier}'",
+                    anchor,
+                    fallback=select,
+                    hint=self._known_hint(),
+                )
+            bindings = [binding]
+        else:
+            bindings = list(env.bindings.values())
+
+        columns: list[_Column] = []
+        for binding in bindings:
+            if isinstance(binding, _InputBinding):
+                columns += self._star_input(binding.alias, anchor, env, select)
+            else:
+                columns += self._star_cte(binding, anchor, env, select)
+        return columns
+
+    def _star_input(
+        self, alias: str, anchor: exp.Expr, env: _Env, select: exp.Select
+    ) -> list[_Column]:
+        """Every stream of one input alias, in file order.
+
+        Splat tier, same policy as a bare ``a.audio`` (RFC-001 "Probing
+        policy"): how many streams a file has, and of which types, is a
+        property of the file, so an input that could not be probed is
+        INPUT_NOT_FOUND rather than a guess.
+        """
+        result = self.probes.get(alias)
+        path = self.res.input_paths[self.graph.sources[alias]]
+        if result is None:
+            raise _error(
+                ErrorCode.INPUT_NOT_FOUND,
+                f"cannot expand '*' over '{path}': file not found or unreadable",
+                anchor,
+                fallback=select,
+                hint="'*' is every stream of the input, and only a readable input "
+                f"can list them; name the streams instead, e.g. {alias}.video[1]",
+            )
+        if not result.streams:
+            raise _error(
+                ErrorCode.STREAM_NOT_FOUND,
+                f"'*' over '{path}' selects nothing: it has no video, audio, "
+                "subtitle or data streams",
+                anchor,
+                fallback=select,
+                hint="an empty expansion would select nothing; drop the star",
+            )
         return [
             _Column(
-                name=_projection_name(projection),
-                value=self._lower_expr(projection, env, select),
+                name=None,
+                value=self._access(
+                    env,
+                    alias,
+                    _scalar(self._source_stream(alias, meta.type, meta.index)),
+                    anchor,
+                    select,
+                ),
             )
-            for projection in projections
+            for meta in result.streams
+        ]
+
+    def _star_cte(
+        self, binding: _CteBinding, anchor: exp.Expr, env: _Env, select: exp.Select
+    ) -> list[_Column]:
+        """A CTE's columns, in order, arrays splatted. No probe is involved.
+
+        A CTE's shape was fixed when its body lowered, so this is static — the
+        same information `<cte>.<name>` already reads. Column names are kept:
+        the star selects the columns the CTE named, not anonymous streams.
+        """
+        return [
+            _Column(
+                name=column.name,
+                value=self._access(
+                    env, binding.name, _scalar(stream), anchor, select
+                ),
+            )
+            for column in binding.columns
+            for stream in column.value.streams
         ]
 
     # -- FROM -------------------------------------------------------------
@@ -878,15 +1078,41 @@ class _Lowerer:
                 _number(high, ErrorCode.UNSUPPORTED_SQL),
             )
 
-    def _access(self, env: _Env, alias: str, value: _Value) -> _Value:
+    def _access(
+        self,
+        env: _Env,
+        alias: str,
+        value: _Value,
+        anchor: exp.Expr,
+        select: exp.Select,
+    ) -> _Value:
         """Apply `alias`'s WHERE trim to every stream of `value`.
 
         Elementwise over an array, and memoized per stream, so each element of
         a broadcast array gets exactly one trim, shared by all its consumers.
+
+        This is also where a trimmed caption is rejected (RFC-004): the WHERE
+        window is collected before any projection lowers, so "is this alias's
+        subtitle/data actually CONSUMED under a trim" is only knowable here, at
+        the point the trim would be applied. Today's trim is a filtergraph
+        ``trim``/``atrim`` pair, which cannot carry subtitle or data streams at
+        all. Plan 035 lifts this for INPUT aliases by lowering the window to
+        ``-ss``/``-to`` on the alias's ``-i`` (which trims every stream type
+        coherently); for a CTE alias — a filtergraph pad, not an input — the
+        rejection is permanent.
         """
         window = env.trims.get(alias)
         if window is None:
             return value
+        if value.type in _PASSTHROUGH_ONLY:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"captions cannot be trimmed yet: 'WHERE {alias}.t' would have to "
+                f"trim a {value.type} stream, which no filtergraph can carry",
+                anchor,
+                fallback=select,
+                hint=_CAPTION_TRIM_HINT,
+            )
         return _Value(
             type=value.type,
             streams=tuple(self._trim(env, window, stream) for stream in value.streams),
@@ -925,7 +1151,7 @@ class _Lowerer:
         node = _unwrap(node)
         if isinstance(node, exp.Bracket | exp.Column):
             alias, value = self._base_stream(node, env, select)
-            return self._access(env, alias, value)
+            return self._access(env, alias, value, node, select)
         if isinstance(node, exp.Cast):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -1058,7 +1284,7 @@ class _Lowerer:
                     anchor,
                     fallback=select,
                     hint=f"an input exposes {alias}.frame, {alias}.video, "
-                    f"{alias}.audio and {alias}.t",
+                    f"{alias}.audio, {alias}.subtitle, {alias}.data and {alias}.t",
                 )
             if index is None:
                 return self._enumerate(alias, array_type, anchor, select)
@@ -1255,6 +1481,7 @@ class _Lowerer:
         select: exp.Select,
     ) -> _Value:
         kinds = [self._classify(arg, env, select) for arg in call.args]
+        self._reject_passthrough_args(name, kinds, call, node)
         variant = _match_variant(spec.variants, kinds)
         if variant is None:
             got = ", ".join(kinds)
@@ -1372,6 +1599,7 @@ class _Lowerer:
         not a thing users should have to know.
         """
         kinds = [self._classify(arg, env, select) for arg in call.args]
+        self._reject_passthrough_args(name, kinds, call, node)
         expected = list(dynamic.inputs)
         if kinds != expected:
             raise _error(
@@ -1412,6 +1640,36 @@ class _Lowerer:
         )
 
     # -- shared call machinery --------------------------------------------
+
+    def _reject_passthrough_args(
+        self,
+        name: str,
+        kinds: list[str],
+        call: _Call,
+        node: exp.Expr,
+    ) -> None:
+        """No function takes a subtitle or data stream (RFC-004).
+
+        An ffmpeg filtergraph carries video and audio only, so a caption or
+        timed-metadata stream can never be a filter INPUT — in either tier.
+        Tier 1 would otherwise report it as a generic signature mismatch and
+        tier 2 as "expects gblur(video)"; both are true but neither says the
+        thing that actually matters, which is that no signature could ever
+        accept it. ``ParamKind`` and ``DynamicFilter.inputs`` are deliberately
+        left alone (RFC-004: "ParamKind is UNCHANGED"), so this is the one
+        place that knows it.
+        """
+        for position, kind in enumerate(kinds):
+            if kind not in _PASSTHROUGH_ONLY:
+                continue
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{name}() cannot take a {kind} stream: {kind} streams cannot be "
+                "filtered, only selected",
+                call.args[position],
+                fallback=node,
+                hint=_PASSTHROUGH_HINT,
+            )
 
     def _lower_arguments(
         self,

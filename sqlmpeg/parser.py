@@ -34,6 +34,17 @@ Notes for downstream passes (lower):
   which only lower (and its registry) knows. Names are kept VERBATIM, not folded:
   ffmpeg option names are case-sensitive (``gblur``'s ``sigmaV``).
 
+* ``SELECT *`` / ``SELECT <alias>.*`` (RFC-004) are accepted in PROJECTION
+  position only. VERIFIED shapes under sqlglot 30.17 ``read="postgres"``:
+  ``SELECT *`` puts a bare ``exp.Star()`` in the projection list, while
+  ``SELECT a.*`` puts an ``exp.Column(this=Star(), table=Identifier(a))`` —
+  two different shapes, both recognized by :func:`star_qualifier`. Everything
+  else a star can appear in (``scale(a.*, 0.5)``, ``a.*[1]``, ``* AS x``,
+  ``count(*)``, a star in WHERE) is still rejected: which streams a star
+  stands for is only knowable after probing, so it can only ever BE a column,
+  never feed one. The resolver checks the qualifier is a known alias; lower
+  does the expansion (it is the pass that has the probes).
+
 * Stream subscripts (``a.video[1]``) arrive as ``exp.Bracket`` wrapping the
   ``exp.Column``. **sqlglot rebases the index at parse time**: under
   ``read="postgres"`` (``INDEX_OFFSET = 1``) it rewrites the single subscript
@@ -61,6 +72,7 @@ __all__ = [
     "kwarg_name",
     "parse",
     "resolve",
+    "star_qualifier",
     "subscript_index",
     "union_branches",
 ]
@@ -99,7 +111,9 @@ _COPY_ALLOWED = frozenset({"this", "kind", "credentials", "files", "params"})
 
 # The only column names an INPUT alias exposes. A CTE alias exposes whatever its
 # body named with AS, so the whitelist does not apply there (lower checks those).
-_INPUT_COLUMNS = frozenset({"frame", "video", "audio", "t"})
+# RFC-004 added `subtitle` and `data`: same array/subscript/splat surface as
+# video/audio, passthrough-only downstream (lower enforces that half).
+_INPUT_COLUMNS = frozenset({"frame", "video", "audio", "subtitle", "data", "t"})
 
 # sqlglot's Postgres dialect INDEX_OFFSET. Parsing rebases a subscript by
 # -INDEX_OFFSET and generating adds it back; see the module docstring.
@@ -115,6 +129,10 @@ _ALIAS_HINT = "add an alias, e.g. FROM input('clip.mp4') a"
 _SUBSCRIPT_HINT = (
     "stream subscripts are 1-based integer literals: a.video[1] is the first "
     "video stream"
+)
+_STAR_HINT = (
+    "a star is a whole SELECT column: write `SELECT *` or `SELECT <alias>.*`; "
+    "it cannot be aliased, subscripted, or passed to a function"
 )
 _SINK_HINT = "the only sink form is COPY (<query>) TO '<path>' WITH (<options>)"
 _OPTION_HINT = "sink options are name/value pairs, e.g. crf 20 or video_codec 'libx264'"
@@ -218,6 +236,37 @@ def subscript_index(bracket: exp.Bracket) -> int | None:
     if not _DIGITS_RE.match(text):
         return None
     return int(text) + _INDEX_OFFSET
+
+
+# ---------------------------------------------------------------------------
+# stars (RFC-004)
+# ---------------------------------------------------------------------------
+
+
+def star_qualifier(node: exp.Expr) -> str | None:
+    """The alias a star projection expands, or None if `node` is not a star one.
+
+    VERIFIED shapes (sqlglot 30.17, ``read="postgres"``):
+
+    * ``SELECT *``   -> ``exp.Star()`` sits directly in ``Select.expressions``.
+    * ``SELECT a.*`` -> ``exp.Column(this=Star(), table=Identifier(a))``.
+
+    Returns ``""`` for the unqualified form (which stands for every FROM alias)
+    and the folded alias name for the qualified one. Everything else — a star
+    under an ``Alias`` (``* AS x``), a ``Bracket`` (``a.*[1]``), or a call
+    (``scale(a.*, 0.5)``, ``count(*)``) — is not a star PROJECTION and comes
+    back None, so the generic star rejection still fires on it.
+
+    A ``Column(this=Star())`` with no ``table`` is not something sqlglot
+    produces for any query we accept; it is treated as the bare form rather
+    than crashing.
+    """
+    if isinstance(node, exp.Star):
+        return ""
+    if isinstance(node, exp.Column) and isinstance(node.this, exp.Star):
+        table = node.args.get("table")
+        return _ident_name(table) if isinstance(table, exp.Expr) else ""
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -728,7 +777,11 @@ class _Resolver:
                 ErrorCode.UNSUPPORTED_SQL, "SELECT has no output column", fallback=select
             )
         for projection in projections:
-            self._check_expression(projection, select)
+            # A star projection carries nothing but the star and its qualifier,
+            # so there is no expression to check inside it -- and running the
+            # generic walk would hit the star rejection it is exempt from.
+            if star_qualifier(projection) is None:
+                self._check_expression(projection, select)
 
         where = select.args.get("where")
         if isinstance(where, exp.Where):
@@ -776,12 +829,16 @@ class _Resolver:
                     hint="use a WITH ... AS (...) CTE instead",
                 )
             if isinstance(sub, exp.Star):
+                # RFC-004 accepts a star only as a whole projection, which
+                # `_validate_select` peels off before calling this; anything
+                # that reaches here has one nested inside an expression, where
+                # "every stream of that alias" has no meaning.
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    "SELECT * is not supported",
+                    "* is only supported as a whole SELECT column",
                     sub,
                     fallback=select,
-                    hint="select a single frame expression",
+                    hint=_STAR_HINT,
                 )
             if isinstance(sub, exp.Bracket):
                 self._check_subscript(sub, select)
@@ -1062,6 +1119,11 @@ class _Resolver:
                     fallback=select,
                     hint=self._known_hint(scope),
                 )
+            # `<alias>.*` is an exp.Column whose `this` is a Star: the alias
+            # still has to exist (checked just above), but there is no column
+            # NAME to whitelist -- the star names all of them.
+            if isinstance(sub.this, exp.Star):
+                continue
             # An input exposes a fixed set of pseudo-columns. A CTE exposes
             # whatever its body named with AS, so only lower can check those.
             if kind == "input" and _ident_name(sub.this) not in _INPUT_COLUMNS:

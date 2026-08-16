@@ -11,6 +11,13 @@ FrameRef grammar consumed here (authoritative source: ``ir.py``)::
     "src:<alias>:v:<k>"  -> the k-th (0-based) video stream of the input bound
                             to <alias>; rendered as "[<index>:v:<k>]"
     "src:<alias>:a:<k>"  -> same for audio; rendered as "[<index>:a:<k>]"
+    "src:<alias>:s:<k>"  -> same for subtitle; rendered as "<index>:s:<k>"
+    "src:<alias>:d:<k>"  -> same for data; rendered as "<index>:d:<k>"
+
+Subtitle and data refs (RFC-004) are passthrough-only: they only ever appear
+as ``Graph.outputs`` entries and are only ever rendered as bare ``-map``
+targets, never as filtergraph labels. Repeating one is legal ffmpeg, so they
+are exempt from the consume-once check (:func:`_check_fanout`).
 
 Outputs and passthrough
 -----------------------
@@ -89,7 +96,16 @@ OUTPUT_LABEL_PREFIX = "out"
 _SPLIT_FILTERS = frozenset({"split", "asplit"})
 _VALUE_ONLY_KEYS = frozenset({"expr"})
 
-_TYPE_MARKERS: dict[StreamType, str] = {"video": "v", "audio": "a"}
+_TYPE_MARKERS: dict[StreamType, str] = {
+    "video": "v",
+    "audio": "a",
+    "subtitle": "s",
+    "data": "d",
+}
+
+# Stream types no filtergraph can carry (RFC-004): they are only ever bare
+# `-map`s, so they are exempt from the consume-once rule below.
+_PASSTHROUGH_ONLY: frozenset[StreamType] = frozenset({"subtitle", "data"})
 
 # Level 1 (filter-option) escaping: these characters would otherwise separate
 # options / quote inside a single filter's argument list.
@@ -187,7 +203,10 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
 
     Copy suppression: if the sink sets a codec option (``flag == "-c"``)
     scoped to video, video passthrough outputs drop their ``-c:<i> copy``
-    (the explicit codec re-encodes them instead); same for audio.
+    (the explicit codec re-encodes them instead); same for audio and — since
+    the rule reads the option table's ``scope`` rather than naming types —
+    for ``subtitle_codec`` (RFC-004: webvtt -> mov_text on a passthrough
+    subtitle output).
     """
     if out_path is not None:
         path = out_path
@@ -400,13 +419,31 @@ def _check_ref(g: Graph, ref: FrameRef, defined: set[str], where: str) -> None:
 
 
 def _check_fanout(nodes: list[Node], outputs: list[Output]) -> None:
+    """Every pad has at most one consumer, except the ones that are not pads.
+
+    RFC-004: a subtitle/data source ref never enters the filtergraph — it is
+    rendered as a bare ``-map <idx>:s:<k>``, and repeating one is legal ffmpeg
+    (``SELECT f.subtitle[1], f.subtitle[1]`` writes the same track twice).
+    There is no split filter for such a stream, so the split pass leaves it
+    alone and the consume-once rule does not apply to it.
+    """
     counts = _count_consumers(nodes, outputs)
     for slot, count in counts.items():
-        if count > 1:
+        if count > 1 and not _is_passthrough_only(slot):
             raise _internal(
                 f"pad {slot!r} has {count} consumers; ffmpeg pads are consume-once "
                 "(the split pass must run before emit)"
             )
+
+
+def _is_passthrough_only(ref: FrameRef) -> bool:
+    """True for a subtitle/data source ref (a bare -map, never a pad)."""
+    if not is_src(ref):
+        return False
+    try:
+        return src_parts(ref)[1] in _PASSTHROUGH_ONLY
+    except ValueError:  # malformed: _parse_src_ref reports it properly later
+        return False
 
 
 def _count_consumers(nodes: list[Node], outputs: list[Output]) -> dict[str, int]:

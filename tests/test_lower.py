@@ -44,7 +44,7 @@ from sqlmpeg import registry as registry_module
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.emit import build_ffmpeg_args, emit
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import Graph
+from sqlmpeg.ir import Graph, StreamType
 from sqlmpeg.lower import lower
 from sqlmpeg.parser import parse, resolve
 from sqlmpeg.probe import ProbeResult, StreamMeta
@@ -174,6 +174,44 @@ def _probe_result(
         )
         for i in range(audios)
     ]
+    return ProbeResult(streams=streams)
+
+
+_LAYOUT_TYPES: dict[str, StreamType] = {
+    "v": "video",
+    "a": "audio",
+    "s": "subtitle",
+    "d": "data",
+}
+
+
+def _layout_probe(
+    layout: str, tags: dict[int, dict[str, str]] | None = None
+) -> ProbeResult:
+    """A ProbeResult in FILE order, written as a compact layout (RFC-004).
+
+    One character per stream -- ``v``/``a``/``s``/``d`` -- so ``"vasd"`` is the
+    four-type container a star has to expand in order, and ``"vas"`` is
+    avs.mkv's shape. Per-type indices are assigned in file order, exactly as
+    :mod:`sqlmpeg.probe` does. `tags` maps a FILE position (not a per-type
+    index) to that stream's metadata.
+    """
+    counters: dict[str, int] = {}
+    streams: list[StreamMeta] = []
+    for position, letter in enumerate(layout):
+        index = counters.get(letter, 0)
+        counters[letter] = index + 1
+        streams.append(
+            StreamMeta(
+                type=_LAYOUT_TYPES[letter],
+                index=index,
+                metadata=dict((tags or {}).get(position, {})),
+                width=320 if letter == "v" else None,
+                height=240 if letter == "v" else None,
+                fps="15/1" if letter == "v" else None,
+                sample_rate=44100 if letter == "a" else None,
+            )
+        )
     return ProbeResult(streams=streams)
 
 
@@ -1479,6 +1517,379 @@ def test_filtered_output_threads_its_sources_provenance() -> None:
 def test_unprobed_passthrough_has_no_metadata() -> None:
     g = compile_sql("SELECT a.audio[1] FROM input('x.mp4') a")
     assert g.outputs[0].metadata == {}
+
+
+# ---------------------------------------------------------------------------
+# RFC-004: subtitle / data columns -- same surface, passthrough-only
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT a.subtitle[1] FROM input('x.mkv') a", ("src:a:s:0", "subtitle")),
+        ("SELECT a.subtitle[2] FROM input('x.mkv') a", ("src:a:s:1", "subtitle")),
+        ("SELECT a.data[1] FROM input('x.mkv') a", ("src:a:d:0", "data")),
+    ],
+)
+def test_subtitle_and_data_subscripts_lower_to_s_and_d_refs(
+    sql: str, expected: tuple[str, str]
+) -> None:
+    g = _lower(sql, {"a": _layout_probe("vassdd")})
+    assert _outputs(g) == [(expected[0], expected[1], None)]
+    assert g.nodes == {}  # passthrough-only: never a filtergraph node
+
+
+def test_bare_subtitle_array_splats_like_any_other() -> None:
+    g = _lower("SELECT a.subtitle FROM input('x.mkv') a", {"a": _layout_probe("vass")})
+    assert _outputs(g) == [
+        ("src:a:s:0", "subtitle", None),
+        ("src:a:s:1", "subtitle", None),
+    ]
+
+
+def test_bare_data_array_splats_like_any_other() -> None:
+    g = _lower("SELECT a.data FROM input('x.mkv') a", {"a": _layout_probe("vdd")})
+    assert _outputs(g) == [
+        ("src:a:d:0", "data", None),
+        ("src:a:d:1", "data", None),
+    ]
+
+
+def test_bare_subtitle_array_over_an_unprobed_input_is_input_not_found() -> None:
+    err = _reject("SELECT a.subtitle FROM input('does-not-exist.mkv') a")
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+
+
+def test_subtitle_subscript_is_bounds_checked_when_probed() -> None:
+    err = _reject_lower(
+        "SELECT a.subtitle[2] FROM input('x.mkv') a", {"a": _layout_probe("vas")}
+    )
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "a.subtitle[2]" in err.message
+    assert "1 subtitle stream" in err.message
+
+
+def test_empty_subtitle_array_is_a_typed_error() -> None:
+    err = _reject_lower(
+        "SELECT a.subtitle FROM input('x.mkv') a", {"a": _layout_probe("va")}
+    )
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "no subtitle streams" in err.message
+
+
+def test_unprobed_subtitle_subscript_stays_symbolic() -> None:
+    g = compile_sql("SELECT a.subtitle[3] FROM input('does-not-exist.mkv') a")
+    assert _outputs(g) == [("src:a:s:2", "subtitle", None)]
+
+
+def test_subtitle_passthrough_carries_its_language_tag() -> None:
+    """Provenance rides the SAME passthrough metadata path audio tags do."""
+    g = _lower(
+        "SELECT a.subtitle[1] FROM input('x.mkv') a",
+        {"a": _layout_probe("vas", tags={2: {"language": "eng", "title": "English"}})},
+    )
+    assert g.outputs[0].metadata == {"language": "eng", "title": "English"}
+
+
+def test_unknown_input_column_hint_lists_subtitle_and_data() -> None:
+    err = _reject("SELECT a.captions FROM input('x.mkv') a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.hint is not None
+    assert "subtitle" in err.hint and "data" in err.hint
+
+
+# -- passthrough-only: no function ever takes one ---------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT scale(a.subtitle[1], 0.5) FROM input('x.mkv') a",
+        "SELECT hflip(a.subtitle[1]) FROM input('x.mkv') a",
+        "SELECT volume(a.data[1], 0.5) FROM input('x.mkv') a",
+        "SELECT amix(a.audio[1], a.subtitle[1]) FROM input('x.mkv') a",
+        # the array form too: broadcasting does not launder the type
+        "SELECT hflip(a.subtitle) FROM input('x.mkv') a",
+    ],
+)
+def test_stdlib_call_over_a_passthrough_stream_is_udf_arg_type(sql: str) -> None:
+    err = _reject_lower(sql, {"a": _layout_probe("vasd")})
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "cannot be filtered, only selected" in err.message
+
+
+def test_dynamic_call_over_a_subtitle_stream_is_udf_arg_type_not_internal(
+    _registry: Registry,
+) -> None:
+    """Tier 2's pad signature only ever holds video/audio, so a subtitle
+    argument must produce the SAME typed rejection, never an INTERNAL."""
+    err = _reject_dyn(
+        "SELECT gblur(a.subtitle[1], sigma => 5) FROM input('x.mkv') a",
+        _registry,
+        {"a": _layout_probe("vas")},
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "cannot be filtered, only selected" in err.message
+
+
+def test_a_cte_may_carry_a_subtitle_column_through_as_passthrough() -> None:
+    g = _lower(
+        "WITH c AS (SELECT a.video[1] AS v, a.subtitle[1] AS caps "
+        "FROM input('x.mkv') a) "
+        "SELECT c.v, c.caps FROM c",
+        {"a": _layout_probe("vas", tags={2: {"language": "eng"}})},
+    )
+    assert _outputs(g) == [
+        ("src:a:v:0", "video", None),
+        ("src:a:s:0", "subtitle", None),
+    ]
+    assert g.outputs[1].metadata == {"language": "eng"}
+
+
+def test_filtering_a_cte_subtitle_column_is_still_rejected() -> None:
+    err = _reject_lower(
+        "WITH c AS (SELECT a.subtitle[1] AS caps FROM input('x.mkv') a) "
+        "SELECT hflip(c.caps) FROM c",
+        {"a": _layout_probe("vas")},
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+
+
+# -- passthrough-only: WHERE cannot trim them (plan 035 lifts the input half)
+
+
+def test_where_over_a_consumed_subtitle_stream_is_rejected() -> None:
+    err = _reject_lower(
+        "SELECT a.subtitle[1] FROM input('x.mkv') a WHERE a.t BETWEEN 1 AND 2",
+        {"a": _layout_probe("vas")},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "captions cannot be trimmed yet" in err.message
+
+
+def test_where_over_a_consumed_data_stream_is_rejected() -> None:
+    err = _reject_lower(
+        "SELECT a.data FROM input('x.mkv') a WHERE a.t BETWEEN 1 AND 2",
+        {"a": _layout_probe("vad")},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "captions cannot be trimmed yet" in err.message
+
+
+def test_star_plus_where_over_a_captioned_input_is_rejected() -> None:
+    """`SELECT *` consumes the caption track, so the trim rejection fires."""
+    err = _reject_lower(
+        "SELECT * FROM input('x.mkv') a WHERE a.t BETWEEN 1 AND 2",
+        {"a": _layout_probe("vas")},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "captions cannot be trimmed yet" in err.message
+
+
+def test_where_over_a_cte_carrying_a_subtitle_column_is_rejected() -> None:
+    """Permanent per RFC-004: a CTE trim is a filtergraph trim."""
+    err = _reject_lower(
+        "WITH c AS (SELECT a.video[1] AS v, a.subtitle[1] AS caps "
+        "FROM input('x.mkv') a) "
+        "SELECT c.v, c.caps FROM c WHERE c.t BETWEEN 1 AND 2",
+        {"a": _layout_probe("vas")},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "captions cannot be trimmed yet" in err.message
+
+
+def test_where_that_does_not_touch_the_caption_alias_still_trims() -> None:
+    """The rejection is about CONSUMPTION, not about the file having captions."""
+    g = _lower(
+        "SELECT a.video[1], b.subtitle[1] FROM input('x.mkv') a, input('y.mkv') b "
+        "WHERE a.t BETWEEN 1 AND 2",
+        {"a": _layout_probe("vas"), "b": _layout_probe("vas")},
+    )
+    assert _filters(g) == ["trim", "setpts"]
+    assert _outputs(g) == [("n2", "video", None), ("src:b:s:0", "subtitle", None)]
+
+
+def test_a_captioned_input_may_still_be_trimmed_when_captions_are_not_selected() -> None:
+    g = _lower(
+        "SELECT a.video[1] FROM input('x.mkv') a WHERE a.t BETWEEN 1 AND 2",
+        {"a": _layout_probe("vas")},
+    )
+    assert _filters(g) == ["trim", "setpts"]
+
+
+# -- passthrough-only: concat has no s/d pads -------------------------------
+
+
+def test_union_all_branch_with_a_subtitle_column_is_rejected() -> None:
+    err = _reject_lower(
+        "SELECT a.video[1], a.subtitle[1] FROM input('x.mkv') a "
+        "UNION ALL "
+        "SELECT b.video[1], b.subtitle[1] FROM input('y.mkv') b",
+        {"a": _layout_probe("vas"), "b": _layout_probe("vas")},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "video and audio only" in err.message
+
+
+# ---------------------------------------------------------------------------
+# RFC-004: SELECT * and <alias>.*
+# ---------------------------------------------------------------------------
+
+
+def test_bare_star_expands_every_stream_in_file_order() -> None:
+    g = _lower("SELECT * FROM input('x.mkv') a", {"a": _layout_probe("vasd")})
+    assert _outputs(g) == [
+        ("src:a:v:0", "video", None),
+        ("src:a:a:0", "audio", None),
+        ("src:a:s:0", "subtitle", None),
+        ("src:a:d:0", "data", None),
+    ]
+    assert g.nodes == {}  # a star is pure passthrough
+
+
+def test_star_follows_the_containers_own_stream_order() -> None:
+    """File order, not type order: an audio-first container stays audio-first."""
+    g = _lower("SELECT * FROM input('x.mkv') a", {"a": _layout_probe("asv")})
+    assert [(o.ref, o.type) for o in g.outputs] == [
+        ("src:a:a:0", "audio"),
+        ("src:a:s:0", "subtitle"),
+        ("src:a:v:0", "video"),
+    ]
+
+
+def test_bare_star_covers_every_from_alias_in_from_order() -> None:
+    g = _lower(
+        "SELECT * FROM input('x.mkv') a, input('y.mkv') b",
+        {"a": _layout_probe("va"), "b": _layout_probe("vs")},
+    )
+    assert _outputs(g) == [
+        ("src:a:v:0", "video", None),
+        ("src:a:a:0", "audio", None),
+        ("src:b:v:0", "video", None),
+        ("src:b:s:0", "subtitle", None),
+    ]
+
+
+def test_qualified_star_covers_one_alias_and_mixes_with_other_columns() -> None:
+    g = _lower(
+        "SELECT a.*, b.audio[1] FROM input('x.mkv') a, input('y.mkv') b",
+        {"a": _layout_probe("vas"), "b": _layout_probe("vaa")},
+    )
+    assert _outputs(g) == [
+        ("src:a:v:0", "video", None),
+        ("src:a:a:0", "audio", None),
+        ("src:a:s:0", "subtitle", None),
+        ("src:b:a:0", "audio", None),
+    ]
+
+
+def test_a_star_may_follow_an_explicit_column() -> None:
+    g = _lower(
+        "SELECT b.video[1], a.* FROM input('x.mkv') a, input('y.mkv') b",
+        {"a": _layout_probe("as"), "b": _layout_probe("v")},
+    )
+    assert _outputs(g) == [
+        ("src:b:v:0", "video", None),
+        ("src:a:a:0", "audio", None),
+        ("src:a:s:0", "subtitle", None),
+    ]
+
+
+def test_star_carries_provenance_metadata_per_stream() -> None:
+    g = _lower(
+        "SELECT * FROM input('x.mkv') a",
+        {
+            "a": _layout_probe(
+                "vas",
+                tags={
+                    1: {"language": "fra"},
+                    2: {"language": "eng", "title": "English"},
+                },
+            )
+        },
+    )
+    assert [o.metadata for o in g.outputs] == [
+        {},
+        {"language": "fra"},
+        {"language": "eng", "title": "English"},
+    ]
+
+
+def test_star_over_an_unprobed_input_is_input_not_found() -> None:
+    err = _reject("SELECT * FROM input('does-not-exist.mkv') a")
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+    assert "does-not-exist.mkv" in err.message
+
+
+def test_qualified_star_over_an_unprobed_input_is_input_not_found() -> None:
+    err = _reject_lower(
+        "SELECT b.*, a.video[1] FROM input('x.mkv') a, input('y.mkv') b",
+        {"a": _layout_probe("v"), "b": None},
+    )
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+
+
+def test_star_over_a_stream_less_input_is_a_typed_error() -> None:
+    """An attachment-only container would expand to nothing at all."""
+    err = _reject_lower("SELECT * FROM input('x.mkv') a", {"a": _layout_probe("")})
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "selects nothing" in err.message
+
+
+def test_star_over_a_cte_expands_its_columns_statically() -> None:
+    """No probe is consulted: the CTE's shape was fixed when its body lowered."""
+    g = _lower(
+        "WITH c AS (SELECT a.video[1] AS v, a.subtitle[1] AS caps "
+        "FROM input('x.mkv') a) "
+        "SELECT c.* FROM c",
+        {"a": _layout_probe("vas")},
+    )
+    assert _outputs(g) == [
+        ("src:a:v:0", "video", "v"),
+        ("src:a:s:0", "subtitle", "caps"),
+    ]
+
+
+def test_star_over_a_cte_splats_its_array_columns() -> None:
+    g = _lower(
+        "WITH c AS (SELECT a.audio AS tracks FROM input('x.mkv') a) "
+        "SELECT c.* FROM c",
+        {"a": _layout_probe("vaa")},
+    )
+    assert _outputs(g) == [
+        ("src:a:a:0", "audio", "tracks"),
+        ("src:a:a:1", "audio", "tracks"),
+    ]
+
+
+def test_a_star_inside_a_cte_body_expands_there() -> None:
+    g = _lower(
+        "WITH c AS (SELECT * FROM input('x.mkv') a) SELECT c.* FROM c",
+        {"a": _layout_probe("vas")},
+    )
+    assert [(o.ref, o.type) for o in g.outputs] == [
+        ("src:a:v:0", "video"),
+        ("src:a:a:0", "audio"),
+        ("src:a:s:0", "subtitle"),
+    ]
+
+
+def test_star_over_an_unknown_cte_or_alias_is_unknown_alias() -> None:
+    err = _reject_lower(
+        "SELECT nope.* FROM input('x.mkv') a", {"a": _layout_probe("v")}
+    )
+    assert err.code is ErrorCode.UNKNOWN_ALIAS
+
+
+def test_star_output_is_still_stream_copied_end_to_end() -> None:
+    """`SELECT *` is a remux: no filtergraph, one -map + -c copy per stream."""
+    g = insert_splits(_lower("SELECT * FROM input('x.mkv') a", {"a": _layout_probe("vas")}))
+    emitted = emit(g)
+    assert emitted.filter_complex == ""
+    args = build_ffmpeg_args(emitted, "out.mkv")
+    assert args.count("-map") == 3
+    assert [m.target for m in emitted.maps] == ["0:v:0", "0:a:0", "0:s:0"]
 
 
 # ---------------------------------------------------------------------------

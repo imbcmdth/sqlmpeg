@@ -1007,6 +1007,138 @@ def test_sink_video_codec_suppresses_only_video_passthrough_copy() -> None:
 
 
 # ---------------------------------------------------------------------------
+# RFC-004: subtitle / data streams -- bare -map only, repeatable
+# ---------------------------------------------------------------------------
+
+
+def test_subtitle_and_data_src_refs_render_as_s_and_d_stream_specs() -> None:
+    g = _graph(
+        [],
+        [_out("src:a:s:0", "subtitle"), _out("src:b:d:2", "data")],
+        input_paths=["a.mkv", "b.mkv"],
+        sources={"a": 0, "b": 1},
+    )
+    e = emit(g)
+    assert e.filter_complex == ""
+    assert e.maps == [
+        OutputMap(target="0:s:0", type="subtitle", copy=True, metadata={}),
+        OutputMap(target="1:d:2", type="data", copy=True, metadata={}),
+    ]
+
+
+def test_the_same_subtitle_ref_may_be_mapped_twice() -> None:
+    """Consume-once is a filtergraph pad rule; a bare -map may repeat."""
+    g = _graph(
+        [],
+        [_out("src:a:s:0", "subtitle"), _out("src:a:s:0", "subtitle")],
+        input_paths=["a.mkv"],
+    )
+    args = build_ffmpeg_args(emit(g), "out.mkv")
+    assert args[args.index("-map") :] == [
+        "-map",
+        "0:s:0",
+        "-c:0",
+        "copy",
+        "-map",
+        "0:s:0",
+        "-c:1",
+        "copy",
+        "out.mkv",
+    ]
+
+
+def test_the_same_data_ref_may_be_mapped_twice() -> None:
+    g = _graph(
+        [], [_out("src:a:d:0", "data"), _out("src:a:d:0", "data")], input_paths=["a.mkv"]
+    )
+    assert [m.target for m in emit(g).maps] == ["0:d:0", "0:d:0"]
+
+
+def test_a_duplicated_video_pad_is_still_a_consume_once_error() -> None:
+    """The exemption is for subtitle/data ONLY -- video still needs the split pass."""
+    g = _graph([], [_out("src:a:v:0"), _out("src:a:v:0")])
+    with pytest.raises(SqlmpegError) as excinfo:
+        emit(g)
+    assert excinfo.value.code is ErrorCode.INTERNAL
+    assert "consume-once" in excinfo.value.message
+
+
+def test_subtitle_output_keeps_its_language_metadata() -> None:
+    g = _graph(
+        [],
+        [_out("src:a:s:0", "subtitle", metadata={"language": "eng"})],
+        input_paths=["a.mkv"],
+    )
+    args = build_ffmpeg_args(emit(g), "out.mkv")
+    assert "-metadata:s:0" in args
+    assert args[args.index("-metadata:s:0") + 1] == "language=eng"
+
+
+def test_sink_subtitle_codec_renders_per_subtitle_output() -> None:
+    sink = Sink(path="out.mp4", options={"subtitle_codec": "mov_text"})
+    g = _graph(
+        [],
+        [_out("src:a:v:0"), _out("src:a:a:0", "audio"), _out("src:a:s:0", "subtitle")],
+        input_paths=["a.mkv"],
+        sink=sink,
+    )
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-map") :] == [
+        "-map",
+        "0:v:0",
+        "-c:0",
+        "copy",
+        "-map",
+        "0:a:0",
+        "-c:1",
+        "copy",
+        "-map",
+        "0:s:0",
+        # copy suppressed on the SUBTITLE output only: the option table's
+        # scope drives it, so subtitle_codec generalizes for free (plan 033's
+        # contract note; this is the test it had to skip).
+        "-c:2",
+        "mov_text",
+        "out.mp4",
+    ]
+
+
+def test_sink_subtitle_codec_leaves_video_and_audio_copies_alone() -> None:
+    sink = Sink(path="out.mkv", options={"subtitle_codec": "srt"})
+    g = _graph(
+        [],
+        [_out("src:a:a:0", "audio"), _out("src:a:s:0", "subtitle")],
+        input_paths=["a.mkv"],
+        sink=sink,
+    )
+    args = build_ffmpeg_args(emit(g))
+    assert "-c:0" in args and args[args.index("-c:0") + 1] == "copy"
+    assert "-c:1" in args and args[args.index("-c:1") + 1] == "srt"
+
+
+def test_sink_video_codec_does_not_suppress_a_subtitle_copy() -> None:
+    sink = Sink(path="out.mkv", options={"video_codec": "libx264"})
+    g = _graph(
+        [],
+        [_out("src:a:v:0"), _out("src:a:s:0", "subtitle")],
+        input_paths=["a.mkv"],
+        sink=sink,
+    )
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-map") :] == [
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:s:0",
+        "-c:1",
+        "copy",
+        "-c:0",
+        "libx264",
+        "out.mkv",
+    ]
+
+
+# ---------------------------------------------------------------------------
 # real ffmpeg sanity check (exec-marked)
 # ---------------------------------------------------------------------------
 

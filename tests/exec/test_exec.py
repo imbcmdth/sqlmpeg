@@ -31,6 +31,10 @@ _FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 _TESTSRC = _FIXTURES_DIR / "testsrc.mp4"
 _AV2 = _FIXTURES_DIR / "av2.mp4"
 _AV3 = _FIXTURES_DIR / "av3.mp4"
+# RFC-004 caption fixtures: avs.mkv is video + audio + an srt track tagged
+# language=eng; subs.en.vtt is a standalone 3-cue WebVTT file (no tags).
+_AVS = _FIXTURES_DIR / "avs.mkv"
+_SUBS_VTT = _FIXTURES_DIR / "subs.en.vtt"
 
 _SRC_WIDTH = 320
 _SRC_HEIGHT = 240
@@ -375,3 +379,149 @@ def test_copy_sink_codec_options_land_in_the_real_encode(tmp_path: Path) -> None
     assert streams[0]["codec_name"] == "h264"
     assert streams[1]["codec_name"] == "aac"
     assert streams[2]["codec_name"] == "aac"
+
+
+# ---------------------------------------------------------------------------
+# RFC-004: SELECT *, subtitle streams, external caption joins (plan 034)
+# ---------------------------------------------------------------------------
+
+
+def _run_sink_query(query: str, out_path: Path) -> None:
+    """Compile a COPY query and run it at ITS OWN sink path (no -o override)."""
+    emitted = emit(compile_sql(query))
+    args = build_ffmpeg_args(emitted)
+    args.insert(1, "-y")
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, f"{args}\n{result.stderr}"
+    assert out_path.exists()
+
+
+def test_select_star_remuxes_every_stream_of_a_captioned_file(tmp_path: Path) -> None:
+    """`SELECT *` over avs.mkv: video + audio + the eng-tagged subtitle track,
+    all passthrough (no filtergraph at all), language tag carried through."""
+    _require_fixture(_AVS)
+    out_path = tmp_path / "star.mkv"
+    query = f"SELECT * FROM input('{_sql_path(_AVS)}') a"
+
+    emitted = emit(compile_sql(query))
+    assert emitted.filter_complex == ""  # a star is a pure remux
+    assert [m.target for m in emitted.maps] == ["0:v:0", "0:a:0", "0:s:0"]
+
+    _compile_and_run(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["video", "audio", "subtitle"]
+    assert streams[2]["tags"]["language"] == "eng"
+
+
+def test_qualified_star_mixes_with_an_explicit_column(tmp_path: Path) -> None:
+    """`SELECT a.*, b.audio[1]`: one alias splatted whole, one column picked."""
+    _require_fixture(_AVS)
+    _require_fixture(_AV2)
+    out_path = tmp_path / "star-mixed.mkv"
+    query = (
+        f"SELECT a.*, b.audio[1] "
+        f"FROM input('{_sql_path(_AVS)}') a, input('{_sql_path(_AV2)}') b"
+    )
+
+    _compile_and_run(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == [
+        "video",
+        "audio",
+        "subtitle",
+        "audio",
+    ]
+    assert streams[2]["tags"]["language"] == "eng"
+    assert streams[3]["tags"]["language"] == "eng"  # av2's first track
+
+
+def test_vtt_join_muxes_an_external_caption_track_into_an_mkv(tmp_path: Path) -> None:
+    """RFC-004's headline: an external WebVTT file joined as a subtitle track.
+
+    Two inputs, three columns, no new join semantics -- the SELECT list IS the
+    -map list, and `subtitle_codec 'srt'` transcodes webvtt into the mkv.
+    """
+    _require_fixture(_AVS)
+    _require_fixture(_SUBS_VTT)
+    out_path = tmp_path / "joined.mkv"
+    query = (
+        "COPY (\n"
+        f"  SELECT f.video[1], f.audio[1], s.subtitle[1]\n"
+        f"  FROM input('{_sql_path(_AVS)}') f, input('{_sql_path(_SUBS_VTT)}') s\n"
+        f") TO '{_sql_path(out_path)}' WITH (subtitle_codec 'srt')"
+    )
+
+    _run_sink_query(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["video", "audio", "subtitle"]
+    assert streams[2]["codec_name"] == "subrip"
+    # The .vtt fixture carries no language tag of its own, and provenance never
+    # invents one: the joined caption track is untagged.
+    assert "language" not in streams[2].get("tags", {})
+
+
+def test_vtt_join_transcodes_to_mov_text_in_an_mp4(tmp_path: Path) -> None:
+    """The same join into an mp4, where mov_text is the only legal caption codec."""
+    _require_fixture(_AVS)
+    _require_fixture(_SUBS_VTT)
+    out_path = tmp_path / "joined.mp4"
+    query = (
+        "COPY (\n"
+        f"  SELECT f.video[1], f.audio[1], s.subtitle[1]\n"
+        f"  FROM input('{_sql_path(_AVS)}') f, input('{_sql_path(_SUBS_VTT)}') s\n"
+        f") TO '{_sql_path(out_path)}' WITH (subtitle_codec 'mov_text')"
+    )
+
+    _run_sink_query(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["video", "audio", "subtitle"]
+    assert streams[2]["codec_name"] == "mov_text"
+
+
+def test_subtitle_extraction_writes_a_parseable_srt_file(tmp_path: Path) -> None:
+    """`COPY (SELECT f.subtitle[1]) TO 'x.srt'` -- extraction falls out of sinks."""
+    _require_fixture(_AVS)
+    out_path = tmp_path / "captions.srt"
+    query = (
+        "COPY (\n"
+        f"  SELECT f.subtitle[1] FROM input('{_sql_path(_AVS)}') f\n"
+        f") TO '{_sql_path(out_path)}'"
+    )
+
+    _run_sink_query(query, out_path)
+
+    text = out_path.read_text(encoding="utf-8")
+    # SubRip: numbered cues with `hh:mm:ss,mmm --> hh:mm:ss,mmm` timings.
+    assert text.lstrip().startswith("1\n") or text.lstrip().startswith("1\r\n")
+    assert " --> " in text
+    assert "Cue one." in text
+    # ffprobe agrees it is a subtitle stream, i.e. the file really parses.
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["subtitle"]
+
+
+def test_the_same_subtitle_track_may_be_mapped_twice(tmp_path: Path) -> None:
+    """Duplicate consumption of one subtitle src ref: two Outputs, two identical
+    bare -maps, no split filter anywhere (RFC-004's split/emit exemption)."""
+    _require_fixture(_AVS)
+    out_path = tmp_path / "twice.mkv"
+    query = (
+        f"SELECT a.video[1], a.subtitle[1], a.subtitle[1] "
+        f"FROM input('{_sql_path(_AVS)}') a"
+    )
+
+    emitted = emit(compile_sql(query))
+    assert emitted.filter_complex == ""
+    assert [m.target for m in emitted.maps] == ["0:v:0", "0:s:0", "0:s:0"]
+
+    _compile_and_run(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["video", "subtitle", "subtitle"]
+    assert [s["tags"]["language"] for s in streams[1:]] == ["eng", "eng"]

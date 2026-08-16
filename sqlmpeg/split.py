@@ -38,6 +38,16 @@ new node's `outputs` -- is resolved from the *original* graph `g`: a source
 ref's type is `src_parts(ref)[1]`; a node ref's type is `node.outputs[pad]`
 (pad 0 for the unqualified `"<node-id>"` form).
 
+Passthrough-only exemption (RFC-004)
+------------------------------------
+Subtitle and data source refs are EXEMPT from all of the above: they never
+enter the filtergraph, so there is no pad to fan out and no `split` filter
+that could do it (ffmpeg has none for subtitles). A `"src:<alias>:s:<k>"` or
+`"src:<alias>:d:<k>"` ref referenced by two Outputs passes through untouched
+and emit renders the same bare `-map` twice, which is legal ffmpeg. Such a ref
+can only ever appear in `g.outputs` (ir.py's grammar note), so exempting it
+here cannot leave a real filtergraph pad over-consumed.
+
 `insert_splits` is a pure function: it builds and returns a new Graph and
 never mutates its input. It is idempotent -- every ref in the output graph
 has exactly one consumer, so running it again is a no-op.
@@ -46,6 +56,14 @@ has exactly one consumer, so running it again is a no-op.
 from __future__ import annotations
 
 from .ir import FrameRef, Graph, Node, Output, StreamType, is_src, src_parts
+
+# Stream types a filtergraph cannot carry, and therefore cannot split.
+_PASSTHROUGH_ONLY: frozenset[StreamType] = frozenset({"subtitle", "data"})
+
+
+def _is_passthrough_only(ref: FrameRef) -> bool:
+    """True for a subtitle/data source ref -- never a filtergraph pad."""
+    return is_src(ref) and src_parts(ref)[1] in _PASSTHROUGH_ONLY
 
 
 def _ref_type(g: Graph, ref: FrameRef) -> StreamType:
@@ -79,6 +97,10 @@ def insert_splits(g: Graph) -> Graph:
 
     def rewire(ref: FrameRef) -> FrameRef:
         if counts.get(ref, 0) <= 1:
+            return ref
+        if _is_passthrough_only(ref):
+            # Repeating a bare -map is legal ffmpeg; there is no subtitle
+            # split filter and no pad to fan out. See the module docstring.
             return ref
         split_id = split_ids.get(ref)
         if split_id is None:

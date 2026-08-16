@@ -289,3 +289,64 @@ def test_idempotent_on_multi_output_graph() -> None:
     once = insert_splits(g)
     twice = insert_splits(once)
     assert once.to_dict() == twice.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# RFC-004: subtitle/data refs are exempt -- they are never filtergraph pads
+# ---------------------------------------------------------------------------
+
+
+def _duplicate_subtitle_graph() -> Graph:
+    """One subtitle src ref named by TWO Outputs (legal per RFC-004)."""
+    g = Graph(input_paths=["a.mkv"], sources={"a": 0})
+    g.outputs = [
+        _out("src:a:s:0", "subtitle", name="caps"),
+        _out("src:a:s:0", "subtitle", name="caps_again"),
+    ]
+    return g
+
+
+def test_duplicate_subtitle_ref_is_not_split() -> None:
+    out = insert_splits(_duplicate_subtitle_graph())
+    assert out.nodes == {}
+    assert out.outputs == [
+        _out("src:a:s:0", "subtitle", name="caps"),
+        _out("src:a:s:0", "subtitle", name="caps_again"),
+    ]
+
+
+def test_duplicate_data_ref_is_not_split() -> None:
+    g = Graph(input_paths=["a.mkv"], sources={"a": 0})
+    g.outputs = [_out("src:a:d:0", "data"), _out("src:a:d:0", "data")]
+    out = insert_splits(g)
+    assert out.nodes == {}
+    assert [o.ref for o in out.outputs] == ["src:a:d:0", "src:a:d:0"]
+
+
+def test_subtitle_exemption_does_not_disturb_a_video_fanout_in_the_same_graph() -> None:
+    """A video ref alongside the duplicated captions still splits normally."""
+    g = Graph(input_paths=["a.mkv"], sources={"a": 0})
+    g.nodes["n0"] = Node(
+        id="n0", filter="hflip", args={}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    g.nodes["n1"] = Node(
+        id="n1", filter="vflip", args={}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    g.outputs = [
+        _out("n0"),
+        _out("n1"),
+        _out("src:a:s:0", "subtitle"),
+        _out("src:a:s:0", "subtitle"),
+    ]
+    out = insert_splits(g)
+    assert out.nodes["src_a_v_0_split"].outputs == ["video", "video"]
+    assert out.nodes["n0"].inputs == ["src_a_v_0_split:0"]
+    assert out.nodes["n1"].inputs == ["src_a_v_0_split:1"]
+    assert [o.ref for o in out.outputs[2:]] == ["src:a:s:0", "src:a:s:0"]
+
+
+def test_idempotent_on_duplicate_subtitle_refs() -> None:
+    g = _duplicate_subtitle_graph()
+    once = insert_splits(g)
+    twice = insert_splits(once)
+    assert once.to_dict() == twice.to_dict()

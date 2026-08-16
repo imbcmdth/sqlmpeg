@@ -4,7 +4,14 @@ import pytest
 from sqlglot import exp
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.parser import Resolved, parse, resolve, subscript_index, union_branches
+from sqlmpeg.parser import (
+    Resolved,
+    parse,
+    resolve,
+    star_qualifier,
+    subscript_index,
+    union_branches,
+)
 
 README_SQL = """WITH pip AS (
   SELECT scale(crop(b.frame, 1200, 50, 600, 200), 0.5) AS frame
@@ -277,11 +284,104 @@ def test_select_with_no_output_column_is_rejected() -> None:
     assert "no output column" in err.message
 
 
-@pytest.mark.parametrize("sql", ["SELECT * FROM input('x') a", "SELECT a.* FROM input('x') a"])
-def test_select_star(sql: str) -> None:
+# ---------------------------------------------------------------------------
+# resolve — SELECT * / <alias>.* (RFC-004)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM input('x') a",
+        "SELECT a.* FROM input('x') a",
+        "SELECT a.*, b.audio[1] FROM input('x') a, input('y') b",
+        "SELECT a.video[1], b.* FROM input('x') a, input('y') b",
+        "SELECT *, a.audio[1] FROM input('x') a",
+        'SELECT "A".* FROM input(\'x\') "A"',
+        "WITH c AS (SELECT a.frame AS f FROM input('x') a) SELECT c.* FROM c",
+        "WITH c AS (SELECT * FROM input('x') a) SELECT * FROM c",
+        "COPY (SELECT * FROM input('x.mp4') a) TO 'out.mkv'",
+    ],
+)
+def test_star_in_projection_position_is_accepted(sql: str) -> None:
+    resolve(parse(sql))
+
+
+@pytest.mark.parametrize(
+    ("sql", "qualifier"),
+    [
+        ("SELECT * FROM input('x') a", ""),
+        ("SELECT a.* FROM input('x') a", "a"),
+        # Postgres identifier folding applies to the qualifier like any other.
+        ("SELECT A.* FROM input('x') a", "a"),
+        ('SELECT "A".* FROM input(\'x\') "A"', "A"),
+    ],
+)
+def test_star_qualifier_reads_both_sqlglot_shapes(sql: str, qualifier: str) -> None:
+    """The two VERIFIED shapes: bare ``exp.Star`` vs ``Column(this=Star())``."""
+    select = resolve(parse(sql)).branches[0]
+    assert star_qualifier(select.expressions[0]) == qualifier
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # not a projection: a star inside a function call
+        "SELECT scale(a.*, 0.5) FROM input('x') a",
+        "SELECT scale(*, 0.5) FROM input('x') a",
+        # not a projection: subscripted, or aliased
+        "SELECT a.*[1] FROM input('x') a",
+        "SELECT * AS everything FROM input('x') a",
+        "SELECT a.* AS everything FROM input('x') a",
+    ],
+)
+def test_star_outside_projection_position_is_rejected(sql: str) -> None:
     err = _reject(sql)
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert err.hint is not None and "frame expression" in err.hint
+    assert "whole SELECT column" in err.message
+    assert err.hint is not None and "<alias>.*" in err.hint
+
+
+def test_star_over_an_unknown_alias_is_rejected() -> None:
+    err = _reject("SELECT z.* FROM input('x') a")
+    assert err.code is ErrorCode.UNKNOWN_ALIAS
+    assert "'z'" in err.message
+
+
+def test_star_projection_is_column_anchored() -> None:
+    err = _reject("SELECT\n  z.*\nFROM input('x') a")
+    assert err.code is ErrorCode.UNKNOWN_ALIAS
+    assert err.line == 2
+
+
+def test_star_in_where_is_still_rejected() -> None:
+    err = _reject("SELECT a.frame FROM input('x') a WHERE * BETWEEN 1 AND 2")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_count_star_is_still_an_aggregate_rejection() -> None:
+    """``count(*)`` must not be mistaken for a star projection."""
+    err = _reject("SELECT count(*) FROM input('x') a")
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+
+
+# ---------------------------------------------------------------------------
+# resolve — subtitle / data pseudo-columns (RFC-004)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a.subtitle FROM input('x') a",
+        "SELECT a.subtitle[1] FROM input('x') a",
+        "SELECT a.data FROM input('x') a",
+        "SELECT a.data[2] FROM input('x') a",
+        "SELECT a.video[1], a.audio[1], a.subtitle[1], a.data[1] FROM input('x') a",
+    ],
+)
+def test_subtitle_and_data_columns_are_accepted(sql: str) -> None:
+    resolve(parse(sql))
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +426,7 @@ def test_cte_columns_may_have_any_name_and_be_subscripted() -> None:
     "sql",
     [
         "SELECT a.bogus FROM input('x') a",
-        "SELECT a.subtitle[1] FROM input('x') a",
+        "SELECT a.captions[1] FROM input('x') a",
         "SELECT hflip(a.frames) FROM input('x') a",
         'SELECT a."Video" FROM input(\'x\') a',
     ],
@@ -754,7 +854,7 @@ def test_copy_keeps_no_streaming_equivalent_of_the_inner_query() -> None:
     [
         "COPY (SELECT frame FROM input('x.mp4') a) TO 'out.mkv'",
         "COPY (SELECT a.frame FROM input('x.mp4')) TO 'out.mkv'",
-        "COPY (SELECT * FROM input('x.mp4') a) TO 'out.mkv'",
+        "COPY (SELECT scale(a.*, 0.5) FROM input('x.mp4') a) TO 'out.mkv'",
         "COPY (SELECT a.frame FROM input('x.mp4') a LIMIT 1) TO 'out.mkv'",
     ],
 )
