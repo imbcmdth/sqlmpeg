@@ -45,6 +45,10 @@ class FuncSpec:
     # literals, in SQL argument order. Returns the FrameRef of the subgraph
     # output.
     returns: StreamType
+    # The ffmpeg filter whose introspected options validate trailing named
+    # arguments (RFC-003 "Tier-1 named extras"); None = named args rejected
+    # (macros).
+    named_target: str | None = None
 
 
 # --------------------------------------------------------------------------
@@ -380,6 +384,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Resize a frame by a scale factor, or to explicit width/height.",
         expand=_expand_scale,
         returns="video",
+        named_target="scale",
     ),
     "crop": FuncSpec(
         name="crop",
@@ -387,6 +392,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Crop a frame to a w x h rectangle at (x, y).",
         expand=_expand_crop,
         returns="video",
+        named_target="crop",
     ),
     "overlay": FuncSpec(
         name="overlay",
@@ -394,6 +400,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Composite top over base at position (x, y).",
         expand=_expand_overlay,
         returns="video",
+        named_target="overlay",
     ),
     "hflip": FuncSpec(
         name="hflip",
@@ -401,6 +408,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Flip a frame horizontally.",
         expand=_expand_hflip,
         returns="video",
+        named_target="hflip",
     ),
     "vflip": FuncSpec(
         name="vflip",
@@ -408,6 +416,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Flip a frame vertically.",
         expand=_expand_vflip,
         returns="video",
+        named_target="vflip",
     ),
     "blur": FuncSpec(
         name="blur",
@@ -415,6 +424,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Apply a Gaussian blur with the given sigma.",
         expand=_expand_blur,
         returns="video",
+        named_target="gblur",
     ),
     "blur_regions": FuncSpec(
         name="blur_regions",
@@ -431,6 +441,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Blur a w x h rectangle at (x, y) and composite it back over the frame.",
         expand=_expand_blur_regions,
         returns="video",
+        named_target=None,
     ),
     "draw_box": FuncSpec(
         name="draw_box",
@@ -447,6 +458,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Draw an outlined box at (x, y) sized w x h in the given color.",
         expand=_expand_draw_box,
         returns="video",
+        named_target="drawbox",
     ),
     "text": FuncSpec(
         name="text",
@@ -454,6 +466,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Draw text s at (x, y) with the given font size.",
         expand=_expand_text,
         returns="video",
+        named_target="drawtext",
     ),
     "speed": FuncSpec(
         name="speed",
@@ -461,6 +474,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Change a video stream's playback speed by factor (use atempo for audio).",
         expand=_expand_speed,
         returns="video",
+        named_target="setpts",
     ),
     "fade_in": FuncSpec(
         name="fade_in",
@@ -468,6 +482,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Fade in from black over dur seconds starting at t=0.",
         expand=_expand_fade_in,
         returns="video",
+        named_target="fade",
     ),
     "fade_out": FuncSpec(
         name="fade_out",
@@ -482,6 +497,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         ),
         expand=_expand_fade_out,
         returns="video",
+        named_target="fade",
     ),
     "volume": FuncSpec(
         name="volume",
@@ -489,6 +505,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Scale audio volume by a linear factor.",
         expand=_expand_volume,
         returns="audio",
+        named_target="volume",
     ),
     "amix": FuncSpec(
         name="amix",
@@ -496,6 +513,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Mix two audio streams together (equal weight, ffmpeg amix defaults).",
         expand=_expand_amix,
         returns="audio",
+        named_target="amix",
     ),
     "atempo": FuncSpec(
         name="atempo",
@@ -503,6 +521,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Change audio playback tempo by factor (pitch-preserving, audio-only).",
         expand=_expand_atempo,
         returns="audio",
+        named_target="atempo",
     ),
     "afade_in": FuncSpec(
         name="afade_in",
@@ -510,6 +529,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Fade audio in from silence over dur seconds starting at t=0.",
         expand=_expand_afade_in,
         returns="audio",
+        named_target="afade",
     ),
     "afade_out": FuncSpec(
         name="afade_out",
@@ -524,6 +544,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         ),
         expand=_expand_afade_out,
         returns="audio",
+        named_target="afade",
     ),
     "reverb": FuncSpec(
         name="reverb",
@@ -534,6 +555,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         ),
         expand=_expand_reverb,
         returns="audio",
+        named_target="aecho",
     ),
     # ----------------------------------------------------------------------
     # plan 029: tier-1 promotions
@@ -544,6 +566,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Rotate a frame degrees clockwise (ffmpeg evaluates the angle expression).",
         expand=_expand_rotate,
         returns="video",
+        named_target="rotate",
     ),
     "pad": FuncSpec(
         name="pad",
@@ -560,6 +583,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         ),
         expand=_expand_pad,
         returns="video",
+        named_target="pad",
     ),
     "hstack": FuncSpec(
         name="hstack",
@@ -567,6 +591,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Stack two frames side by side horizontally (inputs should share height).",
         expand=_expand_hstack,
         returns="video",
+        named_target="hstack",
     ),
     "vstack": FuncSpec(
         name="vstack",
@@ -574,6 +599,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Stack two frames vertically (inputs should share width).",
         expand=_expand_vstack,
         returns="video",
+        named_target="vstack",
     ),
     "fps": FuncSpec(
         name="fps",
@@ -581,6 +607,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Force a constant output frame rate, duplicating or dropping frames as needed.",
         expand=_expand_fps,
         returns="video",
+        named_target="fps",
     ),
     "sharpen": FuncSpec(
         name="sharpen",
@@ -588,6 +615,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Sharpen a frame by the given luma amount (ffmpeg unsharp, 5x5 matrix).",
         expand=_expand_sharpen,
         returns="video",
+        named_target="unsharp",
     ),
     "deinterlace": FuncSpec(
         name="deinterlace",
@@ -595,6 +623,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Deinterlace a frame (ffmpeg yadif, default mode/parity).",
         expand=_expand_deinterlace,
         returns="video",
+        named_target="yadif",
     ),
     "denoise": FuncSpec(
         name="denoise",
@@ -602,6 +631,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Denoise a frame by the given luma spatial strength (ffmpeg hqdn3d).",
         expand=_expand_denoise,
         returns="video",
+        named_target="hqdn3d",
     ),
     "brightness": FuncSpec(
         name="brightness",
@@ -609,6 +639,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Adjust brightness by v (-1..1, 0 = unchanged; ffmpeg eq).",
         expand=_expand_brightness,
         returns="video",
+        named_target="eq",
     ),
     "contrast": FuncSpec(
         name="contrast",
@@ -616,6 +647,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Adjust contrast by v (0..2, 1 = unchanged; ffmpeg eq).",
         expand=_expand_contrast,
         returns="video",
+        named_target="eq",
     ),
     "saturate": FuncSpec(
         name="saturate",
@@ -623,6 +655,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Adjust saturation by v (0..3, 1 = unchanged; ffmpeg eq).",
         expand=_expand_saturate,
         returns="video",
+        named_target="eq",
     ),
     "grayscale": FuncSpec(
         name="grayscale",
@@ -630,6 +663,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Desaturate a frame to grayscale (ffmpeg hue, s=0).",
         expand=_expand_grayscale,
         returns="video",
+        named_target="hue",
     ),
     "crossfade": FuncSpec(
         name="crossfade",
@@ -643,6 +677,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         ),
         expand=_expand_crossfade,
         returns="video",
+        named_target="xfade",
     ),
     "subtitles": FuncSpec(
         name="subtitles",
@@ -650,6 +685,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Burn subtitles from path into a frame at run time (the file must exist then).",
         expand=_expand_subtitles,
         returns="video",
+        named_target="subtitles",
     ),
     "reverse": FuncSpec(
         name="reverse",
@@ -657,6 +693,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Reverse a video stream (buffers the entire stream in memory).",
         expand=_expand_reverse,
         returns="video",
+        named_target="reverse",
     ),
     "normalize": FuncSpec(
         name="normalize",
@@ -667,6 +704,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Normalize loudness to EBU R128 (default -24 LUFS, or the given target).",
         expand=_expand_normalize,
         returns="audio",
+        named_target="loudnorm",
     ),
     "highpass": FuncSpec(
         name="highpass",
@@ -674,6 +712,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Attenuate frequencies below freq Hz (ffmpeg highpass).",
         expand=_expand_highpass,
         returns="audio",
+        named_target="highpass",
     ),
     "lowpass": FuncSpec(
         name="lowpass",
@@ -681,6 +720,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Attenuate frequencies above freq Hz (ffmpeg lowpass).",
         expand=_expand_lowpass,
         returns="audio",
+        named_target="lowpass",
     ),
     "delay": FuncSpec(
         name="delay",
@@ -688,6 +728,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Delay audio by seconds (converted to integer milliseconds; ffmpeg adelay).",
         expand=_expand_delay,
         returns="audio",
+        named_target="adelay",
     ),
     "acrossfade": FuncSpec(
         name="acrossfade",
@@ -695,6 +736,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Cross fade from a to b over dur seconds of audio.",
         expand=_expand_acrossfade,
         returns="audio",
+        named_target="acrossfade",
     ),
     "areverse": FuncSpec(
         name="areverse",
@@ -702,6 +744,7 @@ FUNCTIONS: dict[str, FuncSpec] = {
         doc="Reverse an audio stream (buffers the entire stream in memory).",
         expand=_expand_areverse,
         returns="audio",
+        named_target="areverse",
     ),
 }
 

@@ -761,3 +761,78 @@ def test_signatures_all_names_resolve() -> None:
     for name in EXPECTED_NAMES:
         sig = signatures(name)
         assert sig.startswith(f"{name}(")
+
+
+# --------------------------------------------------------------------------
+# RFC-003 "Tier-1 named extras": named_target
+# --------------------------------------------------------------------------
+
+# Sample expand() args for every entry that has named_target set (all of
+# them except the blur_regions macro); each of these produces exactly one
+# node, so the single node's filter must equal named_target.
+_NAMED_TARGET_SAMPLE_ARGS: dict[str, list[object]] = {
+    "scale": ["src:a", 2],
+    "crop": ["src:a", 10, 20, 100, 200],
+    "overlay": ["src:base", "src:top", 5, 6],
+    "hflip": ["src:a"],
+    "vflip": ["src:a"],
+    "blur": ["src:a", 3.5],
+    "draw_box": ["src:a", 1, 2, 3, 4, "red"],
+    "text": ["src:a", "hello", 10, 20, 24],
+    "speed": ["src:a", 2],
+    "fade_in": ["src:a", 1.5],
+    "fade_out": ["src:a", 2.0],
+    "volume": ["src:a", 0.5],
+    "amix": ["src:a", "src:b"],
+    "atempo": ["src:a", 1.5],
+    "afade_in": ["src:a", 1.5],
+    "afade_out": ["src:a", 2.0],
+    "reverb": ["src:a", 0.4],
+    "rotate": ["src:a", 90],
+    "pad": ["src:a", 640, 480],
+    "hstack": ["src:a", "src:b"],
+    "vstack": ["src:a", "src:b"],
+    "fps": ["src:a", 30],
+    "sharpen": ["src:a", 1.5],
+    "deinterlace": ["src:a"],
+    "denoise": ["src:a", 4],
+    "brightness": ["src:a", 0.2],
+    "contrast": ["src:a", 1.2],
+    "saturate": ["src:a", 1.5],
+    "grayscale": ["src:a"],
+    "crossfade": ["src:a", "src:b", 1.0, 5.0],
+    "subtitles": ["src:a", "subs.srt"],
+    "reverse": ["src:a"],
+    "normalize": ["src:a"],
+    "highpass": ["src:a", 200],
+    "lowpass": ["src:a", 3000],
+    "delay": ["src:a", 0.25],
+    "acrossfade": ["src:a", "src:b", 2.0],
+    "areverse": ["src:a"],
+}
+
+
+def test_named_target_set_on_every_entry() -> None:
+    # Every FUNCTIONS entry sets named_target explicitly (no accidental
+    # reliance on the dataclass default).
+    assert set(_NAMED_TARGET_SAMPLE_ARGS) | {"blur_regions"} == EXPECTED_NAMES
+
+
+def test_named_target_matches_expand_output_filter() -> None:
+    for name, args in _NAMED_TARGET_SAMPLE_ARGS.items():
+        spec = FUNCTIONS[name]
+        assert spec.named_target is not None, name
+        ctx = FakeCtx()
+        spec.expand(ctx, args)
+        # At least one recorded node's filter equals named_target...
+        assert any(node[1] == spec.named_target for node in ctx.nodes), name
+        # ...and, stronger, these entries all produce exactly one node, so
+        # that single node's filter must equal named_target.
+        assert len(ctx.nodes) == 1, name
+        assert ctx.nodes[0][1] == spec.named_target, name
+
+
+def test_blur_regions_named_target_is_none() -> None:
+    # blur_regions is a macro (three nodes: crop, gblur, overlay) with no
+    # single underlying filter to validate named extras against.
+    assert FUNCTIONS["blur_regions"].named_target is None
