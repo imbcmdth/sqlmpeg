@@ -29,7 +29,7 @@ Check out all the work you didn't need to do! No pad labels. No split bookkeepin
 
 ## Encoding
 
-The query above describes the edit and says nothing about codecs, so ffmpeg picks its defaults. When you care about the encode, wrap the query in `COPY ... TO ... WITH (...)` - stock Postgres syntax doing exactly what a streaming-SQL sink does - and the destination and codec settings ride along inside the query:
+The query above describes the edit and says nothing about codecs, so ffmpeg picks its defaults. When you care about the encode, wrap the query in `COPY ... TO ... WITH (...)` - stock Postgres syntax - and the destination and codec settings ride along inside the query:
 
 ```sql
 COPY (
@@ -151,7 +151,7 @@ Extraction is just a sink with nothing else selected: `COPY (SELECT a.subtitle[1
 
 ## Use with an AI
 
-sqlmpeg ships the system prompt, not the API key. Bring whatever model you like.
+`sqlmpeg` ships with prebaked system prompt. Drop it into whatever model you like.
 
 ```
 $ sqlmpeg prompt > system.txt      # the dialect, the stdlib, worked examples
@@ -167,7 +167,3 @@ $ sqlmpeg validate --json -f query.sql
 Exit 0 with no output means it compiles. On exit 1, hand the JSON back to the model and ask for a repair; the prompt carries per-code repair guidance, so the loop converges in a round or two. Then `sqlmpeg run -f query.sql -o out.mp4`.
 
 The prompt is generated from the same function table the compiler uses, so it cannot drift. A rendered copy lives in [docs/system-prompt.md](docs/system-prompt.md), and `sqlmpeg prompt --dynamic` appends every filter your particular ffmpeg reports, so the model works with your actual machine rather than a platonic ideal of one.
-
----
-
-For the full design, see the [project spec](sqlmpeg-project.md).
