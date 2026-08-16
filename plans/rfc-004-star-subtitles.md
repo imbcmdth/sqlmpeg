@@ -53,8 +53,18 @@ Why this is sound and better:
   has AT MOST ONE time window in the whole query — per-alias seeking maps
   1:1 onto per-input flags. (This was the objection that originally deferred
   the idea; it dissolves under our own input model.)
-- Trims ALL stream types of that input coherently — video, audio, subtitle,
-  data — which is what makes RFC-004's caption story whole.
+- Trims video and audio of that input coherently. CAPTION CORRECTION
+  (measured 2026-08-15, post-implementation): ffmpeg does NOT retime
+  subtitle/data packets under an input -ss — on both the copy and transcode
+  paths, cue timestamps stay near-original while video rebases to zero
+  (verified on muxed output: subtitle packets at 0.0/0.7/1.4 vs a 0.5s seek),
+  so a seeked-and-SELECTED caption track plays out of sync by the seek
+  amount, and pre-window cues are retained. Output-side -ss keeps mutual
+  sync but rebases nothing and decodes everything. Therefore: WHERE + a
+  SELECTED subtitle/data stream of that alias is a typed rejection
+  (UNSUPPORTED_SQL, hint: join an external subtitle file timed for the cut);
+  trimming an input whose captions are NOT selected remains fine (unmapped
+  streams are seeked harmlessly).
 - Faster (demuxer seek, no decode-and-discard) and smaller graphs (the
   trim+setpts / atrim+asetpts pairs disappear). Input -ss rebases timestamps
   to zero, which is exactly what setpts=PTS-STARTPTS did.

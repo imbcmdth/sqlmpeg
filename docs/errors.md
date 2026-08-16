@@ -12,10 +12,11 @@ The JSON shape is formalized in `docs/error-schema.json`.
 Get the structured form from the CLI:
 
 ```
-sqlmpeg validate query.sql --json
+sqlmpeg validate --json "<query>"
 ```
 
-On success this prints nothing and exits 0. On rejection it prints one JSON
+(or `sqlmpeg validate --json -f query.sql` if the query is in a file). On
+success this prints nothing and exits 0. On rejection it prints one JSON
 object to stdout and exits 1. Every example below is real output captured by
 running that exact command against the example query — nothing here is
 invented. Errors that require reading the file (`STREAM_NOT_FOUND`,

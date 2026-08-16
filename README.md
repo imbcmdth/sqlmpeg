@@ -19,7 +19,7 @@ FROM input('film.mkv') f, pip
 ```
 
 ```
-$ sqlmpeg run query.sql -o pip.mkv
+$ sqlmpeg run -f query.sql -o pip.mkv
 ffmpeg -i commentary.mkv -i film.mkv -filter_complex '[0:v:0]scale=w=iw*0.25:h=-2[n1];[1:v:0][n1]overlay=x=20:y=20[out0];[1:a:0]volume=volume=0.65[n3];[1:a:1]volume=volume=0.65[n4];[0:a:0]volume=volume=0.35[n5];[0:a:1]volume=volume=0.35[n6];[n3][n5]amix=inputs=2[out1];[n4][n6]amix=inputs=2[out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra pip.mkv
 ```
 
@@ -44,7 +44,7 @@ COPY (
 ```
 
 ```
-$ sqlmpeg run query.sql
+$ sqlmpeg run -f query.sql
 ffmpeg -i commentary.mkv -i film.mkv -filter_complex '[0:v:0]scale=w=iw*0.25:h=-2[n1];[1:v:0][n1]overlay=x=20:y=20[out0];[1:a:0]volume=volume=0.65[n3];[1:a:1]volume=volume=0.65[n4];[0:a:0]volume=volume=0.35[n5];[0:a:1]volume=volume=0.35[n6];[n3][n5]amix=inputs=2[out1];[n4][n6]amix=inputs=2[out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra -c:0 libx264 -crf:0 20 -c:1 aac -c:2 aac -b:1 192k -b:2 192k pip.mkv
 ```
 
@@ -59,7 +59,7 @@ SELECT b.frame, b.audio FROM input('episode2.mkv') b
 ```
 
 ```
-$ sqlmpeg run query.sql -o season.mkv
+$ sqlmpeg run -f query.sql -o season.mkv
 ffmpeg -i episode1.mkv -i episode2.mkv -filter_complex '[0:v:0][0:a:0][0:a:1][1:v:0][1:a:0][1:a:1]concat=n=2:v=1:a=2[out0][out1][out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra season.mkv
 ```
 
@@ -75,7 +75,7 @@ FROM input('clip.mp4') a
 ```
 
 ```
-$ sqlmpeg compile query.sql
+$ sqlmpeg compile -f query.sql
 ffmpeg -i clip.mp4 -filter_complex '[0:v:0]unsharp=luma_msize_x=7:luma_amount=1.5[out0]' -map '[out0]' -map 0:a:0 -c:1 copy out.mp4
 ```
 
@@ -95,7 +95,7 @@ FROM input('foo.mp4') a
 ```
 
 ```
-$ sqlmpeg compile --no-probe query.sql
+$ sqlmpeg compile --no-probe "SELECT a.video[1], a.audio[2] FROM input('foo.mp4') a"
 ffmpeg -i foo.mp4 -map 0:v:0 -c:0 copy -map 0:a:1 -c:1 copy out.mp4
 ```
 
@@ -107,7 +107,7 @@ FROM input('film.mkv') v
 ```
 
 ```
-$ sqlmpeg compile query.sql
+$ sqlmpeg compile -f query.sql
 ffmpeg -i film.mkv -filter_complex '[0:a:0]aecho=in_gain=0.8:out_gain=0.9:delays=60:decays=0.3[out1];[0:a:1]aecho=in_gain=0.8:out_gain=0.9:delays=60:decays=0.3[out2]' -map 0:v:0 -c:0 copy -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra out.mp4
 ```
 
@@ -125,13 +125,13 @@ Pipe that as the system prompt, ask for the edit in English, and put the reply
 through the validator:
 
 ```
-$ sqlmpeg validate --json query.sql
+$ sqlmpeg validate --json -f query.sql
 {"line": 1, "col": 8, "code": "UDF_ARG_TYPE", "message": "...", "hint": "..."}
 ```
 
 Exit 0 and silence means it compiles. On exit 1, hand the JSON object back to
 the model and ask for a repair; the prompt carries per-code repair guidance, so
-the loop converges in a round or two. Then `sqlmpeg run query.sql -o out.mp4`.
+the loop converges in a round or two. Then `sqlmpeg run -f query.sql -o out.mp4`.
 
 The prompt is generated from the function table, so it never drifts from the
 compiler. A rendered copy lives in [docs/system-prompt.md](docs/system-prompt.md).

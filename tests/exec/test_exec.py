@@ -24,6 +24,7 @@ from PIL import Image
 
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.emit import build_ffmpeg_args, emit
+from sqlmpeg.errors import SqlmpegError
 
 pytestmark = pytest.mark.exec
 
@@ -277,27 +278,34 @@ def test_a_trimmed_passthrough_is_stream_copied_within_keyframe_tolerance(
     assert duration <= source_duration + _DURATION_SLACK
 
 
-def test_a_trimmed_star_keeps_the_caption_track(tmp_path: Path) -> None:
-    """RFC-004's caption story, whole: a WHERE over a captioned input used to be
-    rejected outright; the seek cuts video, audio and subtitles coherently."""
+def test_a_trimmed_captioned_input_still_remuxes_video_and_audio(tmp_path: Path) -> None:
+    """A WHERE over a captioned input is fine as long as the captions are not
+    selected (they are seeked but unmapped). Selecting them under a trim is
+    rejected: measured 2026-08-15, ffmpeg does not retime caption packets
+    under an input -ss (copy or transcode), so they would desync."""
     _require_fixture(_AVS)
-    out_path = tmp_path / "trimmed-star.mkv"
+    out_path = tmp_path / "trimmed-av.mkv"
     query = (
-        f"SELECT * FROM input('{_sql_path(_AVS)}') a "
+        f"SELECT a.video[1], a.audio[1] FROM input('{_sql_path(_AVS)}') a "
         f"WHERE a.t BETWEEN {_TRIM_START} AND {_TRIM_END}"
     )
 
     emitted = emit(compile_sql(query))
     assert emitted.filter_complex == ""
-    assert [m.target for m in emitted.maps] == ["0:v:0", "0:a:0", "0:s:0"]
+    assert [m.target for m in emitted.maps] == ["0:v:0", "0:a:0"]
     assert emitted.input_trims == [(_TRIM_START, _TRIM_END)]
 
     _compile_and_run(query, out_path)
 
     streams = _ffprobe_streams(out_path)
-    assert [s["codec_type"] for s in streams] == ["video", "audio", "subtitle"]
-    assert streams[2]["codec_name"] == "subrip"
-    assert streams[2]["tags"]["language"] == "eng"
+    assert [s["codec_type"] for s in streams] == ["video", "audio"]
+
+    with pytest.raises(SqlmpegError) as excinfo:
+        compile_sql(
+            f"SELECT * FROM input('{_sql_path(_AVS)}') a "
+            f"WHERE a.t BETWEEN {_TRIM_START} AND {_TRIM_END}"
+        )
+    assert "out of sync" in excinfo.value.message
 
 
 def test_hflip_matches_pil_flipped_source_by_phash(tmp_path: Path) -> None:

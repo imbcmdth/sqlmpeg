@@ -1740,33 +1740,43 @@ def test_filtering_a_cte_subtitle_column_is_still_rejected() -> None:
 # -- passthrough-only: an INPUT seek trims them; a CTE's filter trim cannot
 
 
-def test_where_over_a_consumed_subtitle_stream_is_seeked() -> None:
-    """Plan 035 flipped this: the window is an input seek, which cuts the
-    subtitle track along with everything else in the file."""
-    g = _lower(
+def test_where_over_a_consumed_subtitle_stream_is_rejected() -> None:
+    """Measured 2026-08-15: ffmpeg does NOT retime caption packets under an
+    input -ss (copy or transcode), so a seeked-and-selected caption track
+    would desync by the seek amount. Rejected rather than shipped broken."""
+    err = _reject_lower(
         "SELECT a.subtitle[1] FROM input('x.mkv') a WHERE a.t BETWEEN 1 AND 2",
         {"a": _layout_probe("vas")},
     )
-    assert _filters(g) == []
-    assert g.input_trims == {"a": (1, 2)}
-    assert _outputs(g) == [("src:a:s:0", "subtitle", None)]
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "out of sync" in err.message
 
 
-def test_where_over_a_consumed_data_stream_is_seeked() -> None:
-    g = _lower(
+def test_where_over_a_consumed_data_stream_is_rejected() -> None:
+    err = _reject_lower(
         "SELECT a.data FROM input('x.mkv') a WHERE a.t BETWEEN 1 AND 2",
         {"a": _layout_probe("vad")},
     )
-    assert _filters(g) == []
-    assert g.input_trims == {"a": (1, 2)}
-    assert _outputs(g) == [("src:a:d:0", "data", None)]
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "data" in err.message
 
 
-def test_star_plus_where_over_a_captioned_input_seeks_every_stream() -> None:
-    """RFC-004's caption story, whole: `SELECT *` under a WHERE remuxes every
-    stream of the file, all cut by the one seek on its -i."""
-    g = _lower(
+def test_star_plus_where_over_a_captioned_input_is_rejected() -> None:
+    """`SELECT *` consumes the caption track, so the same desync rejection
+    applies; trim + star works on caption-less files (covered elsewhere)."""
+    err = _reject_lower(
         "SELECT * FROM input('x.mkv') a WHERE a.t BETWEEN 1 AND 2",
+        {"a": _layout_probe("vas")},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "out of sync" in err.message
+
+
+def test_where_plus_unselected_captions_still_seeks() -> None:
+    """The trim stays legal when the captions are NOT selected: unmapped
+    streams are seeked harmlessly."""
+    g = _lower(
+        "SELECT a.video[1], a.audio[1] FROM input('x.mkv') a WHERE a.t BETWEEN 1 AND 2",
         {"a": _layout_probe("vas")},
     )
     assert _filters(g) == []
@@ -1774,7 +1784,6 @@ def test_star_plus_where_over_a_captioned_input_seeks_every_stream() -> None:
     assert _outputs(g) == [
         ("src:a:v:0", "video", None),
         ("src:a:a:0", "audio", None),
-        ("src:a:s:0", "subtitle", None),
     ]
 
 
@@ -1788,7 +1797,7 @@ def test_where_over_a_cte_carrying_a_subtitle_column_is_rejected() -> None:
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "a CTE's captions cannot be trimmed" in err.message
-    assert err.hint is not None and "INPUT alias" in err.hint
+    assert err.hint is not None and "external subtitle file" in err.hint
 
 
 def test_where_that_does_not_touch_the_caption_alias_still_seeks_its_own_input() -> None:

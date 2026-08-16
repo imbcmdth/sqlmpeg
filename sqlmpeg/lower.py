@@ -271,9 +271,9 @@ _PASSTHROUGH_HINT = (
     "drop them from the call and select them as their own column"
 )
 _CAPTION_TRIM_HINT = (
-    "put the WHERE on the INPUT alias instead (an input's time range becomes a "
-    "seek, which trims every stream type), or select the subtitle/data columns "
-    "of the CTE without a WHERE time range"
+    "trim the video/audio without selecting the subtitle/data columns, or select "
+    "them in a query without a WHERE time range; to caption a trimmed clip, join "
+    "an external subtitle file whose cues are timed for the cut"
 )
 
 # Longest option/constant list a hint or message renders before it stops
@@ -1147,6 +1147,21 @@ class _Lowerer:
         """
         window = env.trims.get(alias)
         if window is None:
+            if value.type in _PASSTHROUGH_ONLY and alias in self.graph.input_trims:
+                # Measured, not theoretical: ffmpeg does not retime subtitle/data
+                # packets under an input -ss (copy OR transcode; cue times stay
+                # near-original while video rebases to zero), so a seeked caption
+                # track plays out of sync by the seek amount. Reject rather than
+                # ship silent desync. (2026-08-15 investigation; see RFC-004.)
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'WHERE {alias}.t' cannot trim a selected {value.type} stream: "
+                    "ffmpeg does not retime caption packets under an input seek, so "
+                    "they would play out of sync with the trimmed video",
+                    anchor,
+                    fallback=select,
+                    hint=_CAPTION_TRIM_HINT,
+                )
             return value
         if value.type in _PASSTHROUGH_ONLY:
             raise _error(

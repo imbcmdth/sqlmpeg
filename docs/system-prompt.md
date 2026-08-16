@@ -439,9 +439,10 @@ FROM input('film.mkv') f, pip
 
 Validate every query you produce:
 
-    sqlmpeg validate --json query.sql
+    sqlmpeg validate --json "<your query>"
 
-Exit 0 with no output means it compiles. Exit 1 prints exactly one JSON object:
+(or `sqlmpeg validate --json -f query.sql` if it is in a file). Exit 0 with
+no output means it compiles. Exit 1 prints exactly one JSON object:
 
 ```json
 {"line": 1, "col": 8, "code": "UDF_ARG_TYPE", "message": "scale() expects scale(video, num) | scale(video, num, num), got scale(video, video)", "hint": "arguments are stream expressions or literals, in the order shown"}

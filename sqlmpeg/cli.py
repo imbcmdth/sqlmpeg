@@ -2,24 +2,24 @@
 
 Thin wrapper around the library pipeline (``compile_sql`` -> ``emit`` ->
 ``build_ffmpeg_args``). See the "CLI" section of sqlmpeg-project.md and
-plan 008.
+plan 008 (plan 037 for the SQL-string-is-the-default-input convention below).
 
 Subcommands:
 
-* ``compile QUERY.sql [--graph-only] [-o OUT] [--no-probe] [--portable]`` --
-  print the full ffmpeg command (POSIX-quoted via ``shlex.join``, even on
+* ``compile SQL [-f FILE] [--graph-only] [-o OUT] [--no-probe] [--portable]``
+  -- print the full ffmpeg command (POSIX-quoted via ``shlex.join``, even on
   Windows -- it is documentation output, not something meant to be pasted
   into cmd.exe), or just the ``-filter_complex`` string with
   ``--graph-only``. Output path resolution (RFC-002, plan 027): ``-o`` if
   given, else the query's ``COPY ... TO`` sink path if it has one, else the
   ``out.mp4`` placeholder (today's default).
-* ``explain QUERY.sql [--no-probe] [--portable]`` -- dump the IR graph as
-  JSON (the sink, if any, is part of that JSON already).
-* ``validate QUERY.sql [--json] [--no-probe] [--portable]`` -- exit 0 silent
-  on success; on error, exit 1 with either a one-line human message or
-  ``err.to_dict()`` JSON.
-* ``run QUERY.sql [-o OUT] [--timeout SECS] [-y]`` -- compile and execute
-  ffmpeg as a subprocess (guardrail #6: argv list, no shell, timeout
+* ``explain SQL [-f FILE] [--no-probe] [--portable]`` -- dump the IR graph
+  as JSON (the sink, if any, is part of that JSON already).
+* ``validate SQL [-f FILE] [--json] [--no-probe] [--portable]`` -- exit 0
+  silent on success; on error, exit 1 with either a one-line human message
+  or ``err.to_dict()`` JSON.
+* ``run SQL [-f FILE] [-o OUT] [--timeout SECS] [-y]`` -- compile and
+  execute ffmpeg as a subprocess (guardrail #6: argv list, no shell, timeout
   enforced, stderr captured and surfaced on failure). ``run`` always
   probes -- the files must exist to execute, so there is no ``--no-probe``
   escape hatch here; it has no ``--portable`` either, since it needs an
@@ -33,6 +33,22 @@ Subcommands:
   part of the printed prompt that is machine-dependent; without the flag,
   the output is identical to the portable, tier-1-only base prompt.
 
+``compile``/``explain``/``validate``/``run`` take the query as SQL TEXT
+directly on the command line -- ``sqlmpeg compile "SELECT ... FROM
+input('x.mp4') a"`` -- since that is the common case. Pass ``-f/--file PATH``
+instead to read the query from a file (``-f -`` reads stdin, e.g. for the LLM
+repair loop's pipe). Exactly one of the positional SQL string or ``-f`` is
+required; giving both or neither is a usage error, exit 2.
+
+Muscle-memory guard: if the positional SQL string fails to compile -- ANY
+error code, since a bare filename like ``query.sql`` parses as a SQL column
+reference and fails as ``UNSUPPORTED_SQL``, not ``PARSE_ERROR`` -- and it
+looks like a file was meant instead (it names a path that exists, or ends in
+``.sql``/``.SQL``), a second stderr line suggests ``-f``. No legitimate query
+ever looks like a file path. This is CLI-layer-only sugar: it never touches
+``SqlmpegError`` or the machine-readable ``--json`` output, which always
+prints the library's error verbatim on stdout.
+
 ``--no-probe`` (compile/explain/validate only) skips ffprobe entirely for a
 byte-reproducible, fully offline compile (RFC-001 "Probing policy"): no
 ``STREAM_NOT_FOUND``/``BROADCAST_MISMATCH`` validation, ``SELECT *`` and bare
@@ -45,15 +61,13 @@ naming a dynamic (tier-2) filter or passing a named option is rejected
 (``UNKNOWN_FUNCTION`` / ``UNSUPPORTED_SQL``) exactly as it would be on a
 machine with no ffmpeg installed at all. Use it to confirm a query will
 compile on someone else's machine.
-
-``QUERY.sql`` may be ``-`` to read the query text from stdin in every
-subcommand.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -91,6 +105,15 @@ def main(argv: list[str] | None = None) -> int:
 # ---------------------------------------------------------------------------
 
 
+_QUERY_HELP = "SQL query text (exactly one of this or -f/--file is required)"
+_FILE_HELP = "read the query from a file instead of the command line ('-' for stdin)"
+
+
+def _add_query_arguments(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument("query", nargs="?", default=None, help=_QUERY_HELP)
+    subparser.add_argument("-f", "--file", default=None, help=_FILE_HELP)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sqlmpeg", description="SQL frontend for FFmpeg filtergraphs"
@@ -98,7 +121,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     compile_p = subparsers.add_parser("compile", help="compile SQL to an ffmpeg command")
-    compile_p.add_argument("query", help="path to a .sql file, or - for stdin")
+    _add_query_arguments(compile_p)
     compile_p.add_argument(
         "--graph-only", action="store_true", help="print only the filter_complex string"
     )
@@ -118,7 +141,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     explain_p = subparsers.add_parser("explain", help="dump the compiled IR graph as JSON")
-    explain_p.add_argument("query", help="path to a .sql file, or - for stdin")
+    _add_query_arguments(explain_p)
     explain_p.add_argument(
         "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
     )
@@ -129,7 +152,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     validate_p = subparsers.add_parser("validate", help="check that a query compiles")
-    validate_p.add_argument("query", help="path to a .sql file, or - for stdin")
+    _add_query_arguments(validate_p)
     validate_p.add_argument(
         "--json", action="store_true", dest="as_json", help="emit the error as JSON"
     )
@@ -143,7 +166,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     run_p = subparsers.add_parser("run", help="compile and execute ffmpeg")
-    run_p.add_argument("query", help="path to a .sql file, or - for stdin")
+    _add_query_arguments(run_p)
     run_p.add_argument(
         "-o",
         "--output",
@@ -172,7 +195,7 @@ def _build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
-def _read_query(path: str) -> str | None:
+def _read_file(path: str) -> str | None:
     """Read query text from `path` (or stdin for "-"). None + printed error on failure."""
     if path == "-":
         return sys.stdin.read()
@@ -183,8 +206,56 @@ def _read_query(path: str) -> str | None:
         return None
 
 
-def _print_error(err: SqlmpegError) -> None:
+def _resolve_query(args: argparse.Namespace) -> tuple[str | None, int]:
+    """Resolve the query text for compile/explain/validate/run.
+
+    Exactly one of the positional ``query`` (inline SQL) or ``-f/--file`` is
+    required. Returns ``(text, 0)`` on success, or ``(None, exit_code)`` with
+    the error already printed to stderr: 2 for the usage violation (both or
+    neither given), 1 for a file that could not be read.
+    """
+    has_query = args.query is not None
+    has_file = args.file is not None
+    if has_query and has_file:
+        print(
+            f"error: {args.command}: give a SQL string or -f/--file, not both",
+            file=sys.stderr,
+        )
+        return None, 2
+    if not has_query and not has_file:
+        print(
+            f"error: {args.command}: give a SQL string or -f/--file",
+            file=sys.stderr,
+        )
+        return None, 2
+    if has_file:
+        text = _read_file(args.file)
+        if text is None:
+            return None, 1
+        return text, 0
+    assert args.query is not None
+    return args.query, 0
+
+
+def _maybe_print_file_hint(err: SqlmpegError, source: str | None) -> None:
+    """Muscle-memory guard (plan 037): an inline positional string that names
+    an existing file, or ends in .sql/.SQL, probably meant -f/--file. Fires on
+    ANY compile error, not just PARSE_ERROR -- a bare filename like
+    `query.sql` parses as a SQL column reference and fails as UNSUPPORTED_SQL,
+    and no legitimate query ever looks like a file path. CLI-layer sugar only
+    -- never touches `err` itself."""
+    if source is None:
+        return
+    if os.path.exists(source) or source.lower().endswith(".sql"):
+        print(
+            f"hint: '{source}' looks like a file; did you mean -f '{source}'?",
+            file=sys.stderr,
+        )
+
+
+def _print_error(err: SqlmpegError, *, source: str | None = None) -> None:
     print(f"error: {err}", file=sys.stderr)
+    _maybe_print_file_hint(err, source)
 
 
 def _check_output_dir(out_path: str) -> str | None:
@@ -210,15 +281,15 @@ def _resolve_out_path(cli_output: str | None, graph: Graph, *, default: str | No
 
 
 def _cmd_compile(args: argparse.Namespace) -> int:
-    text = _read_query(args.query)
+    text, code = _resolve_query(args)
     if text is None:
-        return 1
+        return code
 
     try:
         graph = compile_sql(text, probe=not args.no_probe, portable=args.portable)
         emitted = emit(graph)
     except SqlmpegError as err:
-        _print_error(err)
+        _print_error(err, source=args.query)
         return 1
 
     if args.graph_only:
@@ -232,14 +303,14 @@ def _cmd_compile(args: argparse.Namespace) -> int:
 
 
 def _cmd_explain(args: argparse.Namespace) -> int:
-    text = _read_query(args.query)
+    text, code = _resolve_query(args)
     if text is None:
-        return 1
+        return code
 
     try:
         graph = compile_sql(text, probe=not args.no_probe, portable=args.portable)
     except SqlmpegError as err:
-        _print_error(err)
+        _print_error(err, source=args.query)
         return 1
 
     print(json.dumps(graph.to_dict(), indent=2))
@@ -247,32 +318,36 @@ def _cmd_explain(args: argparse.Namespace) -> int:
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:
-    text = _read_query(args.query)
+    text, code = _resolve_query(args)
     if text is None:
-        return 1
+        return code
 
     try:
         compile_sql(text, probe=not args.no_probe, portable=args.portable)
     except SqlmpegError as err:
         if args.as_json:
+            # Machine contract: stdout stays pure JSON, the library error
+            # verbatim. The file-hint is human-output sugar only, so it goes
+            # to stderr even here rather than perturbing stdout.
             print(json.dumps(err.to_dict()))
+            _maybe_print_file_hint(err, args.query)
         else:
-            _print_error(err)
+            _print_error(err, source=args.query)
         return 1
 
     return 0
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    text = _read_query(args.query)
+    text, code = _resolve_query(args)
     if text is None:
-        return 1
+        return code
 
     try:
         graph: Graph = compile_sql(text)
         emitted: Emitted = emit(graph)
     except SqlmpegError as err:
-        _print_error(err)
+        _print_error(err, source=args.query)
         return 1
 
     out_path = _resolve_out_path(args.output, graph, default=None)
