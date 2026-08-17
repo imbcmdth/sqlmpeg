@@ -2,15 +2,6 @@
 
 Real tasks, in roughly the order people meet them. Each recipe is the question as it's usually asked, the query that answers it, and the exact ffmpeg command that query compiles to. Every command on this page is real output - a test recompiles all of them and diffs byte for byte, so if a recipe is here, it works.
 
-## How to read this file
-
-Two kinds of query fence, checked by `tests/test_examples.py`:
-
-- ` ```sql ` - compiles anywhere, even with no ffmpeg installed: stream selection, remaps, trims and sinks, but no filter calls (a filter call needs a binary to resolve against). The command shown is what such a machine would print.
-- ` ```sql-exec ` - needs the installed ffmpeg to compile: any filter call, a generated source, or a whole-array splat whose length only a real file knows.
-
-Every query fence is followed by a plain fence holding the `$ sqlmpeg compile -f query.sql ...` invocation and exactly what it prints. Paths are illustrative (`film.mp4` doesn't need to exist to compile); the recipes that genuinely need a readable file use this repo's `tests/fixtures/` paths verbatim.
-
 ## 1. Transcode a file to H.264/AAC
 
 The most-asked ffmpeg question there is. Select the streams, name the codecs in the sink, done - `faststart` moves the index to the front so the file starts playing before it finishes downloading:
@@ -34,7 +25,7 @@ ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -preset:0 slow -
 
 `SELECT *` means keep everything: every stream, untouched, tags intact. Nothing decodes; this runs as fast as the disk. The one wrinkle is captions - mp4 only carries `mov_text`, so the subtitle track transcodes while video and audio copy:
 
-```sql-exec
+```pgsql
 COPY (
   SELECT * FROM input('tests/fixtures/avs.mkv') a
 ) TO 'film.mp4' WITH (subtitle_codec 'mov_text')
@@ -95,7 +86,7 @@ ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 18 -c:
 
 `-2` for the height means "keep the aspect ratio, rounded to an even number" - encoders insist on even dimensions, and this saves you doing the arithmetic:
 
-```sql-exec
+```pgsql
 SELECT scale(f.frame, 1280, -2), f.audio[1]
 FROM input('film.mp4') f
 ```
@@ -107,7 +98,7 @@ ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=1280:height=-2[out0]' -ma
 
 Or express the width relative to the input - any string-typed option takes an ffmpeg expression - and let `-2` keep the aspect:
 
-```sql-exec
+```pgsql
 SELECT scale(f.frame, 'iw/2', -2), f.audio[1]
 FROM input('film.mp4') f
 ```
@@ -121,7 +112,7 @@ ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=iw/2:height=-2[out0]' -ma
 
 For quarter turns, ffmpeg's `transpose` is the right tool (it swaps the axes rather than resampling). For arbitrary angles there's `rotate`, whose angle is an expression in radians - `rotate(f.frame, '7*PI/180')` leans a clip seven degrees:
 
-```sql-exec
+```pgsql
 SELECT transpose(v.frame, dir => 'clock'), v.audio[1]
 FROM input('phone.mp4') v
 ```
@@ -135,7 +126,7 @@ ffmpeg -i phone.mp4 -filter_complex '[0:v:0]transpose=dir=clock[out0]' -map '[ou
 
 Any of your ffmpeg's filters is callable directly, options by name, checked against what the binary actually supports. (The one-knob version, if you don't need the fine control: `unsharp(f.frame, 5, 5, 1.5)`, matrix sizes then amount, positionally in unsharp's own order.)
 
-```sql-exec
+```pgsql
 SELECT unsharp(a.frame, luma_msize_x => 7, luma_amount => 1.5), a.audio[1]
 FROM input('clip.mp4') a
 ```
@@ -162,7 +153,7 @@ ffmpeg -i part1.mp4 -i part2.mp4 -filter_complex '[0:v:0][0:a:0][1:v:0][1:a:0]co
 
 And it scales to files you'd rather not count streams in: splat the whole audio array and the languages pair up positionally, English with English, French with French, tags surviving. (This one needs real files - a splat has to know how many tracks there are.)
 
-```sql-exec
+```pgsql
 SELECT a.frame, a.audio FROM input('tests/fixtures/av2.mp4') a
 UNION ALL
 SELECT b.frame, b.audio FROM input('tests/fixtures/av3.mp4') b
@@ -177,7 +168,7 @@ ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex '[0:v
 
 `loop => true` keeps a still image alive for the whole duration, and the position is an ffmpeg expression - `(W-w)/2` centers it without you knowing either file's dimensions:
 
-```sql-exec
+```pgsql
 SELECT overlay(f.frame, logo.frame, '(W-w)/2', '(H-h)/2'), f.audio[1]
 FROM input('film.mp4') f, input('watermark.png', loop => true) logo
 ```
@@ -221,7 +212,7 @@ ffmpeg -i film.mkv -map 0:s:0 -c:0 copy subs.en.srt
 
 Different from muxing a track: `subtitles()` is a video filter that renders the cues into the pixels. The subtitle file is read when ffmpeg runs, so it needs to exist then, not now:
 
-```sql-exec
+```pgsql
 SELECT subtitles(f.frame, 'subs.en.srt'), f.audio[1]
 FROM input('film.mp4') f
 ```
@@ -235,7 +226,7 @@ ffmpeg -i film.mp4 -filter_complex '[0:v:0]subtitles=filename=subs.en.srt[out0]'
 
 Two functions because the two stream types speed up differently: `sqlmpeg.speed` restamps video frames, `atempo` resamples audio while keeping the pitch (so nobody turns into a chipmunk):
 
-```sql-exec
+```pgsql
 SELECT sqlmpeg.speed(f.frame, 2), atempo(f.audio[1], 2)
 FROM input('film.mp4') f
 ```
@@ -249,7 +240,7 @@ ffmpeg -i film.mp4 -filter_complex '[0:v:0]setpts=PTS/2[out0];[0:a:0]atempo=temp
 
 `xfade` takes both clips, then `duration` and `offset` by name (its first option is the transition style, which defaults to a plain dissolve) - the offset is seconds into the FIRST clip where the fade begins, so a 10-second clip with a 1-second fade starts dissolving at 9. `acrossfade` does the same for the sound:
 
-```sql-exec
+```pgsql
 SELECT xfade(a.frame, b.frame, duration => 1, offset => 9),
        acrossfade(a.audio[1], b.audio[1], duration => 1)
 FROM input('one.mp4') a, input('two.mp4') b
@@ -264,7 +255,7 @@ ffmpeg -i one.mp4 -i two.mp4 -filter_complex '[0:v:0][1:v:0]xfade=duration=1:off
 
 The good-looking way needs two passes over the frames - one to build a palette, one to use it. Write it as a CTE consumed twice; the compiler inserts the split:
 
-```sql-exec
+```pgsql
 WITH small AS (
   SELECT fps(scale(v.frame, 480, -2), 12) AS frame
   FROM input('clip.mp4') v
@@ -294,7 +285,7 @@ ffmpeg -i film.mp4 -i voiceover.wav -map 0:v:0 -c:0 copy -map 1:a:0 -c:1 copy du
 
 Keeping both, with the music turned down, is a mix:
 
-```sql-exec
+```pgsql
 SELECT v.video[1], amix(v.audio[1], volume(m.audio[1], 0.2))
 FROM input('film.mp4') v, input('music.m4a') m
 ```
@@ -306,7 +297,7 @@ ffmpeg -i film.mp4 -i music.m4a -filter_complex '[1:a:0]volume=volume=0.2[n1];[0
 
 Real ducking - music that dips when someone speaks - is a sidechain compressor keyed off the dialogue. Naming `v.audio[1]` twice is fine; the compiler inserts the split:
 
-```sql-exec
+```pgsql
 SELECT v.video[1], amix(v.audio[1], sidechaincompress(m.audio[1], v.audio[1], threshold => 0.03, ratio => 8))
 FROM input('film.mp4') v, input('music.m4a') m
 ```
@@ -320,7 +311,7 @@ ffmpeg -i film.mp4 -i music.m4a -filter_complex '[0:a:0]asplit=2[src_v_a_0_split
 
 A quarter-size camera in the bottom-right corner, 20 pixels off each edge - the expressions mean the position holds whatever the two resolutions are. (The dual-language version, with the audio mixed per language, is the README's opening demo.)
 
-```sql-exec
+```pgsql
 SELECT overlay(f.frame, scale(c.frame, 'iw/4', -2), 'W-w-20', 'H-h-20'), f.audio[1]
 FROM input('film.mp4') f, input('camera.mp4') c
 ```
@@ -349,7 +340,7 @@ ffmpeg -to 120 -i film.mp4 -i promo.mp4 -ss 120 -i film.mp4 -filter_complex '[0:
 
 Or keep the main video playing and overlay the insert on top: a delayed video stream is transparent until its start time (and after it ends), so it composes with a plain `overlay` - no timeline bookkeeping:
 
-```sql-exec
+```pgsql
 SELECT overlay(f.frame, sqlmpeg.delay(promo.frame, 120), 20, 20), f.audio[1]
 FROM input('film.mp4') f, input('promo.mp4') promo
 ```
@@ -363,7 +354,7 @@ ffmpeg -i film.mp4 -i promo.mp4 -filter_complex '[1:v:0]format=pix_fmts=yuva420p
 
 A bare `.audio` is the whole track array; handing it to a filter broadcasts, one node per language, and every output keeps its language tag. (`ffmpeg.loudnorm` rather than bare `loudnorm` only out of habit here - the bare name works too; the namespace is the spelling that never collides with Postgres grammar. `I` is EBU R128 integrated loudness, and yes, it's a capital I.)
 
-```sql-exec
+```pgsql
 SELECT f.video[1], ffmpeg.loudnorm(f.audio, I => -23)
 FROM input('tests/fixtures/av2.mp4') f
 ```
@@ -377,7 +368,7 @@ ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:a:0]loudnorm=I=-23[out1];[0
 
 `sqlmpeg.blur_regions` is crop, blur and overlay in one call - the license-plate special:
 
-```sql-exec
+```pgsql
 SELECT sqlmpeg.blur_regions(f.frame, 900, 60, 320, 180, 20), f.audio[1]
 FROM input('interview.mp4') f
 ```
@@ -389,7 +380,7 @@ ffmpeg -i interview.mp4 -filter_complex '[0:v:0]split=2[src_f_v_0_split0][src_f_
 
 To apply an effect only during a time window, `enable` is the switch - no trimming, no branches, no concat, just a filter that turns itself on and off:
 
-```sql-exec
+```pgsql
 SELECT gblur(a.frame, 12, enable => 'between(t,0.5,1.5)')
 FROM input('clip.mp4') a
 ```
@@ -403,7 +394,7 @@ ffmpeg -i clip.mp4 -filter_complex '[0:v:0]gblur=sigma=12:enable=between(t\,0.5\
 
 Sources live in FROM and consume no input file at all - note the command below has no `-i`:
 
-```sql-exec
+```pgsql
 SELECT t.frame, s.audio[1]
 FROM ffmpeg.testsrc2(duration => 10, size => '1280x720', rate => 30) t,
      ffmpeg.sine(frequency => 440, duration => 10) s
@@ -416,7 +407,7 @@ ffmpeg -filter_complex 'testsrc2=duration=10:size=1280x720:rate=30[out0];sine=fr
 
 They also solve a quieter problem: `UNION ALL` branches must match column for column, so appending a slate to a clip needs a silent audio track from somewhere. `anullsrc` is that somewhere:
 
-```sql-exec
+```pgsql
 SELECT f.video[1], f.audio[1] FROM input('clip.mp4') f
 UNION ALL
 SELECT t.video[1], s.audio[1]
@@ -433,7 +424,7 @@ ffmpeg -i clip.mp4 -filter_complex 'color=color=black:duration=3:size=1280x720:r
 
 A few filters return a whole array, sized by one of their own options. `channelsplit` turns one stereo track into two mono streams; splatted into the SELECT list, each becomes its own output:
 
-```sql-exec
+```pgsql
 SELECT ffmpeg.channelsplit(a.audio[1])
 FROM input('stereo.mp4') a
 ```
@@ -445,7 +436,7 @@ ffmpeg -i stereo.mp4 -filter_complex '[0:a:0]channelsplit[out0][out1]' -map '[ou
 
 `acrossover` splits by frequency instead - two split points make three bands - and that's the shape of multiband compression: split, compress each band on its own settings, mix back:
 
-```sql-exec
+```pgsql
 WITH bands AS (
   SELECT ffmpeg.acrossover(a.audio[1], split => '300 3000') AS b
   FROM input('song.m4a') a
@@ -465,7 +456,7 @@ ffmpeg -i song.m4a -filter_complex '[0:a:0]acrossover=split=300\ 3000[n10][n11][
 
 A `CREATE VIEW` is a named, shared piece of the graph, and each `COPY` after it is one output file - the whole script is a single ffmpeg run, so the watermarking happens once no matter how many files consume it. (The classic version of this, the ABR rendition ladder, is in the README.)
 
-```sql-exec
+```pgsql
 CREATE VIEW branded AS
   SELECT overlay(f.frame, logo.frame, 'W-w-20', 20) AS v, f.audio[1] AS a
   FROM input('film.mp4') f, input('watermark.png', loop => true) logo;

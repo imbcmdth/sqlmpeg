@@ -1,6 +1,6 @@
 """Tests for docs/examples.md -- the cookbook (plan 049).
 
-Data-driven, not one test per recipe: every ```sql / ```sql-exec fence in the
+Data-driven, not one test per recipe: every ```sql / ```pgsql fence in the
 cookbook is compiled by running the exact command line the fence below it
 shows, and the printed ffmpeg command must match that fence byte for byte.
 Adding a recipe to the cookbook therefore adds its test here automatically,
@@ -13,7 +13,7 @@ documents:
   returns None, so the filter registry loads empty) and probing stubbed out,
   which is exactly what a machine with no ffmpeg and no readable input file
   sees. Byte-reproducible anywhere, so these run in the default suite.
-* ```sql-exec -- needs this machine: a tier-2 filter, a named option, a
+* ```pgsql -- needs this machine: a tier-2 filter, a named option, a
   generated source, or a bare-array broadcast whose length only the file
   knows. Compiled (never executed) against the real installed ffmpeg in an
   ``exec``-marked test.
@@ -43,7 +43,7 @@ from sqlmpeg.registry import Registry
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES_PATH = REPO_ROOT / "docs" / "examples.md"
 
-_TIERS = {"sql": "offline", "sql-exec": "exec"}
+_TIERS = {"sql": "offline", "pgsql": "exec"}
 
 _FENCE_RE = re.compile(r"^```(?P<info>[^\n]*)\n(?P<body>.*?)^```$", re.DOTALL | re.MULTILINE)
 _HEADING_RE = re.compile(r"^#{1,6} (?P<text>.+)$", re.MULTILINE)
@@ -68,7 +68,7 @@ def _heading_before(text: str, position: int) -> str:
 
 
 def _parse(text: str) -> list[Example]:
-    """Every ```sql / ```sql-exec fence, paired with the fence that follows it.
+    """Every ```sql / ```pgsql fence, paired with the fence that follows it.
 
     Pairing is positional and strict: the command fence must be the very next
     fence in the file, with no info string. Anything else (a second query

@@ -113,7 +113,7 @@ One flag comes up everywhere: `--no-probe` skips ffprobe for a byte-reproducible
 
 ## Use with an AI
 
-sqlmpeg ships the system prompt, not the API key. Bring whatever model you like.
+sqlmpeg ships the system prompt. Bring whatever model you like.
 
 ```
 $ sqlmpeg prompt > system.txt      # the dialect, the calling convention, your filters
