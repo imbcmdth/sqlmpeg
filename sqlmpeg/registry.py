@@ -260,12 +260,12 @@ def _get_version_line(ffmpeg: str) -> str | None:
 
 # --- `-filters` parsing ------------------------------------------------------
 
-# One space, then the 3-char flag column captured as its own group (each of
+# One space, then the 2 or 3-char flag column captured as its own group (each of
 # T/S/C is either its letter or '.'), then the name, the pad spec, and the
 # rest of the line as the description. This intentionally does NOT match
 # the two-space-indented legend lines ("  T.. = Timeline support") or the
 # "Filters:" banner line, so no separate header-skipping logic is needed.
-_FILTER_LINE_RE = re.compile(r"^ ([T.][S.][C.]) (\S+)\s+(\S+)\s+(.*)$")
+_FILTER_LINE_RE = re.compile(r"^ ([TSC.]+) (\S+)\s+(\S+)\s+(.*)$")
 
 _PAD_CHARS: dict[str, StreamType] = {"V": "video", "A": "audio"}
 
