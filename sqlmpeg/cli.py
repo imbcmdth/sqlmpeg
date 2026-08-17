@@ -89,7 +89,6 @@ __all__ = ["main"]
 
 _DEFAULT_OUT = "out.mp4"
 _DEFAULT_TIMEOUT = 600
-_STDERR_TAIL_LINES = 30
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -385,13 +384,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
     ffmpeg_args = build_ffmpeg_args(emitted, out_path)
     if args.overwrite:
         ffmpeg_args.insert(1, "-y")
+    else:
+        ffmpeg_args.insert(1, "-n")
+    ffmpeg_args.insert(1, "-hide_banner")
+
+    print("$", shlex.join(ffmpeg_args))
 
     try:
         result = subprocess.run(
             ffmpeg_args,
             timeout=args.timeout,
-            capture_output=True,
-            text=True,
         )
     except subprocess.TimeoutExpired:
         print(f"error: ffmpeg timed out after {args.timeout}s", file=sys.stderr)
@@ -399,9 +401,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     if result.returncode != 0:
         print(f"error: ffmpeg exited with code {result.returncode}", file=sys.stderr)
-        tail = result.stderr.splitlines()[-_STDERR_TAIL_LINES:]
-        for line in tail:
-            print(line, file=sys.stderr)
         return result.returncode
 
     return 0
