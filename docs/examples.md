@@ -593,3 +593,58 @@ ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng
 ```
 
 Recipe 23 answers "give me whichever track is English"; this one answers "I believe track 1 is English - stop me if I'm wrong". Same wiring out the other end, different contract.
+
+## 30. Look at a file's tracks as a table
+
+A SELECT with no COPY and no `-o` is a table query: `run` (the default subcommand, so no subcommand at all) prints the result set and executes nothing - the whole answer was known at compile time. The columns are the probed metadata, so this is ffprobe you can read:
+
+```pgsql
+SELECT t.index, t.language, t.codec, t.channel_layout
+FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+```
+
+```
+$ sqlmpeg -f query.sql
+ index | language | codec | channel_layout
+-------+----------+-------+----------------
+ 1     | eng      | aac   | mono
+ 2     | fra      | aac   | mono
+(2 rows)
+```
+
+## 31. Inspect a join before you trust it
+
+Stream-valued cells print as placeholders carrying the stream spec, so a table query over a join shows exactly which track paired with which - and an empty cell is an outer join's gap, before you've committed to a fill:
+
+```pgsql
+SELECT a.language, a.track AS film, b.track AS promo
+FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
+     unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.language = b.language
+```
+
+```
+$ sqlmpeg -f query.sql
+ language | film          | promo
+----------+---------------+---------------
+ eng      | <audio 0:a:0> | <audio 1:a:0>
+ fra      | <audio 0:a:1> |
+(2 rows)
+```
+
+## 32. Export track metadata as CSV
+
+`COPY ... TO STDOUT WITH (FORMAT csv)` is stock Postgres, and here it makes the table query scriptable - pipe it wherever your inventory lives. `TO '<path>.csv'` writes a file instead; `header true` adds the column row:
+
+```pgsql
+COPY (
+  SELECT t.language, t.codec, t.channel_layout
+  FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+) TO STDOUT WITH (format 'csv', header true)
+```
+
+```
+$ sqlmpeg -f query.sql
+language,codec,channel_layout
+eng,aac,mono
+fra,aac,mono
+```
