@@ -177,13 +177,13 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from sqlmpeg import binaries
 from sqlmpeg.ir import StreamType
 
 _TIMEOUT_SECONDS = 10.0
@@ -748,7 +748,7 @@ class Registry:
             return
         self._loaded = True
 
-        ffmpeg = shutil.which("ffmpeg")
+        ffmpeg = binaries.ffmpeg_path()
         if ffmpeg is None:
             return
         version_line = _get_version_line(ffmpeg)

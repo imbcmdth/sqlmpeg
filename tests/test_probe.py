@@ -1,7 +1,7 @@
 """Tests for sqlmpeg.probe.
 
-Monkeypatched tests (subprocess/shutil.which faked) are unmarked so the
-default suite (`pytest`, which runs `-m "not exec"`) stays offline. Tests
+Monkeypatched tests (subprocess/binaries.ffprobe_path faked) are unmarked so
+the default suite (`pytest`, which runs `-m "not exec"`) stays offline. Tests
 that shell out to a real ffprobe against generated fixtures are marked
 `@pytest.mark.exec`.
 """
@@ -65,7 +65,7 @@ def _clear_cache() -> Iterator[None]:
 
 
 def _fake_ffprobe_present(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(probe_mod.shutil, "which", lambda name: "/usr/bin/ffprobe")
+    monkeypatch.setattr(probe_mod.binaries, "ffprobe_path", lambda: "/usr/bin/ffprobe")
 
 
 def _fake_run(
@@ -102,7 +102,7 @@ def test_directory_returns_none(tmp_path: Path) -> None:
 def test_ffprobe_absent_returns_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     f = tmp_path / "x.mp4"
     f.write_bytes(b"not really a video")
-    monkeypatch.setattr(probe_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(probe_mod.binaries, "ffprobe_path", lambda: None)
     assert probe(str(f)) is None
 
 

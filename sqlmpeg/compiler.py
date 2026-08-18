@@ -13,8 +13,11 @@ by ALIAS for :func:`sqlmpeg.lower.lower` (two aliases over one file share a
 single probe). :func:`sqlmpeg.probe.probe` never raises and returns ``None``
 for a URL, a missing file, or a missing/failing ffprobe, so a compile is never
 blocked by an unreadable input — it just loses the extra validation (subscript
-bounds) and the provenance metadata that probing would have added. Passing
-``probe=False`` skips probing entirely, for byte-reproducible offline compiles.
+bounds) and the provenance metadata that probing would have added. Probing is
+unconditional (RFC-010): the old ``probe=False`` escape hatch is gone, since
+opportunistic degradation on missing/unreadable inputs already gives every
+byte-reproducible-offline use case it was for, with no separate mode to
+maintain.
 
 The filter REGISTRY (RFC-007) is the whole function surface, not an
 opportunistic extra: every call name resolves in it and nowhere else.
@@ -55,12 +58,12 @@ def _probe_inputs(res: Resolved) -> dict[str, ProbeResult | None]:
     return by_alias
 
 
-def compile_sql(text: str, *, probe: bool = True) -> Graph:
+def compile_sql(text: str) -> Graph:
     """Compile SQL `text` into a split-complete IR graph.
 
-    With ``probe=True`` (the default) every input is probed opportunistically;
-    with ``probe=False`` nothing is read from disk and lowering is fully
-    symbolic.
+    Every input is probed opportunistically -- there is no ``probe=False``
+    escape hatch (RFC-010); a missing or unreadable input degrades the same
+    way it always has (see module docstring).
 
     The installed ffmpeg's filter set IS the function surface (RFC-007): every
     call resolves against :func:`sqlmpeg.registry.load`, so what compiles
@@ -72,7 +75,7 @@ def compile_sql(text: str, *, probe: bool = True) -> Graph:
     """
     try:
         res = resolve(parse(text))
-        probes = _probe_inputs(res) if probe else {}
+        probes = _probe_inputs(res)
         return insert_splits(lower(res, probes, registry=registry_module.load()))
     except SqlmpegError:
         raise

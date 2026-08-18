@@ -160,13 +160,16 @@ def _go_offline(monkeypatch: pytest.MonkeyPatch) -> None:
 
     A fresh, unloadable ``Registry`` rather than the process-wide singleton
     (another test may already have loaded the real one), and ``probe_path``
-    stubbed rather than ``probe=False``, because the command fence shows a
-    plain ``sqlmpeg compile`` -- the flags under test are the ones a reader
-    would type, so the isolation has to come from underneath them. Patched by
-    dotted path rather than by attribute, since the two modules re-export
-    their imports and ``--strict`` will not read through a re-export.
+    stubbed rather than relying on an unreadable path, because the command
+    fence shows a plain ``sqlmpeg compile`` -- the flags under test are the
+    ones a reader would type, so the isolation has to come from underneath
+    them. ``binaries.ffmpeg_path`` is stubbed (not just ``shutil.which``) so
+    this stays offline even when the ``static-ffmpeg`` provisioner (RFC-010)
+    is actually installed and already has a cached binary. Patched by dotted
+    path rather than by attribute, since the two modules re-export their
+    imports and ``--strict`` will not read through a re-export.
     """
-    monkeypatch.setattr("sqlmpeg.registry.shutil.which", lambda name: None)
+    monkeypatch.setattr("sqlmpeg.registry.binaries.ffmpeg_path", lambda: None)
     monkeypatch.setattr("sqlmpeg.compiler.registry_module.load", Registry)
     monkeypatch.setattr("sqlmpeg.compiler.probe_path", lambda path: None)
 

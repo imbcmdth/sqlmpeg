@@ -1,4 +1,4 @@
-"""Tests for the LLM system prompt (plan 012; rewritten 053b, RFC-007).
+"""Tests for the LLM system prompt (plan 012; rewritten 053b, RFC-007; RFC-010).
 
 The load-bearing one is :func:`test_every_sql_example_compiles`: the prompt is
 a contract with a model, so every query it shows off must actually compile.
@@ -9,6 +9,13 @@ Content-keyed rather than full-text pinned (RFC-007 collapsed the old
 stdlib/dynamic split into one calling convention, three namespaces): these
 assert the prompt SAYS the load-bearing facts, not that it says them in one
 exact wording, since prose is expected to keep improving.
+
+RFC-010: ``build_system_prompt`` now REQUIRES a ``Registry`` (ffmpeg is
+always there, PATH or the provisioner). ``PROMPT`` here -- like
+``docs/system-prompt.md`` -- is rendered from the committed, version-pinned
+reference snapshot (:func:`sqlmpeg.registry.load_reference`, no ffmpeg or
+subprocess involved), matching exactly what ``scripts/gen_prompt.py`` does,
+so the two stay comparable and both stay machine-independent.
 """
 
 from __future__ import annotations
@@ -26,17 +33,19 @@ from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import INPUT_OPTIONS
 from sqlmpeg.parser import ROW_SCHEMAS
 from sqlmpeg.prompt import build_system_prompt
-from sqlmpeg.registry import Registry, load
+from sqlmpeg.registry import Registry, load, load_reference
 from sqlmpeg.sink import SINK_OPTIONS
 
 ROOT = Path(__file__).resolve().parent.parent
 DOC_PATH = ROOT / "docs" / "system-prompt.md"
 GEN_SCRIPT = ROOT / "scripts" / "gen_prompt.py"
+SNAPSHOT_PATH = ROOT / "tests" / "data" / "reference_registry.json"
 
 _SQL_FENCE_RE = re.compile(r"```sql\n(.*?)\n```", re.DOTALL)
 _SQL_PROBED_FENCE_RE = re.compile(r"```sql-probed\n(.*?)\n```", re.DOTALL)
 
-PROMPT = build_system_prompt()
+_REFERENCE_REGISTRY = load_reference(SNAPSHOT_PATH)
+PROMPT = build_system_prompt(_REFERENCE_REGISTRY)
 
 
 def _sql_examples(text: str) -> list[str]:
@@ -214,7 +223,8 @@ def test_track_row_examples_are_present_but_gated() -> None:
 
 
 def test_prompt_is_deterministic() -> None:
-    assert build_system_prompt() == build_system_prompt()
+    """Pure given the same registry -- no clock, no environment of its own."""
+    assert build_system_prompt(_REFERENCE_REGISTRY) == build_system_prompt(_REFERENCE_REGISTRY)
 
 
 def test_prompt_is_ascii_and_has_no_trailing_newline() -> None:
@@ -295,32 +305,38 @@ def test_cli_prompt_dynamic_flag_is_gone() -> None:
 
 
 # ---------------------------------------------------------------------------
-# the Functions section: rendered from the live Registry, or a fallback note
+# the Functions section: rendered from a real Registry, or a fallback note
+# for a broken one (guardrail #7 -- RFC-010: this is no longer a normal mode)
 # ---------------------------------------------------------------------------
 
 
-def test_functions_section_without_a_registry_is_one_note() -> None:
+def test_functions_section_is_rendered_from_the_reference_registry() -> None:
+    """PROMPT (like docs/system-prompt.md) always has a real filter list now
+    -- RFC-010 retired the "no registry" default as a documented mode."""
     assert "## Functions" in PROMPT
-    assert "No installed ffmpeg was found on PATH" in PROMPT
-    # No per-machine filter list leaked into the no-registry (pinned) prompt.
-    assert "-> video`" not in PROMPT
-    assert "-> audio`" not in PROMPT
+    assert "gblur(video) -> video" in PROMPT
+    assert "-> video`" in PROMPT
+    assert "-> audio`" in PROMPT
 
 
-def test_functions_section_with_an_unavailable_registry_is_the_same_note(
+def test_functions_section_with_an_unavailable_registry_is_a_provisioner_note(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     empty = Registry()
     monkeypatch.setattr(empty, "available", lambda: False)
     text = build_system_prompt(empty)
-    assert text == PROMPT
+    assert "## Functions" in text
+    assert "provisioner failed" in text
+    # No per-machine filter list leaked into the fallback note.
+    assert "-> video`" not in text
+    assert "-> audio`" not in text
+    assert text != PROMPT
 
 
 @pytest.mark.exec
 def test_functions_section_with_a_live_registry_lists_gblur() -> None:
     text = build_system_prompt(load())
     assert "gblur(video) -> video" in text
-    assert text != PROMPT
 
 
 def test_cli_prompt_loads_the_registry(monkeypatch: pytest.MonkeyPatch) -> None:

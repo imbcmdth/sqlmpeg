@@ -128,7 +128,7 @@ def test_generation_output_is_lf_only(_forced_registry: Registry) -> None:
 @pytest.mark.exec
 def test_build_registry_raises_without_ffmpeg(monkeypatch: pytest.MonkeyPatch) -> None:
     gen_snapshot = _load_gen_snapshot()
-    monkeypatch.setattr(registry_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(registry_mod.binaries, "ffmpeg_path", lambda: None)
     with pytest.raises(RuntimeError):
         gen_snapshot.build_registry()
 
@@ -253,15 +253,15 @@ def test_load_reference_never_spawns_a_subprocess_with_no_ffmpeg(
 ) -> None:
     calls: list[object] = []
 
-    def fake_which(name: str) -> str | None:
-        calls.append(("which", name))
+    def fake_ffmpeg_path() -> str | None:
+        calls.append(("ffmpeg_path",))
         return None
 
     def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(("run", args, kwargs))
         raise AssertionError("subprocess.run must never be called by load_reference()")
 
-    monkeypatch.setattr(registry_mod.shutil, "which", fake_which)
+    monkeypatch.setattr(registry_mod.binaries, "ffmpeg_path", fake_ffmpeg_path)
     monkeypatch.setattr(registry_mod.subprocess, "run", fake_run)
 
     ref = load_reference(_SNAPSHOT_PATH)
@@ -275,7 +275,7 @@ def test_load_reference_never_spawns_a_subprocess_with_no_ffmpeg(
     assert len(ref.names()) > 300
     assert len(ref.source_names()) > 20
 
-    assert calls == [], f"expected zero subprocess/which calls, got {len(calls)}: {calls}"
+    assert calls == [], f"expected zero subprocess/ffmpeg_path calls, got {len(calls)}: {calls}"
 
 
 def test_load_reference_never_spawns_a_subprocess_with_ffmpeg_present(
@@ -285,15 +285,15 @@ def test_load_reference_never_spawns_a_subprocess_with_ffmpeg_present(
     Registry must not shell out even when it COULD."""
     calls: list[object] = []
 
-    def fake_which(name: str) -> str | None:
-        calls.append(("which", name))
+    def fake_ffmpeg_path() -> str | None:
+        calls.append(("ffmpeg_path",))
         return "C:/fake/ffmpeg.exe"
 
     def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(("run", args, kwargs))
         raise AssertionError("subprocess.run must never be called by load_reference()")
 
-    monkeypatch.setattr(registry_mod.shutil, "which", fake_which)
+    monkeypatch.setattr(registry_mod.binaries, "ffmpeg_path", fake_ffmpeg_path)
     monkeypatch.setattr(registry_mod.subprocess, "run", fake_run)
 
     ref = load_reference(_SNAPSHOT_PATH)

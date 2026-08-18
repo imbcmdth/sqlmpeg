@@ -6,7 +6,7 @@ plan 008 (plan 037 for the SQL-string-is-the-default-input convention below).
 
 Subcommands:
 
-* ``compile SQL [-f FILE] [--graph-only] [-o OUT] [--no-probe]``
+* ``compile SQL [-f FILE] [--graph-only] [-o OUT]``
   -- print the full ffmpeg command (POSIX-quoted via ``shlex.join``, even on
   Windows -- it is documentation output, not something meant to be pasted
   into cmd.exe), or just the ``-filter_complex`` string with
@@ -16,17 +16,15 @@ Subcommands:
   compiles to ONE ffmpeg command with one output file per COPY, so ``-o`` --
   which names a single file -- is a usage error (exit 2) against it, naming
   the paths the script found.
-* ``explain SQL [-f FILE] [--no-probe]`` -- dump the IR graph
+* ``explain SQL [-f FILE]`` -- dump the IR graph
   as JSON (the sinks, with their paths and options, are part of that JSON
   already).
-* ``validate SQL [-f FILE] [--json] [--no-probe]`` -- exit 0
+* ``validate SQL [-f FILE] [--json]`` -- exit 0
   silent on success; on error, exit 1 with either a one-line human message
   or ``err.to_dict()`` JSON.
 * ``run SQL [-f FILE] [-o OUT] [--timeout SECS] [-y]`` -- compile and
   execute ffmpeg as a subprocess (guardrail #6: argv list, no shell, timeout
-  enforced, stderr captured and surfaced on failure). ``run`` always
-  probes -- the files must exist to execute, so there is no ``--no-probe``
-  escape hatch here. Output path: ``-o`` if
+  enforced, stderr captured and surfaced on failure). Output path: ``-o`` if
   given, else the query's sink paths, else a usage error (exit 2) -- unlike
   ``compile``, ``run`` never falls back to a placeholder path. A multi-COPY
   script runs as the single ffmpeg command it compiles to, writing every
@@ -34,9 +32,7 @@ Subcommands:
 * ``prompt`` -- print the LLM system prompt (plan 012; rewritten 053b) to
   stdout; takes no arguments and never touches the filesystem itself, though
   it calls ``registry.load()`` to render the filter reference from this
-  machine's ``ffmpeg -filters``/``-help`` output when ffmpeg is on PATH, and
-  falls back to a note that filter names/options resolve against the
-  installed ffmpeg when it is not.
+  machine's ``ffmpeg -filters``/``-help`` output.
 
 ``compile``/``explain``/``validate``/``run`` take the query as SQL TEXT
 directly on the command line -- ``sqlmpeg compile "SELECT ... FROM
@@ -54,17 +50,16 @@ ever looks like a file path. This is CLI-layer-only sugar: it never touches
 ``SqlmpegError`` or the machine-readable ``--json`` output, which always
 prints the library's error verbatim on stdout.
 
-``--no-probe`` (compile/explain/validate only) skips ffprobe entirely for a
-byte-reproducible, fully offline compile (RFC-001 "Probing policy"): no
-``STREAM_NOT_FOUND``/``BROADCAST_MISMATCH`` validation, ``SELECT *`` and bare
-array splats fail with ``INPUT_NOT_FOUND``, and provenance metadata is never
-attached.
+``--no-probe`` is GONE (RFC-010): it made a READABLE file compile as if
+unreadable, which silently strips provenance metadata -- a determinism
+switch that changed the result. Opportunistic probing (RFC-001) already
+degrades silently on missing/unreadable inputs, which is the whole of what
+an offline compile ever needed.
 
 ``--portable`` is GONE (RFC-007, plan 051). There is no longer a portable
 subset to compile against: every function is a filter of the installed
 ffmpeg, so "will this compile elsewhere" is answered by the ffmpeg build, not
-by a flag. ``--no-probe`` survives unchanged -- probing is about FILES, not
-filters.
+by a flag.
 """
 
 from __future__ import annotations
@@ -73,11 +68,11 @@ import argparse
 import json
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+from . import binaries
 from . import registry as registry_module
 from .compiler import compile_sql
 from .emit import Emitted, build_ffmpeg_args, emit
@@ -134,21 +129,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="output path (default: the query's sink path, else out.mp4)",
     )
-    compile_p.add_argument(
-        "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
-    )
     explain_p = subparsers.add_parser("explain", help="dump the compiled IR graph as JSON")
     _add_query_arguments(explain_p)
-    explain_p.add_argument(
-        "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
-    )
     validate_p = subparsers.add_parser("validate", help="check that a query compiles")
     _add_query_arguments(validate_p)
     validate_p.add_argument(
         "--json", action="store_true", dest="as_json", help="emit the error as JSON"
-    )
-    validate_p.add_argument(
-        "--no-probe", action="store_true", help="skip ffprobe; fully offline, symbolic compile"
     )
     run_p = subparsers.add_parser("run", help="compile and execute ffmpeg")
     _add_query_arguments(run_p)
@@ -285,7 +271,7 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         return code
 
     try:
-        graph = compile_sql(text, probe=not args.no_probe)
+        graph = compile_sql(text)
         emitted = emit(graph)
     except SqlmpegError as err:
         _print_error(err, source=args.query)
@@ -316,7 +302,7 @@ def _cmd_explain(args: argparse.Namespace) -> int:
         return code
 
     try:
-        graph = compile_sql(text, probe=not args.no_probe)
+        graph = compile_sql(text)
     except SqlmpegError as err:
         _print_error(err, source=args.query)
         return 1
@@ -331,7 +317,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         return code
 
     try:
-        compile_sql(text, probe=not args.no_probe)
+        compile_sql(text)
     except SqlmpegError as err:
         if args.as_json:
             # Machine contract: stdout stays pure JSON, the library error
@@ -377,8 +363,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(dir_error, file=sys.stderr)
             return 1
 
-    if shutil.which("ffmpeg") is None:
-        print("error: ffmpeg not found on PATH", file=sys.stderr)
+    if binaries.ffmpeg_path() is None:
+        print(f"error: ffmpeg not found: {binaries.INSTALL_HINT}", file=sys.stderr)
         return 1
 
     ffmpeg_args = build_ffmpeg_args(emitted, out_path)

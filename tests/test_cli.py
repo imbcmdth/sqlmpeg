@@ -129,19 +129,10 @@ def test_compile_file_dash_reads_stdin(
     assert "-filter_complex" in out
 
 
-def test_compile_no_probe(capsys: pytest.CaptureFixture[str]) -> None:
-    code = cli.main(["compile", "--no-probe", VALID_QUERY])
-    out = capsys.readouterr().out
-    assert code == 0
-    assert "-filter_complex" in out
-
-
 def test_compile_uses_sink_path_when_no_dash_o(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(
-        cli, "compile_sql", lambda text, probe=True: _sinked_graph("sink.mkv")
-    )
+    monkeypatch.setattr(cli, "compile_sql", lambda text: _sinked_graph("sink.mkv"))
     code = cli.main(["compile", VALID_QUERY])
     out = capsys.readouterr().out
     assert code == 0
@@ -152,9 +143,7 @@ def test_compile_uses_sink_path_when_no_dash_o(
 def test_compile_dash_o_overrides_sink_path(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(
-        cli, "compile_sql", lambda text, probe=True: _sinked_graph("sink.mkv")
-    )
+    monkeypatch.setattr(cli, "compile_sql", lambda text: _sinked_graph("sink.mkv"))
     code = cli.main(["compile", VALID_QUERY, "-o", "override.mp4"])
     out = capsys.readouterr().out
     assert code == 0
@@ -169,9 +158,7 @@ def test_compile_prints_every_sink_path_of_a_script(
     monkeypatch.setattr(
         cli,
         "compile_sql",
-        lambda text, probe=True: _multi_sink_graph(
-            ("720.mp4", {}), ("360.mp4", {})
-        ),
+        lambda text: _multi_sink_graph(("720.mp4", {}), ("360.mp4", {})),
     )
     code = cli.main(["compile", VALID_QUERY])
     out = capsys.readouterr().out
@@ -187,9 +174,7 @@ def test_compile_dash_o_against_a_multi_sink_script_is_a_usage_error(
     monkeypatch.setattr(
         cli,
         "compile_sql",
-        lambda text, probe=True: _multi_sink_graph(
-            ("720.mp4", {}), ("360.mp4", {})
-        ),
+        lambda text: _multi_sink_graph(("720.mp4", {}), ("360.mp4", {})),
     )
     code = cli.main(["compile", VALID_QUERY, "-o", "override.mp4"])
     captured = capsys.readouterr()
@@ -206,9 +191,7 @@ def test_compile_graph_only_still_works_for_a_multi_sink_script(
     monkeypatch.setattr(
         cli,
         "compile_sql",
-        lambda text, probe=True: _multi_sink_graph(
-            ("720.mp4", {}), ("360.mp4", {})
-        ),
+        lambda text: _multi_sink_graph(("720.mp4", {}), ("360.mp4", {})),
     )
     code = cli.main(["compile", "--graph-only", VALID_QUERY, "-o", "override.mp4"])
     assert code == 0
@@ -216,48 +199,30 @@ def test_compile_graph_only_still_works_for_a_multi_sink_script(
 
 
 def test_explain_shows_the_sinks_list(capsys: pytest.CaptureFixture[str]) -> None:
-    code = cli.main(["explain", "--no-probe", VALID_QUERY])
+    code = cli.main(["explain", VALID_QUERY])
     payload = json.loads(capsys.readouterr().out)
     assert code == 0
     assert [unit["path"] for unit in payload["sinks"]] == [None]
 
 
-def test_compile_no_probe_skips_probing(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """--no-probe must never touch the filesystem via probe()."""
-
-    def _boom(path: str) -> None:
-        raise AssertionError("probe() should not be called with --no-probe")
-
-    monkeypatch.setattr("sqlmpeg.compiler.probe_path", _boom)
-    code = cli.main(["compile", "--no-probe", VALID_QUERY])
-    assert code == 0
-    capsys.readouterr()
-
-
 # ---------------------------------------------------------------------------
-# --portable is GONE (RFC-007, plan 051)
+# --portable and --no-probe are GONE (RFC-007 plan 051; RFC-010 plan 065)
 # ---------------------------------------------------------------------------
 
 # There is no portable subset any more: every function is a filter of the
-# installed ffmpeg, so the flag had nothing left to select. `--no-probe`
-# survives, because probing is about FILES, not filters.
+# installed ffmpeg, so --portable had nothing left to select. --no-probe made
+# a READABLE file compile as if unreadable, silently stripping provenance
+# metadata -- a determinism switch that changed the result -- so it is gone
+# too; opportunistic probing (RFC-001) already degrades silently on
+# missing/unreadable inputs, which is the whole of what it was ever for.
 
 
+@pytest.mark.parametrize("flag", ["--portable", "--no-probe"])
 @pytest.mark.parametrize("command", ["compile", "explain", "validate", "run"])
-def test_portable_flag_is_gone_from_every_subcommand(command: str) -> None:
+def test_removed_flags_are_gone_from_every_subcommand(command: str, flag: str) -> None:
     with pytest.raises(SystemExit) as exc_info:
-        cli.main([command, VALID_QUERY, "--portable"])
+        cli.main([command, VALID_QUERY, flag])
     assert exc_info.value.code == 2
-
-
-@pytest.mark.parametrize("command", ["compile", "explain", "validate"])
-def test_no_probe_still_works_on_every_offline_subcommand(
-    command: str, capsys: pytest.CaptureFixture[str]
-) -> None:
-    assert cli.main([command, "--no-probe", VALID_QUERY]) == 0
-    capsys.readouterr()
 
 
 # ---------------------------------------------------------------------------
@@ -276,18 +241,6 @@ def test_explain_round_trips_graph(capsys: pytest.CaptureFixture[str]) -> None:
     graph = Graph.from_dict(data)
     assert graph.input_paths == ["x.mp4"]
     assert graph.to_dict() == data
-
-
-def test_explain_no_probe(capsys: pytest.CaptureFixture[str]) -> None:
-    code = cli.main(["explain", "--no-probe", VALID_QUERY])
-    out = capsys.readouterr().out
-    assert code == 0
-
-    import json
-
-    data = json.loads(out)
-    graph = Graph.from_dict(data)
-    assert graph.input_paths == ["x.mp4"]
 
 
 def test_explain_bad_query(capsys: pytest.CaptureFixture[str]) -> None:
@@ -317,14 +270,6 @@ def test_explain_file_happy_path(tmp_path: Path, capsys: pytest.CaptureFixture[s
 
 def test_validate_success_is_silent(capsys: pytest.CaptureFixture[str]) -> None:
     code = cli.main(["validate", VALID_QUERY])
-    captured = capsys.readouterr()
-    assert code == 0
-    assert captured.out == ""
-    assert captured.err == ""
-
-
-def test_validate_no_probe_success_is_silent(capsys: pytest.CaptureFixture[str]) -> None:
-    code = cli.main(["validate", "--no-probe", VALID_QUERY])
     captured = capsys.readouterr()
     assert code == 0
     assert captured.out == ""
@@ -499,7 +444,7 @@ def test_hint_on_validate_json_goes_to_stderr_stdout_stays_pure_json(
 
 def test_inline_query_with_single_quotes_compiles(capsys: pytest.CaptureFixture[str]) -> None:
     query = "SELECT scale(a.frame, 0.5) FROM input('a clip''s name.mp4') a"
-    code = cli.main(["compile", "--no-probe", query])
+    code = cli.main(["compile", query])
     out = capsys.readouterr().out
     assert code == 0
     assert "-filter_complex" in out
@@ -514,7 +459,7 @@ def test_run_ffmpeg_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     out_path = str(tmp_path / "out.mp4")
-    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: None)
 
     code = cli.main(["run", VALID_QUERY, "-o", out_path])
     captured = capsys.readouterr()
@@ -528,10 +473,10 @@ def test_run_bad_query_never_checks_ffmpeg(
 ) -> None:
     out_path = str(tmp_path / "out.mp4")
 
-    def _boom(name: str) -> str | None:
+    def _boom() -> str | None:
         raise AssertionError("should not check for ffmpeg before compiling")
 
-    monkeypatch.setattr(cli.shutil, "which", _boom)
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", _boom)
     code = cli.main(["run", BAD_QUERY, "-o", out_path])
     captured = capsys.readouterr()
     assert code == 1
@@ -543,7 +488,7 @@ def test_run_uses_sink_path_when_no_dash_o(
 ) -> None:
     """compile_sql is monkeypatched -- see `_sinked_graph`'s docstring."""
     monkeypatch.setattr(cli, "compile_sql", lambda text: _sinked_graph("sink.mkv"))
-    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: None)
 
     code = cli.main(["run", VALID_QUERY])
     captured = capsys.readouterr()
@@ -559,7 +504,7 @@ def test_run_dash_o_overrides_sink_path(
 ) -> None:
     out_path = str(tmp_path / "override.mp4")
     monkeypatch.setattr(cli, "compile_sql", lambda text: _sinked_graph("sink.mkv"))
-    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: None)
 
     code = cli.main(["run", VALID_QUERY, "-o", out_path])
     captured = capsys.readouterr()
@@ -593,7 +538,7 @@ def test_run_of_a_multi_sink_script_reaches_the_ffmpeg_check(
     monkeypatch.setattr(
         cli, "compile_sql", lambda text: _multi_sink_graph(("720.mp4", {}), ("360.mp4", {}))
     )
-    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: None)
     code = cli.main(["run", VALID_QUERY])
     captured = capsys.readouterr()
     assert code == 1
@@ -607,7 +552,7 @@ def test_run_checks_every_sinks_output_directory(
     monkeypatch.setattr(
         cli, "compile_sql", lambda text: _multi_sink_graph(("720.mp4", {}), (missing, {}))
     )
-    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
     code = cli.main(["run", VALID_QUERY])
     captured = capsys.readouterr()
     assert code == 1
@@ -618,7 +563,7 @@ def test_run_missing_output_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     out_path = str(tmp_path / "does_not_exist" / "out.mp4")
-    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
 
     code = cli.main(["run", VALID_QUERY, "-o", out_path])
     captured = capsys.readouterr()
@@ -632,7 +577,7 @@ def test_run_file_happy_path_reaches_ffmpeg_check(
     """-f still works end to end for run (the LLM repair-loop pipe uses -f -)."""
     query = _write_sql(tmp_path, VALID_QUERY)
     out_path = str(tmp_path / "out.mp4")
-    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: None)
 
     code = cli.main(["run", "-f", query, "-o", out_path])
     captured = capsys.readouterr()

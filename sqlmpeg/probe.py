@@ -1,11 +1,18 @@
 """ffprobe wrapper for sqlmpeg (RFC-001 "Probing policy").
 
 `probe()` NEVER raises. Every failure mode -- a URL-scheme input, a missing
-file, ffprobe absent from PATH, a nonzero ffprobe exit, a 5s timeout, or
-unparseable JSON -- returns `None`, and callers fall back to symbolic
-lowering (see plans/rfc-001-stream-aware.md, "Probing policy"). This module
-depends only on `sqlmpeg.ir` (for `StreamType`) and the stdlib; it must never
+file, ffprobe absent from PATH and its provisioner both, a nonzero ffprobe
+exit, a 5s timeout, or unparseable JSON -- returns `None`, and callers fall
+back to symbolic lowering (see plans/rfc-001-stream-aware.md, "Probing
+policy"). This module depends only on `sqlmpeg.ir` (for `StreamType`),
+`sqlmpeg.binaries` (for locating ffprobe) and the stdlib; it must never
 import anything else from the package.
+
+A local-path existence check runs BEFORE `binaries.ffprobe_path()` is even
+consulted (RFC-010): a missing file is `None` with no subprocess AND no
+provider lookup, which matters because the provider's first call may trigger
+a ~95MB download -- paying that once per compile for an input that does not
+even exist would be its own footgun.
 
 Results are memoized per `(realpath, mtime_ns, size)` so a compile that
 probes the same input multiple times only shells out once; `clear_cache()`
@@ -16,10 +23,10 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 from dataclasses import dataclass
 
+from sqlmpeg import binaries
 from sqlmpeg.ir import StreamType
 
 _TIMEOUT_SECONDS = 5.0
@@ -76,9 +83,9 @@ def probe(path: str) -> ProbeResult | None:
     """Probe a local media file with ffprobe.
 
     Returns None -- never raises -- when: `path` looks like a URL
-    (contains "://"), the file does not exist, ffprobe is not on PATH,
-    ffprobe exits nonzero or times out (5s), or its output is not the JSON
-    shape we expect.
+    (contains "://"), the file does not exist, ffprobe is not on PATH or via
+    its provisioner, ffprobe exits nonzero or times out (5s), or its output
+    is not the JSON shape we expect.
     """
     if "://" in path:
         return None
@@ -96,7 +103,7 @@ def probe(path: str) -> ProbeResult | None:
     if cached is not None:
         return cached
 
-    ffprobe = shutil.which("ffprobe")
+    ffprobe = binaries.ffprobe_path()
     if ffprobe is None:
         return None
 

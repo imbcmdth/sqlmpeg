@@ -275,6 +275,7 @@ from dataclasses import dataclass, field
 
 from sqlglot import exp
 
+from sqlmpeg import binaries
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import validate_option as validate_input_option
 from sqlmpeg.ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType
@@ -354,8 +355,7 @@ _ZIP_HINT = (
     "subscript one of them to pair a single stream with the other, e.g. a.audio[1]"
 )
 _NO_REGISTRY_HINT = (
-    "sqlmpeg's function surface IS your installed ffmpeg's filter set; install "
-    "ffmpeg, or put it on PATH"
+    f"sqlmpeg's function surface IS your installed ffmpeg's filter set; {binaries.INSTALL_HINT}"
 )
 _PASSTHROUGH_HINT = (
     "subtitle and data streams can only be selected (and copied), never filtered; "
@@ -2141,7 +2141,7 @@ class _Lowerer:
             )
         return (
             f"FROM {FILTER_NAMESPACE}.<source>(...) generates a stream with your "
-            "installed ffmpeg; ffmpeg was not found on PATH"
+            "installed ffmpeg; the provisioner failed to supply one"
         )
 
     def _source_stream_of(self, binding: _SourceBinding) -> _Stream:
@@ -4374,7 +4374,7 @@ class _Lowerer:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 "options are validated against your installed ffmpeg; "
-                "ffmpeg was not found",
+                "the provisioner failed to supply one",
                 anchor,
                 fallback=fallback,
                 hint=_NO_REGISTRY_HINT,
@@ -4503,7 +4503,7 @@ class _Lowerer:
             )
         return (
             f"the {FILTER_NAMESPACE}.<filter> namespace is your installed ffmpeg's "
-            "filter set; ffmpeg was not found on PATH"
+            "filter set; the provisioner failed to supply one"
         )
 
     def _zip_length(

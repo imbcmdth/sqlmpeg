@@ -81,9 +81,9 @@ statement is not. `--` and `/* */` comments are allowed.
   SELECT list (one output stream per element, in order) and legal as a
   function argument, where a video/audio array broadcasts (see Broadcasting
   below). Either use needs a readable input to know how many streams there
-  are: `sqlmpeg compile` probes local files automatically, but a URL, a
-  missing file, or `--no-probe` falls back to a fully symbolic compile, where
-  a bare array cannot be sized and is rejected.
+  are: `sqlmpeg compile` probes local files automatically, but a URL or a
+  missing file falls back to a fully symbolic compile, where a bare array
+  cannot be sized and is rejected.
 - `subtitle` and `data` streams are PASSTHROUGH-ONLY: select them (bare,
   subscripted, splatted, or carried through a CTE column), but never filter
   them. Passing one to any function is `UDF_ARG_TYPE` ("cannot be filtered,
@@ -379,11 +379,10 @@ A handful of names are exceptions to "one stream in, one filter, one call":
 Function names are case-insensitive; option names are not. Filter calls are
 machine-dependent -- a query naming a filter (or an option) only compiles
 where the installed ffmpeg has it; the three `sqlmpeg.*` macros and the
-dialect otherwise compile anywhere. If the filter set is unavailable (no
-ffmpeg on PATH, or `--no-probe` cannot help here since this is about the
-filter LIST, not a specific file), every filter call is `UNKNOWN_FUNCTION`
-and every named argument on one is `UNSUPPORTED_SQL`; the message says
-which.
+dialect otherwise compile anywhere. sqlmpeg requires ffmpeg (PATH, or its
+bundled provisioner); if that provisioner ever fails and no ffmpeg is
+available, every filter call is `UNKNOWN_FUNCTION` and every named argument
+on one is `UNSUPPORTED_SQL`, with the message saying so.
 
 ## Output
 
@@ -463,9 +462,474 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   `WHERE` window (a CTE trim is a filtergraph trim, which cannot carry
   captions at all).
 
-## Functions
+## Functions (464 installed filters, plus the 3 sqlmpeg.* macros)
 
-No installed ffmpeg was found on PATH (or its filter list could not be read), so there is no per-machine filter list to render here; Calling convention above still describes the mechanism -- bare and `ffmpeg.<name>` calls both resolve against the installed ffmpeg's filter set, whatever it turns out to be. `sqlmpeg.blur_regions` / `sqlmpeg.speed` / `sqlmpeg.delay` need no registry at all and always compile.
+Every filter this machine's installed ffmpeg reports -- name, pad signature, one-line description, sorted alphabetically -- callable bare or as `ffmpeg.<name>` (see Calling convention). This list is machine-dependent: it is only what THIS ffmpeg reported when this prompt was generated. Options are never dumped here -- pass them by name (`<name> => <value>`) as usual and let `sqlmpeg validate --json` report the real option set on a mistake (`UNKNOWN_FILTER_OPTION` / `FILTER_OPTION_TYPE`); the repair loop below covers the rest. The three `sqlmpeg.*` macros (`blur_regions`, `speed`, `delay`) are not in this list -- their signatures are fixed and given in full under Calling convention.
+
+- `a3dscope(audio) -> video` -- Convert input audio to 3d scope video output.
+- `aap(audio, audio) -> audio` -- Apply Affine Projection algorithm to first audio stream.
+- `abench(audio) -> audio` -- Benchmark part of a filtergraph.
+- `abitscope(audio) -> video` -- Convert input audio to audio bit scope video output.
+- `acompressor(audio) -> audio` -- Audio compressor.
+- `acontrast(audio) -> audio` -- Simple audio dynamic range compression/expansion filter.
+- `acopy(audio) -> audio` -- Copy the input audio unchanged to the output.
+- `acrossfade(audio, audio) -> audio` -- Cross fade two input audio streams.
+- `acrusher(audio) -> audio` -- Reduce audio bit resolution.
+- `acue(audio) -> audio` -- Delay filtering to match a cue.
+- `addroi(video) -> video` -- Add region of interest to frame.
+- `adeclick(audio) -> audio` -- Remove impulsive noise from input audio.
+- `adeclip(audio) -> audio` -- Remove clipping from input audio.
+- `adecorrelate(audio) -> audio` -- Apply decorrelation to input audio.
+- `adelay(audio) -> audio` -- Delay one or more audio channels.
+- `adenorm(audio) -> audio` -- Remedy denormals by adding extremely low-level noise.
+- `aderivative(audio) -> audio` -- Compute derivative of input audio.
+- `adrawgraph(audio) -> video` -- Draw a graph using input audio metadata.
+- `adrc(audio) -> audio` -- Audio Spectral Dynamic Range Controller.
+- `adynamicequalizer(audio) -> audio` -- Apply Dynamic Equalization of input audio.
+- `adynamicsmooth(audio) -> audio` -- Apply Dynamic Smoothing of input audio.
+- `aecho(audio) -> audio` -- Add echoing to the audio.
+- `aemphasis(audio) -> audio` -- Audio emphasis.
+- `aeval(audio) -> audio` -- Filter audio signal according to a specified expression.
+- `aexciter(audio) -> audio` -- Enhance high frequency part of audio.
+- `afade(audio) -> audio` -- Fade in/out input audio.
+- `afftdn(audio) -> audio` -- Denoise audio samples using FFT.
+- `afftfilt(audio) -> audio` -- Apply arbitrary expressions to samples in frequency domain.
+- `aformat(audio) -> audio` -- Convert the input audio to one of the specified formats.
+- `afreqshift(audio) -> audio` -- Apply frequency shifting to input audio.
+- `afwtdn(audio) -> audio` -- Denoise audio stream using Wavelets.
+- `agate(audio) -> audio` -- Audio gate.
+- `agraphmonitor(audio) -> video` -- Show various filtergraph stats.
+- `ahistogram(audio) -> video` -- Convert input audio to histogram video output.
+- `aintegral(audio) -> audio` -- Compute integral of input audio.
+- `alatency(audio) -> audio` -- Report audio filtering latency.
+- `alimiter(audio) -> audio` -- Audio lookahead limiter.
+- `allpass(audio) -> audio` -- Apply a two-pole all-pass filter.
+- `aloop(audio) -> audio` -- Loop audio samples.
+- `alphaextract(video) -> video` -- Extract an alpha channel as a grayscale image component.
+- `alphamerge(video, video) -> video` -- Copy the luma value of the second input into the alpha channel of the first input.
+- `ametadata(audio) -> audio` -- Manipulate audio frame metadata.
+- `amplify(video) -> video` -- Amplify changes between successive video frames.
+- `amultiply(audio, audio) -> audio` -- Multiply two audio streams.
+- `anlmdn(audio) -> audio` -- Reduce broadband noise from stream using Non-Local Means.
+- `anlmf(audio, audio) -> audio` -- Apply Normalized Least-Mean-Fourth algorithm to first audio stream.
+- `anlms(audio, audio) -> audio` -- Apply Normalized Least-Mean-Squares algorithm to first audio stream.
+- `anull(audio) -> audio` -- Pass the source unchanged to the output.
+- `apad(audio) -> audio` -- Pad audio with silence.
+- `aperms(audio) -> audio` -- Set permissions for the output audio frame.
+- `aphaser(audio) -> audio` -- Add a phasing effect to the audio.
+- `aphaseshift(audio) -> audio` -- Apply phase shifting to input audio.
+- `apsnr(audio, audio) -> audio` -- Measure Audio Peak Signal-to-Noise Ratio.
+- `apsyclip(audio) -> audio` -- Audio Psychoacoustic Clipper.
+- `apulsator(audio) -> audio` -- Audio pulsator.
+- `arealtime(audio) -> audio` -- Slow down filtering to match realtime.
+- `aresample(audio) -> audio` -- Resample audio data.
+- `areverse(audio) -> audio` -- Reverse an audio clip.
+- `arls(audio, audio) -> audio` -- Apply Recursive Least Squares algorithm to first audio stream.
+- `arnndn(audio) -> audio` -- Reduce noise from speech using Recurrent Neural Networks.
+- `asdr(audio, audio) -> audio` -- Measure Audio Signal-to-Distortion Ratio.
+- `asendcmd(audio) -> audio` -- Send commands to filters.
+- `asetnsamples(audio) -> audio` -- Set the number of samples for each output audio frames.
+- `asetpts(audio) -> audio` -- Set PTS for the output audio frame.
+- `asetrate(audio) -> audio` -- Change the sample rate without altering the data.
+- `asettb(audio) -> audio` -- Set timebase for the audio output link.
+- `ashowinfo(audio) -> audio` -- Show textual information for each audio frame.
+- `asidedata(audio) -> audio` -- Manipulate audio frame side data.
+- `asisdr(audio, audio) -> audio` -- Measure Audio Scale-Invariant Signal-to-Distortion Ratio.
+- `asoftclip(audio) -> audio` -- Audio Soft Clipper.
+- `aspectralstats(audio) -> audio` -- Show frequency domain statistics about audio frames.
+- `ass(video) -> video` -- Render ASS subtitles onto input video using the libass library.
+- `astats(audio) -> audio` -- Show time domain statistics about audio frames.
+- `asubboost(audio) -> audio` -- Boost subwoofer frequencies.
+- `asubcut(audio) -> audio` -- Cut subwoofer frequencies.
+- `asupercut(audio) -> audio` -- Cut super frequencies.
+- `asuperpass(audio) -> audio` -- Apply high order Butterworth band-pass filter.
+- `asuperstop(audio) -> audio` -- Apply high order Butterworth band-stop filter.
+- `atadenoise(video) -> video` -- Apply an Adaptive Temporal Averaging Denoiser.
+- `atempo(audio) -> audio` -- Adjust audio tempo.
+- `atilt(audio) -> audio` -- Apply spectral tilt to audio.
+- `atrim(audio) -> audio` -- Pick one continuous section from the input, drop the rest.
+- `avectorscope(audio) -> video` -- Convert input audio to vectorscope video output.
+- `avgblur(video) -> video` -- Apply Average Blur filter.
+- `avgblur_opencl(video) -> video` -- Apply average blur filter
+- `avgblur_vulkan(video) -> video` -- Apply avgblur mask to input video
+- `axcorrelate(audio, audio) -> audio` -- Cross-correlate two audio streams.
+- `azmq(audio) -> audio` -- Receive commands through ZMQ and broker them to filters.
+- `backgroundkey(video) -> video` -- Turns a static background into transparency.
+- `bandpass(audio) -> audio` -- Apply a two-pole Butterworth band-pass filter.
+- `bandreject(audio) -> audio` -- Apply a two-pole Butterworth band-reject filter.
+- `bass(audio) -> audio` -- Boost or cut lower frequencies.
+- `bbox(video) -> video` -- Compute bounding box for each frame.
+- `bench(video) -> video` -- Benchmark part of a filtergraph.
+- `bilateral(video) -> video` -- Apply Bilateral filter.
+- `bilateral_cuda(video) -> video` -- GPU accelerated bilateral filter
+- `biquad(audio) -> audio` -- Apply a biquad IIR filter with the given coefficients.
+- `bitplanenoise(video) -> video` -- Measure bit plane noise.
+- `blackdetect(video) -> video` -- Detect video intervals that are (almost) black.
+- `blackframe(video) -> video` -- Detect frames that are (almost) black.
+- `blend(video, video) -> video` -- Blend two video frames into each other.
+- `blend_vulkan(video, video) -> video` -- Blend two video frames in Vulkan
+- `blockdetect(video) -> video` -- Blockdetect filter.
+- `blurdetect(video) -> video` -- Blurdetect filter.
+- `boxblur(video) -> video` -- Blur the input.
+- `boxblur_opencl(video) -> video` -- Apply boxblur filter to input video
+- `bs2b(audio) -> audio` -- Bauer stereo-to-binaural filter.
+- `bwdif(video) -> video` -- Deinterlace the input image.
+- `bwdif_cuda(video) -> video` -- Deinterlace CUDA frames
+- `bwdif_vulkan(video) -> video` -- Deinterlace Vulkan frames via bwdif
+- `cas(video) -> video` -- Contrast Adaptive Sharpen.
+- `ccrepack(video) -> video` -- Repack CEA-708 closed caption metadata
+- `channelmap(audio) -> audio` -- Remap audio channels.
+- `chorus(audio) -> audio` -- Add a chorus effect to the audio.
+- `chromaber_vulkan(video) -> video` -- Offset chroma of input video (chromatic aberration)
+- `chromahold(video) -> video` -- Turns a certain color range into gray.
+- `chromakey(video) -> video` -- Turns a certain color into transparency. Operates on YUV colors.
+- `chromakey_cuda(video) -> video` -- GPU accelerated chromakey filter
+- `chromanr(video) -> video` -- Reduce chrominance noise.
+- `chromashift(video) -> video` -- Shift chroma.
+- `ciescope(video) -> video` -- Video CIE scope.
+- `codecview(video) -> video` -- Visualize information about some codecs.
+- `colorbalance(video) -> video` -- Adjust the color balance.
+- `colorchannelmixer(video) -> video` -- Adjust colors by mixing color channels.
+- `colorcontrast(video) -> video` -- Adjust color contrast between RGB components.
+- `colorcorrect(video) -> video` -- Adjust color white balance selectively for blacks and whites.
+- `colorhold(video) -> video` -- Turns a certain color range into gray. Operates on RGB colors.
+- `colorize(video) -> video` -- Overlay a solid color on the video stream.
+- `colorkey(video) -> video` -- Turns a certain color into transparency. Operates on RGB colors.
+- `colorkey_opencl(video) -> video` -- Turns a certain color into transparency. Operates on RGB colors.
+- `colorlevels(video) -> video` -- Adjust the color levels.
+- `colormap(video, video, video) -> video` -- Apply custom Color Maps to video stream.
+- `colormatrix(video) -> video` -- Convert color matrix.
+- `colorspace(video) -> video` -- Convert between colorspaces.
+- `colorspace_cuda(video) -> video` -- CUDA accelerated video color converter
+- `colortemperature(video) -> video` -- Adjust color temperature of video.
+- `compand(audio) -> audio` -- Compress or expand audio dynamic range.
+- `compensationdelay(audio) -> audio` -- Audio Compensation Delay Line.
+- `convolution(video) -> video` -- Apply convolution filter.
+- `convolution_opencl(video) -> video` -- Apply convolution mask to input video
+- `convolve(video, video) -> video` -- Convolve first video stream with second video stream.
+- `copy(video) -> video` -- Copy the input video unchanged to the output.
+- `corr(video, video) -> video` -- Calculate the correlation between two video streams.
+- `cover_rect(video) -> video` -- Find and cover a user specified object.
+- `crop(video) -> video` -- Crop the input video.
+- `cropdetect(video) -> video` -- Auto-detect crop size.
+- `crossfeed(audio) -> audio` -- Apply headphone crossfeed filter.
+- `crystalizer(audio) -> audio` -- Simple audio noise sharpening filter.
+- `cue(video) -> video` -- Delay filtering to match a cue.
+- `curves(video) -> video` -- Adjust components curves.
+- `datascope(video) -> video` -- Video data analysis.
+- `dblur(video) -> video` -- Apply Directional Blur filter.
+- `dcshift(audio) -> audio` -- Apply a DC shift to the audio.
+- `dctdnoiz(video) -> video` -- Denoise frames using 2D DCT.
+- `deband(video) -> video` -- Debands video.
+- `deblock(video) -> video` -- Deblock video.
+- `deconvolve(video, video) -> video` -- Deconvolve first video stream with second video stream.
+- `dedot(video) -> video` -- Reduce cross-luminance and cross-color.
+- `deesser(audio) -> audio` -- Apply de-essing to the audio.
+- `deflate(video) -> video` -- Apply deflate effect.
+- `deflicker(video) -> video` -- Remove temporal frame luminance variations.
+- `deinterlace_qsv(video) -> video` -- Quick Sync Video "deinterlacing"
+- `deinterlace_vaapi(video) -> video` -- Deinterlacing of VAAPI surfaces
+- `dejudder(video) -> video` -- Remove judder produced by pullup.
+- `delogo(video) -> video` -- Remove logo from input video.
+- `denoise_vaapi(video) -> video` -- VAAPI VPP for de-noise
+- `deshake(video) -> video` -- Stabilize shaky video.
+- `deshake_opencl(video) -> video` -- Feature-point based video stabilization filter
+- `despill(video) -> video` -- Despill video.
+- `detelecine(video) -> video` -- Apply an inverse telecine pattern.
+- `dialoguenhance(audio) -> audio` -- Audio Dialogue Enhancement.
+- `dilation(video) -> video` -- Apply dilation effect.
+- `dilation_opencl(video) -> video` -- Apply dilation effect
+- `displace(video, video, video) -> video` -- Displace pixels.
+- `doubleweave(video) -> video` -- Weave input video fields into double number of frames.
+- `drawbox(video) -> video` -- Draw a colored box on the input video.
+- `drawbox_vaapi(video) -> video` -- Draw a colored box on the input video.
+- `drawgraph(video) -> video` -- Draw a graph using input video metadata.
+- `drawgrid(video) -> video` -- Draw a colored grid on the input video.
+- `drawtext(video) -> video` -- Draw text on top of video frames using libfreetype library.
+- `drmeter(audio) -> audio` -- Measure audio dynamic range.
+- `dynaudnorm(audio) -> audio` -- Dynamic Audio Normalizer.
+- `earwax(audio) -> audio` -- Widen the stereo image.
+- `edgedetect(video) -> video` -- Detect and draw edge.
+- `elbg(video) -> video` -- Apply posterize effect, using the ELBG algorithm.
+- `entropy(video) -> video` -- Measure video frames entropy.
+- `epx(video) -> video` -- Scale the input using EPX algorithm.
+- `eq(video) -> video` -- Adjust brightness, contrast, gamma, and saturation.
+- `equalizer(audio) -> audio` -- Apply two-pole peaking equalization (EQ) filter.
+- `erosion(video) -> video` -- Apply erosion effect.
+- `erosion_opencl(video) -> video` -- Apply erosion effect
+- `estdif(video) -> video` -- Apply Edge Slope Tracing deinterlace.
+- `exposure(video) -> video` -- Adjust exposure of the video stream.
+- `extrastereo(audio) -> audio` -- Increase difference between stereo audio channels.
+- `fade(video) -> video` -- Fade in/out input video.
+- `fftdnoiz(video) -> video` -- Denoise frames using 3D FFT.
+- `fftfilt(video) -> video` -- Apply arbitrary expressions to pixels in frequency domain.
+- `field(video) -> video` -- Extract a field from the input video.
+- `fieldhint(video) -> video` -- Field matching using hints.
+- `fieldorder(video) -> video` -- Set the field order.
+- `fillborders(video) -> video` -- Fill borders of the input video.
+- `find_rect(video) -> video` -- Find a user specified object.
+- `firequalizer(audio) -> audio` -- Finite Impulse Response Equalizer.
+- `flanger(audio) -> audio` -- Apply a flanging effect to the audio.
+- `flip_vulkan(video) -> video` -- Flip both horizontally and vertically
+- `floodfill(video) -> video` -- Fill area with same color with another color.
+- `format(video) -> video` -- Convert the input video to one of the specified pixel formats.
+- `fps(video) -> video` -- Force constant framerate.
+- `framepack(video, video) -> video` -- Generate a frame packed stereoscopic video.
+- `framerate(video) -> video` -- Upsamples or downsamples progressive source between specified frame rates.
+- `framestep(video) -> video` -- Select one frame every N frames.
+- `freezedetect(video) -> video` -- Detects frozen video input.
+- `freezeframes(video, video) -> video` -- Freeze video frames.
+- `frei0r(video) -> video` -- Apply a frei0r effect.
+- `fspp(video) -> video` -- Apply Fast Simple Post-processing filter.
+- `fsync(video) -> video` -- Synchronize video frames from external source.
+- `gblur(video) -> video` -- Apply Gaussian Blur filter.
+- `gblur_vulkan(video) -> video` -- Gaussian Blur in Vulkan
+- `geq(video) -> video` -- Apply generic equation to each pixel.
+- `gradfun(video) -> video` -- Debands video quickly using gradients.
+- `graphmonitor(video) -> video` -- Show various filtergraph stats.
+- `grayworld(video) -> video` -- Adjust white balance using LAB gray world algorithm
+- `greyedge(video) -> video` -- Estimates scene illumination by grey edge assumption.
+- `haas(audio) -> audio` -- Apply Haas Stereo Enhancer.
+- `haldclut(video, video) -> video` -- Adjust colors using a Hald CLUT.
+- `hdcd(audio) -> audio` -- Apply High Definition Compatible Digital (HDCD) decoding.
+- `hflip(video) -> video` -- Horizontally flip the input video.
+- `hflip_vulkan(video) -> video` -- Horizontally flip the input video in Vulkan
+- `highpass(audio) -> audio` -- Apply a high-pass filter with 3dB point frequency.
+- `highshelf(audio) -> audio` -- Apply a high shelf filter.
+- `histeq(video) -> video` -- Apply global color histogram equalization.
+- `histogram(video) -> video` -- Compute and draw a histogram.
+- `hqdn3d(video) -> video` -- Apply a High Quality 3D Denoiser.
+- `hqx(video) -> video` -- Scale the input by 2, 3 or 4 using the hq*x magnification algorithm.
+- `hsvhold(video) -> video` -- Turns a certain HSV range into gray.
+- `hsvkey(video) -> video` -- Turns a certain HSV range into transparency. Operates on YUV colors.
+- `hue(video) -> video` -- Adjust the hue and saturation of the input video.
+- `huesaturation(video) -> video` -- Apply hue-saturation-intensity adjustments.
+- `hwdownload(video) -> video` -- Download a hardware frame to a normal frame
+- `hwmap(video) -> video` -- Map hardware frames
+- `hwupload(video) -> video` -- Upload a normal frame to a hardware frame
+- `hwupload_cuda(video) -> video` -- Upload a system memory frame to a CUDA device.
+- `hysteresis(video, video) -> video` -- Grow first stream into second stream by connecting components.
+- `identity(video, video) -> video` -- Calculate the Identity between two video streams.
+- `idet(video) -> video` -- Interlace detect Filter.
+- `il(video) -> video` -- Deinterleave or interleave fields.
+- `inflate(video) -> video` -- Apply inflate effect.
+- `interlace(video) -> video` -- Convert progressive video into interlaced.
+- `kerndeint(video) -> video` -- Apply kernel deinterlacing to the input.
+- `kirsch(video) -> video` -- Apply kirsch operator.
+- `lagfun(video) -> video` -- Slowly update darker pixels.
+- `latency(video) -> video` -- Report video filtering latency.
+- `lenscorrection(video) -> video` -- Rectify the image by correcting for lens distortion.
+- `lensfun(video) -> video` -- Apply correction to an image based on info derived from the lensfun database.
+- `libvmaf(video, video) -> video` -- Calculate the VMAF between two video streams.
+- `limiter(video) -> video` -- Limit pixels components to the specified range.
+- `loop(video) -> video` -- Loop video frames.
+- `loudnorm(audio) -> audio` -- EBU R128 loudness normalization
+- `lowpass(audio) -> audio` -- Apply a low-pass filter with 3dB point frequency.
+- `lowshelf(audio) -> audio` -- Apply a low shelf filter.
+- `lumakey(video) -> video` -- Turns a certain luma into transparency.
+- `lut(video) -> video` -- Compute and apply a lookup table to the RGB/YUV input video.
+- `lut1d(video) -> video` -- Adjust colors using a 1D LUT.
+- `lut2(video, video) -> video` -- Compute and apply a lookup table from two video inputs.
+- `lut3d(video) -> video` -- Adjust colors using a 3D LUT.
+- `lutrgb(video) -> video` -- Compute and apply a lookup table to the RGB input video.
+- `lutyuv(video) -> video` -- Compute and apply a lookup table to the YUV input video.
+- `maskedclamp(video, video, video) -> video` -- Clamp first stream with second stream and third stream.
+- `maskedmax(video, video, video) -> video` -- Apply filtering with maximum difference of two streams.
+- `maskedmerge(video, video, video) -> video` -- Merge first stream with second stream using third stream as mask.
+- `maskedmin(video, video, video) -> video` -- Apply filtering with minimum difference of two streams.
+- `maskedthreshold(video, video) -> video` -- Pick pixels comparing absolute difference of two streams with threshold.
+- `maskfun(video) -> video` -- Create Mask.
+- `mcdeint(video) -> video` -- Apply motion compensating deinterlacing.
+- `mcompand(audio) -> audio` -- Multiband Compress or expand audio dynamic range.
+- `median(video) -> video` -- Apply Median filter.
+- `mestimate(video) -> video` -- Generate motion vectors.
+- `metadata(video) -> video` -- Manipulate video frame metadata.
+- `midequalizer(video, video) -> video` -- Apply Midway Equalization.
+- `minterpolate(video) -> video` -- Frame rate conversion using Motion Interpolation.
+- `monochrome(video) -> video` -- Convert video to gray using custom color filter.
+- `morpho(video, video) -> video` -- Apply Morphological filter.
+- `mpdecimate(video) -> video` -- Remove near-duplicate frames.
+- `msad(video, video) -> video` -- Calculate the MSAD between two video streams.
+- `multiply(video, video) -> video` -- Multiply first video stream with second video stream.
+- `negate(video) -> video` -- Negate input video.
+- `nlmeans(video) -> video` -- Non-local means denoiser.
+- `nlmeans_opencl(video) -> video` -- Non-local means denoiser through OpenCL
+- `nlmeans_vulkan(video) -> video` -- Non-local means denoiser (Vulkan)
+- `nnedi(video) -> video` -- Apply neural network edge directed interpolation intra-only deinterlacer.
+- `noformat(video) -> video` -- Force libavfilter not to use any of the specified pixel formats for the input to the next filter.
+- `noise(video) -> video` -- Add noise.
+- `normalize(video) -> video` -- Normalize RGB video.
+- `null(video) -> video` -- Pass the source unchanged to the output.
+- `oscilloscope(video) -> video` -- 2D Video Oscilloscope.
+- `overlay(video, video) -> video` -- Overlay a video source on top of the input.
+- `overlay_cuda(video, video) -> video` -- Overlay one video on top of another using CUDA
+- `overlay_opencl(video, video) -> video` -- Overlay one video on top of another
+- `overlay_qsv(video, video) -> video` -- Quick Sync Video overlay.
+- `overlay_vaapi(video, video) -> video` -- Overlay one video on top of another
+- `overlay_vulkan(video, video) -> video` -- Overlay a source on top of another
+- `owdenoise(video) -> video` -- Denoise using wavelets.
+- `pad(video) -> video` -- Pad the input video.
+- `pad_opencl(video) -> video` -- Pad the input video.
+- `pad_vaapi(video) -> video` -- Pad the input video.
+- `palettegen(video) -> video` -- Find the optimal palette for a given stream.
+- `paletteuse(video, video) -> video` -- Use a palette to downsample an input video stream.
+- `pan(audio) -> audio` -- Remix channels with coefficients (panning).
+- `perms(video) -> video` -- Set permissions for the output video frame.
+- `perspective(video) -> video` -- Correct the perspective of video.
+- `phase(video) -> video` -- Phase shift fields.
+- `photosensitivity(video) -> video` -- Filter out photosensitive epilepsy seizure-inducing flashes.
+- `pixdesctest(video) -> video` -- Test pixel format definitions.
+- `pixelize(video) -> video` -- Pixelize video.
+- `pixscope(video) -> video` -- Pixel data analysis.
+- `pp(video) -> video` -- Filter video using libpostproc.
+- `pp7(video) -> video` -- Apply Postprocessing 7 filter.
+- `prewitt(video) -> video` -- Apply prewitt operator.
+- `prewitt_opencl(video) -> video` -- Apply prewitt operator
+- `procamp_vaapi(video) -> video` -- ProcAmp (color balance) adjustments for hue, saturation, brightness, contrast
+- `pseudocolor(video) -> video` -- Make pseudocolored video frames.
+- `psnr(video, video) -> video` -- Calculate the PSNR between two video streams.
+- `pullup(video) -> video` -- Pullup from field sequence to frames.
+- `qp(video) -> video` -- Change video quantization parameters.
+- `qrencode(video) -> video` -- Draw a QR code on top of video frames.
+- `quirc(video) -> video` -- Decode and show QR codes content.
+- `random(video) -> video` -- Return random frames.
+- `readeia608(video) -> video` -- Read EIA-608 Closed Caption codes from input video and write them to frame metadata.
+- `readvitc(video) -> video` -- Read vertical interval timecode and write it to frame metadata.
+- `realtime(video) -> video` -- Slow down filtering to match realtime.
+- `remap(video, video, video) -> video` -- Remap pixels.
+- `remap_opencl(video, video, video) -> video` -- Remap pixels using OpenCL.
+- `removegrain(video) -> video` -- Remove grain.
+- `removelogo(video) -> video` -- Remove a TV logo based on a mask image.
+- `repeatfields(video) -> video` -- Hard repeat fields based on MPEG repeat field flag.
+- `replaygain(audio) -> audio` -- ReplayGain scanner.
+- `reverse(video) -> video` -- Reverse a clip.
+- `rgbashift(video) -> video` -- Shift RGBA.
+- `roberts(video) -> video` -- Apply roberts cross operator.
+- `roberts_opencl(video) -> video` -- Apply roberts operator
+- `rotate(video) -> video` -- Rotate the input image.
+- `rubberband(audio) -> audio` -- Apply time-stretching and pitch-shifting.
+- `sab(video) -> video` -- Apply shape adaptive blur.
+- `scale(video) -> video` -- Scale the input video size and/or convert the image format.
+- `scale_cuda(video) -> video` -- GPU accelerated video resizer
+- `scale_qsv(video) -> video` -- Quick Sync Video "scaling and format conversion"
+- `scale_vaapi(video) -> video` -- Scale to/from VAAPI surfaces.
+- `scale_vulkan(video) -> video` -- Scale Vulkan frames
+- `scdet(video) -> video` -- Detect video scene change
+- `scharr(video) -> video` -- Apply scharr operator.
+- `scroll(video) -> video` -- Scroll input video.
+- `selectivecolor(video) -> video` -- Apply CMYK adjustments to specific color ranges.
+- `sendcmd(video) -> video` -- Send commands to filters.
+- `separatefields(video) -> video` -- Split input video frames into fields.
+- `setdar(video) -> video` -- Set the frame display aspect ratio.
+- `setfield(video) -> video` -- Force field for the output video frame.
+- `setparams(video) -> video` -- Force field, or color property for the output video frame.
+- `setpts(video) -> video` -- Set PTS for the output video frame.
+- `setrange(video) -> video` -- Force color range for the output video frame.
+- `setsar(video) -> video` -- Set the pixel sample aspect ratio.
+- `settb(video) -> video` -- Set timebase for the video output link.
+- `sharpness_vaapi(video) -> video` -- VAAPI VPP for sharpness
+- `shear(video) -> video` -- Shear transform the input image.
+- `showcqt(audio) -> video` -- Convert input audio to a CQT (Constant/Clamped Q Transform) spectrum video output.
+- `showcwt(audio) -> video` -- Convert input audio to a CWT (Continuous Wavelet Transform) spectrum video output.
+- `showfreqs(audio) -> video` -- Convert input audio to a frequencies video output.
+- `showinfo(video) -> video` -- Show textual information for each video frame.
+- `showpalette(video) -> video` -- Display frame palette.
+- `showspatial(audio) -> video` -- Convert input audio to a spatial video output.
+- `showspectrum(audio) -> video` -- Convert input audio to a spectrum video output.
+- `showspectrumpic(audio) -> video` -- Convert input audio to a spectrum video output single picture.
+- `showvolume(audio) -> video` -- Convert input audio volume to video output.
+- `showwaves(audio) -> video` -- Convert input audio to a video output.
+- `showwavespic(audio) -> video` -- Convert input audio to a video output single picture.
+- `shuffleframes(video) -> video` -- Shuffle video frames.
+- `shufflepixels(video) -> video` -- Shuffle video pixels.
+- `shuffleplanes(video) -> video` -- Shuffle video planes.
+- `sidechaincompress(audio, audio) -> audio` -- Sidechain compressor.
+- `sidechaingate(audio, audio) -> audio` -- Audio sidechain gate.
+- `sidedata(video) -> video` -- Manipulate video frame side data.
+- `signalstats(video) -> video` -- Generate statistics from video analysis.
+- `silencedetect(audio) -> audio` -- Detect silence.
+- `silenceremove(audio) -> audio` -- Remove silence.
+- `siti(video) -> video` -- Calculate spatial information (SI) and temporal information (TI).
+- `smartblur(video) -> video` -- Blur the input video without impacting the outlines.
+- `sobel(video) -> video` -- Apply sobel operator.
+- `sobel_opencl(video) -> video` -- Apply sobel operator
+- `sofalizer(audio) -> audio` -- SOFAlizer (Spatially Oriented Format for Acoustics).
+- `spectrumsynth(video, video) -> audio` -- Convert input spectrum videos to audio output.
+- `speechnorm(audio) -> audio` -- Speech Normalizer.
+- `spp(video) -> video` -- Apply a simple post processing filter.
+- `ssim(video, video) -> video` -- Calculate the SSIM between two video streams.
+- `ssim360(video, video) -> video` -- Calculate the SSIM between two 360 video streams.
+- `stereo3d(video) -> video` -- Convert video stereoscopic 3D view.
+- `stereotools(audio) -> audio` -- Apply various stereo tools.
+- `stereowiden(audio) -> audio` -- Apply stereo widening effect.
+- `subtitles(video) -> video` -- Render text subtitles onto input video using the libass library.
+- `super2xsai(video) -> video` -- Scale the input by 2x using the Super2xSaI pixel art algorithm.
+- `superequalizer(audio) -> audio` -- Apply 18 band equalization filter.
+- `surround(audio) -> audio` -- Apply audio surround upmix filter.
+- `swaprect(video) -> video` -- Swap 2 rectangular objects in video.
+- `swapuv(video) -> video` -- Swap U and V components.
+- `tblend(video) -> video` -- Blend successive frames.
+- `telecine(video) -> video` -- Apply a telecine pattern.
+- `thistogram(video) -> video` -- Compute and draw a temporal histogram.
+- `threshold(video, video, video, video) -> video` -- Threshold first video stream using other video streams.
+- `thumbnail(video) -> video` -- Select the most representative frame in a given sequence of consecutive frames.
+- `thumbnail_cuda(video) -> video` -- Select the most representative frame in a given sequence of consecutive frames.
+- `tile(video) -> video` -- Tile several successive frames together.
+- `tiltandshift(video) -> video` -- Generate a tilt-and-shift'd video.
+- `tiltshelf(audio) -> audio` -- Apply a tilt shelf filter.
+- `tinterlace(video) -> video` -- Perform temporal field interlacing.
+- `tlut2(video) -> video` -- Compute and apply a lookup table from two successive frames.
+- `tmedian(video) -> video` -- Pick median pixels from successive frames.
+- `tmidequalizer(video) -> video` -- Apply Temporal Midway Equalization.
+- `tmix(video) -> video` -- Mix successive video frames.
+- `tonemap(video) -> video` -- Conversion to/from different dynamic ranges.
+- `tonemap_opencl(video) -> video` -- Perform HDR to SDR conversion with tonemapping.
+- `tonemap_vaapi(video) -> video` -- VAAPI VPP for tone-mapping
+- `tpad(video) -> video` -- Temporarily pad video frames.
+- `transpose(video) -> video` -- Transpose input video.
+- `transpose_opencl(video) -> video` -- Transpose input video
+- `transpose_vaapi(video) -> video` -- VAAPI VPP for transpose
+- `transpose_vulkan(video) -> video` -- Transpose Vulkan Filter
+- `treble(audio) -> audio` -- Boost or cut upper frequencies.
+- `tremolo(audio) -> audio` -- Apply tremolo effect.
+- `trim(video) -> video` -- Pick one continuous section from the input, drop the rest.
+- `unsharp(video) -> video` -- Sharpen or blur the input video.
+- `unsharp_opencl(video) -> video` -- Apply unsharp mask to input video
+- `untile(video) -> video` -- Untile a frame into a sequence of frames.
+- `uspp(video) -> video` -- Apply Ultra Simple / Slow Post-processing filter.
+- `v360(video) -> video` -- Convert 360 projection of video.
+- `vaguedenoiser(video) -> video` -- Apply a Wavelet based Denoiser.
+- `varblur(video, video) -> video` -- Apply Variable Blur filter.
+- `vectorscope(video) -> video` -- Video vectorscope.
+- `vflip(video) -> video` -- Flip the input video vertically.
+- `vflip_vulkan(video) -> video` -- Vertically flip the input video in Vulkan
+- `vfrdet(video) -> video` -- Variable frame rate detect filter.
+- `vibrance(video) -> video` -- Boost or alter saturation.
+- `vibrato(audio) -> audio` -- Apply vibrato effect.
+- `vidstabdetect(video) -> video` -- Extract relative transformations, pass 1 of 2 for stabilization (see vidstabtransform for pass 2).
+- `vidstabtransform(video) -> video` -- Transform the frames, pass 2 of 2 for stabilization (see vidstabdetect for pass 1).
+- `vif(video, video) -> video` -- Calculate the VIF between two video streams.
+- `vignette(video) -> video` -- Make or reverse a vignette effect.
+- `virtualbass(audio) -> audio` -- Audio Virtual Bass.
+- `vmafmotion(video) -> video` -- Calculate the VMAF Motion score.
+- `volume(audio) -> audio` -- Change input volume.
+- `volumedetect(audio) -> audio` -- Detect audio volume.
+- `vpp_qsv(video) -> video` -- Quick Sync Video "VPP"
+- `w3fdif(video) -> video` -- Apply Martin Weston three field deinterlace.
+- `waveform(video) -> video` -- Video waveform monitor.
+- `weave(video) -> video` -- Weave input video fields into frames.
+- `xbr(video) -> video` -- Scale the input using xBR algorithm.
+- `xcorrelate(video, video) -> video` -- Cross-correlate first video stream with second video stream.
+- `xfade(video, video) -> video` -- Cross fade one video with another video.
+- `xfade_opencl(video, video) -> video` -- Cross fade one video with another video.
+- `xfade_vulkan(video, video) -> video` -- Cross fade one video with another video.
+- `xpsnr(video, video) -> video` -- Calculate the extended perceptually weighted peak signal-to-noise ratio (XPSNR) between two video streams.
+- `yadif(video) -> video` -- Deinterlace the input image.
+- `yadif_cuda(video) -> video` -- Deinterlace CUDA frames
+- `yaepblur(video) -> video` -- Yet another edge preserving blur filter.
+- `zmq(video) -> video` -- Receive commands through ZMQ and broker them to filters.
+- `zoompan(video) -> video` -- Apply Zoom & Pan effect.
+- `zscale(video) -> video` -- Apply resizing, colorspace and bit depth conversion.
 
 ## Examples
 
@@ -671,7 +1135,7 @@ not in the dialect.
 - `CONCAT_MISMATCH` -- UNION ALL branches disagree. `message` says how: if it names stream types, column counts, or order, make every branch select the same columns, the same types, in the same order (a splatted array counts one column per element, so array lengths must match too); if it is a resolution/frame-rate mismatch, wrap each branch's video column in `scale(<expr>, width, height)` with the same width and height everywhere.
 - `UNSUPPORTED_SQL` -- The construct is outside the dialect. Read `hint` -- it names the replacement: a CTE instead of a subquery, a comma instead of `JOIN ... ON`, a bare CTE name instead of an aliased one, one lower and one upper time bound per alias, `<alias>.video`/`<alias>.audio` instead of `*` or an unqualified column, a positive integer literal subscript instead of zero, a negative number, or a computed index.
 - `STREAM_NOT_FOUND` -- The subscript is out of range for the actual stream count named in `message` (from the probed file, or a CTE array column's recorded length). Subscripts are 1-based -- lower the number into range, or select a different alias/column/element.
-- `INPUT_NOT_FOUND` -- A bare array (`<alias>.video` / `<alias>.audio` with no subscript, splatted or handed to a function) needs to read the file to know how many streams it has, and this input cannot be read (missing path, a URL, or `--no-probe`). Subscript one specific stream instead -- `hint` names one -- or point at a path you know is readable.
+- `INPUT_NOT_FOUND` -- A bare array (`<alias>.video` / `<alias>.audio` with no subscript, splatted or handed to a function) needs to read the file to know how many streams it has, and this input cannot be read (missing path or a URL). Subscript one specific stream instead -- `hint` names one -- or point at a path you know is readable.
 - `BROADCAST_MISMATCH` -- Two array arguments to the same call have different lengths (both named in `message`) and cannot zip elementwise. Subscript one of them down to a single stream, e.g. `<alias>.audio[1]`, so it broadcasts as a scalar instead, or make both arrays the same length.
 - `UNKNOWN_SINK_OPTION` -- The name inside `COPY ... WITH (...)` is not a known sink option. Take the did-you-mean from `hint` if there is one, otherwise pick from the exact set of option names sqlmpeg supports; do not invent an ffmpeg flag name or option that isn't in that set.
 - `SINK_OPTION_TYPE` -- The value given for that `COPY ... WITH (...)` option does not match its expected type, named in `message`. A `str` option needs a single-quoted literal (e.g. `video_codec 'libx264'`), an `int` option needs a bare integer literal with no quotes and no decimal point (e.g. `crf 20`), and a `bool` option needs exactly `true` or `false` with no quotes.

@@ -389,7 +389,7 @@ def _readme_ladder_sql() -> str:
 
 
 def test_readme_ladder_example_compiles() -> None:
-    g = compile_sql(_readme_ladder_sql(), probe=False)
+    g = compile_sql(_readme_ladder_sql())
     assert [unit.path for unit in g.sinks] == ["720.mp4", "360.mp4", "audio.m4a"]
     filters = [node.filter for node in g.nodes.values()]
     assert filters.count("scale") == 3  # master's own + one per video COPY
@@ -401,7 +401,7 @@ def test_readme_ladder_example_command_is_the_real_compilation() -> None:
     """The command shown under "Views and multiple outputs" is what sqlmpeg
     actually prints for that script -- no fixture path to substitute back,
     since the query names no file sqlmpeg can (or needs to) read."""
-    args = build_ffmpeg_args(emit(compile_sql(_readme_ladder_sql(), probe=False)), None)
+    args = build_ffmpeg_args(emit(compile_sql(_readme_ladder_sql())), None)
     assert shlex.join(args) in _readme_text()
 
 
@@ -572,9 +572,9 @@ def test_unprobeable_bare_array_as_an_argument_is_the_same_error() -> None:
     assert err.hint is not None and "a.audio[1]" in err.hint
 
 
-def test_no_probe_flag_also_loses_the_ability_to_enumerate() -> None:
+def test_an_unreadable_input_also_loses_the_ability_to_enumerate() -> None:
     with pytest.raises(SqlmpegError) as excinfo:
-        compile_sql("SELECT a.audio FROM input('x.mp4') a", probe=False)
+        compile_sql("SELECT a.audio FROM input('x.mp4') a")
     assert excinfo.value.code is ErrorCode.INPUT_NOT_FOUND
 
 
@@ -946,10 +946,7 @@ def test_a_trimmed_column_that_nothing_filters_stays_a_passthrough() -> None:
     The ref is still a source ref, so emit maps it bare and stream-copies it,
     with the window carried as input options on the -i.
     """
-    g = compile_sql(
-        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 5 AND 60",
-        probe=False,
-    )
+    g = compile_sql("SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 5 AND 60")
     assert g.nodes == {}
     assert _outputs(g) == [("src:a:v:0", "video", None)]
     emitted = emit(g)
@@ -1014,8 +1011,7 @@ def test_each_windowed_alias_gets_its_own_i_in_the_argv() -> None:
         compile_sql(
             "SELECT overlay(a.frame, b.frame, 0, 0) "
             "FROM input('x.mp4') a, input('y.mp4') b "
-            "WHERE a.t BETWEEN 0 AND 1 AND b.t BETWEEN 2.5 AND 3",
-            probe=False,
+            "WHERE a.t BETWEEN 0 AND 1 AND b.t BETWEEN 2.5 AND 3"
         )
     )
     assert emitted.input_trims == [(0, 1), (2.5, 3)]
@@ -1041,8 +1037,7 @@ def test_union_all_branches_seek_their_own_inputs() -> None:
     g = compile_sql(
         "SELECT a.frame FROM input('x.mp4') a WHERE a.t BETWEEN 0 AND 1 "
         "UNION ALL "
-        "SELECT b.frame FROM input('y.mp4') b WHERE b.t BETWEEN 2 AND 3",
-        probe=False,
+        "SELECT b.frame FROM input('y.mp4') b WHERE b.t BETWEEN 2 AND 3"
     )
     assert _filters(g) == ["concat"]
     assert g.nodes["n1"].inputs == ["src:a:v:0", "src:b:v:0"]
@@ -1051,10 +1046,9 @@ def test_union_all_branches_seek_their_own_inputs() -> None:
 
 
 def test_an_input_window_is_probe_independent() -> None:
-    """The bounds are pure numbers from the SQL: probe=False changes nothing."""
+    """The bounds are pure numbers from the SQL, not anything probing supplies."""
     query = "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 1.5 AND 4"
-    assert compile_sql(query, probe=False).input_trims == {"a": (1.5, 4)}
-    assert compile_sql(query, probe=True).input_trims == {"a": (1.5, 4)}
+    assert compile_sql(query).input_trims == {"a": (1.5, 4)}
 
 
 def test_the_seek_covers_the_whole_input_selected_or_not() -> None:
@@ -2082,17 +2076,6 @@ def test_compile_sql_probes_each_distinct_path_once(
     assert calls == ["game.mp4"]  # two aliases, one file, one probe
 
 
-def test_compile_sql_no_probe_skips_probing_entirely(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def boom(path: str) -> ProbeResult | None:
-        raise AssertionError("probe() must not be called with probe=False")
-
-    monkeypatch.setattr(compiler, "probe_path", boom)
-    g = compile_sql("SELECT a.audio[9] FROM input('x.mp4') a", probe=False)
-    assert _outputs(g) == [("src:a:a:8", "audio", None)]
-
-
 def test_compile_sql_uses_probe_results_for_bounds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2646,7 +2629,7 @@ def _registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Registry:
     never reads (or writes) the developer's own ~/.cache/sqlmpeg.
     """
     monkeypatch.setattr(registry_module, "_cache_dir", lambda: tmp_path / "cache")
-    monkeypatch.setattr(registry_module.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(registry_module.binaries, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
 
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if "-version" in argv:
@@ -3225,7 +3208,7 @@ def test_a_dynamic_node_is_split_like_any_other(_registry: Registry) -> None:
 def test_without_a_registry_a_filter_name_is_an_unknown_function() -> None:
     err = _reject_dyn("SELECT deband(a.frame, range => 8) FROM input('x.mp4') a", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "install ffmpeg" in err.hint
+    assert err.hint is not None and "provisioner" in err.hint
 
 
 def test_without_a_registry_every_name_is_unknown_including_common_ones() -> None:
@@ -3239,7 +3222,7 @@ def test_without_a_registry_every_name_is_unknown_including_common_ones() -> Non
 def test_without_a_registry_the_namespace_is_unknown_too() -> None:
     err = _reject_dyn("SELECT ffmpeg.gblur(a.frame) FROM input('x.mp4') a", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "ffmpeg was not found" in err.hint
+    assert err.hint is not None and "provisioner" in err.hint
 
 
 def test_did_you_mean_over_the_registry(_registry: Registry) -> None:
@@ -3320,12 +3303,6 @@ def test_probed_fixture_accepts_its_real_streams(_av_fixture: str) -> None:
         ("src:a:v:0", "video", None),
         ("src:a:a:0", "audio", None),
     ]
-
-
-@pytest.mark.exec
-def test_no_probe_flag_skips_the_bounds_check_on_a_real_file(_av_fixture: str) -> None:
-    g = compile_sql(f"SELECT a.audio[3] FROM input('{_av_fixture}') a", probe=False)
-    assert _outputs(g) == [("src:a:a:2", "audio", None)]
 
 
 @pytest.mark.exec
@@ -3663,13 +3640,13 @@ def test_a_namespaced_call_broadcasts_like_any_other(_registry: Registry) -> Non
 def test_without_a_registry_the_namespace_is_an_unknown_function() -> None:
     err = _reject_dyn("SELECT ffmpeg.gblur(a.frame) FROM input('x.mp4') a", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "ffmpeg was not found on PATH" in err.hint
+    assert err.hint is not None and "provisioner" in err.hint
 
 
 def test_no_ffmpeg_turns_the_namespace_off() -> None:
     err = _reject_dyn("SELECT ffmpeg.gblur(a.frame) FROM input('x.mp4') a", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "ffmpeg was not found" in err.hint
+    assert err.hint is not None and "provisioner" in err.hint
 
 
 def test_ffmpeg_is_reserved_as_an_input_alias() -> None:
@@ -4041,7 +4018,7 @@ def test_an_array_filter_this_ffmpeg_lacks_is_an_unknown_function(
 def test_an_array_call_needs_a_registry() -> None:
     err = _reject_dyn("SELECT ffmpeg.channelsplit(a.audio[1]) FROM input('x.mp4') a", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "ffmpeg was not found on PATH" in err.hint
+    assert err.hint is not None and "provisioner" in err.hint
 
 
 def test_no_ffmpeg_turns_the_array_table_off_too() -> None:
@@ -4051,7 +4028,7 @@ def test_no_ffmpeg_turns_the_array_table_off_too() -> None:
         "SELECT ffmpeg.channelsplit(a.audio[1]) FROM input('x.mp4') a", None
     )
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "ffmpeg was not found" in err.hint
+    assert err.hint is not None and "provisioner" in err.hint
 
 
 def test_an_array_call_emits_one_label_per_pad(_registry: Registry) -> None:
@@ -4073,20 +4050,22 @@ def test_an_array_call_emits_one_label_per_pad(_registry: Registry) -> None:
 # built from `tests/data/reference_registry.json` instead of from PATH. These
 # pin that the four surfaces the wave had to preserve -- generated sources, the
 # timeline `enable` option, the array-returning trio and broadcasting -- are
-# all reachable that way, with `shutil.which` stubbed to None and
-# `subprocess.run` booby-trapped so a single introspection call would fail
-# loudly rather than silently rescue the test.
+# all reachable that way, with `binaries.ffmpeg_path` stubbed to None (RFC-010:
+# not just `shutil.which`, so this stays offline even when the `static-ffmpeg`
+# provisioner is actually installed and cached) and `subprocess.run`
+# booby-trapped so a single introspection call would fail loudly rather than
+# silently rescue the test.
 
 
 @pytest.fixture
 def _offline(monkeypatch: pytest.MonkeyPatch) -> Registry:
-    def no_ffmpeg(name: str) -> str | None:
+    def no_ffmpeg() -> str | None:
         return None
 
     def boom(*args: object, **kwargs: object) -> object:
         raise AssertionError("an offline compile must never spawn a subprocess")
 
-    monkeypatch.setattr(registry_module.shutil, "which", no_ffmpeg)
+    monkeypatch.setattr(registry_module.binaries, "ffmpeg_path", no_ffmpeg)
     monkeypatch.setattr(registry_module.subprocess, "run", boom)
     return load_reference(SNAPSHOT_PATH)
 
@@ -4541,13 +4520,13 @@ def test_a_regular_filter_in_from_says_it_takes_inputs(_registry: Registry) -> N
 def test_a_source_needs_a_registry() -> None:
     err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "ffmpeg was not found on PATH" in err.hint
+    assert err.hint is not None and "provisioner" in err.hint
 
 
 def test_no_ffmpeg_turns_the_source_namespace_off() -> None:
     err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
-    assert err.hint is not None and "ffmpeg was not found" in err.hint
+    assert err.hint is not None and "provisioner" in err.hint
 
 
 def test_where_on_a_source_alias_points_at_duration(_registry: Registry) -> None:
@@ -5285,20 +5264,18 @@ _CTE_EQUIVALENT = (
 
 def test_a_view_lowers_into_the_same_ir_a_cte_would() -> None:
     """The whole design claim of RFC-006's first half, as one assertion."""
-    assert compile_sql(_VIEW_SCRIPT, probe=False).to_dict() == compile_sql(
-        _CTE_EQUIVALENT, probe=False
-    ).to_dict()
+    assert compile_sql(_VIEW_SCRIPT).to_dict() == compile_sql(_CTE_EQUIVALENT).to_dict()
 
 
 def test_a_view_script_keeps_its_sink() -> None:
-    g = compile_sql(_VIEW_SCRIPT, probe=False)
+    g = compile_sql(_VIEW_SCRIPT)
     assert len(g.sinks) == 1
     assert g.sinks[0].path == "out.mp4"
     assert g.sinks[0].options == {"crf": 20}
 
 
 def test_a_view_script_compiles_to_one_ffmpeg_command() -> None:
-    args = build_ffmpeg_args(emit(compile_sql(_VIEW_SCRIPT, probe=False)), None)
+    args = build_ffmpeg_args(emit(compile_sql(_VIEW_SCRIPT)), None)
     assert args.count("-i") == 1
     assert "scale=width=1280:height=-2" in " ".join(args)
     assert args[-1] == "out.mp4"
@@ -5308,8 +5285,7 @@ def test_a_view_is_split_across_its_consumers() -> None:
     """Two reads of one view pad go through a split, exactly like a CTE's."""
     g = compile_sql(
         "CREATE VIEW m AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
-        "COPY (SELECT gblur(m.v, 1), gblur(m.v, 2) FROM m) TO 'out.mp4';",
-        probe=False,
+        "COPY (SELECT gblur(m.v, 1), gblur(m.v, 2) FROM m) TO 'out.mp4';"
     )
     assert any(node.filter == "split" for node in g.nodes.values())
 
@@ -5318,8 +5294,7 @@ def test_a_view_body_with_its_own_with_lowers() -> None:
     g = compile_sql(
         "CREATE VIEW v AS WITH c AS (SELECT a.frame AS f FROM input('x.mp4') a) "
         "SELECT scale(c.f, 0.5) AS v FROM c;\n"
-        "COPY (SELECT v.v FROM v) TO 'out.mp4';",
-        probe=False,
+        "COPY (SELECT v.v FROM v) TO 'out.mp4';"
     )
     assert _filters(g) == ["scale"]
 
@@ -5328,8 +5303,7 @@ def test_a_view_referencing_a_view_lowers() -> None:
     g = compile_sql(
         "CREATE VIEW one AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
         "CREATE VIEW two AS SELECT scale(one.v, 0.5) AS v FROM one;\n"
-        "COPY (SELECT gblur(two.v, 3) FROM two) TO 'out.mp4';",
-        probe=False,
+        "COPY (SELECT gblur(two.v, 3) FROM two) TO 'out.mp4';"
     )
     assert _filters(g) == ["scale", "gblur"]
 
@@ -5353,7 +5327,7 @@ _TWO_SINKS = (
 
 
 def test_each_copy_becomes_its_own_sink_unit() -> None:
-    g = compile_sql(_TWO_SINKS, probe=False)
+    g = compile_sql(_TWO_SINKS)
     assert [unit.path for unit in g.sinks] == ["720.mp4", "360.mp4"]
     assert [len(unit.outputs) for unit in g.sinks] == [1, 1]
 
@@ -5361,7 +5335,7 @@ def test_each_copy_becomes_its_own_sink_unit() -> None:
 def test_the_parser_and_the_ir_agree_on_the_sink_list() -> None:
     res = resolve(parse(_TWO_SINKS))
     assert [sink.path for sink in res.sinks] == ["720.mp4", "360.mp4"]
-    assert [unit.path for unit in compile_sql(_TWO_SINKS, probe=False).sinks] == [
+    assert [unit.path for unit in compile_sql(_TWO_SINKS).sinks] == [
         "720.mp4",
         "360.mp4",
     ]
@@ -5384,7 +5358,7 @@ def test_the_shared_view_is_lowered_once_and_split_across_the_sinks() -> None:
     exactly once each; what fans them out is the split pass, one `split` for
     the two video readers and one `asplit` for the three audio ones.
     """
-    g = compile_sql(_LADDER_SCRIPT, probe=False)
+    g = compile_sql(_LADDER_SCRIPT)
     filters = [node.filter for node in g.nodes.values()]
     assert filters.count("gblur") == 1
     assert filters.count("volume") == 1
@@ -5397,7 +5371,7 @@ def test_the_shared_view_is_lowered_once_and_split_across_the_sinks() -> None:
 
 
 def test_the_shared_views_split_pads_are_handed_out_in_sink_order() -> None:
-    g = compile_sql(_LADDER_SCRIPT, probe=False)
+    g = compile_sql(_LADDER_SCRIPT)
     asplit = next(node for node in g.nodes.values() if node.filter == "asplit")
     assert asplit.args == {"n": 3}
     assert [unit.outputs[-1].ref for unit in g.sinks] == [

@@ -1,9 +1,9 @@
 """Tests for sqlmpeg.registry.
 
-Monkeypatched tests (subprocess/shutil.which faked, disk cache redirected to
-a tmp dir) are unmarked so the default suite (`pytest`, which runs
-`-m "not exec"`) stays offline. Tests that shell out to a real ffmpeg are
-marked `@pytest.mark.exec`.
+Monkeypatched tests (subprocess/binaries.ffmpeg_path faked, disk cache
+redirected to a tmp dir) are unmarked so the default suite (`pytest`, which
+runs `-m "not exec"`) stays offline. Tests that shell out to a real ffmpeg
+are marked `@pytest.mark.exec`.
 
 Fixtures below are REAL captured output from `ffmpeg -hide_banner -filters`
 and `ffmpeg -hide_banner -help filter=<name>` against
@@ -476,7 +476,7 @@ def _isolated_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Itera
 
 
 def _fake_ffmpeg_present(monkeypatch: pytest.MonkeyPatch, path: str = "/usr/bin/ffmpeg") -> None:
-    monkeypatch.setattr(registry_mod.shutil, "which", lambda name: path)
+    monkeypatch.setattr(registry_mod.binaries, "ffmpeg_path", lambda: path)
 
 
 def _fake_run(
@@ -1016,7 +1016,7 @@ def test_empty_doc_options_are_not_merged_across_the_list(
 
 
 def test_missing_ffmpeg_registry_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(registry_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(registry_mod.binaries, "ffmpeg_path", lambda: None)
     reg = load()
     assert reg.available() is False
     assert reg.names() == []

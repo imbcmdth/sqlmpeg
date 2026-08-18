@@ -8,17 +8,28 @@ RFC-007 collapsed the old two-tier stdlib/dynamic split into ONE calling
 convention: every function is either a filter of the installed ffmpeg (bare
 or ``ffmpeg.<name>``) or one of three ``sqlmpeg.<name>`` macros. There is no
 longer a "base" and a "dynamic" prompt -- ``build_system_prompt(registry)``
-takes the (optional) live :class:`~sqlmpeg.registry.Registry` straight
-through and renders one "Installed filters" section from it; called with no
-registry (or an unavailable one) it renders a short note instead, since
-filter names and options are inherently machine-dependent (what ffmpeg has).
+takes a :class:`~sqlmpeg.registry.Registry` straight through and renders one
+"Functions" section from it.
 
-Two properties the no-registry path (the default) must keep:
+RFC-010 (ffmpeg is required) retired the OLD no-registry fallback as a
+documented mode: a ``Registry`` is now a REQUIRED argument, not an optional
+one defaulting to ``None`` -- sqlmpeg always has ffmpeg (PATH or the
+``static-ffmpeg`` provisioner), so a caller always has a real registry to
+pass. ``registry.available()`` being False here means the provisioner
+FAILED, not that "no ffmpeg" is a normal, supported state; guardrail #7
+still requires this to degrade to a typed note rather than crash (see
+``_NO_REGISTRY_NOTE``), but that note now says so plainly.
 
-* **Deterministic and pure.** No I/O, no clock, no environment. The same
-  string every call, on every machine -- ``scripts/gen_prompt.py`` commits it
-  to ``docs/system-prompt.md`` and a test asserts the committed copy is
-  fresh.
+Two properties the committed doc must keep:
+
+* **Deterministic and pure.** No clock, no environment, no dependence on
+  whatever ffmpeg (if any) happens to be on the machine that regenerates it.
+  ``scripts/gen_prompt.py`` renders from the committed, version-pinned
+  ``tests/data/reference_registry.json`` (:func:`sqlmpeg.registry.load_reference`)
+  rather than the live registry ``sqlmpeg prompt`` uses, so
+  ``docs/system-prompt.md`` is the same string on every machine and every
+  CI run regardless of what ffmpeg it has -- and a test asserts the
+  committed copy is fresh.
 * **Generated from the real surface.** The repair guidance is keyed by
   :class:`sqlmpeg.errors.ErrorCode`, the sink/input option tables are
   rendered from :data:`sqlmpeg.sink.SINK_OPTIONS` /
@@ -152,9 +163,9 @@ _DIALECT_TAIL = """\
   SELECT list (one output stream per element, in order) and legal as a
   function argument, where a video/audio array broadcasts (see Broadcasting
   below). Either use needs a readable input to know how many streams there
-  are: `sqlmpeg compile` probes local files automatically, but a URL, a
-  missing file, or `--no-probe` falls back to a fully symbolic compile, where
-  a bare array cannot be sized and is rejected.
+  are: `sqlmpeg compile` probes local files automatically, but a URL or a
+  missing file falls back to a fully symbolic compile, where a bare array
+  cannot be sized and is rejected.
 - `subtitle` and `data` streams are PASSTHROUGH-ONLY: select them (bare,
   subscripted, splatted, or carried through a CTE column), but never filter
   them. Passing one to any function is `UDF_ARG_TYPE` ("cannot be filtered,
@@ -450,11 +461,10 @@ A handful of names are exceptions to "one stream in, one filter, one call":
 Function names are case-insensitive; option names are not. Filter calls are
 machine-dependent -- a query naming a filter (or an option) only compiles
 where the installed ffmpeg has it; the three `sqlmpeg.*` macros and the
-dialect otherwise compile anywhere. If the filter set is unavailable (no
-ffmpeg on PATH, or `--no-probe` cannot help here since this is about the
-filter LIST, not a specific file), every filter call is `UNKNOWN_FUNCTION`
-and every named argument on one is `UNSUPPORTED_SQL`; the message says
-which."""
+dialect otherwise compile anywhere. sqlmpeg requires ffmpeg (PATH, or its
+bundled provisioner); if that provisioner ever fails and no ffmpeg is
+available, every filter call is `UNKNOWN_FUNCTION` and every named argument
+on one is `UNSUPPORTED_SQL`, with the message saying so."""
 
 
 def _dialect_section() -> str:
@@ -562,21 +572,21 @@ These are typed errors, never a best-effort graph. Do not reach for them.
 # ffmpeg reports. Name, pad signature, one-line doc, sorted alphabetically;
 # no per-filter option dump (~460 filters' worth of option tables would be
 # enormous -- validate --json's UNKNOWN_FILTER_OPTION / FILTER_OPTION_TYPE
-# cover that long tail instead). With no registry (or an unavailable one)
-# this degrades to one explanatory note instead -- that is the only part of
-# `build_system_prompt` that is not pure/deterministic, and it is what keeps
-# the default (no-registry) path, which `docs/system-prompt.md` pins,
-# unchanged regardless of what ffmpeg (if any) is on the machine that ran
-# the generator.
+# cover that long tail instead). `registry.available()` being False here
+# (guardrail #7 -- a broken provisioner must still fail typed, not crash)
+# degrades to one explanatory note instead; that is the only part of
+# `build_system_prompt` that can vary given the same registry, and it is not
+# a normal, expected mode any more (RFC-010: ffmpeg is required) -- the note
+# says plainly that this means the provisioner failed.
 
 _NO_REGISTRY_NOTE = (
-    "No installed ffmpeg was found on PATH (or its filter list could not be "
-    "read), so there is no per-machine filter list to render here; Calling "
-    "convention above still describes the mechanism -- bare and "
-    "`ffmpeg.<name>` calls both resolve against the installed ffmpeg's "
-    "filter set, whatever it turns out to be. `sqlmpeg.blur_regions` / "
-    "`sqlmpeg.speed` / `sqlmpeg.delay` need no registry at all and always "
-    "compile."
+    "This registry is unavailable, which means the ffmpeg provisioner failed "
+    "to supply a working ffmpeg -- there is no per-machine filter list to "
+    "render here. Calling convention above still describes the mechanism -- "
+    "bare and `ffmpeg.<name>` calls both resolve against the installed "
+    "ffmpeg's filter set, whatever it turns out to be, once the provisioner "
+    "is fixed. `sqlmpeg.blur_regions` / `sqlmpeg.speed` / `sqlmpeg.delay` "
+    "need no registry at all and always compile."
 )
 
 
@@ -587,8 +597,8 @@ def _filter_line(name: str, registry: Registry) -> str:
     return f"- `{name}({signature}) -> {f.output}` -- {f.doc}"
 
 
-def _function_reference(registry: Registry | None) -> str:
-    if registry is None or not registry.available():
+def _function_reference(registry: Registry) -> str:
+    if not registry.available():
         return f"## Functions\n\n{_NO_REGISTRY_NOTE}"
     names = sorted(registry.names())
     lines = [
@@ -899,9 +909,9 @@ _REPAIR: dict[ErrorCode, str] = {
     ErrorCode.INPUT_NOT_FOUND: (
         "A bare array (`<alias>.video` / `<alias>.audio` with no subscript, "
         "splatted or handed to a function) needs to read the file to know how "
-        "many streams it has, and this input cannot be read (missing path, a "
-        "URL, or `--no-probe`). Subscript one specific stream instead -- "
-        "`hint` names one -- or point at a path you know is readable."
+        "many streams it has, and this input cannot be read (missing path or "
+        "a URL). Subscript one specific stream instead -- `hint` names one -- "
+        "or point at a path you know is readable."
     ),
     ErrorCode.BROADCAST_MISMATCH: (
         "Two array arguments to the same call have different lengths (both "
@@ -983,16 +993,21 @@ def _repair_section() -> str:
 # ---------------------------------------------------------------------------
 
 
-def build_system_prompt(registry: Registry | None = None) -> str:
+def build_system_prompt(registry: Registry) -> str:
     """The sqlmpeg system prompt: ASCII, no trailing newline.
 
-    `registry=None` (the default) is deterministic and pure -- no I/O, no
-    clock, no environment -- and is byte-identical to `docs/system-prompt.md`:
-    the Functions section degrades to one explanatory note instead of a
-    filter list. Passing a live `Registry` (`sqlmpeg prompt` does, via
-    `registry.load()`) renders the real Functions section from THIS
-    machine's installed ffmpeg; that is the only impure, machine-dependent
-    part of the output, and it never changes anything else.
+    `registry` is REQUIRED (RFC-010: ffmpeg is always there, PATH or the
+    provisioner, so there is always a real registry to pass) and is the only
+    thing that can vary the output -- everything else here is pure, with no
+    I/O, clock, or environment of its own. `sqlmpeg prompt` passes the live
+    registry (`registry.load()`), machine-dependent by nature; the committed
+    `docs/system-prompt.md` is rendered by `scripts/gen_prompt.py` from the
+    committed reference snapshot (`registry.load_reference(...)`) instead, so
+    it stays byte-identical across machines and CI runs regardless of what
+    ffmpeg (if any) generated it. `registry.available()` being False (a
+    failed provisioner, guardrail #7) degrades the Functions section to one
+    explanatory note rather than crashing; that is the only other thing that
+    can vary given two different registries.
     """
     sections: tuple[str, ...] = (
         _ROLE,
