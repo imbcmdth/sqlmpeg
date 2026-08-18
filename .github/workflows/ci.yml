@@ -30,6 +30,10 @@ jobs:
       - name: Type-check (mypy, strict on sqlmpeg/)
         run: mypy sqlmpeg/
 
+      # No ffmpeg installed yet, on purpose: the default suite must be
+      # deterministic on a bare machine, compiling against
+      # tests/data/reference_registry.json wherever a test needs a filter
+      # surface (RFC-007: the snapshot exists for offline CI).
       - name: Test (pytest, exec tests excluded by default)
         run: python -m pytest tests/
 
