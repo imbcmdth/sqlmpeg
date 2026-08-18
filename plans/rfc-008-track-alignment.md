@@ -35,13 +35,25 @@ for get a **silence fill** (anullsrc node, finite duration, the
 counterpart's sample_rate and language tag). `tracks_intersection` never
 fills - the template only holds keys everyone has.
 
-Every cooperating call site writes the SAME argument list and varies only
-`take`, so all sites share one template by construction:
+Every cooperating call site writes the SAME argument list (same paths,
+same order) and varies only `take`, so all sites share one template by
+construction. SQL scoping means each branch must FROM every input it
+names - a branch cannot reference another branch's alias - and the flat
+alias namespace means the second branch respells (both measured, not
+assumed):
 
-    -- concat: one template (f's order + g's extras), each branch takes its own side
-    SELECT f.video[1], sqlmpeg.tracks_union(f.audio, g.audio)            FROM input('a.mkv') f
+    -- concat: one template (a.mkv's order + b.mkv's extras), each branch takes its own side
+    SELECT f.video[1], sqlmpeg.tracks_union(f.audio, g.audio)
+    FROM input('a.mkv') f, input('b.mkv') g
     UNION ALL
-    SELECT g.video[1], sqlmpeg.tracks_union(f.audio, g.audio, take => 2) FROM input('b.mkv') g
+    SELECT g2.video[1], sqlmpeg.tracks_union(f2.audio, g2.audio, take => 2)
+    FROM input('a.mkv') f2, input('b.mkv') g2
+
+**Non-taken arguments are template-only**: their track census (keys,
+order, sample rates) shapes the result, but their STREAMS are never
+consumed - no nodes, no splits, no decode. `g` above exists so branch 1
+can see what b.mkv carries; ffmpeg never touches its audio in that
+branch.
 
     -- pairwise mix by language, silence where one side is missing one
     SELECT amix(sqlmpeg.tracks_union(f.audio, p.audio),
@@ -99,6 +111,12 @@ silence track would hang concat - not shipped broken).
    over freshly minted anullsrc nodes with `source=` the counterpart's
    `StreamMeta` (provenance and `-metadata` emission come free).
    Downstream (split/emit/goldens) sees ordinary nodes - no changes.
+4. `-i` dedup for identical untrimmed inputs: the concat shape names each
+   file once per branch, which today emits one `-i` per ALIAS (measured:
+   4 -i's for 2 files). Aliases with the same path, same input options
+   and no WHERE window fold into one `-i`; distinct trim windows keep
+   distinct `-i`s (the splice pattern is untouched). Existing goldens
+   regenerate where two aliases share an untrimmed path.
 
 ## Waves
 
