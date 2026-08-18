@@ -20,13 +20,14 @@ The SELECT list is the result set; **COPY is what makes it a file**.
   a typed usage message pointing at `run` (there is no command to show).
   `validate` unchanged. `explain` unchanged (IR dump; a table query's
   graph is just small).
-- **Naked invocation is `run`** (amended per maintainer): a first CLI
-  argument that is not a known subcommand dispatches to `run`, so
+- **`run` is the default subcommand, unconditionally** (amended per
+  maintainer): any invocation whose first argument is not a known
+  subcommand is `run`'s argv, so
   `sqlmpeg "SELECT * FROM input('f.mkv') f, unnest(f.audio) t"` prints
-  its table with zero ceremony, pgcli-style. Same for `sqlmpeg -f q.sql`.
-  Unknown-subcommand typos keep failing loudly: dispatch only when the
-  first token starts a plausible query/flag (`SELECT`/`WITH`/`COPY`/
-  `CREATE`/`-`), else the existing usage error.
+  its table with zero ceremony, pgcli-style, and `sqlmpeg -f q.sql`
+  works the same. No plausibility gating: a mistyped subcommand falls
+  through to run's SQL parser and dies as a line-anchored PARSE_ERROR,
+  which is a better diagnostic than a usage line anyway.
 
 ## Table mode
 
