@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sqlmpeg"
-version = "0.12.3"
+version = "0.13.0"
 description = "SQL frontend for FFmpeg filtergraphs"
 readme = "README.md"
 keywords = ["ffmpeg", "sql", "filter", "filtergraphs"]
