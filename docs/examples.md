@@ -577,3 +577,19 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -i tests/fixtures/smptebars.mp4 -filter_com
 ```
 
 A video gap in an outer join fills with `COALESCE(b.track, ffmpeg.color())` - black by default, size, rate and duration inherited from the paired row. A caption gap fills with `COALESCE(b.track, sqlmpeg.empty_captions())`: the track exists and takes its language tag, it just contains zero cues - nobody generates your subtitles for you.
+
+## 29. Assert what you're shipping
+
+A subscripted track has the same metadata columns a row does: `f.audio[1].language` is the first track's tag, right there in a `WHERE`. Since the predicate evaluates at compile time, this is an assertion - if track 1 isn't English, the script refuses to compile instead of quietly shipping the wrong language. (`f.audio[1]` itself is sugar for `f.audio[1].track`; the strictly-Postgres spelling `(f.audio[1]).language` works too.)
+
+```pgsql
+SELECT f.audio[1] FROM input('tests/fixtures/av2.mp4') f
+WHERE f.audio[1].language = 'eng'
+```
+
+```
+$ sqlmpeg compile -f query.sql -o eng.m4a
+ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng eng.m4a
+```
+
+Recipe 23 answers "give me whichever track is English"; this one answers "I believe track 1 is English - stop me if I'm wrong". Same wiring out the other end, different contract.
