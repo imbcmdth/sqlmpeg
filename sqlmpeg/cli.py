@@ -67,6 +67,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -80,6 +81,7 @@ from .errors import SqlmpegError
 from .ir import Graph
 from .prompt import build_system_prompt
 from .table import TableSink, render_csv, render_table
+from .vars import substitute
 
 __all__ = ["main"]
 
@@ -120,11 +122,21 @@ def main(argv: list[str] | None = None) -> int:
 
 _QUERY_HELP = "SQL query text (exactly one of this or -f/--file is required)"
 _FILE_HELP = "read the query from a file instead of the command line ('-' for stdin)"
+_SET_HELP = "define a variable for :name/:'name'/:\"name\" substitution (repeatable)"
 
 
 def _add_query_arguments(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument("query", nargs="?", default=None, help=_QUERY_HELP)
     subparser.add_argument("-f", "--file", default=None, help=_FILE_HELP)
+    subparser.add_argument(
+        "-v",
+        "--set",
+        dest="set_vars",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help=_SET_HELP,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -187,13 +199,42 @@ def _read_file(path: str) -> str | None:
         return None
 
 
+_VAR_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _parse_set_vars(pairs: list[str], command: str) -> tuple[dict[str, str] | None, int]:
+    """Parse repeated ``-v/--set NAME=VALUE`` pairs into a dict (last wins).
+
+    Returns ``(variables, 0)`` on success, or ``(None, 2)`` with a usage
+    error already printed to stderr for a malformed pair: no ``=``, or a
+    name outside ``[A-Za-z_][A-Za-z0-9_]*``.
+    """
+    variables: dict[str, str] = {}
+    for pair in pairs:
+        name, sep, value = pair.partition("=")
+        if not sep or _VAR_NAME_RE.fullmatch(name) is None:
+            print(
+                f"error: {command}: malformed -v/--set {pair!r}, want "
+                "NAME=VALUE with NAME matching [A-Za-z_][A-Za-z0-9_]*",
+                file=sys.stderr,
+            )
+            return None, 2
+        variables[name] = value
+    return variables, 0
+
+
 def _resolve_query(args: argparse.Namespace) -> tuple[str | None, int]:
     """Resolve the query text for compile/explain/validate/run.
 
     Exactly one of the positional ``query`` (inline SQL) or ``-f/--file`` is
     required. Returns ``(text, 0)`` on success, or ``(None, exit_code)`` with
-    the error already printed to stderr: 2 for the usage violation (both or
-    neither given), 1 for a file that could not be read.
+    the error already printed to stderr: 2 for a usage violation (both or
+    neither given; a malformed ``-v``), 1 for a file that could not be read.
+
+    ``-v/--set`` substitution (plan 069) runs here, once, so every handler
+    inherits it. A `SqlmpegError` from an undefined variable reference is
+    not caught here -- it propagates to the caller's own `SqlmpegError`
+    handling, the same as any other compile-time rejection.
     """
     has_query = args.query is not None
     has_file = args.file is not None
@@ -213,9 +254,14 @@ def _resolve_query(args: argparse.Namespace) -> tuple[str | None, int]:
         text = _read_file(args.file)
         if text is None:
             return None, 1
-        return text, 0
-    assert args.query is not None
-    return args.query, 0
+    else:
+        assert args.query is not None
+        text = args.query
+
+    variables, code = _parse_set_vars(args.set_vars, args.command)
+    if variables is None:
+        return None, code
+    return substitute(text, variables), 0
 
 
 def _maybe_print_file_hint(err: SqlmpegError, source: str | None) -> None:
@@ -275,6 +321,23 @@ def _output_paths(out_path: str | None, graph: Graph) -> list[str]:
     return [unit.path for unit in graph.sinks if unit.path is not None]
 
 
+def _is_table_capable_query(text: str) -> bool:
+    """True if `text` fails media compilation but succeeds as a table/csv
+    query -- the RFC-011 fallback `compile` and `validate` both try before
+    giving up on a `SqlmpegError` from `compile_sql`."""
+    try:
+        is_table_capable, _has_copy = classify(text)
+    except SqlmpegError:
+        return False
+    if not is_table_capable:
+        return False
+    try:
+        compile_table_sql(text)
+    except SqlmpegError:
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # table/csv queries (RFC-011, plan 067)
 # ---------------------------------------------------------------------------
@@ -314,11 +377,11 @@ def _print_table_sinks(sinks: list[TableSink]) -> int:
 
 
 def _cmd_compile(args: argparse.Namespace) -> int:
-    text, code = _resolve_query(args)
-    if text is None:
-        return code
-
+    text: str | None = None
     try:
+        text, code = _resolve_query(args)
+        if text is None:
+            return code
         graph = compile_sql(text)
         emitted = emit(graph)
     except SqlmpegError as err:
@@ -332,19 +395,12 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         # already failed, and only for a query that could even BE one (no
         # media COPY at all, or every COPY a csv one); its own failure just
         # surfaces the original error, which is usually the more informative
-        # one (e.g. UNKNOWN_FUNCTION).
-        try:
-            is_table_capable, _has_copy = classify(text)
-        except SqlmpegError:
-            is_table_capable = False
-        if is_table_capable:
-            try:
-                compile_table_sql(text)
-            except SqlmpegError:
-                pass
-            else:
-                print(_TABLE_USAGE_HINT, file=sys.stderr)
-                return 2
+        # one (e.g. UNKNOWN_FUNCTION). ``text`` is None here only when `err`
+        # came from `-v` substitution itself (plan 069), which cannot be
+        # table-capable either -- guarded, not fed to `classify`.
+        if text is not None and _is_table_capable_query(text):
+            print(_TABLE_USAGE_HINT, file=sys.stderr)
+            return 2
         _print_error(err, source=args.query)
         return 1
 
@@ -368,11 +424,10 @@ def _cmd_compile(args: argparse.Namespace) -> int:
 
 
 def _cmd_explain(args: argparse.Namespace) -> int:
-    text, code = _resolve_query(args)
-    if text is None:
-        return code
-
     try:
+        text, code = _resolve_query(args)
+        if text is None:
+            return code
         graph = compile_sql(text)
     except SqlmpegError as err:
         _print_error(err, source=args.query)
@@ -383,29 +438,22 @@ def _cmd_explain(args: argparse.Namespace) -> int:
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:
-    text, code = _resolve_query(args)
-    if text is None:
-        return code
-
+    text: str | None = None
     try:
+        text, code = _resolve_query(args)
+        if text is None:
+            return code
         compile_sql(text)
     except SqlmpegError as err:
         # RFC-011: unchanged in spirit ("compiles = valid") -- a table/csv
         # query now compiles too, through its own lenient pipeline, tried
         # here as a fallback exactly like `compile`'s (see its comment): a
         # plain sinkless SELECT of real streams already succeeded above and
-        # never reaches this branch.
-        try:
-            is_table_capable, _has_copy = classify(text)
-        except SqlmpegError:
-            is_table_capable = False
-        if is_table_capable:
-            try:
-                compile_table_sql(text)
-            except SqlmpegError:
-                pass
-            else:
-                return 0
+        # never reaches this branch. ``text`` is None here only when `err`
+        # came from `-v` substitution (plan 069) -- guarded, not fed to
+        # `classify`.
+        if text is not None and _is_table_capable_query(text):
+            return 0
         if args.as_json:
             # Machine contract: stdout stays pure JSON, the library error
             # verbatim. The file-hint is human-output sugar only, so it goes
@@ -420,11 +468,10 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    text, code = _resolve_query(args)
-    if text is None:
-        return code
-
     try:
+        text, code = _resolve_query(args)
+        if text is None:
+            return code
         is_table_capable, has_copy = classify(text)
     except SqlmpegError as err:
         _print_error(err, source=args.query)

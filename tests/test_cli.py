@@ -789,3 +789,93 @@ def test_explicit_run_and_default_dispatch_agree(
     default_out = capsys.readouterr().out
     assert code_explicit == code_default == 0
     assert explicit_out == default_out
+
+
+# ---------------------------------------------------------------------------
+# -v/--set CLI variables (plan 069)
+# ---------------------------------------------------------------------------
+
+VAR_QUERY = "SELECT scale(a.frame, 640, 480) FROM input(:'path') a"
+
+
+def test_compile_with_v_substitutes(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["compile", VAR_QUERY, "-v", "path=x.mp4"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "x.mp4" in out
+
+
+def test_compile_with_set_alias(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["compile", VAR_QUERY, "--set", "path=x.mp4"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "x.mp4" in out
+
+
+def test_duplicate_v_last_wins(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["compile", VAR_QUERY, "-v", "path=first.mp4", "-v", "path=second.mp4"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "second.mp4" in out
+    assert "first.mp4" not in out
+
+
+@pytest.mark.parametrize("bad_pair", ["noequals", "1bad=x", "=novame"])
+def test_malformed_v_exits_2(bad_pair: str, capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["compile", VALID_QUERY, "-v", bad_pair])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert "error:" in captured.err
+    assert "-v/--set" in captured.err
+
+
+def test_missing_var_through_compile(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["compile", VAR_QUERY])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert "UNSUPPORTED_SQL" in captured.err
+    assert "path" in captured.err
+
+
+def test_missing_var_through_validate_json(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["validate", "--json", VAR_QUERY])
+    captured = capsys.readouterr()
+    assert code == 1
+
+    data = json.loads(captured.out)
+    assert data["code"] == "UNSUPPORTED_SQL"
+    assert "path" in data["message"]
+
+
+def test_naked_dispatch_accepts_v(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """`run`'s own parser must know -v -- naked dispatch (no explicit `run`
+    token) reuses it, so this pins that it isn't lost along the way."""
+    query = _write_sql(tmp_path, VAR_QUERY)
+    code = cli.main(["-f", query, "-v", "path=x.mp4"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "(1 row)" in captured.out
+
+
+def test_unused_v_is_silent(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["compile", VALID_QUERY, "-v", "unused=1"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.err == ""
+
+
+def test_v_accepted_on_explain(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["explain", VAR_QUERY, "-v", "path=x.mp4"])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["inputs"] == ["x.mp4"]
+
+
+def test_v_accepted_on_run(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["run", VAR_QUERY, "-v", "path=x.mp4"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "(1 row)" in captured.out
