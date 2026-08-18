@@ -1,17 +1,12 @@
-"""Sink option table for sqlmpeg (RFC-002, plan 025).
+"""Sink option table for sqlmpeg.
 
 Guardrail #4: the option table is DATA, not code. ``SINK_OPTIONS`` is the
-single source of truth that drives ``COPY ... TO 'path' WITH (...)``
-validation (plan 026's lower), rendering into ffmpeg args (plan 027's emit),
-docs, and the LLM system prompt. No option-specific logic should live
-anywhere else -- every sink-visible option's behavior is expressed here as a
-``SinkOptionSpec``.
+single source of truth driving ``COPY ... TO 'path' WITH (...)`` validation,
+emit, docs and the LLM prompt. No option-specific logic lives anywhere else --
+every sink-visible option's behavior is a ``SinkOptionSpec`` field.
 
-v1 set is exactly RFC-002's table: ``video_codec``, ``audio_codec``, ``crf``,
-``preset``, ``pix_fmt``, ``video_bitrate``, ``audio_bitrate``,
-``sample_rate``, ``format``, ``faststart``. No ``extra_args`` escape hatch --
-arbitrary flag passthrough would break "reject, never approximate"; the
-table grows instead.
+No ``extra_args`` escape hatch: arbitrary flag passthrough would break
+"reject, never approximate"; the table grows instead.
 """
 
 from __future__ import annotations
@@ -131,11 +126,10 @@ SINK_OPTIONS: dict[str, SinkOptionSpec] = {
 }
 
 
-# CSV option table (RFC-011, plan 067): a COPY ... WITH (FORMAT csv, ...) sink
-# takes exactly these two options -- a media option (video_codec, crf, ...)
-# in a csv COPY is a typed rejection against THIS table, not SINK_OPTIONS, and
-# the reverse (a csv-only option like `header` in a media COPY) is already a
-# typed rejection against SINK_OPTIONS today, since `header` was never in it.
+# CSV option table: a COPY ... WITH (FORMAT csv, ...) sink takes
+# exactly these two. A media option in a csv COPY is rejected against THIS
+# table, not SINK_OPTIONS; `header` in a media COPY is rejected against
+# SINK_OPTIONS, which never held it.
 CSV_OPTIONS: dict[str, SinkOptionSpec] = {
     "format": SinkOptionSpec(
         name="format",
@@ -172,13 +166,11 @@ def validate_option(
 ) -> object:
     """Validate one COPY ... WITH (name value) pair against SINK_OPTIONS.
 
-    Returns the normalized value on success. Raises ``SqlmpegError`` with
-    ``UNKNOWN_SINK_OPTION`` if ``name`` isn't in the table, or
-    ``SINK_OPTION_TYPE`` if ``value``'s type doesn't match the spec's
-    declared type. Bools accept `true`/`false`; ints reject floats and
-    strings (bool is a subclass of int in Python but never accepted where
-    an int is declared, and never confused with the bool case since that is
-    checked first).
+    Returns the normalized value. Raises ``UNKNOWN_SINK_OPTION`` for a name
+    not in the table, ``SINK_OPTION_TYPE`` for a value whose type doesn't
+    match the spec. Bools accept `true`/`false`; ints reject floats, strings
+    and bools (a Python bool is an int subclass, so the bool case is checked
+    first and `isinstance(value, bool)` guards the int case).
     """
     return _validate_against(SINK_OPTIONS, name, value, line=line, col=col)
 
@@ -192,9 +184,8 @@ def validate_csv_option(
 ) -> object:
     """Validate one COPY ... WITH (name value) pair against CSV_OPTIONS.
 
-    A separate table from ``SINK_OPTIONS`` (RFC-011, plan 067): a media
-    option like ``video_codec`` in a csv COPY is unknown here, and gets its
-    own typed rejection rather than borrowing the media one.
+    A separate table from ``SINK_OPTIONS``: a media option like
+    ``video_codec`` is unknown here and gets its own typed rejection.
     """
     return _validate_against(CSV_OPTIONS, name, value, line=line, col=col)
 

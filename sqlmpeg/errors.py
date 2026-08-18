@@ -15,29 +15,19 @@ class ErrorCode(str, Enum):
     UNKNOWN_FUNCTION = "UNKNOWN_FUNCTION"
     UNKNOWN_ALIAS = "UNKNOWN_ALIAS"
     UDF_ARG_TYPE = "UDF_ARG_TYPE"
-    SINGLE_OUTPUT_ONLY = "SINGLE_OUTPUT_ONLY"  # retired in v2: multi-column SELECT
-    # is legal now (RFC-001); kept in the enum for the docs' sake, not raised
-    # by any v2 code path.
+    SINGLE_OUTPUT_ONLY = "SINGLE_OUTPUT_ONLY"  # retired; never raised
     NO_STREAMING_EQUIVALENT = "NO_STREAMING_EQUIVALENT"
-    CONCAT_MISMATCH = "CONCAT_MISMATCH"  # reserved for v1 probing
+    CONCAT_MISMATCH = "CONCAT_MISMATCH"  # reserved; never raised
     UNSUPPORTED_SQL = "UNSUPPORTED_SQL"  # catch-all for constructs outside dialect
     STREAM_NOT_FOUND = "STREAM_NOT_FOUND"  # probed subscript out of range
-    INPUT_NOT_FOUND = "INPUT_NOT_FOUND"  # */splat/broadcast needs a readable
-    # input and there is none
-    BROADCAST_MISMATCH = "BROADCAST_MISMATCH"  # zip length mismatch across
-    # broadcast-expanded array arguments
-    UNKNOWN_SINK_OPTION = "UNKNOWN_SINK_OPTION"  # COPY ... WITH (...) names an
-    # option not in sqlmpeg.sink.SINK_OPTIONS
-    SINK_OPTION_TYPE = "SINK_OPTION_TYPE"  # COPY ... WITH (...) option value
-    # doesn't match its declared type (str/int/bool)
-    UNKNOWN_FILTER_OPTION = "UNKNOWN_FILTER_OPTION"  # a `name => value` argument
-    # names an option the ffmpeg filter it targets does not have (RFC-003)
-    FILTER_OPTION_TYPE = "FILTER_OPTION_TYPE"  # a `name => value` argument's value
-    # does not match the option's introspected type, range or constant set
-    UNKNOWN_INPUT_OPTION = "UNKNOWN_INPUT_OPTION"  # input('path', name => value)
-    # names an option not in sqlmpeg.inputs.INPUT_OPTIONS
-    INPUT_OPTION_TYPE = "INPUT_OPTION_TYPE"  # input('path', name => value)'s
-    # value doesn't match its declared type (str/int/bool/num)
+    INPUT_NOT_FOUND = "INPUT_NOT_FOUND"  # */splat/broadcast with no readable input
+    BROADCAST_MISMATCH = "BROADCAST_MISMATCH"  # zip length mismatch across arrays
+    UNKNOWN_SINK_OPTION = "UNKNOWN_SINK_OPTION"  # name not in sink.SINK_OPTIONS
+    SINK_OPTION_TYPE = "SINK_OPTION_TYPE"  # value vs declared str/int/bool
+    UNKNOWN_FILTER_OPTION = "UNKNOWN_FILTER_OPTION"  # `name => value` the filter lacks
+    FILTER_OPTION_TYPE = "FILTER_OPTION_TYPE"  # value vs introspected type/range/consts
+    UNKNOWN_INPUT_OPTION = "UNKNOWN_INPUT_OPTION"  # name not in inputs.INPUT_OPTIONS
+    INPUT_OPTION_TYPE = "INPUT_OPTION_TYPE"  # value vs declared str/int/bool/num
     INTERNAL = "INTERNAL"  # bug backstop; fuzz asserts this never fires
 
 

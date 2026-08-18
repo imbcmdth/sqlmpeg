@@ -8,6 +8,9 @@ Delete: narrative blocks restating the code, plan/RFC archaeology that
 git history already records ("plan 051 did X", "an earlier draft..."),
 comments explaining a change's correctness to a reviewer, restated
 docstring content, section banners that a blank line serves as well.
+SHARPENED (maintainer, mid-wave): EVERY RFC/plan-number citation goes -
+"stop mentioning RFCs in comments that no one will read" - module
+docstrings included. Keep the fact, drop the citation.
 
 ## Preservation guardrails (NON-NEGOTIABLE)
 - MEASURED FACTS stay: every empirically-pinned behavior record - the

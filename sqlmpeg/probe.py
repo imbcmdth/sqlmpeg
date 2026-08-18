@@ -1,15 +1,14 @@
-"""ffprobe wrapper for sqlmpeg (RFC-001 "Probing policy").
+"""ffprobe wrapper for sqlmpeg.
 
-`probe()` NEVER raises. Every failure mode -- a URL-scheme input, a missing
-file, ffprobe absent from PATH and its provisioner both, a nonzero ffprobe
-exit, a 5s timeout, or unparseable JSON -- returns `None`, and callers fall
-back to symbolic lowering (see plans/rfc-001-stream-aware.md, "Probing
-policy"). This module depends only on `sqlmpeg.ir` (for `StreamType`),
-`sqlmpeg.binaries` (for locating ffprobe) and the stdlib; it must never
-import anything else from the package.
+`probe()` NEVER raises. Every failure mode -- a missing file, ffprobe absent
+from PATH and its provisioner both, a nonzero ffprobe exit, a timeout, or
+unparseable JSON -- returns `None`, and callers fall back to symbolic
+lowering. This module depends only on `sqlmpeg.ir` (`StreamType`),
+`sqlmpeg.binaries` (locating ffprobe) and the stdlib; it must never import
+anything else from the package.
 
 A local-path existence check runs BEFORE `binaries.ffprobe_path()` is even
-consulted (RFC-010): a missing file is `None` with no subprocess AND no
+consulted: a missing file is `None` with no subprocess AND no
 provider lookup, which matters because the provider's first call may trigger
 a ~95MB download -- paying that once per compile for an input that does not
 even exist would be its own footgun.
@@ -37,16 +36,12 @@ _REMOTE_TIMEOUT_SECONDS = 15.0
 
 @dataclass(frozen=True)
 class StreamMeta:
-    """RFC-009 "Columns": audio rows carry channels/channel_layout/sample_rate,
-    video rows carry width/height/fps/color_transfer; codec/bitrate/duration
-    are common to both. Every new field is opportunistic like the rest of
-    this module -- absent or wrong-typed in ffprobe's JSON means None, never
-    a raised exception (see `_int_opt`/`_float_opt`/`_str_opt`).
-
-    The plan 060 fields all default to None so pre-existing call sites that
-    build a `StreamMeta` directly (e.g. test_lower.py's fake-probe helper,
-    firewalled from this plan) keep compiling unchanged -- None is exactly
-    what they mean anyway (opportunistic, "not supplied").
+    """Audio rows carry channels/channel_layout/sample_rate, video rows carry
+    width/height/fps/color_transfer; codec/bitrate/duration
+    are common to both. Every field is opportunistic -- absent or wrong-typed
+    in ffprobe's JSON means None, never an exception (see
+    `_int_opt`/`_float_opt`/`_str_opt`), and a defaulted field means exactly
+    that: not supplied.
     """
 
     type: StreamType
@@ -89,14 +84,12 @@ def probe(path: str) -> ProbeResult | None:
     is not on PATH or via its provisioner, ffprobe exits nonzero or times
     out, or its output is not the JSON shape we expect.
 
-    A spec containing "://" is handed to ffprobe VERBATIM: ffprobe is the
-    authority on its own protocols (http, https, file, rtmp, ...), so a
-    remote input probes over the network -- naming a URL is asking for
-    exactly that -- and an unsupported scheme fails into the same permissive
-    None every other unreadable input gets. Remote probes get a longer
-    timeout (manifest + init-segment fetches) and are memoized by the spec
-    string alone; there is no mtime to key on, so the cache is per-process
-    "what this URL said when we asked".
+    A spec containing "://" is handed to ffprobe VERBATIM -- ffprobe is the
+    authority on its own protocols, so a remote input probes over the network
+    and an unsupported scheme fails into the same permissive None. Remote
+    probes get a longer timeout and are memoized by the spec string alone:
+    there is no mtime to key on, so the cache is per-process "what this URL
+    said when we asked".
     """
     if "://" in path:
         cache_key: _CacheKey = (path, -1, -1)

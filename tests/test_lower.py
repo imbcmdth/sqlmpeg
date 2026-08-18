@@ -1,4 +1,4 @@
-"""Tests for the lower pass and the compiler pipeline (plans 005, 019, 020).
+"""Tests for the lower pass and the compiler pipeline.
 
 These go through the real parser: lowering is only ever handed a ``Resolved``
 that ``resolve`` accepted, so hand-built inputs would test a shape that cannot
@@ -8,13 +8,13 @@ synthetic :class:`~sqlmpeg.probe.ProbeResult`.
 
 Paths in these queries deliberately do not exist, so ``compile_sql``'s
 opportunistic probing degrades to symbolic lowering without shelling out
-(RFC-001 "Probing policy"); probe-dependent behavior — which is ALL of
+; probe-dependent behavior — which is ALL of
 broadcasting, since an array's length comes from the file — is exercised
 either with a hand-built ``ProbeResult`` through ``lower`` directly, or, for
 the real thing, in an ``exec``-marked test against ``tests/fixtures/av.mp4``
 (1 audio track) and ``tests/fixtures/av2.mp4`` (2 language-tagged tracks).
 
-Tier-2 behavior (RFC-003) is tested twice over: once against a `Registry`
+Tier-2 behavior is tested twice over: once against a `Registry`
 built from the captured ffmpeg output embedded below, so the default suite
 stays offline and machine-independent, and once (``exec``-marked) against the
 real installed ffmpeg, where only what ffmpeg itself guarantees is asserted.
@@ -75,7 +75,7 @@ def _readme_block(needle: str, *, exclude: str | None = None) -> str:
     """The one ```sql block of README.md containing `needle`, verbatim.
 
     `exclude`, if given, drops any block that ALSO contains that substring --
-    needed for the Encoding section (plan 028), whose ```sql block wraps the
+    needed for the Encoding section, whose ```sql block wraps the
     flagship query verbatim in `COPY (...)`, so it contains every needle the
     flagship's own block does (e.g. "commentary").
     """
@@ -208,7 +208,7 @@ _LAYOUT_TYPES: dict[str, StreamType] = {
 def _layout_probe(
     layout: str, tags: dict[int, dict[str, str]] | None = None
 ) -> ProbeResult:
-    """A ProbeResult in FILE order, written as a compact layout (RFC-004).
+    """A ProbeResult in FILE order, written as a compact layout.
 
     One character per stream -- ``v``/``a``/``s``/``d`` -- so ``"vasd"`` is the
     four-type container a star has to expand in order, and ``"vas"`` is
@@ -242,7 +242,7 @@ def _layout_probe(
 
 
 # ---------------------------------------------------------------------------
-# the README flagship: PiP composite + broadcast-zip mix (plan 024)
+# the README flagship: PiP composite + broadcast-zip mix
 # ---------------------------------------------------------------------------
 
 
@@ -321,7 +321,7 @@ def test_readme_flagship_command_is_the_real_compilation(_fixtures: None) -> Non
 
 
 # ---------------------------------------------------------------------------
-# the README Encoding section: the flagship wrapped in COPY (plan 028)
+# the README Encoding section: the flagship wrapped in COPY
 # ---------------------------------------------------------------------------
 
 
@@ -331,7 +331,7 @@ def _readme_encoding_sql() -> str:
 
     Needled on 'pip.mkv' (its TO destination), not the more obvious 'COPY (':
     the Views and multiple outputs section's ladder script also opens with
-    COPY ( now, which would make that needle match two blocks.
+    'COPY (', which would make that needle match two blocks.
     """
     sql = _readme_block("pip.mkv")
     for shown, fixture in _FLAGSHIP_README_PATHS.items():
@@ -375,7 +375,7 @@ def test_readme_encoding_command_is_the_real_compilation(_fixtures: None) -> Non
 
 
 # ---------------------------------------------------------------------------
-# the README "Views and multiple outputs" example (RFC-006, plan 048)
+# the README "Views and multiple outputs" example
 # ---------------------------------------------------------------------------
 #
 # Explicit subscripts only (`f.video[1]`, `f.audio[1]`), so this compiles
@@ -511,7 +511,7 @@ def test_frame_cannot_be_subscripted() -> None:
 
 
 # ---------------------------------------------------------------------------
-# broadcasting: bare arrays splat (plan 020)
+# broadcasting: bare arrays splat
 # ---------------------------------------------------------------------------
 
 
@@ -559,7 +559,7 @@ def test_a_one_stream_array_still_splats() -> None:
 
 
 def test_unprobeable_bare_array_cannot_be_enumerated() -> None:
-    """No probe -> no length -> INPUT_NOT_FOUND, the natural error (RFC-001)."""
+    """No probe -> no length -> INPUT_NOT_FOUND, the natural error."""
     err = _reject("SELECT a.audio FROM input('nope.mp4') a")
     assert err.code is ErrorCode.INPUT_NOT_FOUND
     assert "cannot enumerate the streams of 'nope.mp4'" in err.message
@@ -947,7 +947,7 @@ def test_concat_after_agreeing_amix_keeps_the_shared_language() -> None:
 
 
 # ---------------------------------------------------------------------------
-# WHERE on an INPUT alias -> input-level seek (RFC-004 amendment, plan 035)
+# WHERE on an INPUT alias -> input-level seek
 #
 # An input alias owns its own -i, so its window becomes Graph.input_trims and
 # emit renders -ss/-to in front of that -i. No filter node is spliced and the
@@ -1105,7 +1105,7 @@ def test_the_seek_covers_the_whole_input_selected_or_not() -> None:
 
 
 # ---------------------------------------------------------------------------
-# open-ended input windows (plan 039): >= / <=, either operand order, merging
+# open-ended input windows: >= / <=, either operand order, merging
 # ---------------------------------------------------------------------------
 
 
@@ -1196,7 +1196,7 @@ def test_a_scalar_cte_column_cannot_be_subscripted() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CTE array columns: splat, broadcast again, subscript (plan 020)
+# CTE array columns: splat, broadcast again, subscript
 # ---------------------------------------------------------------------------
 
 
@@ -1272,7 +1272,7 @@ def test_a_single_array_video_cte_column_is_not_frame_sugar() -> None:
 
 def test_where_trims_a_cte_column_by_its_type() -> None:
     """A CTE name is a filtergraph pad, not an -i, so its window stays a FILTER
-    trim (RFC-004: the one surviving use of trim/atrim)."""
+    trim (the one surviving use of trim/atrim)."""
     g = _lower(
         "WITH c AS (SELECT a.audio[1] AS snd FROM input('x.mp4') a) "
         "SELECT c.snd FROM c WHERE c.t BETWEEN 1 AND 2"
@@ -2183,7 +2183,7 @@ def test_pipeline_output_survives_a_round_trip_through_dicts(_fixtures: None) ->
 
 
 # ---------------------------------------------------------------------------
-# COPY ... TO ... WITH (...) -- the sink (RFC-002, plan 026)
+# COPY ... TO ... WITH (...) -- the sink
 # ---------------------------------------------------------------------------
 
 SINK_QUERY = "SELECT a.frame FROM input('x.mp4') a"
@@ -2321,7 +2321,7 @@ def test_sink_does_not_change_the_graph_shape() -> None:
 
 
 # ---------------------------------------------------------------------------
-# input() named options (RFC-005 SS4, plan 041)
+# input() named options
 # ---------------------------------------------------------------------------
 
 
@@ -2585,7 +2585,7 @@ xfade AVOptions:
    expr              <string>     ..FV....... set expression for custom transition
 
 """,
-    # -- array-returning filters (RFC-006, plan 047). All three are `->N` and
+    # -- array-returning filters. All three are `->N` and
     # so are FENCED out of the registry's tables; their option blocks are
     # still reachable through `Registry.fenced_options`, which is what makes
     # them callable through the namespace. Real ffmpeg 7.1 captures.
@@ -2619,7 +2619,7 @@ extractplanes AVOptions:
      a                            ..FV....... set alpha plane
 
 """,
-    # -- generated sources (RFC-005 SS1, plan 042). Same lazy `-help` path a
+    # -- generated sources. Same lazy `-help` path a
     # regular filter's options take; the short/long alias pairs (size/s,
     # rate/r, duration/d, frequency/f, ...) are real ffmpeg 7.1 captures.
     "testsrc": """\
@@ -2878,7 +2878,7 @@ def test_excluded_filters_are_not_callable(_registry: Registry) -> None:
     multiple outputs (feedback) and sources (testsrc) are all in the fixture's
     -filters output but excluded, so lowering never sees them at all.
 
-    `acrossover` is array-RETURNING (plan 047) and callable as
+    `acrossover` is array-RETURNING and callable as
     `ffmpeg.acrossover(...)`, but that table is namespace-only: the BARE name
     resolves exactly as it always did, which is not at all."""
     for sql in (
@@ -3722,7 +3722,7 @@ def test_an_unrelated_qualified_call_is_still_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-006 (plan 047): array-RETURNING filters
+# RFC-006: array-RETURNING filters
 # ---------------------------------------------------------------------------
 #
 # `channelsplit`, `acrossover` and `extractplanes` are `->N` filters, fenced
@@ -3842,7 +3842,7 @@ def test_acrossover_takes_either_list_separator(_registry: Registry, split: str)
 
 
 def test_a_single_numeric_split_is_two_bands(_registry: Registry) -> None:
-    """A `<string>` option also takes a bare number (RFC-003), so the count
+    """A `<string>` option also takes a bare number, so the count
     rule reads the rendered text either way."""
     g = _dyn(
         "SELECT ffmpeg.acrossover(a.audio[1], split => 800) FROM input('x.mp4') a",
@@ -4086,16 +4086,15 @@ def test_an_array_call_emits_one_label_per_pad(_registry: Registry) -> None:
 # plan 051: everything still works OFFLINE, through the captured snapshot
 # ---------------------------------------------------------------------------
 #
-# RFC-007 deleted --portable: there is no curated subset to fall back on, so
-# "does this compile without ffmpeg" is answered by handing lowering a registry
-# built from `tests/data/reference_registry.json` instead of from PATH. These
-# pin that the four surfaces the wave had to preserve -- generated sources, the
-# timeline `enable` option, the array-returning trio and broadcasting -- are
-# all reachable that way, with `binaries.ffmpeg_path` stubbed to None (RFC-010:
-# not just `shutil.which`, so this stays offline even when the `static-ffmpeg`
-# provisioner is actually installed and cached) and `subprocess.run`
-# booby-trapped so a single introspection call would fail loudly rather than
-# silently rescue the test.
+# There is no curated subset to fall back on, so "does this compile without
+# ffmpeg" is answered by handing lowering a registry built from
+# `tests/data/reference_registry.json` instead of from PATH. These pin that
+# generated sources, the timeline `enable` option, the array-returning trio and
+# broadcasting are all reachable that way, with `binaries.ffmpeg_path` stubbed
+# to None (not just `shutil.which`, so this stays offline even when the
+# `static-ffmpeg` provisioner is installed and cached) and `subprocess.run`
+# booby-trapped so a single introspection call fails loudly rather than
+# silently rescuing the test.
 
 
 @pytest.fixture
@@ -4357,7 +4356,7 @@ def test_an_n_input_node_is_split_like_any_other(_registry: Registry) -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-005 SS1 (plan 042): FROM ffmpeg.<source>(...) alias
+# RFC-005 SS1: FROM ffmpeg.<source>(...) alias
 # ---------------------------------------------------------------------------
 #
 # Offline, against the same fixture registry: the fixture's `-filters` block
@@ -4602,7 +4601,7 @@ def test_a_source_works_inside_a_cte(_registry: Registry) -> None:
 
 
 def test_the_silent_audio_union_all_branch(_registry: Registry) -> None:
-    """The headline (RFC-005 SS1): a real clip concatenated with a generated
+    """The headline: a real clip concatenated with a generated
     segment whose audio is silence, so both branches agree on (video, audio)
     and `concat` has something to join."""
     g = _dyn(
@@ -4657,7 +4656,7 @@ def test_an_unknown_alias_hint_lists_source_aliases(_registry: Registry) -> None
 
 
 # ---------------------------------------------------------------------------
-# RFC-005 SS2 (plan 043): the timeline `enable` named argument
+# RFC-005 SS2: the timeline `enable` named argument
 # ---------------------------------------------------------------------------
 #
 # Offline again, and the fixture `-filters` block is what makes it possible:
@@ -4803,7 +4802,7 @@ def test_enable_without_a_registry_never_gets_that_far() -> None:
 
 def test_enable_broadcasts_onto_every_element(_registry: Registry) -> None:
     """A named extra is validated once and merged into each element's node
-    (RFC-003); `enable` is no different."""
+; `enable` is no different."""
     g = _dyn(
         "SELECT gblur(a.video, enable => 'gt(t,1)') FROM input('x.mp4') a",
         _registry,
@@ -4815,7 +4814,7 @@ def test_enable_broadcasts_onto_every_element(_registry: Registry) -> None:
     ]
 
 
-# RFC-005 SS3 (plan 043)'s "expr parameter kind" (a stdlib FUNCTIONS-table
+# RFC-005 SS3's "expr parameter kind" (a stdlib FUNCTIONS-table
 # concept: which stdlib slots took a quoted expression vs. a bare number) is
 # dead post-RFC-007 -- there is no stdlib table anymore, only the registry's
 # own option types (num/str/bool/enum), covered by the dynamic-call tests
@@ -4827,7 +4826,7 @@ def test_enable_broadcasts_onto_every_element(_registry: Registry) -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-003: the same shapes against the REAL installed ffmpeg (plan 031)
+# RFC-003: the same shapes against the REAL installed ffmpeg
 # ---------------------------------------------------------------------------
 #
 # The offline tests above pin the semantics against captured fixtures; these
@@ -5282,7 +5281,7 @@ def test_the_real_trim_filter_runs_through_the_namespace(
 
 
 # ---------------------------------------------------------------------------
-# scripts + CREATE VIEW (RFC-006, plan 045)
+# scripts + CREATE VIEW
 # ---------------------------------------------------------------------------
 #
 # A view is to STATEMENTS what a CTE is to branches, and lower treats it as
@@ -5358,7 +5357,7 @@ def test_a_view_column_error_still_names_the_view() -> None:
     assert err.line == 2
 
 
-# --- multiple sinks (RFC-006 wave 2, plan 046) -----------------------------
+# --- multiple sinks (RFC-006 wave 2) -----------------------------
 
 _TWO_SINKS = (
     "CREATE VIEW m AS SELECT a.frame AS v FROM input('film.mkv') a;\n"
@@ -5440,7 +5439,7 @@ def test_a_view_based_query_runs(_av_fixture: str, tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# track rows: unnest, row columns, WHERE, ORDER BY (RFC-009, plan 061)
+# track rows: unnest, row columns, WHERE, ORDER BY
 # ---------------------------------------------------------------------------
 #
 # Synthetic probes throughout: what a row table holds is decided entirely by
@@ -5839,7 +5838,7 @@ def test_a_track_row_query_runs_end_to_end(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# subscript metadata WHERE assertions (RFC-009 addendum, plan 064)
+# subscript metadata WHERE assertions
 # ---------------------------------------------------------------------------
 #
 # Same synthetic probes `_row_probes`/`_ROW_TRACKS` already builds for the
@@ -5947,7 +5946,7 @@ def test_dot_track_sugar_works_as_a_call_argument_too() -> None:
 
 
 # ---------------------------------------------------------------------------
-# track-row JOINs and COALESCE fills (RFC-009, plan 062)
+# track-row JOINs and COALESCE fills
 # ---------------------------------------------------------------------------
 #
 # Synthetic probes again: a join is decided entirely by the probed columns, so

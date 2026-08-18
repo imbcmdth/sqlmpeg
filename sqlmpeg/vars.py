@@ -1,4 +1,4 @@
-"""psql-style variable substitution for query text (plan 069).
+"""psql-style variable substitution for query text.
 
 ``substitute(text, variables)`` scans `text` for three reference forms --
 ``:'name'`` (quoted string literal), ``:"name"`` (quoted identifier), and

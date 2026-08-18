@@ -1,24 +1,21 @@
-"""The LLM system prompt for sqlmpeg (plan 012; rewritten 053b, RFC-007).
+"""The LLM system prompt for sqlmpeg.
 
 ``build_system_prompt()`` returns the text a user hands to whatever model they
 like as a system prompt, so that "describe the edit in English, get a runnable
 ffmpeg command" works without sqlmpeg ever calling an API itself.
 
-RFC-007 collapsed the old two-tier stdlib/dynamic split into ONE calling
-convention: every function is either a filter of the installed ffmpeg (bare
-or ``ffmpeg.<name>``) or one of three ``sqlmpeg.<name>`` macros. There is no
-longer a "base" and a "dynamic" prompt -- ``build_system_prompt(registry)``
-takes a :class:`~sqlmpeg.registry.Registry` straight through and renders one
-"Functions" section from it.
+There is ONE calling convention: every function is either a filter of the
+installed ffmpeg (bare or ``ffmpeg.<name>``) or a ``sqlmpeg.<name>`` macro.
+``build_system_prompt(registry)`` takes a
+:class:`~sqlmpeg.registry.Registry` and renders one "Functions" section
+from it.
 
-RFC-010 (ffmpeg is required) retired the OLD no-registry fallback as a
-documented mode: a ``Registry`` is now a REQUIRED argument, not an optional
-one defaulting to ``None`` -- sqlmpeg always has ffmpeg (PATH or the
-``static-ffmpeg`` provisioner), so a caller always has a real registry to
-pass. ``registry.available()`` being False here means the provisioner
-FAILED, not that "no ffmpeg" is a normal, supported state; guardrail #7
-still requires this to degrade to a typed note rather than crash (see
-``_NO_REGISTRY_NOTE``), but that note now says so plainly.
+The ``Registry`` is a REQUIRED argument, never optional: sqlmpeg always has
+ffmpeg (PATH or the ``static-ffmpeg`` provisioner), so a caller always has a
+real registry to pass. ``registry.available()`` being False means the
+provisioner FAILED, not that "no ffmpeg" is a supported state; guardrail #7
+still requires that to degrade to a typed note rather than crash (see
+``_NO_REGISTRY_NOTE``), and the note says so plainly.
 
 Two properties the committed doc must keep:
 
@@ -60,10 +57,6 @@ from sqlmpeg.sink import SINK_OPTIONS
 __all__ = ["build_system_prompt"]
 
 
-# ---------------------------------------------------------------------------
-# role
-# ---------------------------------------------------------------------------
-
 _ROLE = """\
 # sqlmpeg SQL
 
@@ -76,10 +69,6 @@ unless you are explicitly asked for them. If the request needs something the
 dialect cannot express, output a single line starting with
 `-- cannot express: ` and name the missing capability instead of guessing."""
 
-
-# ---------------------------------------------------------------------------
-# dialect
-# ---------------------------------------------------------------------------
 
 _DIALECT_HEAD = """\
 ## Dialect
@@ -468,14 +457,12 @@ on one is `UNSUPPORTED_SQL`, with the message saying so."""
 
 
 def _dialect_section() -> str:
-    """## Dialect, with the input-options bullets (RFC-005 SS4, plan 041)
+    """## Dialect, with the input-options bullets
     rendered from INPUT_OPTIONS spliced in after the Sources bullets."""
     return "\n".join((_DIALECT_HEAD, _input_options_section(), _DIALECT_TAIL))
 
 
-# ---------------------------------------------------------------------------
-# output: COPY ... TO ... WITH (...) (option table rendered from SINK_OPTIONS)
-# ---------------------------------------------------------------------------
+# The output section: option table rendered from SINK_OPTIONS.
 
 _OUTPUT_HEADER = """\
 ## Output
@@ -528,10 +515,6 @@ def _output_section() -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# rejections
-# ---------------------------------------------------------------------------
-
 _REJECTED = """\
 ## Rejected
 
@@ -563,21 +546,16 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   captions at all)."""
 
 
-# ---------------------------------------------------------------------------
-# function reference (RFC-007, plan 053b): rendered from the live Registry
-# ---------------------------------------------------------------------------
+# The function reference, rendered from the live Registry -- machine-dependent
+# by design, since what a bare or `ffmpeg.<name>` call resolves to is exactly
+# what THIS installed ffmpeg reports. Name, pad signature, one-line doc, sorted
+# alphabetically; no per-filter option dump (~460 filters' worth of option
+# tables would be enormous, and `validate --json`'s UNKNOWN_FILTER_OPTION /
+# FILTER_OPTION_TYPE cover that long tail instead).
 #
-# Unlike the old stdlib table, this is genuinely machine-dependent -- what a
-# bare or `ffmpeg.<name>` call resolves to is exactly what THIS installed
-# ffmpeg reports. Name, pad signature, one-line doc, sorted alphabetically;
-# no per-filter option dump (~460 filters' worth of option tables would be
-# enormous -- validate --json's UNKNOWN_FILTER_OPTION / FILTER_OPTION_TYPE
-# cover that long tail instead). `registry.available()` being False here
-# (guardrail #7 -- a broken provisioner must still fail typed, not crash)
-# degrades to one explanatory note instead; that is the only part of
-# `build_system_prompt` that can vary given the same registry, and it is not
-# a normal, expected mode any more (RFC-010: ffmpeg is required) -- the note
-# says plainly that this means the provisioner failed.
+# `registry.available()` being False degrades to one explanatory note
+# (guardrail #7: a broken provisioner must fail typed, not crash). That note is
+# the only part of `build_system_prompt` that can vary given the same registry.
 
 _NO_REGISTRY_NOTE = (
     "This registry is unavailable, which means the ffmpeg provisioner failed "
@@ -620,10 +598,6 @@ def _function_reference(registry: Registry) -> str:
     lines.extend(_filter_line(name, registry) for name in names)
     return "\n".join(lines)
 
-
-# ---------------------------------------------------------------------------
-# worked examples
-# ---------------------------------------------------------------------------
 
 # (natural-language request, query). Every query here is compiled by
 # tests/test_prompt.py -- an example that does not compile fails the build.
@@ -729,11 +703,9 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
 )
 
 # Examples that broadcast a bare array need a real, readable file to know how
-# many streams to expand over -- compile_sql cannot size an array symbolically
-# (see "Broadcasting" above). tests/test_prompt.py extracts and compiles every
-# ```sql fence as a promise that it succeeds standalone against whatever path
-# it names, so these are fenced ```sql-probed instead: a distinct tag the
-# extractor does not match, deliberately excluding them from that guarantee.
+# many streams to expand over. tests/test_prompt.py compiles every ```sql fence
+# as a promise it succeeds standalone, so these are fenced ```sql-probed: a
+# distinct tag the extractor does not match.
 _PROBED_EXAMPLES: tuple[tuple[str, str], ...] = (
     (
         "Add echo/reverb to every audio track in film.mkv, whatever language "
@@ -814,9 +786,7 @@ def _examples() -> str:
     return "\n".join(lines).rstrip()
 
 
-# ---------------------------------------------------------------------------
-# repair loop (keyed by ErrorCode -- every code must have guidance)
-# ---------------------------------------------------------------------------
+# The repair loop, keyed by ErrorCode: every code must have guidance.
 
 _REPAIR_HEADER = """\
 ## Repair loop
@@ -988,15 +958,10 @@ def _repair_section() -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# public entry point
-# ---------------------------------------------------------------------------
-
-
 def build_system_prompt(registry: Registry) -> str:
     """The sqlmpeg system prompt: ASCII, no trailing newline.
 
-    `registry` is REQUIRED (RFC-010: ffmpeg is always there, PATH or the
+    `registry` is REQUIRED (ffmpeg is always there, PATH or the
     provisioner, so there is always a real registry to pass) and is the only
     thing that can vary the output -- everything else here is pure, with no
     I/O, clock, or environment of its own. `sqlmpeg prompt` passes the live

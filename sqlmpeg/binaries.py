@@ -1,25 +1,19 @@
-"""ffmpeg/ffprobe binary discovery for sqlmpeg (RFC-010 "ffmpeg is required").
+"""ffmpeg/ffprobe binary discovery for sqlmpeg.
 
-sqlmpeg requires BOTH ffmpeg and ffprobe. Discovery is PATH-first -- a system
-install always wins, so a video engineer who already has ffmpeg set up never
-gets a second one they didn't ask for -- falling back to the ``static-ffmpeg``
-provisioning package (a default dependency, vetted at RFC-010 implementation
-time: it is the only candidate found that ships ffprobe as well as ffmpeg,
-downloading a static prebuilt pair on first use for win32/darwin/darwin_arm64/
-linux/linux_arm64 from ``github.com/zackees/ffmpeg_bins`` and caching them
-under its own package directory) only when nothing is on PATH.
+sqlmpeg requires BOTH ffmpeg and ffprobe. Discovery is PATH-first, so a system
+install always wins; only when nothing is on PATH does it fall back to the
+``static-ffmpeg`` provisioning package (a default dependency, chosen because
+it is the only candidate that ships ffprobe as well as ffmpeg, fetching a
+static prebuilt pair on first use and caching it under its own package dir).
 
 ``ffmpeg_path()`` / ``ffprobe_path()`` are the ONLY entry points other modules
-should use to locate these binaries -- :mod:`sqlmpeg.registry`,
-:mod:`sqlmpeg.probe` and :mod:`sqlmpeg.cli`'s ``run`` command all route
-through here instead of calling ``shutil.which`` directly, so there is
-exactly one place that knows about the provider fallback.
+may use to locate these binaries -- :mod:`sqlmpeg.registry`,
+:mod:`sqlmpeg.probe` and :mod:`sqlmpeg.cli`'s ``run`` route through here
+rather than ``shutil.which``, so one place knows about the provider fallback.
 
-Both NEVER raise and return ``None`` when a binary is on neither PATH nor
-delivered by the provider -- which, since the provider is a default
-dependency, only happens if it failed (a broken install, an unwritable cache
-directory, no network on its first-use download, ...). ``INSTALL_HINT`` is
-the user-facing wording for that case.
+Both NEVER raise; they return ``None`` when a binary is on neither PATH nor
+delivered by the provider (a broken install, unwritable cache dir, no network
+on first use). ``INSTALL_HINT`` is the user-facing wording for that case.
 """
 
 from __future__ import annotations
@@ -36,12 +30,10 @@ INSTALL_HINT = (
 def _provider_paths() -> tuple[str, str] | None:
     """``(ffmpeg, ffprobe)`` from the ``static-ffmpeg`` provisioner, or None.
 
-    Lazy import: ``static_ffmpeg`` is a default dependency, but importing it
-    -- and, on first use, having it download a ~95MB binary pair -- at module
-    load time would pay that cost even on the (common) path where PATH
-    already has both binaries. Never raises: an absent or broken provider
-    package, a failed download, or any other provisioning error degrades to
-    None, exactly like a PATH miss.
+    Imported lazily: at module load it would cost a ~95MB first-use download
+    even on the common path where PATH already has both binaries. Never
+    raises -- an absent or broken provider, a failed download, or any other
+    provisioning error degrades to None, exactly like a PATH miss.
     """
     try:
         from static_ffmpeg.run import get_or_fetch_platform_executables_else_raise

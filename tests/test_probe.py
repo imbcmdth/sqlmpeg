@@ -339,7 +339,7 @@ def test_per_type_index_counted_in_file_order(
     assert [s.index for s in result.streams] == [0, 0, 1]
 
 
-# --- probe enrichment (RFC-009, plan 060): opportunistic, never raises -----
+# --- probe enrichment: opportunistic, never raises -----
 
 
 def test_enrichment_fields_absent_default_to_none(
@@ -528,7 +528,7 @@ def _fixtures() -> Path:
 
 @pytest.mark.exec
 def test_probe_avs_fixture_has_subtitle_stream_with_language_tag(_fixtures: Path) -> None:
-    """avs.mkv (RFC-004, plan 033): av.mp4 + subs.en.vtt muxed with -c:s srt."""
+    """avs.mkv: av.mp4 + subs.en.vtt muxed with -c:s srt."""
     result = probe(str(_fixtures / "avs.mkv"))
     assert result is not None
     assert len(result.streams) == 3
@@ -587,7 +587,7 @@ def test_probe_av_fixture_has_video_and_audio(_fixtures: Path) -> None:
 
 @pytest.mark.exec
 def test_probe_av_eng_fixture_language_and_duration(_fixtures: Path) -> None:
-    """av-eng.mp4 (RFC-009): one eng-tagged audio track, ~2s -- both the
+    """av-eng.mp4: one eng-tagged audio track, ~2s -- both the
     per-stream and the container-level duration."""
     result = probe(str(_fixtures / "av-eng.mp4"))
     assert result is not None
@@ -602,7 +602,7 @@ def test_probe_av_eng_fixture_language_and_duration(_fixtures: Path) -> None:
 
 @pytest.mark.exec
 def test_probe_stereo_fixture_channel_layout(_fixtures: Path) -> None:
-    """stereo.mp4 (RFC-009): a real 2-channel `join` mux, channel_layout=stereo."""
+    """stereo.mp4: a real 2-channel `join` mux, channel_layout=stereo."""
     result = probe(str(_fixtures / "stereo.mp4"))
     assert result is not None
 
@@ -614,7 +614,7 @@ def test_probe_stereo_fixture_channel_layout(_fixtures: Path) -> None:
 
 @pytest.mark.exec
 def test_probe_av2_fixture_bitrate_and_codec(_fixtures: Path) -> None:
-    """av2.mp4 (RFC-009): video + two audio tracks, all with a real codec name
+    """av2.mp4: video + two audio tracks, all with a real codec name
     and a positive bitrate from ffprobe."""
     result = probe(str(_fixtures / "av2.mp4"))
     assert result is not None

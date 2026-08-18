@@ -1,4 +1,4 @@
-"""Tests for the table/CSV renderer (RFC-011, plan 067).
+"""Tests for the table/CSV renderer.
 
 Format is PINNED byte-for-byte by cookbook recipes 30-32 (see
 tests/test_examples.py, which runs those through the CLI); this file is the

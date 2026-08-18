@@ -1,11 +1,10 @@
-"""Tests for queries/ -- ready-to-run programs distilled from the cookbook
-(plan 070).
+"""Tests for queries/ -- ready-to-run programs distilled from the cookbook.
 
 Parametrized over every ``queries/*.sql`` file: the header comment's
 ``-- variables:`` list supplies dummy ``-v NAME=VALUE`` pairs, and the file is
 compiled through ``sqlmpeg.cli.main``. ``validate`` is the harness verb rather
 than ``compile`` because ``tracks-to-csv.sql`` is a metadata/CSV query, which
-the ``compile`` subcommand refuses by design (RFC-011: ``compile`` wants an
+the ``compile`` subcommand refuses by design (``compile`` wants an
 ffmpeg command, ``validate`` accepts any compilable query, table or media) --
 one verb, uniform across all the query shapes here.
 

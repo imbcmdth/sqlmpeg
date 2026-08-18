@@ -1,65 +1,44 @@
 """Command-line interface for sqlmpeg.
 
 Thin wrapper around the library pipeline (``compile_sql`` -> ``emit`` ->
-``build_ffmpeg_args``). See the "CLI" section of sqlmpeg-project.md and
-plan 008 (plan 037 for the SQL-string-is-the-default-input convention below).
+``build_ffmpeg_args``). See the "CLI" section of sqlmpeg-project.md.
 
 Subcommands:
 
-* ``compile SQL [-f FILE] [--graph-only] [-o OUT]``
-  -- print the full ffmpeg command (POSIX-quoted via ``shlex.join``, even on
-  Windows -- it is documentation output, not something meant to be pasted
-  into cmd.exe), or just the ``-filter_complex`` string with
-  ``--graph-only``. Output path resolution (RFC-002, plan 027): ``-o`` if
-  given, else the query's ``COPY ... TO`` sink paths if it has any, else the
-  ``out.mp4`` placeholder (today's default). A multi-COPY script (RFC-006)
-  compiles to ONE ffmpeg command with one output file per COPY, so ``-o`` --
-  which names a single file -- is a usage error (exit 2) against it, naming
-  the paths the script found.
-* ``explain SQL [-f FILE]`` -- dump the IR graph
-  as JSON (the sinks, with their paths and options, are part of that JSON
-  already).
-* ``validate SQL [-f FILE] [--json]`` -- exit 0
-  silent on success; on error, exit 1 with either a one-line human message
-  or ``err.to_dict()`` JSON.
-* ``run SQL [-f FILE] [-o OUT] [--timeout SECS] [-y]`` -- compile and
-  execute ffmpeg as a subprocess (guardrail #6: argv list, no shell, timeout
-  enforced, stderr captured and surfaced on failure). Output path: ``-o`` if
-  given, else the query's sink paths, else a usage error (exit 2) -- unlike
-  ``compile``, ``run`` never falls back to a placeholder path. A multi-COPY
-  script runs as the single ffmpeg command it compiles to, writing every
-  COPY's file; ``-o`` against one is the same usage error ``compile`` gives.
-* ``prompt`` -- print the LLM system prompt (plan 012; rewritten 053b) to
-  stdout; takes no arguments and never touches the filesystem itself, though
-  it calls ``registry.load()`` to render the filter reference from this
-  machine's ``ffmpeg -filters``/``-help`` output.
+* ``compile SQL [-f FILE] [--graph-only] [-o OUT]`` -- print the full ffmpeg
+  command (POSIX-quoted via ``shlex.join`` even on Windows: it is
+  documentation output, not something to paste into cmd.exe), or just the
+  ``-filter_complex`` string with ``--graph-only``. Output path:
+  ``-o`` if given, else the query's ``COPY ... TO`` sink paths, else the
+  ``out.mp4`` placeholder. A multi-COPY script compiles to ONE
+  ffmpeg command with one output file per COPY, so ``-o`` -- one path -- is a
+  usage error (exit 2) against it, naming the paths the script found.
+* ``explain SQL [-f FILE]`` -- dump the IR graph as JSON, sinks included.
+* ``validate SQL [-f FILE] [--json]`` -- exit 0 silent on success; on error,
+  exit 1 with a one-line human message or ``err.to_dict()`` JSON.
+* ``run SQL [-f FILE] [-o OUT] [--timeout SECS] [-y]`` -- compile and execute
+  ffmpeg as a subprocess (guardrail #6: argv list, no shell, timeout
+  enforced, stderr surfaced on failure). Output path: ``-o``, else the
+  query's sink paths, else a usage error (exit 2) -- unlike ``compile``,
+  ``run`` never falls back to a placeholder. ``-o`` against a multi-COPY
+  script is the same usage error ``compile`` gives.
+* ``prompt`` -- print the LLM system prompt to stdout. Takes no arguments and
+  touches no files, but calls ``registry.load()`` to render the filter
+  reference from this machine's ``ffmpeg -filters``/``-help`` output.
 
-``compile``/``explain``/``validate``/``run`` take the query as SQL TEXT
-directly on the command line -- ``sqlmpeg compile "SELECT ... FROM
-input('x.mp4') a"`` -- since that is the common case. Pass ``-f/--file PATH``
-instead to read the query from a file (``-f -`` reads stdin, e.g. for the LLM
-repair loop's pipe). Exactly one of the positional SQL string or ``-f`` is
-required; giving both or neither is a usage error, exit 2.
+``compile``/``explain``/``validate``/``run`` take the query as SQL TEXT on
+the command line. ``-f/--file PATH`` reads it from a file instead (``-f -``
+reads stdin, e.g. for the LLM repair loop's pipe). Exactly one of the two is
+required; both or neither is a usage error, exit 2. If the positional string
+fails to compile and looks like a filename, a stderr hint suggests ``-f``
+(see ``_maybe_print_file_hint``).
 
-Muscle-memory guard: if the positional SQL string fails to compile -- ANY
-error code, since a bare filename like ``query.sql`` parses as a SQL column
-reference and fails as ``UNSUPPORTED_SQL``, not ``PARSE_ERROR`` -- and it
-looks like a file was meant instead (it names a path that exists, or ends in
-``.sql``/``.SQL``), a second stderr line suggests ``-f``. No legitimate query
-ever looks like a file path. This is CLI-layer-only sugar: it never touches
-``SqlmpegError`` or the machine-readable ``--json`` output, which always
-prints the library's error verbatim on stdout.
-
-``--no-probe`` is GONE (RFC-010): it made a READABLE file compile as if
-unreadable, which silently strips provenance metadata -- a determinism
-switch that changed the result. Opportunistic probing (RFC-001) already
-degrades silently on missing/unreadable inputs, which is the whole of what
-an offline compile ever needed.
-
-``--portable`` is GONE (RFC-007, plan 051). There is no longer a portable
-subset to compile against: every function is a filter of the installed
-ffmpeg, so "will this compile elsewhere" is answered by the ffmpeg build, not
-by a flag.
+Two flags are deliberately absent. ``--no-probe`` made a READABLE
+file compile as if unreadable, silently stripping provenance metadata -- a
+determinism switch that changed the result; opportunistic probing already
+degrades on unreadable inputs. ``--portable`` had no portable
+subset left to mean anything against: every function is a filter of the
+installed ffmpeg, so the ffmpeg build answers "will this compile elsewhere".
 """
 
 from __future__ import annotations
@@ -88,13 +67,12 @@ __all__ = ["main"]
 _DEFAULT_OUT = "out.mp4"
 _DEFAULT_TIMEOUT = 600
 
-# RFC-011, plan 067: `run` is the DEFAULT subcommand, unconditionally -- any
-# argv whose first token is not one of these five names IS run's argv, flags
-# included (`sqlmpeg -f q.sql`). No plausibility gating: a mistyped
-# subcommand falls through to run's SQL parser and dies as a line-anchored
-# PARSE_ERROR, a better diagnostic than a usage line. This also means
-# `sqlmpeg -h` shows run's help, not the top-level one -- an accepted trade,
-# since run IS the default.
+# `run` is the DEFAULT subcommand, unconditionally: any argv whose
+# first token is not one of these five names IS run's argv, flags included
+# (`sqlmpeg -f q.sql`). No plausibility gating -- a mistyped subcommand falls
+# through to run's SQL parser and dies as a line-anchored PARSE_ERROR, a
+# better diagnostic than a usage line. Consequence: `sqlmpeg -h` shows run's
+# help, not the top-level one.
 _SUBCOMMANDS = frozenset({"compile", "explain", "validate", "run", "prompt"})
 
 
@@ -113,11 +91,6 @@ def main(argv: list[str] | None = None) -> int:
 
     handler = _HANDLERS[args.command]
     return handler(args)
-
-
-# ---------------------------------------------------------------------------
-# argument parsing
-# ---------------------------------------------------------------------------
 
 
 _QUERY_HELP = "SQL query text (exactly one of this or -f/--file is required)"
@@ -183,11 +156,6 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# ---------------------------------------------------------------------------
-# shared helpers
-# ---------------------------------------------------------------------------
-
-
 def _read_file(path: str) -> str | None:
     """Read query text from `path` (or stdin for "-"). None + printed error on failure."""
     if path == "-":
@@ -231,10 +199,9 @@ def _resolve_query(args: argparse.Namespace) -> tuple[str | None, int]:
     the error already printed to stderr: 2 for a usage violation (both or
     neither given; a malformed ``-v``), 1 for a file that could not be read.
 
-    ``-v/--set`` substitution (plan 069) runs here, once, so every handler
-    inherits it. A `SqlmpegError` from an undefined variable reference is
-    not caught here -- it propagates to the caller's own `SqlmpegError`
-    handling, the same as any other compile-time rejection.
+    ``-v/--set`` substitution runs here, once, so every handler inherits it.
+    A `SqlmpegError` from an undefined variable reference is not caught here;
+    it propagates to the caller's own handling, like any other rejection.
     """
     has_query = args.query is not None
     has_file = args.file is not None
@@ -265,12 +232,10 @@ def _resolve_query(args: argparse.Namespace) -> tuple[str | None, int]:
 
 
 def _maybe_print_file_hint(err: SqlmpegError, source: str | None) -> None:
-    """Muscle-memory guard (plan 037): an inline positional string that names
-    an existing file, or ends in .sql/.SQL, probably meant -f/--file. Fires on
-    ANY compile error, not just PARSE_ERROR -- a bare filename like
-    `query.sql` parses as a SQL column reference and fails as UNSUPPORTED_SQL,
-    and no legitimate query ever looks like a file path. CLI-layer sugar only
-    -- never touches `err` itself."""
+    """Suggest -f when an inline positional string names an existing file or
+    ends in .sql/.SQL. Fires on ANY compile error, not just PARSE_ERROR: a
+    bare filename like `query.sql` parses as a SQL column reference and fails
+    as UNSUPPORTED_SQL. CLI sugar only -- never touches `err`."""
     if source is None:
         return
     if os.path.exists(source) or source.lower().endswith(".sql"):
@@ -296,9 +261,9 @@ def _check_output_dir(out_path: str) -> str | None:
 def _reject_output_override(cli_output: str | None, graph: Graph) -> str | None:
     """``-o`` names ONE file, so it is illegal against a multi-sink script.
 
-    RFC-006: a script's COPYs each carry their own destination, and one ``-o``
-    cannot stand in for several — it would silently write every group over the
-    same file. Returns the stderr message (usage error, exit 2), or None.
+    Each COPY carries its own destination, and one ``-o`` would
+    silently write every group over the same file. Returns the stderr message
+    (usage error, exit 2), or None.
     """
     if cli_output is None or len(graph.sinks) <= 1:
         return None
@@ -322,9 +287,8 @@ def _output_paths(out_path: str | None, graph: Graph) -> list[str]:
 
 
 def _is_table_capable_query(text: str) -> bool:
-    """True if `text` fails media compilation but succeeds as a table/csv
-    query -- the RFC-011 fallback `compile` and `validate` both try before
-    giving up on a `SqlmpegError` from `compile_sql`."""
+    """True if `text` succeeds as a table/csv query -- the fallback `compile`
+    and `validate` try before giving up on a `compile_sql` error."""
     try:
         is_table_capable, _has_copy = classify(text)
     except SqlmpegError:
@@ -337,10 +301,6 @@ def _is_table_capable_query(text: str) -> bool:
         return False
     return True
 
-
-# ---------------------------------------------------------------------------
-# table/csv queries (RFC-011, plan 067)
-# ---------------------------------------------------------------------------
 
 _TABLE_USAGE_HINT = (
     "error: compile has nothing to show: this query has no media destination "
@@ -371,11 +331,6 @@ def _print_table_sinks(sinks: list[TableSink]) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# subcommands
-# ---------------------------------------------------------------------------
-
-
 def _cmd_compile(args: argparse.Namespace) -> int:
     text: str | None = None
     try:
@@ -385,19 +340,14 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         graph = compile_sql(text)
         emitted = emit(graph)
     except SqlmpegError as err:
-        # RFC-011: `compile` shows an ffmpeg command, and there may genuinely
-        # be none to show -- a query whose SELECT list has no streaming
-        # representation at all (metadata columns, an un-COALESCEd join gap)
-        # fails HERE, not because it is sinkless. A plain sinkless SELECT of
-        # real streams (recipes 7/19: no COPY, no -o, still a normal ffmpeg
-        # command) is untouched -- it compiled above and never reaches this
-        # branch. Table mode is the fallback, tried only once compilation has
-        # already failed, and only for a query that could even BE one (no
-        # media COPY at all, or every COPY a csv one); its own failure just
-        # surfaces the original error, which is usually the more informative
-        # one (e.g. UNKNOWN_FUNCTION). ``text`` is None here only when `err`
-        # came from `-v` substitution itself (plan 069), which cannot be
-        # table-capable either -- guarded, not fed to `classify`.
+        # A query with no streaming representation at all (metadata
+        # columns, an un-COALESCEd join gap) fails HERE, so table mode is the
+        # fallback -- tried only after compilation failed, and only for a
+        # query that could BE one. A sinkless SELECT of real streams compiled
+        # above and never reaches this branch. If the fallback fails too, the
+        # original error surfaces; it is usually more informative.
+        # `text` is None only when `err` came from `-v` substitution, which
+        # cannot be table-capable either, so it is guarded out of `classify`.
         if text is not None and _is_table_capable_query(text):
             print(_TABLE_USAGE_HINT, file=sys.stderr)
             return 2
@@ -413,8 +363,8 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         print(override_error, file=sys.stderr)
         return 2
 
-    # `-o` if given; else each COPY's own path (build_ffmpeg_args reads them
-    # off the groups), with the placeholder standing in for a bare SELECT.
+    # `-o`, else each COPY's own path (build_ffmpeg_args reads them off the
+    # groups), with the placeholder standing in for a bare SELECT.
     out_path = args.output
     if out_path is None and _needs_out_path(graph):
         out_path = _DEFAULT_OUT
@@ -445,19 +395,13 @@ def _cmd_validate(args: argparse.Namespace) -> int:
             return code
         compile_sql(text)
     except SqlmpegError as err:
-        # RFC-011: unchanged in spirit ("compiles = valid") -- a table/csv
-        # query now compiles too, through its own lenient pipeline, tried
-        # here as a fallback exactly like `compile`'s (see its comment): a
-        # plain sinkless SELECT of real streams already succeeded above and
-        # never reaches this branch. ``text`` is None here only when `err`
-        # came from `-v` substitution (plan 069) -- guarded, not fed to
-        # `classify`.
+        # "compiles = valid" still holds: a table/csv query compiles through
+        # its own lenient pipeline, tried here exactly as in `_cmd_compile`.
         if text is not None and _is_table_capable_query(text):
             return 0
         if args.as_json:
-            # Machine contract: stdout stays pure JSON, the library error
-            # verbatim. The file-hint is human-output sugar only, so it goes
-            # to stderr even here rather than perturbing stdout.
+            # Machine contract: stdout is pure JSON, the library error
+            # verbatim. The file hint goes to stderr so it cannot perturb it.
             print(json.dumps(err.to_dict()))
             _maybe_print_file_hint(err, args.query)
         else:
@@ -481,10 +425,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(_CSV_DASH_O_ERROR, file=sys.stderr)
         return 2
 
-    # A csv COPY, or a bare SELECT with no `-o`: RFC-011's table/csv path.
-    # `-o` against a bare SELECT falls through to the media path below
-    # unchanged -- "`-o` stays as the implicit media COPY it always morally
-    # was" -- and no ffmpeg is needed at all for the table/csv path itself.
+    # A csv COPY, or a bare SELECT with no `-o`: the table/csv path, which
+    # needs no ffmpeg. `-o` against a bare SELECT falls through to the
+    # media path below -- `-o` IS an implicit media COPY.
     if is_table_capable and (has_copy or args.output is None):
         try:
             sinks = compile_table_sql(text)

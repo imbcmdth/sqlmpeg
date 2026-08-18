@@ -281,7 +281,7 @@ def test_graph_with_several_sinks_round_trips() -> None:
 
 
 # ---------------------------------------------------------------------------
-# subtitle / data stream types + src refs (RFC-004, plan 033)
+# subtitle / data stream types + src refs
 # ---------------------------------------------------------------------------
 
 
@@ -338,7 +338,7 @@ def test_node_outputs_reject_subtitle_data_type_strings_are_still_parseable() ->
 
 
 # ---------------------------------------------------------------------------
-# Graph.input_trims (RFC-004 input-seek amendment, plan 033)
+# Graph.input_trims (RFC-004 input-seek amendment)
 # ---------------------------------------------------------------------------
 
 
@@ -376,7 +376,7 @@ def test_graph_from_dict_tolerates_missing_input_trims_key() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Graph.input_trims open-ended windows (plan 039)
+# Graph.input_trims open-ended windows
 # ---------------------------------------------------------------------------
 
 
@@ -401,7 +401,7 @@ def test_graph_input_trims_open_lower_round_trips_as_json_null() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Graph.input_options (RFC-005 SS4, plan 041)
+# Graph.input_options
 # ---------------------------------------------------------------------------
 
 

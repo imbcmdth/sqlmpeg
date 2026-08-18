@@ -9,7 +9,7 @@ Fixtures below are REAL captured output from `ffmpeg -hide_banner -filters`
 and `ffmpeg -hide_banner -help filter=<name>` against
 `ffmpeg version 7.1-full_build-www.gyan.dev` (captured 2026-08), trimmed to
 representative subsets -- NOT retyped by hand. Exceptions are explicitly
-marked CONSTRUCTED below (synthetic snippets exercising RFC-table shapes --
+marked CONSTRUCTED below (synthetic snippets exercising option-table shapes --
 `binary`/`dictionary` types, malformed option lines -- that were not
 observed in a full scan of this ffmpeg build's ~460 included filters).
 """
@@ -276,7 +276,7 @@ aecho AVOptions:
 
 """
 
-# testsrc is a SOURCE filter (|->V) -- retained (plan 040) and reachable
+# testsrc is a SOURCE filter (|->V) -- retained and reachable
 # through the normal `Registry.options()` lazy path since testsrc IS a
 # known name (self._sources), unlike sinks/multi-output/dynamic sources
 # which stay fully excluded. Its short/long alias pairs (size/s, rate/r,
@@ -895,11 +895,11 @@ def test_scale_alias_dedup_regardless_of_file_order(monkeypatch: pytest.MonkeyPa
     )
     assert in_color_matrix.default == "auto"  # symbolic, not "-1"
     # The kept names are in ffmpeg's own declared order, which IS its
-    # positional binding order (plan 051): `scale=640:480` binds w,h.
+    # positional binding order: `scale=640:480` binds w,h.
     assert list(opts)[:3] == ["width", "height", "flags"]
 
 
-# --- dedup is ADJACENCY-scoped (plan 051) ---------------------------------
+# --- dedup is ADJACENCY-scoped ---------------------------------
 #
 # ffmpeg's positional binding (`process_options`) skips a duplicate AVOption
 # only when it sits IMMEDIATELY after the entry it aliases, so two same-doc

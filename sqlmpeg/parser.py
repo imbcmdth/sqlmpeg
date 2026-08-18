@@ -1,96 +1,91 @@
 """Parse + resolve passes for sqlmpeg.
 
 ``parse`` turns SQL text into a sqlglot AST (always ``read="postgres"``,
-guardrail #2). ``resolve`` validates that the AST stays inside the v0 dialect
+guardrail #2). ``resolve`` validates that the AST stays inside the dialect
 surface, builds the alias/CTE table, and assigns ffmpeg input indices.
 
-Neither function ever lets a sqlglot (or any other) exception escape: every
-rejection is a :class:`sqlmpeg.errors.SqlmpegError` with a typed code and, where
-sqlglot gives us token positions, a line/col anchor.
+Neither ever lets a sqlglot (or any other) exception escape: every rejection is
+a :class:`sqlmpeg.errors.SqlmpegError` with a typed code and, where sqlglot
+gives token positions, a line/col anchor.
 
 Notes for downstream passes (lower):
 
-* Input indices are keyed by ALIAS, not by path. Two aliases over the same file
-  produce two ``-i`` entries (the README PiP example is exactly this), so
-  ``input_paths`` may contain duplicates.
-* ``Resolved.select`` is the top-level query and may be an ``exp.Union`` when the
-  query is a ``UNION ALL``. Use ``Resolved.branches`` (or :func:`union_branches`
-  for CTE bodies) to get the flat list of branch selects.
-* Identifier names are normalized the Postgres way: unquoted identifiers are
-  lowercased, quoted ones are kept verbatim. ``sources`` keys are normalized.
-* The SELECT list may hold MORE THAN ONE projection (RFC-001: one column = one
-  output stream). ``SINGLE_OUTPUT_ONLY`` is retired; the parser only rejects an
-  empty projection list.
-* A statement may be wrapped in ``COPY (<query>) TO '<path>' WITH (<options>)``
-  (RFC-002). The COPY is peeled off into a ``Resolved.sinks`` entry and the
-  query it wraps goes through the EXACT same validation a bare SELECT does; a
-  bare SELECT leaves ``sinks`` empty. Only the shape is checked here — option
-  NAMES and VALUES are validated against ``sqlmpeg.sink.SINK_OPTIONS`` by lower.
+* Input indices are keyed by ALIAS, not by path. Two aliases over one file
+  produce two ``-i`` entries, so ``input_paths`` may contain duplicates.
+* ``Resolved.select`` may be an ``exp.Union`` (a ``UNION ALL`` query). Use
+  ``Resolved.branches``, or :func:`union_branches` for CTE bodies, for the
+  flat list of branch selects.
+* Identifier names are normalized the Postgres way: unquoted lowercased,
+  quoted verbatim. ``sources`` keys are normalized.
+* The SELECT list may hold MORE THAN ONE projection (one column = one output
+  stream); only an empty projection list is rejected.
+* A statement may be wrapped in ``COPY (<query>) TO '<path>' WITH (<options>)``.
+  The COPY is peeled off into a ``Resolved.sinks`` entry and the query it wraps
+  goes through the EXACT same validation a bare SELECT does; a bare SELECT
+  leaves ``sinks`` empty. Only the shape is checked here — option NAMES and
+  VALUES are validated against ``sqlmpeg.sink.SINK_OPTIONS`` by lower.
 
 * Input text may be a SCRIPT: ``CREATE VIEW <name> AS <query>;``* followed by
-  ``COPY ...;``+ (RFC-006). See :func:`_statements` and :meth:`_Resolver._view`
-  for the VERIFIED sqlglot shapes. A view is to STATEMENTS what a CTE is to
-  branches, so it is stored as one: ``Resolved.ctes`` is the flat, ordered
-  binding table (views AND CTEs, in definition order) that lower walks, and
-  ``Resolved.views`` names the subset that came from a ``CREATE VIEW``. A
-  binding may be ALIASED in FROM (``FROM master m``, plan 046): the alias is
-  branch-local — two branches, or two COPYs, may both spell it ``m`` — but it
-  may not shadow the flat namespace (:meth:`_Resolver._local_alias`).
-* Named function arguments (``gblur(a.frame, sigma => 5)``, RFC-003) are native
-  Postgres syntax: sqlglot parses each into an ``exp.Kwarg(this=Var(name),
-  expression=<value>)`` inside the call's ``expressions`` list. The resolver only
-  checks their SHAPE — named args must TRAIL the positional ones and may not
-  repeat — because which options exist is a property of the installed ffmpeg,
-  which only lower (and its registry) knows. Names are kept VERBATIM, not folded:
-  ffmpeg option names are case-sensitive (``gblur``'s ``sigmaV``).
+  ``COPY ...;``+. See :func:`_statements` and :meth:`_Resolver._view` for the
+  VERIFIED sqlglot shapes. A view is to STATEMENTS what a CTE is to branches,
+  so it is stored as one: ``Resolved.ctes`` is the flat, ordered binding table
+  (views AND CTEs, in definition order) that lower walks, and
+  ``Resolved.views`` names the subset from a ``CREATE VIEW``. A binding may be
+  ALIASED in FROM (``FROM master m``): the alias is branch-local — two
+  branches, or two COPYs, may both spell it ``m`` — but may not shadow the flat
+  namespace (:meth:`_Resolver._local_alias`).
+* Named function arguments (``gblur(a.frame, sigma => 5)``) are native Postgres
+  syntax: sqlglot parses each into an ``exp.Kwarg(this=Var(name),
+  expression=<value>)`` inside the call's ``expressions`` list. The resolver
+  checks their SHAPE only — named args must TRAIL the positional ones and may
+  not repeat — since which options exist is a property of the installed ffmpeg,
+  which only lower (and its registry) knows. Names are kept VERBATIM, never
+  folded: ffmpeg option names are case-sensitive (``gblur``'s ``sigmaV``).
 
-* ``SELECT *`` / ``SELECT <alias>.*`` (RFC-004) are accepted in PROJECTION
-  position only. VERIFIED shapes under sqlglot 30.17 ``read="postgres"``:
-  ``SELECT *`` puts a bare ``exp.Star()`` in the projection list, while
-  ``SELECT a.*`` puts an ``exp.Column(this=Star(), table=Identifier(a))`` —
-  two different shapes, both recognized by :func:`star_qualifier`. Everything
-  else a star can appear in (``scale(a.*, 0.5)``, ``a.*[1]``, ``* AS x``,
-  ``count(*)``, a star in WHERE) is still rejected: which streams a star
-  stands for is only knowable after probing, so it can only ever BE a column,
-  never feed one. The resolver checks the qualifier is a known alias; lower
-  does the expansion (it is the pass that has the probes).
+* ``SELECT *`` / ``SELECT <alias>.*`` are accepted in PROJECTION position only.
+  VERIFIED shapes under sqlglot 30.17 ``read="postgres"``: ``SELECT *`` puts a
+  bare ``exp.Star()`` in the projection list, ``SELECT a.*`` puts an
+  ``exp.Column(this=Star(), table=Identifier(a))`` — two shapes, both
+  recognized by :func:`star_qualifier`. Every other position a star can appear
+  in (``scale(a.*, 0.5)``, ``a.*[1]``, ``* AS x``, ``count(*)``, a star in
+  WHERE) is rejected: which streams a star stands for is knowable only after
+  probing, so it can BE a column but never feed one. The resolver checks the
+  qualifier is a known alias; lower, which has the probes, expands it.
 
-* The ``ffmpeg.<filter>(...)`` namespace (plan 038) needs nothing from this
-  pass but a reserved name. VERIFIED under sqlglot 30.17 ``read="postgres"``:
-  a qualified call parses as ``exp.Dot(this=Identifier(ffmpeg),
+* The ``ffmpeg.<filter>(...)`` namespace needs nothing from this pass but a
+  reserved name. VERIFIED under sqlglot 30.17 ``read="postgres"``: a qualified
+  call parses as ``exp.Dot(this=Identifier(ffmpeg),
   expression=exp.Anonymous(this=<filter>, expressions=[...]))`` for EVERY
   filter name, collision victims included — the builtin special-form grammars
   (``OVERLAY ... PLACING``, ``TRIM``, ``FORMAT``, ...) key on a bare name, so
-  qualifying it bypasses them completely, and ``=>`` arguments land in the
-  ``Anonymous`` as ordinary ``exp.Kwarg``s. The resolver therefore only
-  RESERVES the name ``ffmpeg`` (:meth:`_Resolver._reserve`) so no alias or CTE
-  can shadow the namespace; lower does the resolution.
+  qualifying bypasses them completely, and ``=>`` arguments land in the
+  ``Anonymous`` as ordinary ``exp.Kwarg``s. The resolver only RESERVES the name
+  ``ffmpeg`` (:meth:`_Resolver._reserve`) so no alias or CTE can shadow the
+  namespace; lower does the resolution.
 
-* The ``sqlmpeg.<name>(...)`` macro namespace (RFC-007, plan 052) is the SAME
-  shape, re-probed empirically and IDENTICAL: ``exp.Dot(this=Identifier(
-  sqlmpeg), expression=exp.Anonymous(this=<macro>, expressions=[...]))`` for
-  all three macro names (none collides with a Postgres special form, so the
-  namespace is optional there, but the shape does not care). ``sqlmpeg`` joins
-  ``ffmpeg`` as a second reserved qualifier (:data:`MACRO_NAMESPACE`,
-  :meth:`_Resolver._reserve`); lower resolves the call against
-  ``sqlmpeg.macros.MACROS`` and nowhere else.
+* The ``sqlmpeg.<name>(...)`` macro namespace is the SAME shape, re-probed
+  empirically and IDENTICAL: ``exp.Dot(this=Identifier(sqlmpeg),
+  expression=exp.Anonymous(this=<macro>, expressions=[...]))`` for all three
+  macro names (none collides with a Postgres special form, so the namespace is
+  optional there, but the shape does not care). ``sqlmpeg`` joins ``ffmpeg`` as
+  a second reserved qualifier (:data:`MACRO_NAMESPACE`); lower resolves the
+  call against ``sqlmpeg.macros.MACROS`` and nowhere else.
 
-* ``FROM ffmpeg.<source>(<named options>) alias`` (RFC-005 §1, plan 042) is the
-  SAME namespace in TABLE position, and it is a DIFFERENT sqlglot shape from
-  the call one above — a ``Dot`` never appears. VERIFIED under sqlglot 30.17
-  ``read="postgres"``, see the table in :meth:`_Resolver._add_source`:
-  ``FROM ffmpeg.testsrc(duration => 2) t`` parses as
-  ``exp.Table(this=Anonymous(testsrc, [Kwarg...]), db=Identifier(ffmpeg),
-  alias=TableAlias(t))`` — the qualifier lands in the Table's ``db`` slot
-  (``catalog`` too, for a three-part name), NOT wrapped around the call. The
-  parenthesis-less ``FROM ffmpeg.testsrc t`` is the same Table with an
-  ``Identifier`` rather than an ``Anonymous`` ``this``, which is how that form
-  is told apart and rejected with a hint. A generated source takes NO ffmpeg
-  input index — it is a zero-input filter node, there is no ``-i`` — so it
+* ``FROM ffmpeg.<source>(<named options>) alias`` is the same namespace in
+  TABLE position, and a DIFFERENT sqlglot shape from the call above — no
+  ``Dot`` appears. VERIFIED under sqlglot 30.17 ``read="postgres"``, see the
+  table in :meth:`_Resolver._add_source`: ``FROM ffmpeg.testsrc(duration => 2)
+  t`` parses as ``exp.Table(this=Anonymous(testsrc, [Kwarg...]),
+  db=Identifier(ffmpeg), alias=TableAlias(t))`` — the qualifier lands in the
+  Table's ``db`` slot (``catalog`` too, for a three-part name), NOT wrapped
+  around the call. The parenthesis-less ``FROM ffmpeg.testsrc t`` is the same
+  Table with an ``Identifier`` rather than an ``Anonymous`` ``this``, which is
+  how that form is told apart and rejected with a hint. A generated source
+  takes NO ffmpeg input index — a zero-input filter node has no ``-i`` — so it
   never enters ``input_paths``/``sources``; its record goes into
-  ``Resolved.source_filters`` instead. Which source names exist, and which
-  options they take, is the installed ffmpeg's business: this pass checks the
-  SHAPE only (alias mandatory, arguments named-only) and lower does the rest.
+  ``Resolved.source_filters``. Which source names exist, and which options they
+  take, is the installed ffmpeg's business: this pass checks SHAPE only (alias
+  mandatory, arguments named-only).
 
 * Stream subscripts (``a.video[1]``) arrive as ``exp.Bracket`` wrapping the
   ``exp.Column``. **sqlglot rebases the index at parse time**: under
@@ -98,11 +93,11 @@ Notes for downstream passes (lower):
   expression to ``expr - 1`` whenever it annotates it as an integer type, so
   ``a.video[1]`` holds ``Literal(0)`` and ``a.video[0]`` holds ``Neg(Literal(1))``.
   Never read ``Bracket.expressions[0]`` directly — use :func:`subscript_index`,
-  which undoes the rebase and hands back the 1-based number the user wrote.
+  which undoes the rebase and returns the 1-based number the user wrote.
 
-* ``unnest(<alias>.<type>) <row alias>`` in FROM (RFC-009, plan 061) is a
-  TRACK-ROW table: one row per stream of that array, one column per piece of
-  probed metadata (:data:`ROW_SCHEMAS`). Shapes VERIFIED under sqlglot 30.17
+* ``unnest(<alias>.<type>) <row alias>`` in FROM is a TRACK-ROW table: one row
+  per stream of that array, one column per piece of probed metadata
+  (:data:`ROW_SCHEMAS`). Shapes VERIFIED under sqlglot 30.17
   ``read="postgres"``:
 
   ==================================================== ==========================
@@ -135,33 +130,31 @@ Notes for downstream passes (lower):
                                                        the resolver)
   ==================================================== ==========================
 
-  JOIN node shapes, captured for wave 062 (all of them ``exp.Join`` entries in
-  the SAME ``Select.joins`` list a comma source uses):
-  ``JOIN`` -> ``args = this, on, pivots`` (no ``side``, no ``kind``);
-  ``LEFT JOIN`` -> ``side='LEFT'``; ``RIGHT JOIN`` -> ``side='RIGHT'``;
+  VERIFIED JOIN node shapes (all ``exp.Join`` entries in the SAME
+  ``Select.joins`` list a comma source uses): ``JOIN`` -> ``args = this, on,
+  pivots`` (no ``side``, no ``kind``); ``INNER JOIN`` -> ``kind='INNER'`` (no
+  ``side``); ``LEFT JOIN`` -> ``side='LEFT'``; ``LEFT OUTER JOIN`` ->
+  ``side='LEFT', kind='OUTER'``; ``RIGHT JOIN`` -> ``side='RIGHT'``;
   ``FULL OUTER JOIN`` -> ``side='FULL', kind='OUTER'``; ``FULL JOIN`` ->
   ``side='FULL'`` with NO ``kind``; ``CROSS JOIN`` -> ``kind='CROSS'`` with no
-  ``side`` and no ``on``. A comma source carries none of the five. Re-VERIFIED
-  for plan 062: ``INNER JOIN`` -> ``kind='INNER'`` (no ``side``),
-  ``LEFT OUTER JOIN`` -> ``side='LEFT', kind='OUTER'``, ``NATURAL JOIN`` ->
-  ``method='NATURAL'``, ``USING (col)`` -> ``using=[Identifier]``.
+  ``side`` and no ``on``; ``NATURAL JOIN`` -> ``method='NATURAL'``;
+  ``USING (col)`` -> ``using=[Identifier]``. A comma source carries none.
 
-* ``JOIN`` between two ``unnest`` tables (RFC-009, plan 062) is admitted —
-  INNER (``JOIN`` / ``INNER JOIN``), ``LEFT [OUTER]`` and ``FULL [OUTER]``,
-  each with a mandatory ``ON`` — and nowhere else: a join whose right side is
-  not an ``unnest``, or that stands before any row table has been bound, keeps
-  the old blanket rejection, and so do ``RIGHT``, ``CROSS``, ``NATURAL`` and
-  ``USING``. :func:`from_entries` pairs each FROM item with the
-  :class:`RawRowJoin` describing how it attaches (``"cross"`` for a comma
-  source), which is what lower evaluates the join from. The ``ON`` predicate is
-  061's row grammar with one addition: both operands may be row COLUMNS (of any
-  row tables in scope), which is the whole point — ``a.language = b.language``.
+* ``JOIN`` between two ``unnest`` tables is admitted — INNER (``JOIN`` /
+  ``INNER JOIN``), ``LEFT [OUTER]`` and ``FULL [OUTER]``, each with a mandatory
+  ``ON`` — and nowhere else: a join whose right side is not an ``unnest``, or
+  that stands before any row table is bound, is rejected, as are ``RIGHT``,
+  ``CROSS``, ``NATURAL`` and ``USING``. :func:`from_entries` pairs each FROM
+  item with the :class:`RawRowJoin` describing how it attaches (``"cross"`` for
+  a comma source), which is what lower evaluates the join from. The ``ON``
+  predicate is the row grammar plus one addition: both operands may be row
+  COLUMNS of any row table in scope — ``a.language = b.language``.
 
-* ``ORDER BY`` over track-row columns (RFC-009) is the ONE carve-out in the
+* ``ORDER BY`` over track-row columns is the ONE carve-out in the
   ``NO_STREAMING_EQUIVALENT`` fence: ``Select.args["order"]`` is admitted only
   when the branch's FROM clause holds at least one ``unnest`` (frames still
   never sort). VERIFIED: an ``exp.Ordered`` carries ``desc`` and
-  ``nulls_first`` as plain bools and sqlglot fills BOTH in from the Postgres
+  ``nulls_first`` as plain bools and sqlglot fills BOTH from the Postgres
   defaults — ``ASC`` gives ``nulls_first=False`` (NULLS LAST), ``DESC`` gives
   ``nulls_first=True`` (NULLS FIRST) — so honoring the flags verbatim IS
   Postgres semantics, explicit ``NULLS FIRST``/``LAST`` included.
@@ -203,15 +196,14 @@ __all__ = [
     "union_branches",
 ]
 
-# The reserved qualifier of the raw-filter namespace: `ffmpeg.<filter>(...)`
-# (plan 038). It is not an alias and never resolves against the FROM clause, so
-# no alias or CTE may claim the name (`_Resolver._reserve`).
+# The reserved qualifier of the raw-filter namespace, `ffmpeg.<filter>(...)`.
+# Not an alias, never resolved against the FROM clause, so no alias or CTE may
+# claim the name (`_Resolver._reserve`).
 FILTER_NAMESPACE = "ffmpeg"
 
-# The reserved qualifier of the macro namespace: `sqlmpeg.<name>(...)` (RFC-007,
-# plan 052). Joins FILTER_NAMESPACE as a second reserved alias/CTE name; the
-# macro table itself (`sqlmpeg.macros.MACROS`) is lower's business, not this
-# pass's.
+# The reserved qualifier of the macro namespace, `sqlmpeg.<name>(...)`. A
+# second reserved alias/CTE name; the macro table (`sqlmpeg.macros.MACROS`) is
+# lower's business, not this pass's.
 MACRO_NAMESPACE = "sqlmpeg"
 
 # A top-level (or CTE-level) query: a plain SELECT, or a UNION ALL of them.
@@ -248,11 +240,11 @@ _COPY_ALLOWED = frozenset({"this", "kind", "credentials", "files", "params"})
 
 # The only column names an INPUT alias exposes. A CTE alias exposes whatever its
 # body named with AS, so the whitelist does not apply there (lower checks those).
-# RFC-004 added `subtitle` and `data`: same array/subscript/splat surface as
-# video/audio, passthrough-only downstream (lower enforces that half).
+# `subtitle`/`data` have the same array/subscript/splat surface as video/audio
+# but are passthrough-only downstream (lower enforces that half).
 _INPUT_COLUMNS = frozenset({"frame", "video", "audio", "subtitle", "data", "t"})
 
-# The array columns `unnest(<alias>.<name>)` accepts (RFC-009). Exactly the
+# The array columns `unnest(<alias>.<name>)` accepts. Exactly the
 # array-typed half of `_INPUT_COLUMNS`: `frame` is one stream and `t` is a
 # timeline, and neither is a set of tracks.
 _UNNEST_COLUMNS = frozenset({"video", "audio", "subtitle", "data"})
@@ -276,10 +268,9 @@ _ROW_COMMON: dict[str, RowColumnType] = {
     "codec": "text",
 }
 
-# RFC-009 § Columns, plus the subtitle set from "Every stream type unnests".
 # `data` rows get the caption schema: a data track has no dimensions, no
-# channels and no frame rate either, and inventing columns a probe never fills
-# would just make every one of them NULL.
+# channels and no frame rate, and inventing columns a probe never fills would
+# just make every one of them NULL.
 ROW_SCHEMAS: dict[str, dict[str, RowColumnType]] = {
     "audio": _ROW_COMMON
     | {
@@ -373,9 +364,7 @@ _SUBSCRIPT_WHERE_HINT = (
 )
 
 
-# ---------------------------------------------------------------------------
 # position helpers
-# ---------------------------------------------------------------------------
 
 
 def _node_pos(node: exp.Expr) -> tuple[int, int] | None:
@@ -438,9 +427,7 @@ def _ident_name(node: exp.Expr | None) -> str:
     return str(node.name).lower()
 
 
-# ---------------------------------------------------------------------------
 # subscripts
-# ---------------------------------------------------------------------------
 
 
 def subscript_index(bracket: exp.Bracket) -> int | None:
@@ -469,16 +456,11 @@ def subscript_index(bracket: exp.Bracket) -> int | None:
     return int(text) + _INDEX_OFFSET
 
 
-# ---------------------------------------------------------------------------
-# subscript metadata accessors: <alias>.<type>[k].<column> (RFC-009 addendum,
-# plan 064)
-# ---------------------------------------------------------------------------
-
-
+# subscript metadata accessors: <alias>.<type>[k].<column>
 def subscript_metadata_shape(node: exp.Expr) -> tuple[exp.Bracket, str] | None:
     """Recognize ``<alias>.<type>[k].<column>``; return ``(bracket, name)``.
 
-    VERIFIED under sqlglot 30.17 ``read="postgres"`` (plan 064): both
+    VERIFIED under sqlglot 30.17 ``read="postgres"``: both
     ``f.audio[1].language`` and the strictly-Postgres cast spelling
     ``(f.audio[1]).language`` arrive as ``exp.Dot(this=Bracket(...) |
     Paren(Bracket(...)), expression=Identifier(<name>))`` — identical
@@ -511,9 +493,7 @@ def _accessor_label(bracket: exp.Bracket, name: str) -> str:
     return f"{alias}.{array_column}[{index}].{name}"
 
 
-# ---------------------------------------------------------------------------
-# stars (RFC-004)
-# ---------------------------------------------------------------------------
+# stars
 
 
 def star_qualifier(node: exp.Expr) -> str | None:
@@ -542,9 +522,7 @@ def star_qualifier(node: exp.Expr) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# named arguments (RFC-003)
-# ---------------------------------------------------------------------------
+# named arguments
 
 
 def kwarg_name(kwarg: exp.Kwarg) -> str:
@@ -561,11 +539,7 @@ def kwarg_name(kwarg: exp.Kwarg) -> str:
     return str(left.name)
 
 
-# ---------------------------------------------------------------------------
-# time predicates: WHERE <alias>.t ... (plan 039, open-ended windows)
-# ---------------------------------------------------------------------------
-
-
+# time predicates: WHERE <alias>.t ...
 def _time_bounds(
     conjunct: exp.Expr,
 ) -> tuple[exp.Column, exp.Expr | None, exp.Expr | None, bool] | None:
@@ -638,9 +612,7 @@ def _literal_seconds(node: exp.Literal) -> float | None:
         return None
 
 
-# ---------------------------------------------------------------------------
 # parse
-# ---------------------------------------------------------------------------
 
 
 def _parse_error_position(err: Exception) -> tuple[int, int]:
@@ -670,7 +642,7 @@ def _parse_error_message(err: Exception) -> str:
 def parse(text: str) -> exp.Expression:
     """Parse SQL text into a sqlglot AST using the Postgres dialect.
 
-    ONE statement comes back as itself; a SCRIPT (RFC-006) comes back as an
+    ONE statement comes back as itself; a SCRIPT comes back as an
     ``exp.Block`` whose ``expressions`` are the statements. :func:`_statements`
     is the only thing that should look at that distinction.
 
@@ -734,14 +706,12 @@ def _statements(tree: exp.Expr) -> list[exp.Expr]:
     return [statement for statement in tree.expressions if isinstance(statement, exp.Expr)]
 
 
-# ---------------------------------------------------------------------------
 # resolve
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class RawSinkOption:
-    """One ``WITH (name value)`` pair, still as sqlglot nodes (RFC-002).
+    """One ``WITH (name value)`` pair, still as sqlglot nodes.
 
     `name` is folded lowercase the Postgres way. `value` is the raw sqlglot
     node — lower turns it into a python str/int/bool and checks it against
@@ -762,21 +732,21 @@ class RawSinkOption:
 
 @dataclass(frozen=True)
 class RawSink:
-    """``COPY (query) TO 'path' WITH (...)`` as the parser saw it (RFC-002).
+    """``COPY (query) TO 'path' WITH (...)`` as the parser saw it.
 
     Shape only: the path is known to be a single string literal (or, for a
-    csv sink, possibly absent — ``TO STDOUT``, RFC-011) and the option names
+    csv sink, possibly absent — ``TO STDOUT``) and the option names
     to be unique, but nothing here has been checked against the option table
     yet. ``sqlmpeg.lower`` turns this into ``sqlmpeg.ir.SinkUnit`` (a media
-    COPY) or a table/CSV result (plan 067).
+    COPY) or a table/CSV result.
 
-    A sink carries the query it wraps (RFC-006): a script has one COPY per
+    A sink carries the query it wraps: a script has one COPY per
     OUTPUT GROUP, and each group is a whole query of its own. ``query`` and
     ``branches`` are the same pair ``Resolved.select``/``Resolved.branches``
     are for the single-sink case, fully validated — for a one-COPY statement
     they ARE that pair.
 
-    ``is_csv`` (RFC-011, plan 067) is True exactly when ``WITH (...)`` names
+    ``is_csv`` is True exactly when ``WITH (...)`` names
     ``format`` with value ``'csv'`` — Postgres's own rule for what makes a
     COPY a table sink rather than a media one. It is decided HERE, from the
     raw option shape alone, because it changes what the wrapped query is even
@@ -784,7 +754,7 @@ class RawSink:
     whether ``TO STDOUT`` is a legal target — both decided before the option
     VALUES are otherwise interpreted, which stays lower's job as always.
     ``path`` is None only for a csv sink's ``TO STDOUT``; a media sink's path
-    is always a real string, unchanged from RFC-002.
+    is always a real string.
     """
 
     path: str | None
@@ -797,16 +767,16 @@ class RawSink:
 
 @dataclass(frozen=True)
 class RawInputOption:
-    """One ``input('path', name => value)`` trailing named argument (RFC-005, plan 041).
+    """One ``input('path', name => value)`` trailing named argument.
 
     Shape only, mirroring ``RawSinkOption``: `lower` turns `value` into a
     python scalar and checks it against ``sqlmpeg.inputs.INPUT_OPTIONS``; the
     parser deliberately knows nothing about which options exist.
 
-    `name` is kept VERBATIM (see :func:`kwarg_name`) -- input options reuse
-    the ``name => value`` named-argument syntax RFC-003 gives every call,
-    NOT COPY's folded ``WITH (name value)`` one, so case matters exactly like
-    a dynamic filter option's name does.
+    `name` is kept VERBATIM (see :func:`kwarg_name`) -- input options reuse the
+    ``name => value`` named-argument syntax every call takes, NOT COPY's folded
+    ``WITH (name value)`` one, so case matters exactly as it does for a dynamic
+    filter option's name.
 
     `name_node` is the ``exp.Kwarg``'s ``Var`` (or the ``Kwarg`` itself, if
     that shape ever changes) -- it carries no token position, same gap a sink
@@ -823,7 +793,7 @@ class RawInputOption:
 
 @dataclass(frozen=True)
 class RawSourceOption:
-    """One ``ffmpeg.<source>(name => value)`` option (RFC-005 §1, plan 042).
+    """One ``ffmpeg.<source>(name => value)`` option.
 
     Shape only, exactly like :class:`RawInputOption` -- but validated against
     the INSTALLED ffmpeg's option table for that source filter (the same
@@ -844,7 +814,7 @@ class RawSourceOption:
 
 @dataclass(frozen=True)
 class RawSource:
-    """``FROM ffmpeg.<source>(<named options>) alias`` (RFC-005 §1, plan 042).
+    """``FROM ffmpeg.<source>(<named options>) alias``.
 
     A generated source has NO ffmpeg input index -- it lowers to a zero-input
     filter node, and there is no ``-i`` for it -- so it appears in
@@ -865,7 +835,7 @@ class RawSource:
 
 @dataclass(frozen=True)
 class RawRowJoin:
-    """How one FROM item attaches to the ones before it (RFC-009, plan 062).
+    """How one FROM item attaches to the ones before it.
 
     `kind` is ``"cross"`` (a comma source — and, between two row tables, the
     bounded compile-time cross join), ``"inner"``, ``"left"``, ``"full"``, or
@@ -882,7 +852,7 @@ class RawRowJoin:
 
 @dataclass(frozen=True)
 class RawTrackRows:
-    """``unnest(<source>.<column>) <alias>`` in FROM (RFC-009, plan 061).
+    """``unnest(<source>.<column>) <alias>`` in FROM.
 
     A track-row TABLE: one row per stream of that array, with the stream
     itself in the ``track`` column and each piece of probed metadata in a
@@ -981,7 +951,7 @@ def _bare_array_error(sub: exp.Column, fallback: exp.Expr) -> SqlmpegError | Non
     """``<alias>.<type>.<name>`` (no subscript) is a 3-part ``exp.Column``.
 
     Probed metadata belongs to ONE track; an array of them has none of its
-    own, so this shape is always wrong (plan 064) rather than merely a
+    own, so this shape is always wrong rather than merely a
     qualified name the generic rejection would also catch -- a dedicated
     check gives the specific fix (subscript one track, or unnest the array)
     instead of the generic "qualified column names" message.
@@ -1039,7 +1009,7 @@ def _join_spec(join: exp.Join) -> RawRowJoin:
     matrix in the module docstring, folded into the four kinds lower evaluates
     plus ``"right"``, which exists only so resolve can reject it by name. A
     comma source carries none of the args and is ``"cross"`` — the bounded
-    compile-time cross join between two row tables (RFC-009 § Fences).
+    compile-time cross join between two row tables.
     """
     side = str(join.args.get("side") or "").upper()
     kind = str(join.args.get("kind") or "").upper()
@@ -1086,7 +1056,7 @@ def from_items(select: exp.Select) -> list[exp.Expr]:
 
 
 def _has_unnest(select: exp.Select) -> bool:
-    """True if this branch's FROM clause holds at least one ``unnest`` (RFC-009)."""
+    """True if this branch's FROM clause holds at least one ``unnest``."""
     return any(isinstance(item, exp.Unnest) for item in from_items(select))
 
 
@@ -1196,13 +1166,11 @@ def union_branches(query: exp.Expr) -> list[exp.Select]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# COPY ... TO ... WITH (...)  — the sink wrapper (RFC-002)
-# ---------------------------------------------------------------------------
+# COPY ... TO ... WITH (...)  — the sink wrapper
 
 
 def _is_csv_format(options: tuple[RawSinkOption, ...]) -> bool:
-    """True if ``WITH (...)`` names ``format`` with value ``csv`` (RFC-011).
+    """True if ``WITH (...)`` names ``format`` with value ``csv``.
 
     Postgres's own rule: ``FORMAT csv`` is what makes a COPY a table sink,
     decided from the option SHAPE alone (its value need not even be a
@@ -1225,7 +1193,7 @@ def _sink(
     ``(path, path node, options, wrapped query, is_csv)``.
 
     The pieces rather than a :class:`RawSink`: a sink also carries its
-    VALIDATED query (RFC-006), and that validation is the resolver's job, so
+    VALIDATED query, and that validation is the resolver's job, so
     the record is assembled there once the query has been through it.
 
     Shape only — the option table is lower's business. VERIFIED shapes under
@@ -1236,7 +1204,7 @@ def _sink(
     * ``files`` is a list — ``TO 'a', 'b'`` gives two entries, and ``TO STDOUT``
       / ``TO x`` / ``TO PROGRAM 'cat'`` give an ``exp.Identifier`` rather than a
       ``Literal``. A media COPY still rejects anything but a literal path; a
-      CSV COPY (RFC-011, plan 067) additionally accepts ``TO STDOUT`` — the
+      CSV COPY additionally accepts ``TO STDOUT`` — the
       one-word ``exp.Identifier`` case — since a table sink prints, it does
       not always write a file.
     * ``credentials`` is always an EMPTY ``exp.Credentials()`` — writing an
@@ -1371,13 +1339,12 @@ def _named_only_arguments(
 ) -> list[tuple[str, exp.Expr, exp.Expr]]:
     """Shape-check a table function's ``name => value`` arguments.
 
-    Shared by ``input('path', ...)`` (plan 041) and
-    ``ffmpeg.<source>(...)`` (plan 042): both take named arguments ONLY past
-    a fixed positional prefix (one path literal for ``input``, none at all for
-    a source), so a bare positional among `rest` is rejected outright rather
-    than by RFC-003's softer "positional arguments must come before named
-    arguments" rule. `positional_message` is what that rejection says, and it
-    is the only difference between the two callers.
+    Shared by ``input('path', ...)`` and ``ffmpeg.<source>(...)``: both take
+    named arguments ONLY past a fixed positional prefix (one path literal for
+    ``input``, none for a source), so a bare positional among `rest` is
+    rejected outright rather than by the softer "positional arguments must come
+    before named arguments" rule. `positional_message` is what that rejection
+    says, and the only difference between the two callers.
 
     Returns ``(name, value, name_node)`` triples in written order; which
     option names actually exist is the caller's business (a curated table for
@@ -1483,7 +1450,7 @@ class _Resolver:
     # -- entry point ------------------------------------------------------
 
     def run(self, tree: exp.Expr) -> Resolved:
-        """Resolve one statement, or a whole script (RFC-006).
+        """Resolve one statement, or a whole script.
 
         Script rules, all of them typed rejections:
 
@@ -1516,10 +1483,9 @@ class _Resolver:
                 self._view(statement)
                 continue
             if isinstance(statement, exp.Copy):
-                # RFC-002: peel the COPY wrapper off; what it wraps is
-                # validated exactly like a bare SELECT from here on -- except
-                # a csv sink (RFC-011, plan 067) is table mode, so metadata
-                # columns are legal SELECT outputs for it and nowhere else.
+                # Peel the COPY wrapper off; what it wraps is validated exactly
+                # like a bare SELECT from here on -- except a csv sink is table
+                # mode, where metadata columns are legal SELECT outputs.
                 path, path_node, options, wrapped, is_csv = _sink(statement)
                 query, query_branches = self._resolve_query(wrapped, table_mode=is_csv)
                 sinks.append(
@@ -1553,14 +1519,11 @@ class _Resolver:
                     statement,
                     hint=_SCRIPT_HINT,
                 )
-            # A bare SELECT (no COPY at all) has no media destination, so it
-            # is always at least table-capable (RFC-011): metadata columns
-            # are legal SELECT outputs here regardless of what `-o` the CLI
-            # eventually supplies (that decision is CLI-layer only, plan
-            # 067). Relaxing this fence never weakens a MEDIA query: the
-            # classic streaming lowerer still enforces "streams are the only
-            # output" on its own, independently, for anything that actually
-            # reaches it (`sqlmpeg.lower._row_value`).
+            # A bare SELECT has no media destination, so it is always at least
+            # table-capable: metadata columns are legal SELECT outputs here
+            # whatever `-o` the CLI eventually supplies. This never weakens a
+            # MEDIA query -- the streaming lowerer independently enforces
+            # "streams are the only output" (`sqlmpeg.lower._row_value`).
             select, branches = self._resolve_query(statement, table_mode=True)
 
         if select is None:
@@ -1596,7 +1559,7 @@ class _Resolver:
         FIRST, so the names it defines are visible to it and to everything
         written after it, and nothing else.
 
-        ``table_mode`` (RFC-011, plan 067) is True for a bare SELECT and a
+        ``table_mode`` is True for a bare SELECT and a
         csv COPY — the two contexts a metadata SELECT output is legal in —
         and False everywhere else (a media COPY, and any CTE/view body,
         left conservative since neither is exercised by a table query
@@ -1617,7 +1580,7 @@ class _Resolver:
             self._validate_select(branch, visible, table_mode=table_mode)
         return query, branches
 
-    # -- CREATE VIEW (RFC-006) --------------------------------------------
+    # -- CREATE VIEW --------------------------------------------
 
     def _view(self, create: exp.Create) -> None:
         """Validate one ``CREATE VIEW name AS <query>`` and bind it.
@@ -1722,8 +1685,8 @@ class _Resolver:
                 fallback=create,
                 hint=_VIEW_HINT,
             )
-        # A view BODY is a full query (RFC-006), so unlike a CTE body it may
-        # carry its own WITH: the nested-WITH rejection is CTE-body-only
+        # A view BODY is a full query, so unlike a CTE body it may carry its
+        # own WITH: the nested-WITH rejection is CTE-body-only
         # (`_resolve_ctes`) and branch-level (`_collect_branches`), and neither
         # fires on a statement's own top-level one.
         query, _ = self._resolve_query(body)
@@ -1757,7 +1720,7 @@ class _Resolver:
             )
 
     def _check_views_are_used(self) -> None:
-        """A view nobody reads is a typo (RFC-006), anchored on its CREATE.
+        """A view nobody reads is a typo, anchored on its CREATE.
 
         Deliberately views only: an unused CTE has always been legal, and a
         script's whole point is that its views feed the COPYs, so one that
@@ -1868,14 +1831,14 @@ class _Resolver:
     def _validate_select(
         self, select: exp.Select, visible: set[str], *, table_mode: bool = False
     ) -> None:
-        # RFC-009: `ORDER BY` is admitted for TRACK-ROW queries and nowhere
-        # else. The carve-out is decided from the FROM clause alone, before any
-        # of it is validated, so a branch with no `unnest` keeps the
+        # `ORDER BY` is admitted for TRACK-ROW queries and nowhere else. The
+        # carve-out is decided from the FROM clause alone, before any of it is
+        # validated, so a branch with no `unnest` keeps the
         # NO_STREAMING_EQUIVALENT fence byte for byte.
         allowed = _SELECT_ALLOWED | {"order"} if _has_unnest(select) else _SELECT_ALLOWED
         _check_query_args(select, allowed, "SELECT")
 
-        # RFC-001: the SELECT list IS the output stream list, so any number of
+        # The SELECT list IS the output stream list, so any number of
         # projections is legal. Only an empty list is not.
         projections = select.expressions
         if not projections:
@@ -1938,9 +1901,9 @@ class _Resolver:
                     hint="use a WITH ... AS (...) CTE instead",
                 )
             if isinstance(sub, exp.Star):
-                # RFC-004 accepts a star only as a whole projection, which
+                # A star is legal only as a whole projection, which
                 # `_validate_select` peels off before calling this; anything
-                # that reaches here has one nested inside an expression, where
+                # reaching here has one nested inside an expression, where
                 # "every stream of that alias" has no meaning.
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -1957,7 +1920,7 @@ class _Resolver:
     def _check_named_arguments(self, call: exp.Func, select: exp.Select) -> None:
         """``name => value`` arguments must TRAIL the positional ones, once each.
 
-        Shape only (RFC-003): whether the option exists, and what type it takes,
+        Shape only: whether the option exists, and what type it takes,
         depends on the ffmpeg the query is compiled against, so lower's registry
         owns those two checks (`UNKNOWN_FILTER_OPTION` / `FILTER_OPTION_TYPE`).
 
@@ -2071,7 +2034,7 @@ class _Resolver:
                 self._check_join_predicate(spec.on, scope, join)
         return scope
 
-    # -- JOIN between track-row tables (RFC-009, plan 062) -----------------
+    # -- JOIN between track-row tables -----------------
 
     def _check_join(
         self,
@@ -2082,11 +2045,10 @@ class _Resolver:
     ) -> None:
         """Admit one explicit JOIN, which only track-row tables may use.
 
-        RFC-009 § Fences: "JOIN syntax is admitted between unnest tables ONLY —
-        input-level FROM stays comma-cross-join". Everything a track-row join
-        cannot be (a stream-level operand, RIGHT, CROSS, NATURAL, USING) keeps
-        the blanket rejection plan 061 gave every JOIN, with the hint saying
-        which spelling to reach for instead.
+        JOIN syntax is admitted between unnest tables ONLY; input-level FROM
+        stays comma-cross-join. Everything a track-row join cannot be (a
+        stream-level operand, RIGHT, CROSS, NATURAL, USING) is rejected, with
+        the hint saying which spelling to reach for instead.
         """
         for key in ("using", "method", "match_condition"):
             value = join.args.get(key)
@@ -2283,7 +2245,7 @@ class _Resolver:
                 table,
                 hint="use a WITH ... AS (...) CTE instead of a subquery",
             )
-        # `FROM ffmpeg.<source>(...) alias` (plan 042) is the ONE qualified
+        # `FROM ffmpeg.<source>(...) alias` is the ONE qualified
         # table name there is: the namespace lands in `db`. A three-part name
         # (`x.ffmpeg.testsrc(...)`) also fills `catalog`, and is not it.
         db = table.args.get("db")
@@ -2333,7 +2295,7 @@ class _Resolver:
                     fallback=table,
                     hint=self._known_hint(visible),
                 )
-            # Feeds the unused-VIEW check (RFC-006). CTE names land here too;
+            # Feeds the unused-VIEW check. CTE names land here too;
             # only views are required to be read.
             self.used.add(name)
             local = self._local_alias(name, alias_node, table)
@@ -2354,7 +2316,7 @@ class _Resolver:
             table,
         )
 
-    # -- FROM unnest(<input>.<type>) alias  (RFC-009, plan 061) ------------
+    # -- FROM unnest(<input>.<type>) alias ------------
 
     def _add_track_rows(self, unnest: exp.Unnest, scope: dict[str, str]) -> None:
         """Bind one track-row table. Shape only — the rows are lower's business.
@@ -2488,7 +2450,7 @@ class _Resolver:
     def _local_alias(
         self, name: str, alias_node: exp.Expr | None, table: exp.Table
     ) -> str:
-        """The name a view/CTE is read under in THIS branch (RFC-006).
+        """The name a view/CTE is read under in THIS branch.
 
         ``FROM master`` reads it under its own name; ``FROM master m`` binds
         ``m``, and that binding is BRANCH-LOCAL — nothing else about a branch
@@ -2571,7 +2533,7 @@ class _Resolver:
         alias_node: exp.Expr | None,
         scope: dict[str, str],
     ) -> None:
-        """``FROM ffmpeg.<source>(<named options>) alias`` (RFC-005 §1, plan 042).
+        """``FROM ffmpeg.<source>(<named options>) alias``.
 
         Shapes VERIFIED under sqlglot 30.17 ``read="postgres"`` (every one of
         them a plain ``exp.Table`` with ``db=Identifier(ffmpeg)`` -- an
@@ -2637,7 +2599,7 @@ class _Resolver:
                 ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
             )
         # NO input index is assigned: a source is a zero-input filter node,
-        # not an `-i` (RFC-005 §1). `input_paths`/`sources` stay untouched.
+        # not an `-i`. `input_paths`/`sources` stay untouched.
         self.source_filters[alias] = RawSource(
             alias=alias, name=name, options=options, call_node=inner
         )
@@ -2659,11 +2621,9 @@ class _Resolver:
     ) -> None:
         for sub in node.walk():
             if isinstance(sub, exp.Dot):
-                # `<alias>.<type>[k].<column>` (plan 064): only `.track` is a
-                # legal SELECT output in a MEDIA query -- everything else it
-                # could name is metadata, and streams are the only outputs a
-                # media query has. A table/csv query (RFC-011, plan 067) is
-                # the exception: metadata is a legal output there too.
+                # `<alias>.<type>[k].<column>`: only `.track` is a legal SELECT
+                # output in a MEDIA query, since streams are the only outputs
+                # one has. A table/csv query also accepts the metadata columns.
                 shape = subscript_metadata_shape(sub)
                 if shape is not None:
                     self._check_output_accessor(sub, shape, scope, select, table_mode=table_mode)
@@ -2734,7 +2694,7 @@ class _Resolver:
                     hint=f"an input exposes {', '.join(sorted(_INPUT_COLUMNS))}",
                 )
             # A track-row table's schema is fixed by the stream type it
-            # unnested (RFC-009 § Columns), so it is checkable HERE -- unlike
+            # unnested, so it is checkable HERE -- unlike
             # a CTE's, which only lower knows.
             if kind == "row":
                 self._check_row_column(sub, name, select)
@@ -2755,8 +2715,7 @@ class _Resolver:
             )
         return column_type
 
-    # -- subscript metadata accessors: <alias>.<type>[k].<column> (RFC-009
-    # addendum, plan 064) --------------------------------------------------
+    # -- subscript metadata accessors: <alias>.<type>[k].<column> ----------
 
     def _check_accessor(
         self,
@@ -2842,9 +2801,9 @@ class _Resolver:
         """Why ``alias`` cannot carry a subscript metadata accessor.
 
         A CTE or a generated source has no probed metadata (the same reason
-        neither can be ``unnest``ed, RFC-009 § Fences); a row alias already
+        neither can be ``unnest``ed); a row alias already
         IS the metadata table and wants its own columns directly, not another
-        subscript layer on top. Empirically decided (plan 064): none of the
+        subscript layer on top. Empirically decided: none of the
         three has anything a subscript accessor could read, so each gets its
         own clear rejection rather than a half-working fallback.
         """
@@ -2897,11 +2856,11 @@ class _Resolver:
     ) -> None:
         """A ``<alias>.<type>[k].<column>`` in SELECT position: only ``.track``.
 
-        Streams are the only SELECT output a MEDIA query has (RFC-001);
-        ``.track`` is sugar for the bracket alone (plan 064) and lowers
+        Streams are the only SELECT output a MEDIA query has;
+        ``.track`` is sugar for the bracket alone and lowers
         exactly like it, but every other accessor names a piece of metadata
         -- a string or a number -- which has nowhere to go on an ffmpeg
-        command line. A table/csv query (RFC-011, plan 067) is the one
+        command line. A table/csv query is the one
         exception: its whole point is printing that metadata, so
         ``table_mode`` skips this rejection there.
         """
@@ -2946,14 +2905,13 @@ class _Resolver:
     ) -> bool:
         """Shape-check `conjunct` if it holds a subscript metadata accessor.
 
-        RFC-009 addendum (plan 064): ``<alias>.<type>[k].<column>`` compares
-        like a row column -- same grammar, same static literal typing -- but
-        the alias is an ordinary INPUT alias, not an unnest row, so it is told
-        apart by SHAPE (a ``Dot`` over a ``Bracket``) rather than by which kind
-        of name it is. A loose column reference elsewhere in the same
-        conjunct -- typically the time window, ``<alias>.t`` -- means the
-        conjunct mixes the two languages, the same rejection
-        :meth:`_check_row_conjunct` gives a row/non-row mix.
+        ``<alias>.<type>[k].<column>`` compares like a row column -- same
+        grammar, same static literal typing -- but the alias is an ordinary
+        INPUT alias, not an unnest row, so it is told apart by SHAPE (a ``Dot``
+        over a ``Bracket``) rather than by which kind of name it is. A loose
+        column reference elsewhere in the same conjunct -- typically the time
+        window, ``<alias>.t`` -- means the conjunct mixes the two languages,
+        the same rejection :meth:`_check_row_conjunct` gives a row/non-row mix.
         """
         shapes = [
             subscript_metadata_shape(sub)
@@ -3108,11 +3066,9 @@ class _Resolver:
         ]
 
         # alias -> {"low": <literal>, "high": <literal>}, accumulated across
-        # every conjunct so a second bound of the same kind for one alias is
-        # rejected (mirrors the old one-BETWEEN rule) whether it repeats
-        # within one BETWEEN, across two inequalities, or a BETWEEN plus an
-        # inequality -- and so the closed pair, once both are known, can be
-        # checked for an empty window.
+        # every conjunct so a repeated bound of one kind is rejected however it
+        # is spelled (twice in one BETWEEN, two inequalities, or a mix), and so
+        # a closed pair can be checked for an empty window once both are known.
         bounds: dict[str, dict[str, exp.Literal]] = {}
         for conjunct in conjuncts:
             parsed = _time_bounds(conjunct)
@@ -3202,7 +3158,7 @@ class _Resolver:
                 hint="the start bound must be strictly before the end bound",
             )
 
-    # -- WHERE over track-row columns (RFC-009) ---------------------------
+    # -- WHERE over track-row columns ---------------------------
 
     def _check_row_conjunct(
         self, conjunct: exp.Expr, scope: dict[str, str], where: exp.Where
@@ -3254,7 +3210,7 @@ class _Resolver:
     def _check_row_predicate(
         self, node: exp.Expr, scope: dict[str, str], where: exp.Where
     ) -> None:
-        """One compile-time row predicate, recursively (RFC-009 § Fences).
+        """One compile-time row predicate, recursively.
 
         The grammar is small and closed: ``AND`` / ``OR`` / ``NOT`` over
         comparisons of ONE row column against ONE literal, plus ``BETWEEN`` and
@@ -3416,8 +3372,8 @@ class _Resolver:
     ) -> None:
         """A compile-time predicate's other operand: a literal of ``label``'s type.
 
-        Shared by row-column predicates (RFC-009, plan 061) and subscript
-        metadata predicates (plan 064) -- the whole point of both being
+        Shared by row-column predicates and subscript
+        metadata predicates -- the whole point of both being
         static typing, not a probed-value coincidence: an absent metadata
         field makes the VALUE null, never the column untyped, so comparing a
         text column to a number is a mistake whatever the file turned out to
@@ -3448,7 +3404,7 @@ class _Resolver:
             hint=hint,
         )
 
-    # -- ORDER BY over track-row columns (RFC-009) -------------------------
+    # -- ORDER BY over track-row columns -------------------------
 
     def _check_order(
         self, order: exp.Order, scope: dict[str, str], select: exp.Select

@@ -1,4 +1,4 @@
-"""Tests for docs/examples.md -- the cookbook (plan 049).
+"""Tests for docs/examples.md -- the cookbook.
 
 Data-driven, not one test per recipe: every ```sql / ```pgsql fence in the
 cookbook is compiled by running the exact command line the fence below it
@@ -164,7 +164,7 @@ def _go_offline(monkeypatch: pytest.MonkeyPatch) -> None:
     fence shows a plain ``sqlmpeg compile`` -- the flags under test are the
     ones a reader would type, so the isolation has to come from underneath
     them. ``binaries.ffmpeg_path`` is stubbed (not just ``shutil.which``) so
-    this stays offline even when the ``static-ffmpeg`` provisioner (RFC-010)
+    this stays offline even when the ``static-ffmpeg`` provisioner
     is actually installed and already has a cached binary. Patched by dotted
     path rather than by attribute, since the two modules re-export their
     imports and ``--strict`` will not read through a re-export.

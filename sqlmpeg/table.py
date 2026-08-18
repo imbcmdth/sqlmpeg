@@ -1,19 +1,17 @@
-"""Table/CSV rendering for sqlmpeg (RFC-011, plan 067).
+"""Table/CSV rendering for sqlmpeg.
 
-A table query's whole result set is known at compile time (RFC-009 made
-every metadata value compile time; this module is what makes it VISIBLE).
-``sqlmpeg.lower.lower_table`` builds a :class:`TableResult` per sink -- the
-column names and the cell values, already resolved -- and this module turns
-one into either the psql-style ASCII table or a CSV document. No SQL, no IR
-graph knowledge: everything here is pure formatting over already-typed data.
+``sqlmpeg.lower.lower_table`` builds a :class:`TableResult` per sink -- column
+names and already-resolved cell values -- and this module turns one into
+either the psql-style ASCII table or a CSV document. No SQL, no IR graph
+knowledge: pure formatting over already-typed data.
 
 Format is PINNED byte-for-byte by cookbook recipes 30/31 (docs/examples.md):
-one leading space per cell, cells left-justified to
-``max(header width, every value's width)``, columns joined with ``" | "``,
-a dashed rule with ``"+"`` at the column separators (``width + 2`` dashes
-each), a ``"(N rows)"`` / ``"(1 row)"`` footer, and every line RSTRIPPED --
-so a row whose last cell is empty just ends at its ``"|"``, plain ASCII
-throughout (no unicode box-drawing): it pins cleanly and survives any pipe.
+one leading space per cell, cells left-justified to ``max(header width, every
+value's width)``, columns joined with ``" | "``, a dashed rule with ``"+"`` at
+the column separators (``width + 2`` dashes each), a ``"(N rows)"`` /
+``"(1 row)"`` footer, and every line RSTRIPPED -- so a row whose last cell is
+empty ends at its ``"|"``. Plain ASCII, no unicode box-drawing: it pins
+cleanly and survives any pipe.
 """
 
 from __future__ import annotations
@@ -38,11 +36,10 @@ __all__ = [
 class StreamCell:
     """A stream-valued table cell: what would have been wired, not run.
 
-    ``spec`` is already fully resolved text by the time it gets here -- the
-    ffmpeg stream spec (``"0:a:0"``) for a source passthrough, or a
-    filtergraph node id (``"n2"``) for a filtered stream -- since only
-    ``sqlmpeg.lower`` has ``Graph.sources`` to do that conversion. Renders as
-    ``<video 0:v:0>`` / ``<audio n2>``.
+    ``spec`` arrives fully resolved -- the ffmpeg stream spec (``"0:a:0"``)
+    for a source passthrough, or a filtergraph node id (``"n2"``) for a
+    filtered stream -- because only ``sqlmpeg.lower`` has ``Graph.sources`` to
+    convert it. Renders as ``<video 0:v:0>`` / ``<audio n2>``.
     """
 
     type: StreamType
@@ -50,8 +47,8 @@ class StreamCell:
 
 
 # One table cell: NULL (empty, psql-style), a probed scalar, or a stream
-# placeholder. Never a raw FrameRef -- that would leak IR shape into what is
-# meant to be plain, printable data.
+# placeholder. Never a raw FrameRef -- that would leak IR shape into
+# printable data.
 CellValue = str | int | float | bool | None | StreamCell
 
 
@@ -65,15 +62,14 @@ class TableResult:
 
 @dataclass(frozen=True)
 class TableSink:
-    """One table/csv query's destination (RFC-011, plan 067).
+    """One table/csv query's destination.
 
-    Mirrors ``sqlmpeg.ir.SinkUnit`` for the non-media path: a bare SELECT
-    (no COPY at all) is exactly one of these, ``csv=False``, ``path=None``
-    (``run`` prints the ASCII table to stdout, and there is no file form --
-    see the RFC's non-goals). A ``COPY ... WITH (FORMAT csv)`` is
-    ``csv=True``; ``path`` is None for ``TO STDOUT`` (print) or the file
-    path for ``TO '<path>'`` (``run`` writes it). ``header`` is the csv
-    ``HEADER`` option's value, irrelevant when ``csv`` is False.
+    Mirrors ``sqlmpeg.ir.SinkUnit`` for the non-media path. A bare SELECT is
+    exactly one of these with ``csv=False``, ``path=None`` (``run`` prints the
+    ASCII table to stdout; there is no file form). A ``COPY ... WITH (FORMAT
+    csv)`` has ``csv=True`` and ``path`` None for ``TO STDOUT`` or the file
+    path for ``TO '<path>'``. ``header`` is the csv ``HEADER`` option's value,
+    irrelevant when ``csv`` is False.
     """
 
     result: TableResult

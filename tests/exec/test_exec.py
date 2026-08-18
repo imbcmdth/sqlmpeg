@@ -8,7 +8,7 @@ from the default test run via ``addopts = -m "not exec"``. Run explicitly::
 
 Requires ``ffmpeg``/``ffprobe`` on PATH and the fixtures already generated
 (``python scripts/gen_fixtures.py``). Tests skip cleanly if either is
-missing, per plan 010.
+missing.
 """
 
 from __future__ import annotations
@@ -203,7 +203,7 @@ def test_trim_reports_expected_duration(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-004 input-seek amendment (plan 035): WHERE on an input alias is -ss/-to
+# RFC-004 input-seek amendment: WHERE on an input alias is -ss/-to
 #
 # Accuracy contract, exec-tested on both sides:
 #   * DECODED streams (anything filtered/re-encoded) are frame-accurate --
@@ -512,7 +512,7 @@ def test_pip_mix_flagship_composites_video_and_keeps_both_language_tags(
 
 
 # ---------------------------------------------------------------------------
-# COPY ... TO ... WITH (...) sink options: end to end (RFC-002, plan 028)
+# COPY ... TO ... WITH (...) sink options: end to end
 # ---------------------------------------------------------------------------
 
 
@@ -556,7 +556,7 @@ def test_copy_sink_codec_options_land_in_the_real_encode(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# RFC-004: SELECT *, subtitle streams, external caption joins (plan 034)
+# RFC-004: SELECT *, subtitle streams, external caption joins
 # ---------------------------------------------------------------------------
 
 
@@ -1042,7 +1042,7 @@ def test_a_sine_tone_is_a_whole_query_with_no_input_file(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# RFC-005 SS2 (plan 043): the timeline `enable` argument, RUN
+# RFC-005 SS2: the timeline `enable` argument, RUN
 # ---------------------------------------------------------------------------
 #
 # The claim `enable` makes is about individual FRAMES, so it is checked the way
@@ -1159,7 +1159,7 @@ def test_enable_is_rejected_where_this_ffmpeg_reports_no_timeline_flag() -> None
 
 
 # ---------------------------------------------------------------------------
-# RFC-005 SS3 (plan 043): `expr` slots, RUN, and checked against ffmpeg's types
+# RFC-005 SS3: `expr` slots, RUN, and checked against ffmpeg's types
 # ---------------------------------------------------------------------------
 
 
@@ -1229,7 +1229,7 @@ def test_expression_crop_and_scale_run(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-006 (plan 046): a script with several COPYs is ONE ffmpeg command
+# RFC-006: a script with several COPYs is ONE ffmpeg command
 # ---------------------------------------------------------------------------
 
 
@@ -1321,7 +1321,7 @@ def test_two_sinks_may_stream_copy_the_same_audio_track(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-006 (plan 047): array-RETURNING filters, against real ffmpeg
+# RFC-006: array-RETURNING filters, against real ffmpeg
 # ---------------------------------------------------------------------------
 #
 # `ffmpeg.channelsplit(...)` and friends are `->N` filters the registry fences

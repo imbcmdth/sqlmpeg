@@ -1,4 +1,4 @@
-"""Tests for plan 011 (docs/errors.md, docs/error-schema.json).
+"""Tests for docs/errors.md and docs/error-schema.json.
 
 (a) every ErrorCode value appears as a heading in docs/errors.md.
 (b) docs/error-schema.json validates the dicts SqlmpegError.to_dict()

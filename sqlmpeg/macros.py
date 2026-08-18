@@ -1,24 +1,17 @@
-"""The ``sqlmpeg.<name>`` macro namespace (RFC-007 wave 3a, plan 052).
+"""The ``sqlmpeg.<name>`` macro namespace.
 
-Three ergonomic macros that expand to a small ffmpeg filter subgraph no
-single filter provides ("Three namespaces, one convention" in
-plans/rfc-007-uniform-calls.md). Unlike a registry filter call, a macro's
-signature is OURS: fixed positional parameters in the order documented
-below, checked without ever consulting the installed ffmpeg's option
-tables -- macros work OFFLINE, with no registry at all. Named arguments are
-rejected outright (sqlmpeg/lower.py's ``_lower_macro_call``): there is no
-option surface to name.
+Macros expand to a small ffmpeg filter subgraph no single filter provides.
+Unlike a registry filter call, a macro's signature is OURS: fixed positional
+parameters, checked without consulting the installed ffmpeg's option tables --
+macros work OFFLINE, with no registry. Named arguments are rejected outright
+(``lower._lower_macro_call``): there is no option surface to name.
 
-:data:`MACROS` is keyed by lowercased macro name; sqlmpeg/lower.py is the
-only reader, resolving ``sqlmpeg.<name>(...)`` against this table and
-nowhere else (not the registry). Each entry's ``expand`` builds the macro's
-filter chain through the ``node`` callback it is handed -- one call per
-filter, shaped exactly like :meth:`sqlmpeg.lower._NodeFactory.node`
-(filter name, its args, its input refs, its output pad types -> the new
-node's ref) -- so lower.py's own node-minting is the only place FrameRefs
-are actually created. ``expand`` never validates: by the time it runs,
-lower.py has already checked arity, argument kinds and the macro's own
-stream-type rule.
+:data:`MACROS` is keyed by lowercased macro name and sqlmpeg/lower.py is its
+only reader, resolving ``sqlmpeg.<name>(...)`` here and nowhere else (not the
+registry). Each entry's ``expand`` builds its filter chain through the ``node``
+callback it is handed, so lower.py's node-minting stays the only place
+FrameRefs are created. ``expand`` never validates -- by the time it runs,
+lower.py has checked arity, argument kinds and the macro's stream-type rule.
 """
 
 from __future__ import annotations
@@ -38,9 +31,9 @@ __all__ = [
     "macro_names",
 ]
 
-# One node-minting call: filter name, its args, its input refs, its output pad
-# types -> the new node's ref (pad 0). Exactly `_NodeFactory.node`'s shape, so
-# `self.ctx.node` is passed straight through with no adapter.
+# One node-minting call: filter name, args, input refs, output pad types -> the
+# new node's ref (pad 0). Exactly `_NodeFactory.node`'s shape, so `self.ctx.node`
+# passes through with no adapter.
 NodeBuilder = Callable[[str, dict[str, object], list[str], list[StreamType]], str]
 
 
@@ -61,12 +54,10 @@ class MacroParam:
 class Macro:
     """One ``sqlmpeg.<name>`` macro: its signature, output type, expansion.
 
-    `kind_hints` gives a stream-position argument of the WRONG kind a hint
-    more specific than the generic stream-signature message, keyed by the
-    kind that was actually passed. Only ``delay`` uses this: an audio
-    argument is common enough (video is the macro's only supported type)
-    that it earns a hint naming the bare filter that does what the caller
-    almost certainly wants.
+    `kind_hints` is keyed by the kind actually passed to a stream position,
+    and supplies a hint more specific than the generic stream-signature
+    message. Only ``delay`` uses it: audio into a video-only macro is common
+    enough to earn a hint naming the bare filter that does the job.
     """
 
     name: str
@@ -145,26 +136,20 @@ MACROS: dict[str, Macro] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# input-minting macros (RFC-009, plan 062)
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class InputMacro:
     """A macro that lowers to an extra ``-i``, not to a filter node.
 
-    The one kind of stream a filtergraph cannot generate: ffmpeg has no
-    "empty subtitle source" filter, because a filtergraph carries no subtitle
-    pads at all (RFC-004's passthrough-only rule). So the stand-in for a
-    missing caption track is minted as an INPUT instead -- `format` forces the
+    ffmpeg has no "empty subtitle source" filter, because a filtergraph carries
+    no subtitle pads at all (the passthrough-only rule). So the stand-in
+    for a missing caption track is minted as an INPUT: `format` forces the
     demuxer, `path` is a self-contained ``data:`` URI, and the result is an
     ordinary passthrough subtitle stream that takes tags like any other.
 
-    `format` flows to emit through an INTERNAL per-input option (see
-    ``sqlmpeg.inputs.internal_option``); it is not part of the user-facing
-    ``INPUT_OPTIONS`` table, because there is no ``input('x', format => ...)``
-    surface -- this is the compiler minting its own input.
+    `format` reaches emit as an INTERNAL per-input option (see
+    ``sqlmpeg.inputs.option_spec``), not through the user-facing
+    ``INPUT_OPTIONS`` table -- there is no ``input('x', format => ...)``
+    surface, this is the compiler minting its own input.
     """
 
     name: str

@@ -14,13 +14,13 @@ FrameRef grammar consumed here (authoritative source: ``ir.py``)::
     "src:<alias>:s:<k>"  -> same for subtitle; rendered as "<index>:s:<k>"
     "src:<alias>:d:<k>"  -> same for data; rendered as "<index>:d:<k>"
 
-Subtitle and data refs (RFC-004) are passthrough-only: they only ever appear
+Subtitle and data refs are passthrough-only: they only ever appear
 as sink-unit outputs and are only ever rendered as bare ``-map`` targets,
 never as filtergraph labels. Repeating one is legal ffmpeg, so they are exempt
 from the consume-once check (:func:`_check_fanout`).
 
-Output groups (RFC-006)
------------------------
+Output groups
+-------------
 ``Graph.sinks`` is one :class:`~sqlmpeg.ir.SinkUnit` per output FILE, and
 :attr:`Emitted.groups` mirrors it one-for-one. The whole command is a single
 ffmpeg invocation: the inputs are rendered once, the ``-filter_complex`` once,
@@ -40,52 +40,47 @@ Each ``Output`` becomes an :class:`OutputMap`:
 * **passthrough** -- ``Output.ref`` is a source ref with zero node consumers.
   The stream never enters the filtergraph: the map target is the bare ffmpeg
   stream spec (``"0:a:1"``) and ``copy`` is True, so ``build_ffmpeg_args``
-  adds ``-c:<i> copy``. (v0 hung a ``null`` filter on such refs; that hack is
-  gone.)
+  adds ``-c:<i> copy``.
 * **filtered** -- ``Output.ref`` names a node pad. That pad's label is
   ``out<i>``, where ``i`` is the output's index in ``Graph.outputs``, and the
-  map target is ``"[out<i>]"``. v0's single ``[out]`` label is gone: labels
-  are always indexed, even for a one-column SELECT.
+  map target is ``"[out<i>]"``. Labels are always indexed, even for a
+  one-column SELECT.
 
 A graph whose outputs are all passthrough has NO nodes and therefore an empty
 ``filter_complex``; ``build_ffmpeg_args`` omits ``-filter_complex`` entirely
 in that case.
 
-Input seeking (RFC-004 amendment)
----------------------------------
+Input seeking
+-------------
 ``Graph.input_trims`` maps an alias to a ``(start, end)`` window, either bound
-possibly ``None`` (plan 039: an open-ended ``WHERE <alias>.t >= x`` or
-``<alias>.t <= y``). Since an alias owns exactly one ``-i`` slot, emit resolves
-it against ``Graph.sources`` into :attr:`Emitted.input_trims`, a list parallel
-to :attr:`Emitted.inputs`, and ``build_ffmpeg_args`` renders ``-ss <start>``
-and/or ``-to <end>`` immediately BEFORE the owning ``-i`` — an input option, so
-the demuxer seeks and every stream of that input is cut coherently, subtitle
-and data streams included — omitting whichever half is ``None`` (a tail-only
-window has no ``-to`` at all, so ffmpeg reads to EOF). Both bounds are on the
-input's own timeline. A seeked input can still be stream-copied (a window no
-longer forces a filter node into the graph), and then the cut snaps back to
-the preceding keyframe; a decoded stream is frame-accurate.
+possibly ``None`` (an open-ended ``WHERE <alias>.t >= x`` / ``<= y``). Since an
+alias owns exactly one ``-i`` slot, emit resolves it against ``Graph.sources``
+into :attr:`Emitted.input_trims`, a list parallel to :attr:`Emitted.inputs`,
+and ``build_ffmpeg_args`` renders ``-ss <start>`` and/or ``-to <end>``
+immediately BEFORE the owning ``-i`` — an input option, so the demuxer seeks
+and every stream of that input is cut coherently, subtitle and data included —
+omitting whichever half is ``None`` (a tail-only window has no ``-to``, so
+ffmpeg reads to EOF). Both bounds are on the input's own timeline. A seeked
+input can still be stream-copied, and then the cut snaps back to the preceding
+keyframe; a decoded stream is frame-accurate.
 
-Input options (RFC-005 SS4, plan 041)
---------------------------------------
-``Graph.input_options`` maps an alias to its validated
-``input('path', name => value, ...)`` options (``sqlmpeg.inputs.INPUT_OPTIONS``
--- ``loop``, ``stream_loop``, ``framerate``, ``itsoffset``, ``hwaccel``),
-resolved the same way ``input_trims`` is, into :attr:`Emitted.input_options`, a
-list parallel to :attr:`Emitted.inputs`. ``build_ffmpeg_args`` renders them
-immediately before that input's ``-i``, and BEFORE any ``-ss``/``-to`` from
-``input_trims`` -- verified empirically against a real ffmpeg 7.1
-(``-loop 1 -framerate 15 -to 2 -i frame.png`` runs correctly; ffmpeg input
-options are order-INSENSITIVE among themselves, but this fixed order --
-options, then seek flags, then ``-i`` -- is what sqlmpeg always emits). A bool
-value of ``False`` (e.g. ``loop => false``) is never rendered, same as a sink
-option's False bool.
+Input options
+-------------
+``Graph.input_options`` maps an alias to its validated ``input('path', name =>
+value, ...)`` options, resolved like ``input_trims`` into
+:attr:`Emitted.input_options`, parallel to :attr:`Emitted.inputs`.
+``build_ffmpeg_args`` renders them immediately before that input's ``-i`` and
+BEFORE any ``-ss``/``-to``. ffmpeg input options are order-INSENSITIVE among
+themselves, but this fixed order -- options, seek flags, ``-i`` -- is what
+sqlmpeg always emits; measured against ffmpeg 7.1, ``-loop 1 -framerate 15
+-to 2 -i frame.png`` runs correctly. A ``False`` bool (``loop => false``) is
+never rendered, same as a sink option's False bool.
 
-An option name is resolved through ``sqlmpeg.inputs.option_spec``, not the
-user-facing table alone: lower mints inputs of its own (RFC-009's
-``sqlmpeg.empty_captions()``, whose ``data:`` URI needs ``-f webvtt``) and
-carries their flags as INTERNAL input options, which render exactly like any
-other but are not nameable from SQL.
+An option name resolves through ``sqlmpeg.inputs.option_spec``, not the
+user-facing table alone: lower mints inputs of its own
+(``sqlmpeg.empty_captions()``, whose ``data:`` URI needs ``-f webvtt``) and
+carries their flags as INTERNAL input options, rendered like any other but not
+nameable from SQL.
 
 Pad label scheme
 ----------------
@@ -118,48 +113,38 @@ joined with ``;`` (no whitespace). The README example therefore emits::
 (both source refs read ``[0:v:0]``: the README's two aliases name the same
 untrimmed ``game.mp4``, so input dedup, below, folds them onto one ``-i``.)
 
-Input dedup (RFC-009 "Carried from RFC-008", plan 060)
---------------------------------------------------------
+Input dedup
+-----------
 Two ``INPUT`` aliases over the SAME path, with the SAME (validated,
-normalized) ``input_options`` and NO ``input_trims`` window on either one,
-share a single ``-i``: :func:`_dedup_inputs` runs first, before anything
-else in :func:`emit`, and folds such aliases' ``Graph.sources`` entries onto
-one ``input_paths`` slot (first occurrence wins the slot's position).  A
-trimmed alias is NEVER merged, even against an identical trim window on
-another alias -- the concat splice (two aliases, two DIFFERENT windows, same
-file; cookbook recipe 17) needs two distinct ``-i``'s to seek independently,
-and this pass does not try to tell "two windows that happen to match" apart
-from "two windows that must stay apart", so it conservatively never merges a
-trimmed input at all.
+normalized) ``input_options`` and NO ``input_trims`` window on either, share a
+single ``-i``: :func:`_dedup_inputs` runs first in :func:`emit` and folds such
+aliases' ``Graph.sources`` entries onto one ``input_paths`` slot (first
+occurrence wins the position). A trimmed alias is NEVER merged, even against
+an identical window -- the concat splice (two aliases, two DIFFERENT windows,
+same file; cookbook recipe 17) needs two ``-i``'s to seek independently, and
+this pass does not try to tell "two windows that happen to match" apart from
+"two windows that must stay apart".
 
-This is a POST-LOWER normalization, not a lowering decision: trims are only
-known once `sqlmpeg.lower` has resolved every ``WHERE <alias>.t`` window
-into ``Graph.input_trims`` (RFC-004), so a merge test that has to check "no
-trim window" cannot run any earlier than emit's own entry point without
-either duplicating that resolution or coupling this pass to lower's internal
-state. Doing it here also means the pass never touches `sqlmpeg.parser` or
-`sqlmpeg.lower` (both owned by a concurrently-developed RFC-009 wave): it
-operates purely on the finished :class:`~sqlmpeg.ir.Graph`, the same object
-:func:`emit` already takes as input, by re-keying ``sources``/``input_paths``
--- exactly the resolution :func:`_src_spec` already does per source ref, so
-no FrameRef, node, or label needs to change. The pre-dedup graph (e.g. from
-``sqlmpeg ir``) still shows one input slot per alias -- only the rendered
-``-i`` list and the indices baked into the filtergraph are deduped.
+It is a POST-LOWER normalization: trims are only known once lower has resolved
+every ``WHERE <alias>.t`` window into ``Graph.input_trims``, so the "no trim
+window" test cannot run earlier. It re-keys ``sources``/``input_paths`` only
+-- exactly the resolution :func:`_src_spec` does per source ref -- so no
+FrameRef, node or label changes. The pre-dedup graph (``sqlmpeg explain``)
+still shows one input slot per alias; only the rendered ``-i`` list and the
+indices baked into the filtergraph are deduped.
 
-Zero-input nodes (RFC-005 §1, plan 042)
----------------------------------------
-A generated source (``FROM ffmpeg.testsrc(duration => 2) t``) lowers to a
-node with ``inputs=[]``. This pass needed no change for it, VERIFIED rather
-than assumed: such a node renders as a chain head with no input labels
-(``testsrc=duration=2[out0]``), :func:`_extends` refuses to comma-append any
+Zero-input nodes
+----------------
+A generated source (``FROM ffmpeg.testsrc(duration => 2) t``) lowers to a node
+with ``inputs=[]``. It renders as a chain head with no input labels
+(``testsrc=duration=2[out0]``); :func:`_extends` refuses to comma-append any
 node that does not take exactly one input, so a source always STARTS a chain
-and can never be swallowed into the previous one, and what FOLLOWS it merges
+and never gets swallowed into the previous one, while what FOLLOWS it merges
 normally (``sine=frequency=440,volume=volume=0.5[out0]``).
 :func:`_verify_topological` and :func:`_check_fanout` both iterate
-``node.inputs``, so an empty list simply contributes nothing. A graph made
-only of sources has no ``-i`` at all: ``build_ffmpeg_args`` emits
-``ffmpeg -filter_complex ... -map [out0] out.mp4``, which is a complete and
-valid ffmpeg command.
+``node.inputs``, so an empty list contributes nothing. A graph of only sources
+has no ``-i`` at all: ``ffmpeg -filter_complex ... -map [out0] out.mp4`` is a
+complete, valid command.
 
 Argument rendering
 ------------------
@@ -199,7 +184,7 @@ _TYPE_MARKERS: dict[StreamType, str] = {
     "data": "d",
 }
 
-# Stream types no filtergraph can carry (RFC-004): they are only ever bare
+# Stream types no filtergraph can carry: they are only ever bare
 # `-map`s, so they are exempt from the consume-once rule below.
 _PASSTHROUGH_ONLY: frozenset[StreamType] = frozenset({"subtitle", "data"})
 
@@ -234,13 +219,12 @@ class OutputMap:
 class OutputGroup:
     """One output FILE of the command: its maps, its path, its options.
 
-    Mirrors one :class:`~sqlmpeg.ir.SinkUnit` (RFC-006). `maps` is that
-    file's ``-map`` list in SELECT order, and its INDEX is the ffmpeg output
-    stream index — per file, because ffmpeg restarts output stream numbering
-    at every output — so ``-c:<i>``/``-metadata:s:<i>`` are computed from it
-    and from nothing wider. `path` is None only for a bare-SELECT graph,
-    where the caller supplies the destination (`build_ffmpeg_args`'s
-    ``out_path``). `options` are the validated ``WITH (...)`` sink options.
+    Mirrors one :class:`~sqlmpeg.ir.SinkUnit`. `maps` is that file's
+    ``-map`` list in SELECT order, and its INDEX is the ffmpeg output stream
+    index — per file, since ffmpeg restarts numbering at every output — so
+    ``-c:<i>``/``-metadata:s:<i>`` are computed from it and nothing wider.
+    `path` is None only for a bare-SELECT graph, where the caller supplies the
+    destination. `options` are the validated ``WITH (...)`` sink options.
     """
 
     maps: list[OutputMap]
@@ -253,16 +237,13 @@ class Emitted:
     inputs: list[str]  # file paths in -i order
     filter_complex: str  # "" when every output is a passthrough
     groups: list[OutputGroup]  # one per Graph.sinks entry, same order
-    # RFC-004 input-seek amendment: entry `i` is the (start, end) window of the
-    # `-i` at index `i`, or None if that input is not seeked. Plan 039: either
-    # half of a present window may itself be None (open-ended). :func:`emit`
-    # always fills this in parallel with `inputs` (all None when the graph has
-    # no `input_trims`); the empty default is for hand-built Emitted objects and
-    # means the same thing -- no input is seeked.
+    # Entry `i` is the (start, end) window of the `-i` at index `i`, or None if
+    # that input is not seeked; either half of a window may itself be None
+    # (open-ended). :func:`emit` always fills this parallel to `inputs`. The
+    # empty default (hand-built Emitted objects) means the same: nothing seeked.
     input_trims: list[tuple[float | None, float | None] | None] = field(default_factory=list)
-    # RFC-005 SS4 (plan 041): entry `i` is the validated options of the `-i`
-    # at index `i` (insertion-ordered), or an empty dict if that input set
-    # none. Parallel to `inputs`, same convention as `input_trims`.
+    # Entry `i` is the validated, insertion-ordered options of the `-i` at
+    # index `i`, {} if it set none. Same convention as `input_trims`.
     input_options: list[dict[str, object]] = field(default_factory=list)
 
     @property
@@ -281,15 +262,13 @@ _MergeKey = tuple[str, tuple[tuple[str, object], ...]]
 
 
 def _merge_key(g: Graph, index: int, aliases: list[str], trimmed: set[str]) -> _MergeKey | None:
-    """This input slot's dedup key, or None if it can never merge (RFC-009).
+    """This input slot's dedup key, or None if it can never merge.
 
-    None for any slot carrying a trimmed alias -- a trim is a property of
-    that alias's own ``-i`` (RFC-004), so two windows are never folded
-    together even when they happen to be equal (see the module docstring's
-    "Input dedup" section: telling "coincidentally equal" apart from "must
-    stay apart" is not attempted). Otherwise the key is the path plus the
-    resolved options every alias on this slot set, sorted by option name --
-    two slots merge only when both match exactly.
+    None for any slot carrying a trimmed alias -- a trim is a property of that
+    alias's own ``-i``, so two windows are never folded together
+    even when equal. Otherwise the key is the path plus the resolved options
+    every alias on this slot set, sorted by name: two slots merge only when
+    both match exactly.
     """
     if any(alias in trimmed for alias in aliases):
         return None
@@ -300,15 +279,14 @@ def _merge_key(g: Graph, index: int, aliases: list[str], trimmed: set[str]) -> _
 
 
 def _dedup_inputs(g: Graph) -> Graph:
-    """Fold untrimmed same-path same-options aliases onto one ``-i`` (RFC-009).
+    """Fold untrimmed same-path same-options aliases onto one ``-i``.
 
-    See the module docstring's "Input dedup" section for why this runs here,
-    at the top of :func:`emit`, rather than in `sqlmpeg.lower`. Aliases keep
-    their names; only ``Graph.sources`` (alias -> input index) and
-    ``Graph.input_paths`` are rewritten, in first-occurrence order, so every
-    other pass (labels, chains, fanout) needs no change -- they already
-    resolve a source ref's input index through ``g.sources`` at render time.
-    Returns `g` unchanged (same object) when nothing merges.
+    Aliases keep their names; only ``Graph.sources`` (alias -> input index)
+    and ``Graph.input_paths`` are rewritten, in first-occurrence order, so
+    labels/chains/fanout need no change -- they already resolve a source ref's
+    input index through ``g.sources`` at render time. Returns `g` itself when
+    nothing merges. See the module docstring for why it runs here, not in
+    `sqlmpeg.lower`.
     """
     aliases_by_index: dict[int, list[str]] = {}
     for alias, index in g.sources.items():
@@ -340,16 +318,15 @@ def _dedup_inputs(g: Graph) -> Graph:
 def emit(g: Graph) -> Emitted:
     """Render `g` as an ffmpeg filtergraph plus its output map list.
 
-    Raises ``SqlmpegError(INTERNAL)`` if the graph is malformed: a cycle or
+    Raises ``SqlmpegError(INTERNAL)`` on a malformed graph: a cycle or
     non-topological node ordering, a dangling FrameRef, no outputs, or a pad
-    with more than one consumer (which means the split pass did not run --
-    an ``Output`` counts as a consumer, in whichever group it sits, so a pad
-    feeding both a node and an output, or two outputs naming the same pad, is
-    a split-pass bug).
+    with more than one consumer -- which means the split pass did not run. An
+    ``Output`` counts as a consumer whichever group it sits in, so a pad
+    feeding both a node and an output, or two outputs naming one pad, is a
+    split-pass bug.
 
-    Runs :func:`_dedup_inputs` first (RFC-009): untrimmed aliases that share
-    a path and input options collapse onto one ``-i`` before anything else
-    below reads ``g.sources``/``g.input_paths``.
+    Runs :func:`_dedup_inputs` first, before anything below reads
+    ``g.sources``/``g.input_paths``.
     """
     g = _dedup_inputs(g)
     _verify_topological(g)
@@ -384,13 +361,11 @@ def _output_group(g: Graph, unit: SinkUnit, labels: dict[str, str]) -> OutputGro
 def _input_windows(g: Graph) -> list[tuple[float | None, float | None] | None]:
     """``g.input_trims`` (alias-keyed) resolved into a per-``-i`` list.
 
-    Each alias's window applies to whichever input slot ``g.sources`` sends
-    it to; the result is parallel to ``g.input_paths``: entry `i` is that
-    input's ``(start, end)``, or None. Ordinarily one alias owns a slot, but
-    plan 060's ``_dedup_inputs`` never merges a trimmed alias's slot with
-    another's, so two aliases sharing a slot here (a hand-built ``Graph``,
-    not something dedup produces) are only tolerated when their windows
-    agree exactly -- a genuine mismatch is still the lower/split bug this
+    Each alias's window applies to whichever input slot ``g.sources`` sends it
+    to; entry `i` is that input's ``(start, end)``, or None. ``_dedup_inputs``
+    never merges a trimmed alias's slot, so two aliases sharing a slot here
+    can only come from a hand-built ``Graph``, and are tolerated only when
+    their windows agree exactly -- a real mismatch is the lower/split bug this
     guards against.
     """
     windows: list[tuple[float | None, float | None] | None] = [None] * len(g.input_paths)
@@ -415,12 +390,10 @@ def _input_windows(g: Graph) -> list[tuple[float | None, float | None] | None]:
 def _input_option_list(g: Graph) -> list[dict[str, object]]:
     """``g.input_options`` (alias-keyed) resolved into a per-``-i`` list.
 
-    Same resolution ``_input_windows`` does for trims -- entry `i` is that
-    input's options dict (insertion-ordered), empty for an input that set
-    none. Two aliases sharing a slot (plan 060's dedup merges untrimmed,
-    same-path, same-options aliases onto one) is fine exactly when their
-    option sets agree; a real mismatch on one slot is still a lower/split
-    bug, same as `_input_windows`.
+    Same resolution ``_input_windows`` does for trims: entry `i` is that
+    input's insertion-ordered options dict, empty if it set none. Two aliases
+    sharing a slot (what dedup produces) is fine exactly when their option
+    sets agree; a real mismatch is a lower/split bug, as in `_input_windows`.
     """
     options: list[dict[str, object]] = [{} for _ in g.input_paths]
     seen: list[bool] = [False for _ in g.input_paths]
@@ -446,50 +419,40 @@ def _input_option_list(g: Graph) -> list[dict[str, object]]:
 def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     """Full ffmpeg argv for `e`: one invocation, one output file per group.
 
-    Path precedence per group: `out_path` if given, else that group's own
-    path, else ``ValueError("no output path given and the query has no
-    sink")``. `out_path` OVERRIDES, so it is legal only when `e` has exactly
-    one group — overriding several files with one path would silently write
-    them on top of each other — and a multi-group `e` with `out_path` set is
-    ``ValueError``. This is a CLI/programmer contract, not something user SQL
-    can trigger: the CLI rejects ``-o`` against a multi-sink script itself
-    (usage error, exit 2) before calling this.
+    Path precedence per group: `out_path`, else that group's own path, else
+    ``ValueError``. `out_path` OVERRIDES, so it is legal only for a
+    single-group `e` — overriding several files with one path would write them
+    on top of each other — and a multi-group `e` with `out_path` set raises.
+    A CLI/programmer contract, not something user SQL can trigger: the CLI
+    rejects ``-o`` against a multi-sink script (exit 2) before calling this.
 
     The SELECT list is authoritative: exactly one ``-map`` per
     :class:`OutputMap`, in order, with ``-c:<i> copy`` for passthrough streams
     and ``-metadata:s:<i> k=v`` (keys sorted) for provenance metadata. Those
     ``<i>`` are PER GROUP — ffmpeg restarts output stream numbering at each
-    output file — so group 2's first map is ``-c:0``, not ``-c:<n>``. v0's
-    implicit ``-map 0:a? -c:a copy`` tail is gone. ``-filter_complex`` is
-    rendered once for the whole command, and omitted when the graph is pure
-    passthrough.
+    file — so group 2's first map is ``-c:0``, not ``-c:<n>``.
+    ``-filter_complex`` is rendered once for the command, omitted when the
+    graph is pure passthrough.
 
-    Per-``-i`` flags come first, in a fixed order (verified against real
-    ffmpeg -- see the module docstring's "Input options" section): an input
-    carrying entries in `e.input_options` gets its ``sqlmpeg.inputs.INPUT_OPTIONS``
-    flags (e.g. ``-loop 1``, ``-framerate 15``) rendered FIRST, then an input
-    carrying a window in `e.input_trims` gets ``-ss <start>`` and/or
-    ``-to <end>`` (RFC-004's input seek; plan 039 lets either half be absent
-    for an open-ended window), and only then its own ``-i``. Short or empty
-    `input_options`/`input_trims` lists simply leave the remaining inputs
-    plain, so a hand-built :class:`Emitted` needs neither at all.
+    Per-``-i`` flags come first in a fixed order (see the module docstring's
+    "Input options"): `e.input_options` flags (``-loop 1``, ``-framerate 15``)
+    FIRST, then `e.input_trims`' ``-ss <start>`` and/or ``-to <end>``, then
+    the ``-i``. Short or empty `input_options`/`input_trims` lists leave the
+    remaining inputs plain, so a hand-built :class:`Emitted` needs neither.
 
-    Sink option rendering (RFC-002, plan 027): after each group's
-    -map/-metadata block, that group's own options render in insertion order
-    purely from ``sqlmpeg.sink.SINK_OPTIONS`` table data -- no option-specific
-    logic here. Per-stream specs (``per_stream=True``) render ``f"{flag}:{i}"``
-    for every output index `i` of THAT GROUP whose type matches the spec's
-    scope; container specs (``per_stream=False``) render ``flag`` once,
-    regardless of output types. A bool value of False is never rendered (e.g.
-    ``faststart false`` emits nothing).
+    Sink options render after each group's -map/-metadata block, in
+    insertion order, purely from ``sqlmpeg.sink.SINK_OPTIONS`` table data --
+    no option-specific logic here. ``per_stream=True`` specs render
+    ``f"{flag}:{i}"`` for every output index `i` of THAT GROUP whose type
+    matches the spec's scope; ``per_stream=False`` renders ``flag`` once. A
+    False bool is never rendered (``faststart false`` emits nothing).
 
-    Copy suppression: if a group's options set a codec option (``flag ==
-    "-c"``) scoped to video, that group's video passthrough outputs drop their
-    ``-c:<i> copy`` (the explicit codec re-encodes them instead); same for
-    audio and — since the rule reads the option table's ``scope`` rather than
-    naming types — for ``subtitle_codec`` (RFC-004: webvtt -> mov_text on a
-    passthrough subtitle output). Suppression is per group, so one file may
-    re-encode a stream another file copies.
+    Copy suppression: a group whose options set a codec option (``flag ==
+    "-c"``) scoped to video drops ``-c:<i> copy`` on its video passthrough
+    outputs, since the explicit codec re-encodes them; same for audio and, as
+    the rule reads the table's ``scope`` rather than naming types, for
+    ``subtitle_codec`` (webvtt -> mov_text on a passthrough subtitle
+    output). Per group, so one file may re-encode what another copies.
     """
     if not e.groups:
         raise ValueError("no output path given and the query has no sink")
@@ -530,9 +493,7 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     return args
 
 
-# ---------------------------------------------------------------------------
-# input option rendering (RFC-005 SS4, plan 041)
-# ---------------------------------------------------------------------------
+# input option rendering
 
 
 def _render_input_option_value(spec: InputOptionSpec, value: object) -> str | None:
@@ -564,9 +525,7 @@ def _render_input_options(options: dict[str, object]) -> list[str]:
     return args
 
 
-# ---------------------------------------------------------------------------
-# sink option rendering (RFC-002, plan 027)
-# ---------------------------------------------------------------------------
+# sink option rendering
 
 
 def _copy_suppressed_scopes(options: dict[str, object]) -> set[str]:
@@ -602,9 +561,7 @@ def _render_sink_options(group: OutputGroup) -> list[str]:
     return args
 
 
-# ---------------------------------------------------------------------------
 # escaping
-# ---------------------------------------------------------------------------
 
 
 def _escape_value(s: str) -> str:
@@ -630,9 +587,7 @@ def _escape_value(s: str) -> str:
     return _LEVEL2_SPECIAL.sub(lambda m: "\\" + m.group(0), level1)
 
 
-# ---------------------------------------------------------------------------
 # refs, labels, validation
-# ---------------------------------------------------------------------------
 
 
 def _internal(message: str) -> SqlmpegError:
@@ -753,11 +708,10 @@ def _check_fanout(nodes: list[Node], g: Graph) -> None:
     filtergraph pads — and both mirrored in the split pass, which is what
     leaves them fanned out on purpose:
 
-    * RFC-004: a subtitle/data source ref never enters the filtergraph, and
-      repeating one is legal ffmpeg (``SELECT f.subtitle[1], f.subtitle[1]``
-      writes the same track twice). There is no split filter for such a
-      stream at all.
-    * RFC-006: a video/audio SOURCE ref that no node consumes and that each
+    * a subtitle/data source ref never enters the filtergraph, and repeating
+      one is legal ffmpeg (``SELECT f.subtitle[1], f.subtitle[1]`` writes the
+      same track twice). There is no split filter for such a stream at all.
+    * a video/audio SOURCE ref that no node consumes and that each
       output FILE maps at most once. Two output groups bare-mapping the same
       input stream is a repeated ``-map``, which is equally legal, and it is
       what lets both files stream-copy that track. A repeat within ONE group,
@@ -891,9 +845,7 @@ def _output_map(g: Graph, output: Output, labels: dict[str, str]) -> OutputMap:
     )
 
 
-# ---------------------------------------------------------------------------
 # chain building and rendering
-# ---------------------------------------------------------------------------
 
 
 def _build_chains(nodes: list[Node], pads: dict[str, int]) -> list[list[Node]]:

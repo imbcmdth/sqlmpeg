@@ -361,7 +361,7 @@ def test_idempotent_on_duplicate_subtitle_refs() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-006: several sinks, and the cross-GROUP passthrough exemption (plan 046)
+# RFC-006: several sinks, and the cross-GROUP passthrough exemption
 # ---------------------------------------------------------------------------
 
 
@@ -453,7 +453,7 @@ def test_sink_paths_and_options_survive_the_split_pass() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-004 input seek: input_trims are not part of the pad shape (plan 035)
+# RFC-004 input seek: input_trims are not part of the pad shape
 # ---------------------------------------------------------------------------
 
 
@@ -485,7 +485,7 @@ def test_input_trims_survive_a_graph_that_does_split() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-005 SS4 input options: not part of the pad shape either (plan 041)
+# RFC-005 SS4 input options: not part of the pad shape either
 # ---------------------------------------------------------------------------
 
 

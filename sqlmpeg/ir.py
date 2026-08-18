@@ -4,10 +4,8 @@ The IR is the load-bearing structure: golden tests assert here, not on
 emitted filtergraph strings. See the "Architecture" / "IR" section of
 sqlmpeg-project.md.
 
-FrameRef grammar (v2, RFC-001 "stream-aware" — authoritative statement; split.py's
-module docstring held the v1 grammar and will be brought in line with this one by
-plan 017; RFC-004 widened the marker set to include `s`/`d` — see below)
-------------------------------------------------------------------------------
+FrameRef grammar (authoritative)
+--------------------------------
 A `FrameRef` is a plain `str` and is always exactly one of the following forms:
 
     "src:<alias>:v:<k>"   -> a raw, typed input video stream: the k-th video
@@ -22,32 +20,26 @@ A `FrameRef` is a plain `str` and is always exactly one of the following forms:
                               node with a single consumer, or before the
                               split pass has run).
     "<node-id>:<p>"       -> a Node's output pad p (p = 0..N-1); produced by
-                              the split pass (plan 007/017) when a ref fans
-                              out to more than one consumer, and by any node
-                              whose `outputs` list has more than one entry
-                              (e.g. `split`/`asplit`, or a `concat v=1:a=1`
-                              node with pad 0 = video, pad 1 = audio).
+                              the split pass when a ref fans out to more than
+                              one consumer, and by any node whose `outputs`
+                              list has more than one entry (`split`/`asplit`,
+                              or `concat v=1:a=1` with pad 0 = video, pad
+                              1 = audio).
 
 `k` in a source ref is the ffmpeg *per-type* stream index and is always
 0-based at the IR layer; the SQL surface (`a.video[1]`, `a.audio[2]`, ...) is
-1-based per Postgres array semantics, and lowering (plan 019) converts.
+1-based per Postgres array semantics, and lowering converts. Every source ref
+is stream-typed and indexed -- there is no untyped `"src:<alias>"` form.
 
-v0/v1's untyped `"src:<alias>"` (no `:v:`/`:a:` suffix, no index) is RETIRED
-in v2 — every source ref is now stream-typed and indexed. `is_src()` still
-recognizes any ref starting with the `"src:"` prefix; `src_alias()` and the
-new `src_parts()` parse the typed form.
+A node id must never itself look like a source ref (must not start with
+`"src:"`); `is_src()` relies on this invariant.
 
-A node id must never itself look like a source ref (i.e. must not start with
-`"src:"`); this invariant is relied on by `is_src()` and is unchanged from
-v1.
-
-Subtitle / data refs are PASSTHROUGH-ONLY (RFC-004): ffmpeg filtergraphs
+Subtitle / data refs are PASSTHROUGH-ONLY: ffmpeg filtergraphs
 carry only video/audio, so a `"src:<alias>:s:<k>"` or `"src:<alias>:d:<k>"`
-ref may only ever appear as a `SinkUnit.outputs` entry (a bare `-map`), never
-as a `Node.inputs` entry and never produced by a `Node.outputs` entry. This
-module does not enforce that constraint -- it is a property of well-formed
-IR that later passes (parser/lower in wave 2, split/emit exemptions in wave
-3) are responsible for upholding and checking.
+ref may only appear as a `SinkUnit.outputs` entry (a bare `-map`), never as a
+`Node.inputs` entry and never produced by a `Node.outputs` entry. This module
+does not enforce that; it is a property of well-formed IR that parser/lower
+uphold and split/emit check.
 """
 
 from __future__ import annotations
@@ -70,11 +62,9 @@ def is_src(ref: FrameRef) -> bool:
 def src_parts(ref: FrameRef) -> tuple[str, StreamType, int]:
     """Split a source FrameRef into (alias, stream_type, index).
 
-    `ref` must be of the form "src:<alias>:v:<k>" or "src:<alias>:a:<k>",
-    with `k` a 0-based, per-type ffmpeg stream index. Raises ValueError if
-    `ref` is not a well-formed typed source ref (this is a programmer error —
-    every ref reaching this function is expected to already be validated
-    IR, not user input).
+    `ref` must be a typed source ref, `k` a 0-based per-type ffmpeg stream
+    index. Raises ValueError otherwise -- a programmer error, since every ref
+    reaching here is already-validated IR, not user input.
     """
     rest = ref[len(_SRC_PREFIX):]
     alias, type_marker, index_str = rest.rsplit(":", 2)
@@ -117,8 +107,9 @@ class Node:
     filter: str  # ffmpeg filter name (post macro-expansion)
     args: dict[str, object]  # normalized, SQL arg order already mapped to ffmpeg names
     inputs: list[FrameRef]
-    outputs: list[StreamType]  # one entry per output pad; ["video"] typical.
-    # split/asplit: N same-type entries. concat v=1:a=1: ["video", "audio"].
+    # one entry per output pad; split/asplit have N same-type entries,
+    # concat v=1:a=1 has ["video", "audio"]
+    outputs: list[StreamType]
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -188,22 +179,18 @@ class Output:
 class SinkUnit:
     """One output FILE: its stream list, its destination and its options.
 
-    RFC-006 replaced ``Graph.outputs`` + ``Graph.sink`` with
-    ``Graph.sinks: list[SinkUnit]`` -- one unit per ``COPY (query) TO 'path'
-    WITH (options)`` of a script, in script order. A unit is exactly what
-    ffmpeg calls an output FILE:
+    One unit per ``COPY (query) TO 'path' WITH (options)``, in script order.
 
     * ``outputs`` is that COPY's top-level SELECT list, in ``-map`` order.
       Output STREAM indices are per-file in ffmpeg, so ``-c:<i>`` and
       ``-metadata:s:<i>`` are indexed within this list, not across the
       command (emit's ``OutputGroup``).
-    * ``path`` is None only for the bare-SELECT case -- a query with no COPY
-      at all names no destination, so the caller (the CLI's ``-o``, or a
-      placeholder) supplies one. ``options`` is empty then too.
-    * ``options`` is insertion-ordered and its values are already normalized
-      (validated against `sqlmpeg.sink.SINK_OPTIONS` by lower -- plan 026).
+    * ``path`` is None only for the bare-SELECT case, where the caller (the
+      CLI's ``-o``, or a placeholder) supplies one; ``options`` is empty then.
+    * ``options`` is insertion-ordered with values already validated against
+      `sqlmpeg.sink.SINK_OPTIONS` by lower.
 
-    Filtergraph LABELS are graph-scoped, not file-scoped: a single
+    Filtergraph LABELS are graph-scoped, not file-scoped: one
     ``-filter_complex`` serves every unit, so emit keeps ``out<i>`` unique
     across the whole graph (see :attr:`Graph.outputs`).
     """
@@ -239,41 +226,32 @@ class Graph:
     input_paths: list[str]  # -i order; index is the ffmpeg input index
     sources: dict[str, int]  # alias -> index into input_paths
     nodes: dict[str, Node] = field(default_factory=dict)  # insertion-ordered
-    # RFC-006: one unit per output FILE, in script order. A bare SELECT and a
-    # single COPY are both exactly one unit (path None / the COPY's path); a
-    # script is one per COPY, and they share this graph's nodes -- a view read
-    # by three COPYs is lowered ONCE and fanned out by the split pass.
+    # One unit per output FILE, in script order. Units share this
+    # graph's nodes -- a view read by three COPYs is lowered ONCE and fanned
+    # out by the split pass.
     sinks: list[SinkUnit] = field(default_factory=list)
-    # RFC-004 input-seek amendment: alias -> (start, end) seconds. Emit (wave
-    # 3) renders "-ss <start> -to <end>" immediately before that alias's -i,
-    # trimming every stream type of that input coherently. Empty by default;
-    # to_dict emits the "input_trims" key only when non-empty. Plan 039
-    # (open-ended windows):
-    # either bound may be None -- a missing start omits "-ss", a missing end
-    # omits "-to" -- but not both (a WHERE clause always supplies at least
-    # one bound; see parser._time_bounds).
+    # alias -> (start, end) seconds. Emit renders "-ss <start> -to
+    # <end>" immediately before that alias's -i, trimming every stream type of
+    # the input coherently. Either bound may be None -- a missing start omits
+    # "-ss", a missing end omits "-to" -- but never both, since a WHERE clause
+    # always supplies at least one (parser._time_bounds).
     input_trims: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
-    # RFC-005 SS4 (plan 041): alias -> its validated `input('path', name =>
-    # value, ...)` options, insertion-ordered, values already normalized
-    # against `sqlmpeg.inputs.INPUT_OPTIONS`. Emit (plan 041) resolves this
-    # alias-keyed map into a per-`-i` list, same as `input_trims`, and renders
-    # each input's options immediately before its own `-i` (before any
-    # `-ss`/`-to` from `input_trims`). Empty by default; to_dict emits the
-    # "input_options" key only when non-empty (same pattern as "input_trims").
+    # alias -> its `input('path', name => value, ...)` options,
+    # insertion-ordered, already validated against `sqlmpeg.inputs`. Emit
+    # renders each input's options immediately before its own `-i`, ahead of
+    # any `-ss`/`-to` from `input_trims`.
     input_options: dict[str, dict[str, object]] = field(default_factory=dict)
 
     @property
     def outputs(self) -> list[Output]:
         """Every unit's outputs concatenated, in sink order (read-only).
 
-        The graph-wide output list: this is the UNION the split pass and
-        emit's consume-once check count over, because a filtergraph pad
-        feeding two different output files is still consumed twice. It is
-        derived, not stored -- an Output belongs to exactly one
-        :class:`SinkUnit`, and its index HERE is only an ffmpeg output stream
-        index when the graph has a single unit (ffmpeg restarts output stream
-        numbering per file). Emit uses it for the graph-scoped ``out<i>``
-        labels, which are unique across the whole command.
+        The UNION the split pass and emit's consume-once check count over,
+        since a pad feeding two output files is still consumed twice. Derived,
+        not stored: an Output belongs to exactly one :class:`SinkUnit`, and
+        its index HERE is an ffmpeg output stream index only for a
+        single-unit graph (ffmpeg restarts stream numbering per file). Emit
+        uses it for the graph-scoped ``out<i>`` labels.
         """
         return [output for unit in self.sinks for output in unit.outputs]
 
@@ -284,12 +262,12 @@ class Graph:
             "nodes": [node.to_dict() for node in self.nodes.values()],
             "sinks": [unit.to_dict() for unit in self.sinks],
         }
-        # "input_trims" and "input_options" are emitted ONLY when non-empty,
-        # so a graph that uses neither keeps the smaller shape.
+        # Emitted only when non-empty: a graph using neither keeps the smaller
+        # shape the goldens pin.
         if self.input_trims:
             d["input_trims"] = {
                 alias: [start, end] for alias, (start, end) in self.input_trims.items()
-            }  # None bounds render as JSON null, same as any other field
+            }
         if self.input_options:
             d["input_options"] = {
                 alias: dict(options) for alias, options in self.input_options.items()

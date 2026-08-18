@@ -1,17 +1,16 @@
-"""Tests for the LLM system prompt (plan 012; rewritten 053b, RFC-007; RFC-010).
+"""Tests for the LLM system prompt.
 
 The load-bearing one is :func:`test_every_sql_example_compiles`: the prompt is
 a contract with a model, so every query it shows off must actually compile.
 The marker convention is a fenced ``sql`` block -- prompt.py only ever puts
 complete, accepted queries inside one.
 
-Content-keyed rather than full-text pinned (RFC-007 collapsed the old
-stdlib/dynamic split into one calling convention, three namespaces): these
-assert the prompt SAYS the load-bearing facts, not that it says them in one
-exact wording, since prose is expected to keep improving.
+Content-keyed rather than full-text pinned: these assert the prompt SAYS the
+load-bearing facts, not that it says them in one exact wording, since prose is
+expected to keep improving.
 
-RFC-010: ``build_system_prompt`` now REQUIRES a ``Registry`` (ffmpeg is
-always there, PATH or the provisioner). ``PROMPT`` here -- like
+``build_system_prompt`` REQUIRES a ``Registry`` (ffmpeg is always there,
+PATH or the provisioner). ``PROMPT`` here -- like
 ``docs/system-prompt.md`` -- is rendered from the committed, version-pinned
 reference snapshot (:func:`sqlmpeg.registry.load_reference`, no ffmpeg or
 subprocess involved), matching exactly what ``scripts/gen_prompt.py`` does,
@@ -141,7 +140,7 @@ def test_every_error_code_has_repair_guidance() -> None:
 
 
 def test_every_sink_option_is_documented() -> None:
-    """The Output section's table is rendered from SINK_OPTIONS (plan 028) --
+    """The Output section's table is rendered from SINK_OPTIONS --
     a new option cannot silently go undocumented in the prompt."""
     for spec in SINK_OPTIONS.values():
         assert f"`{spec.name}`" in PROMPT, spec.name
@@ -150,14 +149,14 @@ def test_every_sink_option_is_documented() -> None:
 
 def test_every_input_option_is_documented() -> None:
     """The Dialect > Sources input-options bullets are rendered from
-    INPUT_OPTIONS (plan 041) -- a new option cannot silently go undocumented."""
+    INPUT_OPTIONS -- a new option cannot silently go undocumented."""
     for spec in INPUT_OPTIONS.values():
         assert f"`{spec.name}`" in PROMPT, spec.name
         assert spec.doc in PROMPT, spec.name
 
 
 def test_generated_sources_are_documented() -> None:
-    """RFC-005 SS1 (plan 042): the FROM-position half of the `ffmpeg.`
+    """RFC-005 SS1: the FROM-position half of the `ffmpeg.`
     namespace, its column surface, and the silent-audio pattern it exists
     for."""
     assert "FROM ffmpeg.<source>(<name> => <value>, ...) alias" in PROMPT
@@ -168,7 +167,7 @@ def test_generated_sources_are_documented() -> None:
 
 
 # ---------------------------------------------------------------------------
-# track rows (RFC-009, plan 063): unnest, row columns, WHERE/ORDER BY, joins,
+# track rows: unnest, row columns, WHERE/ORDER BY, joins,
 # COALESCE fills
 # ---------------------------------------------------------------------------
 

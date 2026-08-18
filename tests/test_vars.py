@@ -1,4 +1,4 @@
-"""Tests for sqlmpeg.vars.substitute -- psql-style CLI variables (plan 069)."""
+"""Tests for sqlmpeg.vars.substitute -- psql-style CLI variables."""
 
 from __future__ import annotations
 

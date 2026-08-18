@@ -195,7 +195,7 @@ def test_where_conjunction_per_alias_is_accepted() -> None:
 
 
 # ---------------------------------------------------------------------------
-# resolve — open-ended time windows (plan 039)
+# resolve — open-ended time windows
 # ---------------------------------------------------------------------------
 
 
@@ -345,7 +345,7 @@ def test_union_without_all_suggests_union_all() -> None:
 
 
 # ---------------------------------------------------------------------------
-# resolve — multiple projections (RFC-001: SELECT list = output stream list)
+# resolve — multiple projections (SELECT list = output stream list)
 # ---------------------------------------------------------------------------
 
 
@@ -390,7 +390,7 @@ def test_select_with_no_output_column_is_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
-# resolve — SELECT * / <alias>.* (RFC-004)
+# resolve — SELECT * / <alias>.*
 # ---------------------------------------------------------------------------
 
 
@@ -480,7 +480,7 @@ def test_count_star_over_track_rows_is_still_an_aggregate_rejection() -> None:
 
 
 # ---------------------------------------------------------------------------
-# resolve — subtitle / data pseudo-columns (RFC-004)
+# resolve — subtitle / data pseudo-columns
 # ---------------------------------------------------------------------------
 
 
@@ -735,7 +735,7 @@ def test_unknown_table_function() -> None:
 
 
 # ---------------------------------------------------------------------------
-# input() named options (RFC-005 SS4, plan 041)
+# input() named options
 # ---------------------------------------------------------------------------
 
 
@@ -801,7 +801,7 @@ def test_input_named_option_with_no_value_is_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
-# FROM ffmpeg.<source>(...) alias (RFC-005 SS1, plan 042)
+# FROM ffmpeg.<source>(...) alias
 # ---------------------------------------------------------------------------
 #
 # Shape only: which sources exist and which options they take is the installed
@@ -949,7 +949,7 @@ def test_a_non_namespace_qualifier_is_still_rejected() -> None:
 
 
 def test_a_bare_source_name_in_from_is_not_a_table_function() -> None:
-    """The namespace is mandatory (RFC-005 SS1: `random` etc. collide bare)."""
+    """The namespace is mandatory (`random` etc. collide bare)."""
     err = _reject("SELECT t.frame FROM testsrc(duration => 2) t")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unsupported table function testsrc()" in err.message
@@ -1037,7 +1037,7 @@ def test_cte_body_must_be_a_select() -> None:
 
 
 # ---------------------------------------------------------------------------
-# named arguments — SHAPE only (RFC-003, plan 031)
+# named arguments — SHAPE only
 # ---------------------------------------------------------------------------
 #
 # Which options exist, and what they accept, is a property of the installed
@@ -1122,7 +1122,7 @@ def test_overlay_cannot_take_named_arguments() -> None:
 
 
 # ---------------------------------------------------------------------------
-# COPY ... TO ... WITH (...)  — the sink wrapper (RFC-002, plan 026)
+# COPY ... TO ... WITH (...)  — the sink wrapper
 # ---------------------------------------------------------------------------
 
 
@@ -1260,7 +1260,7 @@ def test_copy_from_names_the_supported_form() -> None:
 
 
 # ---------------------------------------------------------------------------
-# csv sink classification (RFC-011, plan 067): FORMAT csv, TO STDOUT
+# csv sink classification: FORMAT csv, TO STDOUT
 # ---------------------------------------------------------------------------
 
 
@@ -1353,12 +1353,12 @@ def test_copy_shapes_sqlglot_itself_refuses(sql: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# scripts + CREATE VIEW (RFC-006, plan 045)
+# scripts + CREATE VIEW
 # ---------------------------------------------------------------------------
 #
 # A script is `CREATE VIEW name AS <query>;`* followed by `COPY ...;`+. The
 # parser accepts any number of COPYs; lowering is still single-sink, and the
-# TEMPORARY rejection of a second one lives in `sqlmpeg.lower` (plan 046).
+# TEMPORARY rejection of a second one lives in `sqlmpeg.lower`.
 
 VIEW_SCRIPT = """CREATE VIEW master AS
   SELECT scale(a.frame, 1280, -2) AS v FROM input('film.mkv') a;
@@ -1458,7 +1458,7 @@ def test_a_copy_may_still_carry_its_own_with_in_a_script() -> None:
 
 
 def test_several_copies_resolve_cleanly() -> None:
-    """Resolve is already multi-sink; only lowering is not (plan 046)."""
+    """Resolve is already multi-sink; only lowering is not."""
     res = _resolve(
         "CREATE VIEW m AS SELECT a.frame AS v FROM input('film.mkv') a;\n"
         "COPY (SELECT scale(m.v, 1280, -2) FROM m) TO '720.mp4';\n"
@@ -1651,7 +1651,7 @@ def test_an_aliased_name_may_not_collide_with_another_from_entry() -> None:
 
 
 # ---------------------------------------------------------------------------
-# track rows: FROM unnest(<input>.<type>) alias  (RFC-009, plan 061)
+# track rows: FROM unnest(<input>.<type>) alias
 # ---------------------------------------------------------------------------
 
 
@@ -1778,7 +1778,7 @@ def test_unnest_needs_an_input_not_a_cte_or_a_generated_source() -> None:
     assert "only an input's stream array can be unnested" in err.message
 
 
-# -- JOIN between track-row tables (RFC-009, plan 062) ----------------------
+# -- JOIN between track-row tables ----------------------
 
 
 def _joined(join: str = "JOIN", on: str = "ON a.language = b.language") -> str:

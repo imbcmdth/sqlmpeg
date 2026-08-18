@@ -1,7 +1,7 @@
-"""Tests for the input option table (plan 041, RFC-005 SS4).
+"""Tests for the input option table.
 
 Guardrail #4: INPUT_OPTIONS is DATA. This file checks the table's shape
-against RFC-005's v1 list (name/type per option) and exercises
+against the documented option list (name/type per option) and exercises
 ``validate_option``'s happy/unknown/wrong-type paths -- the input-side mirror
 of ``tests/test_sink.py``.
 """
@@ -13,7 +13,7 @@ import pytest
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import INPUT_OPTIONS, InputOptionSpec, validate_option
 
-# name -> type, per RFC-005 SS4's v1 table.
+# name -> type.
 _EXPECTED: dict[str, str] = {
     "loop": "bool",
     "stream_loop": "int",

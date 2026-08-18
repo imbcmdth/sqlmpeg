@@ -1,13 +1,11 @@
 """Suite-wide default: ``compile_sql`` resolves against the captured snapshot.
 
-RFC-007 made the installed ffmpeg's filter set THE function surface, which
-would quietly make every ``compile_sql``-based test depend on whichever
-ffmpeg the machine happens to have -- and fail on a machine with none. CI
-runs the default suite BEFORE installing ffmpeg, deliberately: the non-exec
-tier must be deterministic on a bare machine, and
-``tests/data/reference_registry.json`` exists for exactly that (RFC-007
-"Offline compile": the snapshot serves golden tests, fuzzing, and offline
-CI).
+The installed ffmpeg's filter set is THE function surface, which would
+otherwise make every ``compile_sql``-based test depend on whichever ffmpeg the
+machine happens to have -- and fail on a machine with none. CI runs the default
+suite BEFORE installing ffmpeg, deliberately: the non-exec tier must be
+deterministic on a bare machine, and ``tests/data/reference_registry.json``
+exists for exactly that -- it serves golden tests, fuzzing and offline CI.
 
 The seam is the compiler module's ``registry_module`` reference: swapping it
 for a shim redirects ``compile_sql`` (and everything above it: the CLI, the

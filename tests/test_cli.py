@@ -1,10 +1,10 @@
-"""Tests for the CLI (plan 008; plan 037 for the SQL-string-is-default convention).
+"""Tests for the CLI.
 
 Invokes ``main([...])`` directly (no subprocess) and asserts on captured
 stdout/stderr via pytest's ``capsys``, plus the process exit code returned
 by ``main``.
 
-Convention (plan 037): ``compile``/``explain``/``validate``/``run`` take the
+Convention: ``compile``/``explain``/``validate``/``run`` take the
 query as an inline SQL string by default; ``-f/--file`` reads it from a file
 instead ('-' for stdin). Tests below use the inline positional wherever the
 file itself isn't under test, and ``-f`` (with a real file, or '-' for
@@ -26,7 +26,7 @@ BAD_QUERY = "SELECT nope(a.frame) FROM input('x.mp4') a"
 
 # For tests that monkeypatch cli.compile_sql to return a hand-built, already
 # -sinked Graph (see _sinked_graph/_multi_sink_graph below): the REAL text
-# still goes through cli.classify() first (RFC-011, plan 067), so it must
+# still goes through cli.classify() first, so it must
 # itself look like a media query -- a real COPY, not FORMAT csv -- for
 # `run`'s new table/csv branch to stay out of the way and reach the
 # monkeypatched compile_sql at all.
@@ -207,7 +207,7 @@ def test_compile_graph_only_still_works_for_a_multi_sink_script(
 
 
 # ---------------------------------------------------------------------------
-# compile on a table/csv query (RFC-011, plan 067)
+# compile on a table/csv query
 # ---------------------------------------------------------------------------
 
 
@@ -290,7 +290,7 @@ def test_explain_shows_the_sinks_list(capsys: pytest.CaptureFixture[str]) -> Non
 # installed ffmpeg, so --portable had nothing left to select. --no-probe made
 # a READABLE file compile as if unreadable, silently stripping provenance
 # metadata -- a determinism switch that changed the result -- so it is gone
-# too; opportunistic probing (RFC-001) already degrades silently on
+# too; opportunistic probing already degrades silently on
 # missing/unreadable inputs, which is the whole of what it was ever for.
 
 
@@ -362,7 +362,7 @@ def test_validate_bad_query_human(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 def test_validate_bad_query_json_inline(capsys: pytest.CaptureFixture[str]) -> None:
-    """validate --json on an inline SQL string (plan 037)."""
+    """validate --json on an inline SQL string."""
     code = cli.main(["validate", "--json", BAD_QUERY])
     captured = capsys.readouterr()
     assert code == 1
@@ -401,7 +401,7 @@ def test_validate_file_dash_reads_stdin(
 
 
 # ---------------------------------------------------------------------------
-# usage: exactly one of the positional query / -f is required (plan 037)
+# usage: exactly one of the positional query / -f is required
 # ---------------------------------------------------------------------------
 
 
@@ -429,7 +429,7 @@ def test_neither_query_nor_file_is_a_usage_error(
 
 
 # ---------------------------------------------------------------------------
-# did-you-mean-f hint (plan 037)
+# did-you-mean-f hint
 # ---------------------------------------------------------------------------
 
 
@@ -497,7 +497,7 @@ def test_hint_does_not_fire_for_non_parse_errors(capsys: pytest.CaptureFixture[s
 def test_hint_on_validate_json_goes_to_stderr_stdout_stays_pure_json(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Machine contract (plan 037): --json's stdout is the library error
+    """Machine contract: --json's stdout is the library error
     verbatim, untouched by the hint; the hint (if any) only ever goes to
     stderr."""
     path = _write_sql(tmp_path, VALID_QUERY)
@@ -515,7 +515,7 @@ def test_hint_on_validate_json_goes_to_stderr_stdout_stays_pure_json(
 
 # ---------------------------------------------------------------------------
 # Windows note: a query containing single quotes must survive argparse
-# unquoted -- the common case is input('x.mp4') itself (plan 037).
+# unquoted -- the common case is input('x.mp4') itself.
 # ---------------------------------------------------------------------------
 
 
@@ -750,7 +750,7 @@ def test_unknown_subcommand_falls_through_to_run_and_fails_as_sql(
 
 
 # ---------------------------------------------------------------------------
-# default subcommand (RFC-011, plan 067)
+# default subcommand
 # ---------------------------------------------------------------------------
 
 
@@ -792,7 +792,7 @@ def test_explicit_run_and_default_dispatch_agree(
 
 
 # ---------------------------------------------------------------------------
-# -v/--set CLI variables (plan 069)
+# -v/--set CLI variables
 # ---------------------------------------------------------------------------
 
 VAR_QUERY = "SELECT scale(a.frame, 640, 480) FROM input(:'path') a"

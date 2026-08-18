@@ -1,4 +1,4 @@
-"""ffmpeg filter registry for sqlmpeg (RFC-003 "Dynamic filters").
+"""ffmpeg filter registry for sqlmpeg.
 
 Introspects the ffmpeg binary on PATH for the FULL set of filters it
 supports (~460-560 depending on build), beyond the curated stdlib. Two
@@ -16,159 +16,117 @@ ffmpeg CLI outputs drive this:
   <description>` lines indented 5 spaces directly below their parent
   option.
 
-NEVER raises: any subprocess failure, timeout, missing ffmpeg, or
-unparseable output degrades permissively (see RFC "Registry mechanics" --
-"Unparseable single options degrade to type str ... rather than dropping
-the filter"). Depends only on `sqlmpeg.ir` (for `StreamType`) and the
-stdlib.
+NEVER raises: any subprocess failure, timeout, missing ffmpeg, or unparseable
+output degrades permissively -- an unparseable option becomes type str rather
+than dropping the whole filter. Depends only on `sqlmpeg.ir` (for
+`StreamType`) and the stdlib.
 
-Format quirks discovered empirically against ffmpeg 7.1
-(`ffmpeg version 7.1-full_build-www.gyan.dev`, captured 2026-08) that this
-parser is built around -- see tests/test_registry.py for the captured
-fixtures this was verified against:
+MEASURED format quirks this parser is built around. All figures below come
+from a full scan of `ffmpeg version 7.1-full_build-www.gyan.dev` (captured
+2026-08); tests/test_registry.py holds the captured fixtures.
 
-  - The `-filters` legend (`Filters:` + 7 lines of `X = ...` key) is NEVER
-    explicitly skipped by line count -- the per-line regex requires the
-    3-char flag column at column 1, which the legend text never matches
-    (its lines start with two spaces, not one-space-plus-flags). This
-    makes parsing resilient to legend wording changes across ffmpeg
-    versions.
-  - Pad specs seen in a full scan of ffmpeg 7.1's ~560 filters: `A->A`,
-    `AA->A`, `V->V`, `VV->V`, `VVV->V`, `VVVV->V`, `A->V`, `VV->A` (never
-    observed, but mixed in/out letters are parsed verbatim per character
-    regardless of whether a concrete example exists). Multi-output specs
-    exist and are excluded (`VV->VV` e.g. `feedback`, `scale2ref`). `N`
-    (dynamic pad count, e.g. `split`: `V->N`, `concat`: `N->N`) and `|`
-    (source/sink, e.g. `testsrc`: `|->V`, `anullsink`: `A->|`) are excluded
-    per the RFC v1 scope fence. Every zero-input filter observed uses `|`
-    as its input character (never an empty string); the "zero inputs"
-    exclusion is defensive belt-and-suspenders for a hypothetical future
-    ffmpeg encoding, not something seen in practice.
+  - The `-filters` legend (`Filters:` + 7 `X = ...` lines) is never skipped
+    by line count -- the per-line regex requires the 3-char flag column at
+    column 1, which legend lines (two leading spaces) never match. Resilient
+    to legend wording changes across versions.
+  - Pad specs seen across ~560 filters: `A->A`, `AA->A`, `V->V`, `VV->V`,
+    `VVV->V`, `VVVV->V`, `A->V`. `VV->A` was never observed; mixed in/out
+    letters parse verbatim per character regardless. Multi-output (`VV->VV`:
+    `feedback`, `scale2ref`), dynamic pad count `N` (`split`: `V->N`,
+    `concat`: `N->N`) and source/sink `|` (`testsrc`: `|->V`, `anullsink`:
+    `A->|`) are excluded by the pad scope fence. Every zero-input filter
+    observed uses `|` as its input character, never an empty string -- the
+    "zero inputs" exclusion is defensive, not something seen in practice.
   - The `-help filter=X` AVOptions header does NOT always read
-    `"X AVOptions:"` -- ffmpeg groups filters that share an implementation
-    under one header, e.g. `split`'s header is `"(a)split AVOptions:"`
-    (shared with `asplit`), `acompressor`'s is
-    `"acompressor/sidechaincompress AVOptions:"` (51 of ~460 included
-    filters have a mismatched header in a full scan). The parser therefore
-    does NOT match the header text against the filter name; it takes the
-    FIRST line containing "AVOptions:" in the help output as the start of
-    the option block, unconditionally.
-  - Some filters' help output has MULTIPLE "AVOptions:" sections separated
-    by a blank line -- e.g. `scale` has its own section, then a
-    `SWScaler AVOptions:` section (option names there are even prefixed
-    with a literal `-`, e.g. `-sws_flags`, at 2-space indent) and a
-    `framesync AVOptions:` section; `overlay` has its own section then
-    `framesync AVOptions:`. Only the FIRST block (up to the first blank
-    line) is parsed; later sections belong to a different AVClass and are
-    not this filter's own options.
-  - Filters with no options at all (e.g. `anullsink`) have no "AVOptions:"
-    line in their help output; this degrades permissively to an empty
-    options dict, not an error.
-  - Short/long option aliases are listed as separate AVOption lines with
-    IDENTICAL description text, e.g. `subtitles` has `filename`/`f`,
-    `testsrc` has `size`/`s`, `rate`/`r`, `scale` has `w`/`width`,
-    `h`/`height`. Empirically the LONGER name is the one worth keeping
-    (confirmed against 456 long-first, 29 short-first, and 17 equal-length
-    duplicate-doc groups across a full scan of ffmpeg 7.1's included
-    filters); file ORDER is not a reliable signal by itself (`scale` lists
-    `w` before `width`, but `size` before `s` -- inconsistent). This module
-    dedups by identical doc text and keeps the longest name, breaking
-    length ties by first occurrence -- but ONLY within a run of CONSECUTIVE
-    lines that share that doc text.
+    `"X AVOptions:"`: filters sharing an implementation share a header
+    (`split` -> `"(a)split AVOptions:"`, `acompressor` ->
+    `"acompressor/sidechaincompress AVOptions:"`), 51 of ~460 included
+    filters mismatched. The parser therefore never matches header text
+    against the filter name; it takes the FIRST line containing
+    "AVOptions:", unconditionally.
+  - Some help outputs have MULTIPLE "AVOptions:" sections separated by a
+    blank line: `scale` has its own, then `SWScaler AVOptions:` (whose
+    option names are literally `-`-prefixed, e.g. `-sws_flags`, at 2-space
+    indent), then `framesync AVOptions:`; `overlay` has its own then
+    `framesync`. Only the FIRST block is parsed -- later sections belong to
+    a different AVClass, not this filter.
+  - Filters with no options (e.g. `anullsink`) have no "AVOptions:" line at
+    all; that degrades to an empty options dict, not an error.
+  - Short/long option aliases appear as separate AVOption lines with
+    IDENTICAL description text (`subtitles`: `filename`/`f`; `testsrc`:
+    `size`/`s`, `rate`/`r`; `scale`: `w`/`width`, `h`/`height`). The LONGER
+    name is the one to keep: 456 long-first vs 29 short-first vs 17
+    equal-length duplicate-doc groups. File ORDER is not a reliable signal
+    on its own -- `scale` lists `w` before `width` but `size` before `s`.
+    So: dedup by identical doc text, keep the longest name, break length
+    ties by first occurrence -- but ONLY within a run of CONSECUTIVE lines
+    sharing that doc text.
 
-    The adjacency requirement is ffmpeg's own rule, not a heuristic
-    (plan 051). An alias pair is two AVOption entries at the same struct
-    OFFSET, and libavfilter's `process_options` walks the option list to
-    bind POSITIONAL filtergraph arguments (`gblur=5`, `crop=100:50:10:20`),
-    skipping an entry only when its offset equals the one it just consumed
-    -- i.e. only when the duplicate is ADJACENT. So the surviving list is
-    exactly ffmpeg's positional binding order, which is what plan 051's
-    positional call syntax binds against.
+    Adjacency is ffmpeg's own rule, not a heuristic. An alias pair is two
+    AVOption entries at the same struct OFFSET, and libavfilter's
+    `process_options` binds POSITIONAL filtergraph arguments (`gblur=5`,
+    `crop=100:50:10:20`) by walking the option list, skipping an entry only
+    when its offset equals the one just consumed -- i.e. only when the
+    duplicate is ADJACENT. The surviving list is therefore exactly ffmpeg's
+    positional binding order, which is what positional call syntax binds
+    against.
 
-    Grouping by doc text ALONE (the pre-051 rule) merged options that are
-    genuinely distinct and merely happen to share a description, which both
-    dropped real options and shifted every positional slot after them.
-    Measured against ffmpeg 7.1, 7 of 477 filters/sources were affected:
-    `deshake` (`x`/`rx` and `y`/`ry` -- `x`,`y` vanished and slot 1 became
-    `w`, where ffmpeg binds `x`), `noise` (`all_*`/`c0_*` -- the six `c0_`
-    options vanished and slot 4 became `c1_seed`, where ffmpeg binds
-    `c0_seed`), `cropdetect` (`reset`/`reset_count`, non-adjacent -- ffmpeg
-    binds BOTH, to slots 3 and 5), `trim` and `atrim` (`end`/`endi`/
-    `end_pts` -- `end` vanished and every slot from 2 on shifted),
-    `buffer` (several empty-doc options collapsed into one) and `abuffer`
-    (`channels` vanished). Every other filter's option list is byte-for-byte
-    unchanged by the adjacency rule.
+    Grouping by doc text alone merges genuinely distinct options that happen
+    to share a description, dropping real options and shifting every
+    positional slot after them. Measured: 7 of 477 filters/sources affected
+    -- `deshake` (`x`/`rx`, `y`/`ry`: `x`,`y` vanished, slot 1 became `w`
+    where ffmpeg binds `x`), `noise` (`all_*`/`c0_*`: six `c0_` options
+    vanished, slot 4 became `c1_seed` where ffmpeg binds `c0_seed`),
+    `cropdetect` (`reset`/`reset_count`, non-adjacent -- ffmpeg binds BOTH,
+    slots 3 and 5), `trim`/`atrim` (`end`/`endi`/`end_pts`: `end` vanished,
+    every slot from 2 on shifted), `buffer` (empty-doc options collapsed)
+    and `abuffer` (`channels` vanished). Every other filter's option list is
+    byte-for-byte unchanged by the adjacency rule.
   - Enum options are `<int>`-typed AVOptions whose default is often a
-    CONSTANT NAME rather than a number (e.g. xfade's `transition` default
-    is "fade", not "0"); the constants are the 5-space-indented lines
-    immediately following the option line, each `<name> <value> <flags>
-    <description>` (description may be empty, e.g. overlay's `format`
-    enum). `default` is stored completely verbatim (whatever text ffmpeg
-    printed) for documentation purposes only -- it is never validated
-    against the constant list or re-typed.
+    CONSTANT NAME, not a number (xfade's `transition` defaults to "fade").
+    Constants are the 5-space-indented lines immediately below the option,
+    each `<name> <value> <flags> <description>` (description may be empty,
+    e.g. overlay's `format`). `default` is stored verbatim for docs only --
+    never validated against the constant list, never re-typed.
   - `(from A to B)` bounds are not always numeric (`DBL_MAX`, `INT_MAX`,
-    `INT_MIN` appear, e.g. hqdn3d's `luma_spatial` is
-    `(from 0 to DBL_MAX)`); `minimum`/`maximum` are `None` when a bound
-    does not parse as a Python float.
-  - No real `binary` or `dictionary` typed option was observed in a full
-    scan of all ~460 included ffmpeg 7.1 filters (the RFC's exclusion rule
-    for these types -- mapped to `type="str"`, `unusable=True` -- is
-    implemented but exercised only by a constructed fixture in tests, not
-    a captured one).
-  - `boolean`-typed options can have a non-boolean-looking default, e.g.
-    subtitles' `wrap_unicode` is `<boolean> ... (default auto)` -- again,
-    `default` is stored verbatim without validation.
-  - Types seen beyond the RFC's table (`channel_layout`, `pix_fmt`) are
-    mapped to `"str"` via a permissive fallback (anything not in the
-    explicit type map degrades to `"str"`, matching the "unparseable
-    option lines degrade to str" policy for option TYPES as well as whole
-    lines).
-
-Plan 040 additions (RFC-005 SS1-2), verified against the same ffmpeg 7.1
-build:
-
-  - The flag column's FIRST character (`T` vs `.`) is now retained as
-    `DynamicFilter.timeline`. It reflects the FILTER's own timeline
-    ('enable' option) support, which is independent of any per-OPTION
-    trailing flag character that also happens to be `T` in the `-help`
-    option-flags string (e.g. `color`'s `color`/`c` option prints
-    `..FV.....T.` even though `color` itself is NOT a timeline filter --
-    its `-filters` line is `..C`, and its `-help` output has no trailing
-    "This filter has support for timeline through the 'enable' option."
-    sentence). Only the `-filters` flag column is used; the per-option
-    flag string is still discarded entirely, as before.
-  - A full scan of ffmpeg 7.1's `-filters` output found 43 source lines
-    (`|->`) and 4 sink lines (`->|`), NONE of which carry the `T` flag --
-    timeline support was not observed on any source or sink in this build.
-  - Source pad shapes seen: 40 single-output sources -- 29 `|->V`
-    (testsrc, testsrc2, color, nullsrc, allrgb, mandelbrot, ...) and 11
-    `|->A` (anullsrc, sine, aevalsrc, sinc, flite, ...). One multi-output
-    source was observed, `avsynctest` (`|->AV`, two output pads), and two
-    dynamic-count sources, `movie` and `amovie` (`|->N`). Multi-output and
-    dynamic sources are excluded the same way multi-output/dynamic regular
-    filters are: `|->AV`'s 2-char output fails the single-char check,
-    `|->N`'s output char isn't a recognized V/A pad letter. All 4 sinks
-    are single-input (`A->|`, `V->|`) and stay excluded unconditionally
-    (RFC scope fence -- no SinkFilter type exists).
-  - Source `-help filter=X` option blocks parse via the SAME
-    `_parse_filter_help` used for regular filters (same lazy, per-name,
-    memoized path via `Registry.options()`) -- no separate code path.
-    Verified against `testsrc`, `testsrc2`, `anullsrc`, `sine`, `color`:
-    all list short/long alias pairs with the long name FIRST in the file
-    (size/s, rate/r, duration/d, decimals/n, channel_layout/cl,
-    sample_rate/r, nb_samples/n, frequency/f, beep_factor/b) -- the
-    existing "keep the longer name" dedup rule applies unchanged.
-  - The header-name-mismatch quirk (documented above for `split`/`(a)split`
-    and `overlay`/`framesync`) also affects sources: `nullsrc`'s header is
-    `"nullsrc/yuvtestsrc AVOptions:"` and `allrgb`'s is
-    `"allyuv/allrgb AVOptions:"` (shared implementation, and note the name
-    order is NOT the queried filter first in either case) -- the
-    take-the-first-"AVOptions:"-line rule already handles this with no
-    source-specific logic needed.
-  - Sources have no "Inputs:" pads in `-help` output (it prints
-    `Inputs:\n        none (source filter)` instead of `#0: ...`), but
-    this module never parses that section (only the option block after
-    "AVOptions:"), so it required no code change.
+    `INT_MIN`; hqdn3d's `luma_spatial` is `(from 0 to DBL_MAX)`);
+    `minimum`/`maximum` are None when a bound does not parse as a float.
+  - No real `binary` or `dictionary` typed option was observed across all
+    ~460 included filters. The exclusion rule for them (`type="str"`,
+    `unusable=True`) is implemented but exercised only by a constructed
+    fixture.
+  - `boolean` options can have a non-boolean-looking default: subtitles'
+    `wrap_unicode` is `<boolean> ... (default auto)`. Again, verbatim.
+  - Types beyond `_TYPE_MAP` (`channel_layout`, `pix_fmt`) map to
+    `"str"` via the permissive fallback -- anything not in the explicit type
+    map degrades to `"str"`.
+  - The flag column's FIRST character (`T` vs `.`) is retained as
+    `DynamicFilter.timeline`, the FILTER's own timeline ('enable') support.
+    It is independent of a per-OPTION trailing `T` in the `-help` flags
+    string: `color`'s `color`/`c` option prints `..FV.....T.` although
+    `color` is NOT a timeline filter (its `-filters` line is `..C` and its
+    help has no "This filter has support for timeline..." sentence). Only
+    the `-filters` column is read; per-option flag strings are discarded.
+  - 43 source lines (`|->`) and 4 sink lines (`->|`); NONE carry `T`.
+  - Source pad shapes: 40 single-output sources -- 29 `|->V` (testsrc,
+    testsrc2, color, nullsrc, allrgb, mandelbrot, ...) and 11 `|->A`
+    (anullsrc, sine, aevalsrc, sinc, flite, ...). One multi-output source,
+    `avsynctest` (`|->AV`), and two dynamic-count, `movie`/`amovie`
+    (`|->N`), are excluded exactly as multi-output/dynamic regular filters
+    are: `|->AV`'s 2-char output fails the single-char check, `|->N`'s
+    output char is not a V/A pad letter. All 4 sinks are single-input
+    (`A->|`, `V->|`) and excluded unconditionally -- no SinkFilter exists.
+  - Sources parse through the same `_parse_filter_help` (same lazy,
+    memoized `Registry.options()` path) as regular filters. Verified on
+    `testsrc`, `testsrc2`, `anullsrc`, `sine`, `color`: all list alias
+    pairs long-name-first (size/s, rate/r, duration/d, decimals/n,
+    channel_layout/cl, sample_rate/r, nb_samples/n, frequency/f,
+    beep_factor/b), so the dedup rule applies unchanged.
+  - The header mismatch also affects sources: `nullsrc` ->
+    `"nullsrc/yuvtestsrc AVOptions:"`, `allrgb` -> `"allyuv/allrgb
+    AVOptions:"` -- note neither names the queried filter first.
+  - Sources print `Inputs:\n        none (source filter)` rather than
+    `#0: ...`, but this module parses only the block after "AVOptions:".
 """
 
 from __future__ import annotations
@@ -200,7 +158,7 @@ class FilterOption:
     maximum: float | None
     default: str | None  # verbatim ffmpeg text, doc use only -- never validated
     constants: tuple[str, ...]  # enum constant names, () if not an enum
-    unusable: bool = False  # binary/dictionary AVOption types -- plan 031 rejects usage
+    unusable: bool = False  # binary/dictionary AVOption types; lower rejects use
 
 
 @dataclass(frozen=True)
@@ -209,20 +167,18 @@ class DynamicFilter:
     inputs: tuple[StreamType, ...]  # from the pad spec, e.g. ("video", "video")
     output: StreamType
     doc: str
-    timeline: bool  # `-filters` flag column's leading `T`/`.` char (RFC-005 S2)
-    # Options are NOT stored here -- Registry.options() loads and caches
-    # them lazily, per-filter, on first reference (never all ~460 filters
-    # upfront, per the RFC's "-help parsed lazily on first REFERENCE").
+    timeline: bool  # `-filters` flag column's leading `T`/`.` char
+    # Options are NOT stored here: Registry.options() loads and caches them
+    # lazily per filter on first reference, never all ~460 upfront.
 
 
 @dataclass(frozen=True)
 class SourceFilter:
-    """A zero-input (`|->V` / `|->A`) filter -- RFC-005 S1's `ffmpeg.<source>()`.
+    """A zero-input (`|->V` / `|->A`) filter -- the `ffmpeg.<source>()` call.
 
-    Multi-output (`|->AV`) and dynamic-count (`|->N`) sources, and all
-    sinks (`->|`), are excluded per the v1 scope fence (see module
-    docstring) and never produce a SourceFilter. Options load lazily via
-    the same `Registry.options()` path as regular filters.
+    Multi-output (`|->AV`), dynamic-count (`|->N`) and all sinks (`->|`) are
+    excluded by the pad scope fence and never produce a SourceFilter. Options
+    load lazily via the same `Registry.options()` path as regular filters.
     """
 
     name: str
@@ -230,9 +186,7 @@ class SourceFilter:
     doc: str
 
 
-# --- subprocess plumbing (guardrail #6: argv lists, timeout, never raise) --
-
-
+# Guardrail #6: argv lists, a timeout, and never raise.
 def _run(argv: list[str]) -> str | None:
     try:
         result = subprocess.run(
@@ -258,13 +212,9 @@ def _get_version_line(ffmpeg: str) -> str | None:
     return lines[0]
 
 
-# --- `-filters` parsing ------------------------------------------------------
-
-# One space, then the 2 or 3-char flag column captured as its own group (each of
-# T/S/C is either its letter or '.'), then the name, the pad spec, and the
-# rest of the line as the description. This intentionally does NOT match
-# the two-space-indented legend lines ("  T.. = Timeline support") or the
-# "Filters:" banner line, so no separate header-skipping logic is needed.
+# A `-filters` line: one space, the 2-or-3-char flag column, the name, the pad
+# spec, the description. Deliberately does NOT match the two-space-indented
+# legend lines or the "Filters:" banner, so no header-skipping logic is needed.
 _FILTER_LINE_RE = re.compile(r"^ ([TSC.]+) (\S+)\s+(\S+)\s+(.*)$")
 
 _PAD_CHARS: dict[str, StreamType] = {"V": "video", "A": "audio"}
@@ -289,10 +239,8 @@ def _parse_filters_list(
         timeline = flags[0] == "T"
         doc_text = doc.strip()
         if inp == "|":
-            # Zero-input (source) filter. Single V/A output pad only --
-            # multi-output (e.g. avsynctest's `|->AV`) and dynamic-count
-            # (e.g. movie/amovie's `|->N`) sources stay excluded, same v1
-            # scope fence as for regular filters.
+            # Source filter: single V/A output pad only. Multi-output
+            # (`|->AV`) and dynamic-count (`|->N`) stay excluded.
             if len(outp) != 1:
                 continue
             stream = _PAD_CHARS.get(outp)
@@ -300,7 +248,7 @@ def _parse_filters_list(
                 continue
             sources[name] = SourceFilter(name=name, output=stream, doc=doc_text)
             continue
-        # v1 scope fence: exclude dynamic pad count (N), sink (output '|'),
+        # Scope fence: exclude dynamic pad count (N), sink (output '|'),
         # multi-output, and (defensively) zero-input specs.
         if not inp or "N" in spec or "|" in spec or len(outp) != 1:
             continue
@@ -314,8 +262,6 @@ def _parse_filters_list(
         )
     return filters, sources
 
-
-# --- `-help filter=X` parsing ------------------------------------------------
 
 _OPTION_LINE_RE = re.compile(r"^   (\S+)\s+<(\w+)>\s+(\S+)\s+(.*)$")
 _CONST_LINE_RE = re.compile(r"^     (\S+)\s+(\S+)\s+(\S+)\s*(.*)$")
@@ -386,9 +332,8 @@ def _parse_option_block(lines: list[str]) -> dict[str, FilterOption]:
                 doc = _DEFAULT_RE.sub("", _RANGE_RE.sub("", rest)).strip()
                 current = _RawOption(oname, otype, doc, minimum, maximum, default)
             else:
-                # Option-shaped line (3-space indent) that doesn't match the
-                # expected `<name> <type> <flags> desc` shape: degrade to a
-                # bare str option (RFC: stay quiet, don't drop the filter).
+                # Option-shaped line that isn't `<name> <type> <flags> desc`:
+                # degrade to a bare str option rather than drop the filter.
                 parts = line.strip().split(None, 1)
                 if not parts:
                     current = None
@@ -398,21 +343,17 @@ def _parse_option_block(lines: list[str]) -> dict[str, FilterOption]:
                 current = _RawOption(oname, "string", doc, None, None, None)
             raw.append(current)
             continue
-        # Any other indentation is not a recognized option/constant line;
-        # ignore it without disturbing `current` (permissive).
+        # Any other indentation: ignore it without disturbing `current`.
     return _dedup_and_convert(raw)
 
 
 def _dedup_and_convert(raw: list[_RawOption]) -> dict[str, FilterOption]:
-    # Collapse each run of CONSECUTIVE lines sharing one doc text (ffmpeg's
-    # signal for a short/long alias pair, e.g. scale's `w`/`width`) to the
-    # longest name in that run, breaking length ties by first occurrence.
-    #
-    # Adjacency is the whole rule: ffmpeg's own positional binding skips a
-    # duplicate only when it sits immediately after the entry it aliases, so
-    # two same-doc options that are NOT adjacent are two real options and both
-    # keep their slot (see the module docstring for the seven filters where
-    # this differs, and why the pre-051 global grouping was wrong).
+    # Collapse each run of CONSECUTIVE same-doc lines (ffmpeg's short/long
+    # alias signal) to the longest name in the run, ties by first occurrence.
+    # Adjacency is the whole rule: ffmpeg's positional binding skips a
+    # duplicate only when it immediately follows the entry it aliases, so
+    # NON-adjacent same-doc options are two real options and both keep their
+    # slot. See the module docstring for the seven filters this decides.
     keep: list[int] = []
     start = 0
     while start < len(raw):
@@ -462,14 +403,11 @@ def _parse_filter_help(ffmpeg: str, name: str) -> dict[str, FilterOption]:
     return _parse_option_block(lines[start:])
 
 
-# --- disk cache: ~/.cache/sqlmpeg/, keyed by hash of `ffmpeg -version` -------
-
-# Bumped whenever the cached payload shape changes (e.g. plan 040 added
-# DynamicFilter.timeline and the sources table). A mismatch -- including
-# the key being entirely absent, as in every pre-040 cache file -- is
-# treated exactly like corrupt/wrong-shape JSON: silently discarded and
-# rebuilt from a fresh `-filters`/`-help` pass, via the same
-# `_read_disk_cache` return-None path already used for corrupt caches.
+# Disk cache: ~/.cache/sqlmpeg/, keyed by a hash of `ffmpeg -version`.
+#
+# Bump on any change to the cached payload shape. A mismatch -- including an
+# absent key, as in older cache files -- is treated exactly like corrupt JSON:
+# silently discarded and rebuilt from a fresh `-filters`/`-help` pass.
 _CACHE_FORMAT_VERSION = 2
 
 
@@ -606,13 +544,12 @@ def _decode_options(raw: object) -> dict[str, dict[str, FilterOption]]:
 def _decode_payload(data: dict[str, object]) -> _DiskCache:
     """Shared shape decode for both the disk cache AND the reference snapshot.
 
-    Raises (KeyError, TypeError, ValueError) on any malformed shape -- both
+    Raises (KeyError, TypeError, ValueError) on a malformed shape; both
     callers (`_read_disk_cache`, `load_reference`) catch those and degrade
-    permissively rather than propagate, per this module's NEVER-raises
-    contract. Does not look at `format_version`/`version_line` itself --
-    each caller's own freshness rule differs (the disk cache pins BOTH to
-    the live binary; the reference snapshot only checks `format_version`,
-    since it deliberately outlives any one binary).
+    permissively, per this module's NEVER-raises contract. Ignores
+    `format_version`/`version_line` -- the freshness rules differ: the disk
+    cache pins BOTH to the live binary, the reference snapshot checks only
+    `format_version` since it deliberately outlives any one binary.
     """
     filters = _decode_filters(data["filters"])
     sources = _decode_sources(data["sources"])
@@ -673,9 +610,7 @@ def _read_disk_cache(version_line: str) -> _DiskCache | None:
         if not isinstance(data, dict):
             return None
         if data.get("format_version") != _CACHE_FORMAT_VERSION:
-            # Missing entirely (pre-040 cache) or a future/older version --
-            # either way, rebuild rather than guess at a payload shape.
-            return None
+            return None  # absent or mismatched: rebuild, never guess the shape
         if data.get("version_line") != version_line:
             return None
         return _decode_payload(data)
@@ -690,8 +625,7 @@ def _write_disk_cache(
     options: dict[str, dict[str, FilterOption]],
 ) -> None:
     data = _encode_payload(version_line, filters, sources, options)
-    # Cache is purely an optimization -- any filesystem failure is silently
-    # swallowed, never raised.
+    # Purely an optimization: any filesystem failure is swallowed.
     try:
         cache_dir = _cache_dir()
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -709,9 +643,6 @@ def _write_disk_cache(
         pass
 
 
-# --- Registry -----------------------------------------------------------
-
-
 class Registry:
     """Lazily-loaded view of the installed ffmpeg's filter set.
 
@@ -722,14 +653,14 @@ class Registry:
     `options(name)` / `fenced_options(name)` for that filter -- never for all
     filters upfront. NEVER raises.
 
-    `source` marks how this instance got its data: `"live"` (default, via
-    `load()`/bare `Registry()` -- introspects the ffmpeg on PATH, lazily) or
-    `"reference"` (via `load_reference()` -- fully populated up front from
-    the vendored snapshot, no subprocess ever). `snapshot_of` (the snapshot
+    `source` marks where the data came from: `"live"` (default, via `load()`
+    or a bare `Registry()` -- lazy introspection of the ffmpeg on PATH) or
+    `"reference"` (via `load_reference()` -- fully populated up front from the
+    vendored snapshot, no subprocess ever). `snapshot_of` (the snapshot
     ffmpeg's `-version` first line) and `generated` (the `--stamp` value
-    `scripts/gen_snapshot.py` was run with) are set only on a `"reference"`
-    instance; both stay `None` for `"live"`. RFC-007 wave 2 (plan 051) reads
-    `source` to choose live-vs-snapshot and to annotate `explain` output.
+    `scripts/gen_snapshot.py` ran with) are set only on a `"reference"`
+    instance, None on `"live"`. Callers read `source` to choose
+    live-vs-snapshot and to annotate `explain` output.
     """
 
     def __init__(self) -> None:
@@ -782,19 +713,18 @@ class Registry:
     def names(self) -> list[str]:
         """All included (non-excluded) regular filter names, ffmpeg's own order.
 
-        Sources are NOT included here (use `source_names()`) -- this list
-        drives column-function lookup (`get`), and a source is not callable
-        as a column function (RFC-005 S1; plan 042 wires `FROM`).
+        Sources are NOT included (use `source_names()`): this list drives
+        column-function lookup, and a source is not callable as a column
+        function.
         """
         self._ensure_loaded()
         return list(self._filters)
 
     def get(self, name: str) -> DynamicFilter | None:
-        """None if `name` is unknown to this ffmpeg OR was excluded (v1 scope fence).
+        """None if `name` is unknown to this ffmpeg OR excluded by the pad fence.
 
-        This also returns None for a known SOURCE name -- unchanged from
-        pre-040 behavior: a source is not a column function, use
-        `get_source()` instead.
+        Also None for a known SOURCE name: a source is not a column function,
+        use `get_source()`.
         """
         self._ensure_loaded()
         return self._filters.get(name)
@@ -832,22 +762,22 @@ class Registry:
     def fenced_options(self, name: str) -> dict[str, FilterOption] | None:
         """`-help filter=<name>` options for a name the v1 pad fence EXCLUDED.
 
-        `options()` answers only for names that SURVIVED the fence -- they are
-        the keys of `_filters`/`_sources`, and an excluded name is in neither
-        table, so it reads as unknown there. The array-RETURNING filters
-        (`channelsplit`, `acrossover`, `extractplanes` -- all `->N`) are
-        excluded from those tables yet callable through the table lowering
-        keeps of them (RFC-006), and this is the one door they get: same lazy,
-        memoized, permissive `-help` path, no pad information implied.
+        `options()` answers only for names that SURVIVED the fence, i.e. the
+        keys of `_filters`/`_sources`; an excluded name reads as unknown
+        there. The array-RETURNING filters (`channelsplit`, `acrossover`,
+        `extractplanes` -- all `->N`) are excluded from those tables yet
+        callable through table lowering, and this is their one door:
+        the same lazy, memoized, permissive `-help` path, implying no pad
+        information.
 
         None means "this ffmpeg cannot tell me about that filter": no ffmpeg,
-        or `-help filter=<name>` printed no option block at all -- which is
-        what an ffmpeg build WITHOUT the filter prints (`Unknown filter 'x'.`,
-        exit 0, no "AVOptions:" line, verified against ffmpeg 7.1). Every name
-        this accessor exists for has a non-empty option table in a build that
-        has it, so lowering reads None as "not in this build" and rejects the
-        call as an unknown function. That inference is the accessor's contract,
-        not a general one: it does not hold for a filter with no options.
+        or `-help filter=<name>` printed no option block -- which is what a
+        build WITHOUT the filter prints (`Unknown filter 'x'.`, exit 0, no
+        "AVOptions:" line; verified against ffmpeg 7.1). Every name this
+        accessor exists for has a non-empty option table in a build that has
+        it, so lowering reads None as "not in this build" and rejects the call
+        as an unknown function. That inference is this accessor's contract,
+        not a general one -- it does not hold for a filter with no options.
         """
         self._ensure_loaded()
         cached = self._options.get(name)
@@ -867,12 +797,10 @@ class Registry:
         """This Registry's CURRENT state as a disk-cache-shaped JSON payload.
 
         `None` if `-filters`/`-version` never succeeded (no version line to
-        stamp the payload with). Does NOT force anything to load first --
-        `options()`/`fenced_options()` are exactly as lazy as ever, so a
-        payload taken from a `Registry` nobody has queried yet has an empty
-        `options` table. `scripts/gen_snapshot.py` (the only intended
-        caller) force-loads every name's options before calling this, which
-        is what makes the payload it writes fully self-contained.
+        stamp with). Forces nothing to load first, so a payload taken from a
+        `Registry` nobody has queried has an empty `options` table.
+        `scripts/gen_snapshot.py`, the only intended caller, force-loads every
+        name's options first, which is what makes its payload self-contained.
         """
         self._ensure_loaded()
         if self._version_line is None:
@@ -894,28 +822,25 @@ def load() -> Registry:
 def load_reference(path: str | Path) -> Registry:
     """Build a fully-populated `Registry` from a reference snapshot FILE.
 
-    `path` is explicit and required (plan 051): the snapshot is a committed
-    TEST FIXTURE (`tests/data/reference_registry.json`), not package data,
-    and nothing in the installed package reads it. The test suite passes the
-    path it wants; there is no implicit lookup and no `importlib.resources`
-    involvement, so an installed sqlmpeg does not carry the file at all.
+    `path` is explicit and required: the snapshot is a committed TEST FIXTURE
+    (`tests/data/reference_registry.json`), not package data, and nothing in
+    the installed package reads it. No implicit lookup, no
+    `importlib.resources`, so an installed sqlmpeg does not carry the file.
 
     The payload is the parsed `-filters`/`-help` data
-    `scripts/gen_snapshot.py` captured ahead of time from a real ffmpeg,
-    wrapped with `snapshot_of` (that ffmpeg's `-version` first line) and
-    `generated` (the `--stamp` the script was run with). Every in-fence
-    filter's and source's options, plus the array-returning trio's
-    `fenced_options()`, are already in the payload -- so unlike `load()`,
-    `_ensure_loaded()` never runs (`_loaded` is set `True` up front) and
-    NO subprocess is ever spawned by the returned instance, on any
-    platform, with or without ffmpeg on PATH.
+    `scripts/gen_snapshot.py` captured from a real ffmpeg, wrapped with
+    `snapshot_of` (that ffmpeg's `-version` first line) and `generated` (the
+    `--stamp` it ran with). Every in-fence filter's and source's options, plus
+    the array-returning trio's `fenced_options()`, are already in it -- so
+    `_ensure_loaded()` never runs (`_loaded` is True up front) and the
+    returned instance spawns NO subprocess, on any platform, with or without
+    ffmpeg on PATH.
 
-    Returns a FRESH `Registry` every call (unlike `load()`'s process-wide
-    singleton) -- callers that want memoization do it themselves.
+    Returns a FRESH `Registry` every call, unlike `load()`'s singleton.
 
     NEVER raises: a missing or malformed snapshot degrades to an empty,
-    unavailable `Registry` with `source == "reference"` -- exactly like a
-    live `Registry` with no ffmpeg on PATH.
+    unavailable `Registry` with `source == "reference"`, exactly like a live
+    `Registry` with no ffmpeg on PATH.
     """
     registry = Registry()
     registry.source = "reference"

@@ -1,9 +1,7 @@
-"""Tests for the ``sqlmpeg.<name>`` macro namespace (RFC-007 wave 3a, plan 052).
+"""Tests for the ``sqlmpeg.<name>`` macro namespace.
 
-Self-contained (file firewall: tests/test_lower.py, tests/exec and the
-goldens are owned by a concurrently-running respell agent) -- every helper
-below is a trimmed-down copy of test_lower.py's own conventions, not an
-import from it, so this file has no coupling to what that agent is doing.
+Self-contained: every helper below is a trimmed-down copy of test_lower.py's
+conventions rather than an import from it.
 
 Macros resolve against `sqlmpeg.macros.MACROS` alone (never the registry),
 so most tests pass `registry=None` -- proving the offline claim by
@@ -145,7 +143,7 @@ def test_delay_seconds_may_be_a_float() -> None:
 
 
 # ---------------------------------------------------------------------------
-# broadcasting (plan 020): the machinery is type-driven, macros need no
+# broadcasting: the machinery is type-driven, macros need no
 # special casing
 # ---------------------------------------------------------------------------
 
@@ -326,7 +324,7 @@ def test_ad_insert_composition_execs(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# the input-minting macro: sqlmpeg.empty_captions() (RFC-009, plan 062)
+# the input-minting macro: sqlmpeg.empty_captions()
 # ---------------------------------------------------------------------------
 
 

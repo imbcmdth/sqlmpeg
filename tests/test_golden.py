@@ -1,4 +1,4 @@
-"""Golden IR tests (plan 009).
+"""Golden IR tests.
 
 Every `tests/golden/NNN-name.sql` fixture is compiled with `compile_sql` and
 checked against a blessed expectation file sitting next to it:

@@ -1,4 +1,4 @@
-"""Tests for sqlmpeg.binaries (RFC-010 "ffmpeg is required").
+"""Tests for sqlmpeg.binaries.
 
 All monkeypatched -- PATH via ``shutil.which``, the provider via
 ``sys.modules["static_ffmpeg.run"]`` (the lazy-import seam) -- so these never

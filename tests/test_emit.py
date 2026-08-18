@@ -1,4 +1,4 @@
-"""Tests for the emit pass (plans 007 + 018).
+"""Tests for the emit pass.
 
 Graphs are hand-built with ir.Node/ir.Graph/ir.Output -- emit must not depend
 on the parser/lower/split modules.
@@ -73,7 +73,7 @@ def _graph(
 ) -> Graph:
     """A ONE-sink graph carrying `outputs` (`sink` names its destination).
 
-    `sinks` is the multi-sink escape hatch (RFC-006): pass whole
+    `sinks` is the multi-sink escape hatch: pass whole
     :class:`SinkUnit`s, each with its own outputs, and `outputs` is ignored.
     """
     if sinks is not None:
@@ -798,7 +798,7 @@ def test_no_outputs_is_internal_error() -> None:
 
 
 def test_build_ffmpeg_args_exact_list() -> None:
-    """`a`/`b` dedup onto one `-i` (plan 060): see test_readme_example_shape."""
+    """`a`/`b` dedup onto one `-i`: see test_readme_example_shape."""
     g = _graph(
         [
             _node("n1", "crop", {"w": 600, "h": 200, "x": 1200, "y": 50}, ["src:b:v:0"]),
@@ -951,7 +951,7 @@ def test_build_ffmpeg_args_metadata_values_are_passed_raw() -> None:
 
 
 # ---------------------------------------------------------------------------
-# sink (RFC-002, plan 027) -- Graphs are hand-built with sink=_sink(...) here,
+# sink -- Graphs are hand-built with sink=_sink(...) here,
 # which plan 046 turned into one `SinkUnit` / one `Emitted.groups` entry.
 # ---------------------------------------------------------------------------
 
@@ -1000,7 +1000,7 @@ def test_build_ffmpeg_args_out_path_overrides_sink_path() -> None:
 def test_build_ffmpeg_args_no_sink_graph_unchanged_byte_for_byte() -> None:
     """Regression pin: a sinkless graph's args are byte-for-byte what plan 027 found.
 
-    `a`/`b` dedup onto one `-i` (plan 060): see test_readme_example_shape.
+    `a`/`b` dedup onto one `-i`: see test_readme_example_shape.
     """
     g = _graph(
         [
@@ -1300,7 +1300,7 @@ def test_sink_video_codec_does_not_suppress_a_subtitle_copy() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-006 output groups (plan 046): one ffmpeg command, one file per sink
+# RFC-006 output groups: one ffmpeg command, one file per sink
 # ---------------------------------------------------------------------------
 
 
@@ -1495,7 +1495,7 @@ def test_a_group_without_a_path_and_without_out_path_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-004 input seek (plan 035): -ss/-to in front of the owning -i
+# RFC-004 input seek: -ss/-to in front of the owning -i
 # ---------------------------------------------------------------------------
 
 
@@ -1580,7 +1580,7 @@ def test_a_hand_built_emitted_needs_no_input_trims() -> None:
 
 
 # ---------------------------------------------------------------------------
-# open-ended windows (plan 039): either half of a window may be None
+# open-ended windows: either half of a window may be None
 # ---------------------------------------------------------------------------
 
 
@@ -1659,7 +1659,7 @@ def test_two_aliases_disagreeing_on_one_inputs_window_is_internal_error() -> Non
 
 
 # ---------------------------------------------------------------------------
-# RFC-005 SS4 input options (plan 041): rendered before -ss/-to, before -i
+# RFC-005 SS4 input options: rendered before -ss/-to, before -i
 # ---------------------------------------------------------------------------
 
 
@@ -1790,7 +1790,7 @@ def test_two_aliases_disagreeing_on_one_inputs_option_set_is_internal_error() ->
 
 
 # ---------------------------------------------------------------------------
-# input dedup (RFC-009, plan 060): untrimmed same-path same-options aliases
+# input dedup: untrimmed same-path same-options aliases
 # share one -i; a mismatched option set or a trim window blocks it.
 # ---------------------------------------------------------------------------
 
@@ -1986,7 +1986,7 @@ def test_passthrough_map_runs_under_real_ffmpeg(tmp_path: Path) -> None:
 
 @pytest.mark.exec
 def test_a_deduped_compile_runs_under_real_ffmpeg(tmp_path: Path) -> None:
-    """Two untrimmed, option-free aliases of the SAME real file (plan 060):
+    """Two untrimmed, option-free aliases of the SAME real file:
     one decoded input feeds both a filtered chain and a passthrough map."""
     _require_ffmpeg_and_fixture()
     g = _graph(

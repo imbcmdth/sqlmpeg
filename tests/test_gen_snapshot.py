@@ -1,7 +1,7 @@
 """Tests for scripts/gen_snapshot.py and sqlmpeg.registry.load_reference().
 
 The snapshot is a committed TEST FIXTURE, `tests/data/reference_registry.json`
-(plan 051): it is NOT package data, nothing in the installed package reads it,
+: it is NOT package data, nothing in the installed package reads it,
 and `load_reference(_SNAPSHOT_PATH)` takes the path explicitly. It exists so the suite can
 build a fully-populated Registry with no ffmpeg and no subprocess.
 
@@ -184,7 +184,7 @@ def test_round_trip_matches_live_registry_spot_check(pinned_ffmpeg: None) -> Non
 
 
 # ---------------------------------------------------------------------------
-# option ORDER is data, not presentation (plan 051)
+# option ORDER is data, not presentation
 # ---------------------------------------------------------------------------
 
 
@@ -238,7 +238,7 @@ def test_snapshot_fixture_is_present_and_well_shaped() -> None:
 
 def test_snapshot_is_not_package_data() -> None:
     """It lives under tests/, never under sqlmpeg/ -- the wheel must not carry
-    a 800 KB fixture no installed code path reads (plan 051)."""
+    a 800 KB fixture no installed code path reads."""
     assert not (_REPO_ROOT / "sqlmpeg" / "reference_registry.json").exists()
     assert not list((_REPO_ROOT / "sqlmpeg").glob("*.json"))
 

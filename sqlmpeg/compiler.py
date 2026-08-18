@@ -4,32 +4,26 @@
 
     parse -> resolve -> probe -> lower -> insert_splits
 
-The returned graph is split-complete, i.e. every pad has exactly one consumer,
+The returned graph is split-complete — every pad has exactly one consumer,
 which is what :func:`sqlmpeg.emit.emit` expects.
 
-Probing (RFC-001 "Probing policy") happens here, between resolve and lower:
-every distinct input path is probed exactly once and the results are re-keyed
-by ALIAS for :func:`sqlmpeg.lower.lower` (two aliases over one file share a
-single probe). :func:`sqlmpeg.probe.probe` never raises and returns ``None``
-for a URL, a missing file, or a missing/failing ffprobe, so a compile is never
-blocked by an unreadable input — it just loses the extra validation (subscript
-bounds) and the provenance metadata that probing would have added. Probing is
-unconditional (RFC-010): the old ``probe=False`` escape hatch is gone, since
-opportunistic degradation on missing/unreadable inputs already gives every
-byte-reproducible-offline use case it was for, with no separate mode to
-maintain.
+Probing happens between resolve and lower: every
+distinct input path is probed exactly once, results re-keyed by ALIAS for
+:func:`sqlmpeg.lower.lower`, so two aliases over one file share a probe.
+:func:`sqlmpeg.probe.probe` never raises and returns ``None`` for a URL, a
+missing file, or a missing/failing ffprobe, so an unreadable input never
+blocks a compile — it only loses subscript-bound validation and provenance
+metadata. Probing is unconditional; there is no ``probe=False``.
 
-The filter REGISTRY (RFC-007) is the whole function surface, not an
-opportunistic extra: every call name resolves in it and nowhere else.
-:func:`sqlmpeg.registry.load` never raises and degrades to an empty registry
-when ffmpeg is missing, so a compile without ffmpeg is not an error — it is a
-compile in which every call name is UNKNOWN_FUNCTION.
+The filter REGISTRY is the whole function surface: every call name
+resolves in it and nowhere else. :func:`sqlmpeg.registry.load` never raises
+and degrades to an empty registry when ffmpeg is missing, so a compile without
+ffmpeg is not an error — it is one where every call name is UNKNOWN_FUNCTION.
 
 Guardrail #7 lives here: no input, however malformed, may produce anything but
-a compile result or a :class:`~sqlmpeg.errors.SqlmpegError`. Each pass already
-carries its own backstop; this one catches anything that still slips through
-(including recursion limits and sqlglot internals) and reports it as
-``INTERNAL``, the code the fuzz corpus asserts never fires.
+a compile result or a :class:`~sqlmpeg.errors.SqlmpegError`. Each pass carries
+its own backstop; this one catches the rest (recursion limits, sqlglot
+internals) as ``INTERNAL``, the code the fuzz corpus asserts never fires.
 """
 
 from __future__ import annotations
@@ -62,15 +56,11 @@ def _probe_inputs(res: Resolved) -> dict[str, ProbeResult | None]:
 def compile_sql(text: str) -> Graph:
     """Compile SQL `text` into a split-complete IR graph.
 
-    Every input is probed opportunistically -- there is no ``probe=False``
-    escape hatch (RFC-010); a missing or unreadable input degrades the same
-    way it always has (see module docstring).
-
-    The installed ffmpeg's filter set IS the function surface (RFC-007): every
-    call resolves against :func:`sqlmpeg.registry.load`, so what compiles
-    depends on what that ffmpeg reports. Tests that want a fixed, machine-
-    independent surface call :func:`sqlmpeg.lower.lower` directly with a
-    registry built from the captured snapshot.
+    Every input is probed opportunistically (see module docstring). The
+    installed ffmpeg's filter set IS the function surface, so what
+    compiles depends on what that ffmpeg reports; tests wanting a fixed,
+    machine-independent surface call :func:`sqlmpeg.lower.lower` directly with
+    a registry built from the captured snapshot.
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
@@ -99,16 +89,14 @@ def compile_sql(text: str) -> Graph:
 
 
 def classify(text: str) -> tuple[bool, bool]:
-    """``(is_table_capable, has_copy)`` for `text` (RFC-011, plan 067).
+    """``(is_table_capable, has_copy)`` for `text`.
 
     Cheap and static: parse + resolve only, no probing. ``is_table_capable``
-    is True when `text` has no media destination -- a bare SELECT (``not
-    has_copy``), or every COPY a ``FORMAT csv`` one. ``-o`` is CLI-only and
-    never reaches here, so a bare SELECT is always table-capable by this
-    check alone -- the CLI decides, from its own ``-o``, whether to actually
-    use :func:`compile_table_sql` or fall back to :func:`compile_sql` for a
-    pure-stream bare SELECT (RFC-011: "``-o`` stays as the implicit media
-    COPY it always morally was").
+    is True when `text` has no media destination -- a bare SELECT, or every
+    COPY a ``FORMAT csv`` one. ``-o`` is CLI-only and never reaches here, so a
+    bare SELECT is always table-capable by this check alone; the CLI decides
+    from its own ``-o`` whether to use :func:`compile_table_sql` or fall back
+    to :func:`compile_sql`.
 
     Raises ``SqlmpegError`` on a query that does not even resolve.
     """
@@ -119,11 +107,11 @@ def classify(text: str) -> tuple[bool, bool]:
 def compile_table_sql(text: str) -> list[TableSink]:
     """Compile SQL `text` into its printable table/csv result set(s).
 
-    The sibling of :func:`compile_sql` for a table query (RFC-011, plan 067):
-    one :class:`~sqlmpeg.table.TableSink` per COPY, or one for a bare SELECT.
+    The sibling of :func:`compile_sql` for a table query: one
+    :class:`~sqlmpeg.table.TableSink` per COPY, or one for a bare SELECT.
     Metadata columns and NULL-row gaps, both rejections under
-    :func:`compile_sql`, are legal here — that is the whole difference. Every
-    input is still probed opportunistically, same as :func:`compile_sql`.
+    :func:`compile_sql`, are legal here — that is the whole difference. Inputs
+    are probed opportunistically, same as :func:`compile_sql`.
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """

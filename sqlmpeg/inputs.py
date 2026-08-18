@@ -1,25 +1,18 @@
-"""Input option table for sqlmpeg (RFC-005 SS4, plan 041).
+"""Input option table for sqlmpeg.
 
-Guardrail #4: the option table is DATA, not code -- ``INPUT_OPTIONS`` is the
-single source of truth that drives ``input('path', <name> => <value>, ...)``
-validation (plan 041's lower), rendering into ffmpeg args (plan 041's emit),
-docs, and the LLM system prompt. This is the input-side mirror of
-``sqlmpeg.sink.SINK_OPTIONS``; read that module's docstring first, the shapes
-are deliberately the same.
+Guardrail #4: ``INPUT_OPTIONS`` is DATA, the single source of truth driving
+``input('path', <name> => <value>, ...)`` validation, emit, docs and the LLM
+prompt. Input-side mirror of ``sqlmpeg.sink.SINK_OPTIONS``, deliberately the
+same shape.
 
-v1 set is exactly RFC-005's table: ``loop``, ``stream_loop``, ``framerate``,
-``itsoffset``, ``hwaccel``. No ``extra_args`` escape hatch -- arbitrary flag
-passthrough would break "reject, never approximate"; the table grows instead.
+No ``extra_args`` escape hatch: arbitrary flag passthrough would break
+"reject, never approximate"; the table grows instead.
 
-Unlike ``SINK_OPTIONS`` (whose options apply per OUTPUT stream, hence
-``scope``/``per_stream``), every input option here applies once to the
-input's own ``-i`` -- there is no per-stream axis to a demuxer-level flag --
-so ``InputOptionSpec`` carries no ``scope``/``per_stream`` fields at all.
-
-The type vocabulary also grows by one over the sink table: ``"num"`` (int OR
-float, never bool) for ``framerate``/``itsoffset``, whose values are
-routinely fractional (``framerate 29.97``) and, for ``itsoffset``, legally
-NEGATIVE (ffmpeg accepts a negative ``-itsoffset`` to shift a stream earlier).
+``InputOptionSpec`` has no ``scope``/``per_stream`` (unlike ``SinkOptionSpec``)
+-- a demuxer-level flag applies once to the input's ``-i``, with no per-stream
+axis. It adds one type over the sink table: ``"num"`` (int or float, never
+bool) for ``framerate``/``itsoffset``, which are routinely fractional and, for
+``itsoffset``, legally negative (ffmpeg shifts a stream earlier).
 """
 
 from __future__ import annotations
@@ -75,13 +68,10 @@ INPUT_OPTIONS: dict[str, InputOptionSpec] = {
 }
 
 
-# INTERNAL per-input options (RFC-009, plan 062): flags the COMPILER sets on an
-# input it minted itself, never something user SQL can name. They are kept OUT
-# of `INPUT_OPTIONS` deliberately -- that table is the user-facing surface and
-# drives docs, the prompt and `input('path', name => value)` validation, none
-# of which should learn about a flag no query can write. `validate_option`
-# therefore still rejects these names as unknown; only `option_spec` (which
-# emit renders through) knows they exist.
+# Flags the COMPILER sets on an input it minted itself; no user SQL can name
+# them. Kept out of `INPUT_OPTIONS` so the user-facing surface (docs, prompt,
+# validation) never learns of them: `validate_option` still rejects these names
+# as unknown, only `option_spec` (which emit renders through) resolves them.
 #
 # `format` is what `sqlmpeg.empty_captions()` needs: a `data:` URI carries no
 # extension, so the demuxer has to be named (`-f webvtt -i "data:..."`).
@@ -116,13 +106,11 @@ def validate_option(
 ) -> object:
     """Validate one ``input('path', name => value)`` pair against INPUT_OPTIONS.
 
-    Returns the normalized value on success. Raises ``SqlmpegError`` with
-    ``UNKNOWN_INPUT_OPTION`` if ``name`` isn't in the table, or
-    ``INPUT_OPTION_TYPE`` if ``value``'s type doesn't match the spec's
-    declared type. Mirrors ``sqlmpeg.sink.validate_option`` exactly for
-    ``str``/``int``/``bool``, and adds ``"num"``: any ``int`` or ``float``
-    (bools are never accepted where a number is declared, negative values
-    are fine -- ``itsoffset`` legitimately takes them).
+    Returns the normalized value. Raises ``UNKNOWN_INPUT_OPTION`` for a name
+    not in the table, ``INPUT_OPTION_TYPE`` for a value whose type doesn't
+    match the spec. ``str``/``int``/``bool`` mirror
+    ``sqlmpeg.sink.validate_option``; ``"num"`` accepts any int or float,
+    never a bool, and negatives are legal (``itsoffset``).
     """
     spec = INPUT_OPTIONS.get(name)
     if spec is None:

@@ -1,7 +1,7 @@
-"""Tests for the sink option table (plan 025, RFC-002).
+"""Tests for the sink option table.
 
 Guardrail #4: SINK_OPTIONS is DATA. This file checks the table's shape
-against RFC-002's v1 list (name/scope/type per option) and exercises
+against the documented option list (name/scope/type per option) and exercises
 ``validate_option``'s happy/unknown/wrong-type paths.
 """
 
@@ -18,7 +18,7 @@ from sqlmpeg.sink import (
     validate_option,
 )
 
-# name -> (scope, type) per RFC-002's v1 table, plus RFC-004's subtitle_codec.
+# name -> (scope, type), subtitle_codec included.
 _EXPECTED: dict[str, tuple[str, str]] = {
     "video_codec": ("video", "str"),
     "audio_codec": ("audio", "str"),
@@ -198,7 +198,7 @@ def test_validate_option_preserves_line_col() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CSV_OPTIONS / validate_csv_option (RFC-011, plan 067)
+# CSV_OPTIONS / validate_csv_option
 # ---------------------------------------------------------------------------
 
 

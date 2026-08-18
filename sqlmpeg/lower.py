@@ -6,13 +6,12 @@ rejection raised here is either a check resolve deliberately left to lowering
 (CTE column names, function names, argument types, probed stream bounds) or a
 defensive re-check.
 
-RFC-001 (stream-aware) shapes this pass: the top-level SELECT list IS the
-output stream list, and every value flowing through lowering is a *typed*
-stream (``video``, ``audio``, ``subtitle`` or ``data``), never an untyped
-"frame".
+The top-level SELECT list IS the output stream list, and every value flowing
+through lowering is a *typed* stream (``video``, ``audio``, ``subtitle`` or
+``data``), never an untyped "frame".
 
-Passthrough-only stream types (RFC-004)
----------------------------------------
+Passthrough-only stream types
+-----------------------------
 ``subtitle`` and ``data`` streams get the exact same surface as video/audio —
 ``a.subtitle[1]``, the bare array ``a.data``, a CTE column, a star expansion —
 but an ffmpeg filtergraph carries video and audio only, so they may never be a
@@ -33,8 +32,8 @@ Everything else about them is ordinary: they lower to ``"src:<alias>:s:<k>"`` /
 tag rides the same passthrough metadata path an audio track's does), and become
 ``Output`` rows that split and emit treat as bare ``-map``s.
 
-``SELECT *`` and ``<alias>.*`` (RFC-004)
-----------------------------------------
+``SELECT *`` and ``<alias>.*``
+------------------------------
 A star is a column GENERATOR, not an expression: :meth:`_Lowerer._expand_star`
 turns it into one passthrough column per stream. A bare ``*`` covers every FROM
 alias in FROM order; ``<alias>.*`` covers one. Within an INPUT alias the order
@@ -49,10 +48,10 @@ What lowering does, in order:
 * CTE bodies lower first, in definition order, into the *same* graph. A CTE
   records a list of ``(name, type, ref)`` columns — its SELECT list — and
   ``FROM <cte>`` later exposes those columns by their ``AS`` names. A script's
-  VIEWS are CTEs here (RFC-006): ``Resolved.ctes`` holds both, so the whole
+  VIEWS are CTEs here: ``Resolved.ctes`` holds both, so the whole
   binding table is lowered exactly ONCE no matter how many COPYs read it.
 * Then one :class:`~sqlmpeg.ir.SinkUnit` per ``COPY``, in script order, each
-  from that COPY's own query (RFC-006) — or, for a bare SELECT, a single unit
+  from that COPY's own query — or, for a bare SELECT, a single unit
   with ``path=None``. Every unit shares this graph's nodes, so a view read by
   three COPYs is decoded and filtered once and fanned out by the split pass.
 * Inside a branch, ``FROM`` builds a typed environment: an ``input()`` alias
@@ -61,11 +60,10 @@ What lowering does, in order:
   recorded columns (under its own name, or under a branch-local alias:
   ``FROM master m``), and a ``ffmpeg.<source>(...)`` alias exposes exactly one
   statically-typed stream (see below).
-* ``<alias>.frame`` is sugar for ``<alias>.video[1]`` (v0 compat). A single
-  unnamed video column of a CTE is likewise reachable as ``<cte>.frame``.
-* ``WHERE <alias>.t BETWEEN x AND y`` records a per-alias time range, and where
-  that window lands depends on what the alias is (RFC-004's input-seek
-  amendment):
+* ``<alias>.frame`` is sugar for ``<alias>.video[1]``. A single unnamed video
+  column of a CTE is likewise reachable as ``<cte>.frame``.
+* ``WHERE <alias>.t BETWEEN x AND y`` records a per-alias time range; where
+  that window lands depends on what the alias is:
 
   - an INPUT alias owns its own ``-i`` slot and has at most one window in the
     whole query, so the window is recorded as ``Graph.input_trims[alias]`` and
@@ -89,8 +87,8 @@ What lowering does, in order:
   option arguments against that filter's introspected AVOptions (see "One
   calling convention" below).
 
-Generated sources: ``FROM ffmpeg.<source>(...) a`` (RFC-005 §1)
---------------------------------------------------------------
+Generated sources: ``FROM ffmpeg.<source>(...) a``
+--------------------------------------------------
 A source alias is the third kind of binding (:class:`_SourceBinding`), and
 it is the registry surface in TABLE position: the name resolves through
 ``Registry.get_source`` alone (never ``get``), and its options through the
@@ -122,8 +120,8 @@ ffmpeg.testsrc2(...) t, ffmpeg.anullsrc(...) s`` as the second branch of a
 concat, is the motivating case — and the node it builds is one split, emit
 and the goldens cannot tell apart from any other.
 
-One calling convention (RFC-007, plan 051)
-------------------------------------------
+One calling convention
+----------------------
 Every call is an ffmpeg filter, spelled the way ffmpeg's own filtergraph
 syntax spells it::
 
@@ -140,8 +138,8 @@ compiles therefore depends on what that ffmpeg reports, and an empty registry
 * POSITIONAL OPTIONS follow, binding to the filter's options in REGISTRY
   ORDER, which is ffmpeg's AVOption declaration order and therefore exactly
   the order ``gblur=5:2`` binds in a filtergraph (see
-  ``sqlmpeg/registry.py``'s dedup docstring for why the deduped list is that
-  order, and what had to be fixed for it to be). ``crop(f, 100, 50, 10, 20)``
+  ``sqlmpeg/registry.py``'s docstring for why the deduped list is that order).
+  ``crop(f, 100, 50, 10, 20)``
   is ``crop=out_w=100:out_h=50:x=10:y=20``; ``scale(f, 640, 480)`` is
   ``scale=width=640:height=480``. A positional binds AS the option it lands
   on and is validated as that option — same type/range/enum checks, same two
@@ -155,9 +153,9 @@ compiles therefore depends on what that ffmpeg reports, and an empty registry
   ``FILTER_OPTION_TYPE`` — a named argument never silently overrides one.
 * ``enable`` stays NAMED-ONLY and framework-level: it is in no filter's option
   table, so it can never be reached positionally, and it is admitted by the
-  ``T`` flag alone (RFC-005 §2).
+  ``T`` flag alone.
 * ``ffmpeg.<filter>(...)`` is the same call under a name no SQL grammar can
-  claim (plan 038): identical semantics, but it bypasses Postgres's special
+  claim: identical semantics, but it bypasses Postgres's special
   forms, so ``ffmpeg.overlay(base, top, x => 20, eof_action => 'pass')``
   reaches the option set the ``OVERLAY..PLACING`` grammar hides, and
   ``ffmpeg.trim(...)`` / ``ffmpeg.format(...)`` arrive with their arguments
@@ -166,23 +164,23 @@ compiles therefore depends on what that ffmpeg reports, and an empty registry
   downstream knows the namespace exists.
 * Three ``->N`` filters are callable through that namespace despite the pad
   fence, because their output COUNT is fixed by an option: ``channelsplit``,
-  ``acrossover`` and ``extractplanes`` (RFC-006, :data:`ARRAY_RETURNING`).
-  Each lowers to ONE node with N output pads and RETURNS an array — the first
-  call that does — so its result splats into a SELECT list, subscripts out of
-  a CTE column and broadcasts elementwise like any other array. The table is
+  ``acrossover`` and ``extractplanes`` (:data:`ARRAY_RETURNING`). Each lowers
+  to ONE node with N output pads and RETURNS an array, so its result splats
+  into a SELECT list, subscripts out of a CTE column and broadcasts
+  elementwise like any other array. The table is
   consulted before the registry's verdict, since the registry has no entry to
   give; every other fenced name keeps its ``UNKNOWN_FUNCTION``.
-* Three ``N->1`` filters are re-admitted the mirror way (:data:`N_INPUT`,
-  plan 051): ``amix``, ``hstack`` and ``vstack`` take a variable number of
-  INPUT pads fixed by their ``inputs`` option, so the pad fence excludes them
-  too, yet the count is statically knowable the moment that option is read.
+* Three ``N->1`` filters are re-admitted the mirror way (:data:`N_INPUT`):
+  ``amix``, ``hstack`` and ``vstack`` take a variable number of INPUT pads
+  fixed by their ``inputs`` option, so the pad fence excludes them too, yet
+  the count is statically knowable the moment that option is read.
   Their leading stream arguments ARE the input pads and their `inputs` option
   must agree with how many were supplied (``UDF_ARG_TYPE`` naming both
   numbers when it does not). Unlike the array trio these are reachable BARE
   as well as namespaced — no Postgres grammar claims their names.
-* ``sqlmpeg.<name>(...)`` (RFC-007, plan 052) is a THIRD namespace, resolved
-  against :data:`sqlmpeg.macros.MACROS` and NEVER the registry -- macros work
-  offline, with no ffmpeg on PATH at all. A macro owns its own fixed
+* ``sqlmpeg.<name>(...)`` is a THIRD namespace, resolved against
+  :data:`sqlmpeg.macros.MACROS` and NEVER the registry -- macros work offline,
+  with no ffmpeg on PATH at all. A macro owns its own fixed
   positional signature (no named arguments, no option table) and expands to a
   small filter subgraph (:data:`sqlmpeg.macros.Macro.expand`); its one stream
   argument broadcasts elementwise through the same :meth:`_expand_call` every
@@ -197,8 +195,8 @@ compiles therefore depends on what that ffmpeg reports, and an empty registry
   — and its output pads are ``["video"]*v + ["audio"]*a``, mapped back to the
   branch's own column order.
 
-Broadcasting (plan 020) makes a bare ``a.video`` / ``a.audio`` the WHOLE array
-of that input's streams, in probe order. Splatted into a SELECT list it becomes
+Broadcasting makes a bare ``a.video`` / ``a.audio`` the WHOLE array of that
+input's streams, in probe order. Splatted into a SELECT list it becomes
 one Output per element; handed to a function it expands the call elementwise
 (a fresh subgraph per element); stored in a CTE column it keeps its length, so
 ``<cte>.<name>`` splats or broadcasts again and ``<cte>.<name>[k]`` picks one
@@ -229,10 +227,17 @@ by :class:`_NodeFactory`.
 
 sqlglot notes that matter here
 ------------------------------
-* Postgres has a builtin ``OVERLAY``, so ``overlay(a, b, x, y)`` parses to
-  :class:`sqlglot.exp.Overlay` with *named* args (``this``, ``expression``,
-  ``from_``, ``for_``) rather than to ``exp.Anonymous``. :func:`_call_parts`
-  normalizes it back to four positional arguments.
+* Postgres has a builtin ``OVERLAY(x PLACING y FROM n FOR m)``, so
+  ``overlay(a, b, x, y)`` parses to :class:`sqlglot.exp.Overlay` with *named*
+  args (``this``, ``expression``, ``from_``, ``for_``) rather than to
+  ``exp.Anonymous``; :func:`_call_parts` normalizes it back to four
+  positionals. A ``=>`` inside that grammar is a PARSE_ERROR before lowering
+  sees the call, so a BARE ``overlay`` can take its options positionally but
+  never by name. Eleven registry names collide with a Postgres special form
+  this way (census in docs/dynamic-filters.md); ``ffmpeg.<filter>(...)``
+  reaches every one of them, because the special-form grammars key on a BARE
+  name and a qualified call parses as ``Dot(Identifier(ffmpeg),
+  Anonymous(...))`` whatever the filter is called.
 * A subscript arrives as ``exp.Bracket`` wrapping the ``exp.Column``, and
   sqlglot REBASES the index at parse time (postgres ``INDEX_OFFSET = 1``), so
   ``a.video[1]`` holds ``Literal(0)``. Never read ``Bracket.expressions``
@@ -249,16 +254,6 @@ sqlglot notes that matter here
   every rejection about one anchors on the VALUE — a literal, which does have a
   position — and falls back to the call itself for a ``Boolean`` value, which
   does not.
-* Postgres has a builtin ``OVERLAY(x PLACING y FROM n FOR m)``, and sqlglot
-  parses ``overlay(...)`` with that grammar: a ``=>`` inside it is a PARSE_ERROR
-  before lowering ever sees the call, so a BARE ``overlay`` can take its
-  options positionally but never by name. Eleven registry names collide with a
-  Postgres special form this way (see docs/dynamic-filters.md for the census);
-  ``ffmpeg.<filter>(...)`` is the spelling that reaches every one of them,
-  because the special-form grammars key on a BARE name and a qualified call
-  parses as ``Dot(Identifier(ffmpeg), Anonymous(...))`` no matter what the
-  filter is called. (All of this is surface-level sqlglot behavior, not a
-  lowering rule.)
 * A COPY option value (``WITH (crf 20)``) is NOT always a ``Literal``: ``true``
   / ``false`` arrive as ``exp.Boolean``, a bare word as ``exp.Var``, a
   double-quoted word as ``exp.Identifier``, ``NULL`` as ``exp.Null``.
@@ -311,7 +306,7 @@ _FRAME_COLUMN = "frame"
 _TIME_COLUMN = "t"
 
 # The array-typed pseudo-columns an input exposes, and their element type.
-# RFC-004 added subtitle/data: identical array/subscript/splat surface, but
+# subtitle/data have the identical array/subscript/splat surface but are
 # passthrough-only (see `_PASSTHROUGH_ONLY` below).
 _ARRAY_COLUMNS: dict[str, StreamType] = {
     "video": "video",
@@ -327,9 +322,9 @@ _TYPE_MARKERS: dict[StreamType, str] = {
     "data": "d",
 }
 
-# Stream types an ffmpeg filtergraph cannot carry (RFC-004, "Passthrough-only"):
-# they may only ever become an Output (a bare `-map`), never a filter argument
-# and never the input of a WHERE trim.
+# Stream types an ffmpeg filtergraph cannot carry: they may only become an
+# Output (a bare `-map`), never a filter argument and never a WHERE trim's
+# input.
 _PASSTHROUGH_ONLY: frozenset[StreamType] = frozenset({"subtitle", "data"})
 
 # Kind label used in UDF_ARG_TYPE "got" lists for anything that is neither a
@@ -378,13 +373,11 @@ _CAPTION_TRIM_HINT = (
     "an external subtitle file whose cues are timed for the cut"
 )
 
-# -- timeline `enable` (RFC-005 SS2) ---------------------------------------
-#
 # `enable` is FRAMEWORK-level: ffmpeg implements it in the filter framework,
-# not in any filter, so it never appears in a filter's `-help` AVOptions and
-# no options table can ever contain it. Which filters honour it is the `T`
-# column of `ffmpeg -filters`, captured as DynamicFilter.timeline (plan 040),
-# and that flag is what admits the name here.
+# not in any filter, so it never appears in a filter's `-help` AVOptions and no
+# options table can contain it. Which filters honour it is the `T` column of
+# `ffmpeg -filters`, captured as DynamicFilter.timeline; that flag admits the
+# name here.
 _ENABLE = "enable"
 _ENABLE_HINT = (
     "enable takes a single-quoted ffmpeg timeline expression over t (seconds), "
@@ -401,29 +394,23 @@ _NO_TIMELINE_HINT = (
 _MAX_LISTED = 12
 
 
-# ---------------------------------------------------------------------------
-# array-RETURNING filters (RFC-006, plan 047)
-# ---------------------------------------------------------------------------
+# array-RETURNING filters.
 #
 # Three ffmpeg filters take ONE input pad and produce a number of output pads
-# that is fixed, statically, by one of their options. The registry's v1 pad
-# fence excludes all three (their `-filters` spec is `A->N` / `V->N`, and `N`
-# is excluded wholesale), so `Registry.get` says None for them and they are
-# not callable as tier-2 filters. This table is what re-admits exactly those
-# three, and it lives here rather than in the registry because the count rule
-# is a property of the OPTION SEMANTICS, which nothing ffmpeg prints exposes:
-# the registry keeps saying `A->N`, and lowering keeps the arithmetic.
+# fixed statically by one of their options. Their `-filters` spec is `A->N` /
+# `V->N`, so the pad fence excludes all three and `Registry.get` says None.
+# This table re-admits exactly those three. It lives here, not in the registry,
+# because the count rule is a property of the OPTION SEMANTICS, which nothing
+# ffmpeg prints exposes: the registry keeps saying `A->N`, lowering keeps the
+# arithmetic.
 #
-# Re-admitted through the `ffmpeg.<filter>(...)` namespace only (RFC-006:
-# "Remains namespace-only"). A bare `channelsplit(...)` stays UNKNOWN_FUNCTION,
-# exactly as every other fenced name does -- the namespace is where a call
-# that needs a special shape is spelled.
+# Re-admitted through the `ffmpeg.<filter>(...)` namespace ONLY. A bare
+# `channelsplit(...)` stays UNKNOWN_FUNCTION like every other fenced name.
 #
 # The result is an ARRAY value: `Node(outputs=[element]*N)` plus one `_Stream`
 # per pad, `is_array=True` even when N == 1 (a one-element array still splats,
-# subscripts through a CTE column, and broadcasts). Its pads are ordinary pads
-# -- consume-once, so a pad read by two sinks gets an `asplit` from the split
-# pass like any other.
+# subscripts through a CTE column, and broadcasts). Its pads are ordinary
+# consume-once pads, so a pad read by two sinks gets an `asplit` like any other.
 
 
 @dataclass(frozen=True)
@@ -624,25 +611,20 @@ _ARRAY_INPUT_HINT = (
 )
 
 
-# ---------------------------------------------------------------------------
-# fixed-count N-INPUT filters (plan 051)
-# ---------------------------------------------------------------------------
+# fixed-count N-INPUT filters, the mirror image of ARRAY_RETURNING.
 #
-# The mirror image of ARRAY_RETURNING. Three ffmpeg filters take a number of
-# INPUT pads that is fixed, statically, by one of their options and produce
-# exactly one output pad. Their `-filters` spec is `N->A` / `N->V`, so the v1
-# pad fence excludes all three and `Registry.get` says None for them -- yet
-# the count is knowable the moment the option is read, which is the same
-# argument that re-admits the array-returning trio.
+# Three ffmpeg filters take a number of INPUT pads fixed statically by one of
+# their options and produce exactly one output pad. Their `-filters` spec is
+# `N->A` / `N->V`, so the pad fence excludes all three -- yet the count is
+# knowable the moment the option is read, the same argument that re-admits the
+# array-returning trio.
 #
-# Re-admitted under BOTH spellings, bare and namespaced: unlike the array
-# trio, none of these three names collides with a Postgres special form, and
-# `amix(a, b)` is the spelling everybody already writes.
+# Re-admitted under BOTH spellings, bare and namespaced: unlike the array trio,
+# none of these three names collides with a Postgres special form.
 #
 # The mechanism generalizes to any `N->1` filter whose input count is one
-# option (`concat`'s `n`, `mix`, `interleave`, ...); it is deliberately
-# scoped to these three for now, since the general variadic/array-CONSUMING
-# story (passing one array where N streams are wanted) is queued separately.
+# option (`concat`'s `n`, `mix`, `interleave`, ...), but stays scoped to these
+# three until array-CONSUMING calls exist.
 
 
 @dataclass(frozen=True)
@@ -687,9 +669,7 @@ _N_INPUT_HINT = (
 )
 
 
-# ---------------------------------------------------------------------------
 # errors
-# ---------------------------------------------------------------------------
 
 
 def _error(
@@ -717,9 +697,7 @@ def _describe(node: exp.Expr) -> str:
     return f"a {node.__class__.__name__.upper()} expression"
 
 
-# ---------------------------------------------------------------------------
 # small AST helpers
-# ---------------------------------------------------------------------------
 
 
 def _unwrap(node: exp.Expr) -> exp.Expr:
@@ -734,7 +712,7 @@ def _unwrap(node: exp.Expr) -> exp.Expr:
 
 
 def _strip_track_sugar(node: exp.Expr) -> exp.Expr:
-    """``<alias>.<type>[k].track`` is sugar for ``<alias>.<type>[k]`` (plan 064):
+    """``<alias>.<type>[k].track`` is sugar for ``<alias>.<type>[k]``:
     the SAME stream, spelled with the accessor that names it explicitly.
     Every other accessor a subscript metadata shape could name is metadata,
     not a stream, and resolve already confines those to WHERE, so this is the
@@ -760,8 +738,8 @@ def _projection_name(node: exp.Expr) -> str | None:
 def _table_column_name(node: exp.Expr) -> str:
     """A table/csv column's header: the ``AS`` alias, else its natural name.
 
-    RFC-011: "the SELECT alias when given, else the column expression's
-    natural name (``language``, ``track``, ...)". A bare row/input column
+    The SELECT alias when given, else the column expression's natural name
+    (``language``, ``track``, ...). A bare row/input column
     names itself; a subscript metadata accessor names the metadata field it
     reads (``f.audio[1].language`` -> ``language``, matching a row table's
     own column of the same name); anything else (a filter call, COALESCE,
@@ -800,7 +778,7 @@ def _flatten_and(node: exp.Expr | None) -> list[exp.Expr]:
 
 @dataclass(frozen=True)
 class _NamedArg:
-    """One ``name => value`` call argument (RFC-003).
+    """One ``name => value`` call argument.
 
     `name` is verbatim (ffmpeg AVOption names are case-sensitive) and `value` is
     the raw sqlglot node — the option table this is checked against comes from
@@ -816,9 +794,9 @@ class _NamedArg:
 class _Call:
     """A function call as lowering sees it: a name, positional args, named args.
 
-    `namespaced` marks the ``ffmpeg.<filter>(...)`` spelling (plan 038), which
+    `namespaced` marks the ``ffmpeg.<filter>(...)`` spelling, which
     resolves in the registry under a name no Postgres grammar can claim.
-    `is_macro` marks the ``sqlmpeg.<name>(...)`` spelling (plan 052), which
+    `is_macro` marks the ``sqlmpeg.<name>(...)`` spelling, which
     resolves against :data:`MACROS` and never touches the registry. The two
     are mutually exclusive (different Dot qualifiers).
     """
@@ -863,11 +841,11 @@ def _namespaced_call(node: exp.Expr) -> exp.Anonymous | None:
 def _macro_call(node: exp.Expr) -> exp.Anonymous | None:
     """The ``exp.Anonymous`` inside ``sqlmpeg.<name>(...)``, else None.
 
-    Mirrors :func:`_namespaced_call` exactly, and VERIFIED (plan 052) to parse
+    Mirrors :func:`_namespaced_call` exactly, and VERIFIED to parse
     to the identical shape under sqlglot 30.17 ``read="postgres"`` for all
     three macro names: ``exp.Dot(this=Identifier(sqlmpeg),
     expression=exp.Anonymous(this=<macro>, expressions=[...]))``, symmetric
-    with plan 038's ffmpeg-namespace findings.
+    with the ffmpeg namespace's.
     """
     if not isinstance(node, exp.Dot):
         return None
@@ -944,9 +922,7 @@ def _split_args(
     return _Call(name, positional, named, namespaced, is_macro)
 
 
-# ---------------------------------------------------------------------------
 # literal coercion
-# ---------------------------------------------------------------------------
 
 
 def _number(node: exp.Expr, code: ErrorCode = ErrorCode.UDF_ARG_TYPE) -> int | float:
@@ -1043,9 +1019,7 @@ def _input_value(node: exp.Expr) -> object:
     return _Unrepresentable(_sink_describe(node))
 
 
-# ---------------------------------------------------------------------------
 # typed values, bindings, per-branch environment
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -1067,7 +1041,7 @@ class _Stream:
     source: StreamMeta | None = None
 
 
-# Table mode only (RFC-011, plan 067): the sentinel `_Stream.ref` for an
+# Table mode only: the sentinel `_Stream.ref` for an
 # outer join's NULL row, read back by `_value_to_cells`. Never a real
 # FrameRef -- every well-formed one is non-empty (a node id or a "src:..."
 # ref) -- so there is no ambiguity with an actual stream.
@@ -1133,8 +1107,8 @@ class _CteBinding:
 class _SourceBinding:
     """``FROM ffmpeg.<source>(...) a`` — exposes ONE statically-typed stream.
 
-    RFC-005 §1. Everything about the stream is known before any projection
-    lowers: the registry's :class:`~sqlmpeg.registry.SourceFilter` says which
+    Everything about the stream is known before any projection lowers: the
+    registry's :class:`~sqlmpeg.registry.SourceFilter` says which
     type the source's single output pad carries, so ``a.video[1]`` /
     ``a.frame`` (video sources), ``a.audio[1]`` (audio ones), the bare array
     ``a.video`` (length 1, statically), and ``a.*`` are all answered without
@@ -1185,7 +1159,7 @@ class _TrackRow:
 
 @dataclass
 class _RowRelation:
-    """One branch's joined row set: every unnest table, aligned (plan 062).
+    """One branch's joined row set: every unnest table, aligned.
 
     `tuples` is the relation itself — one dict per result ROW, mapping each row
     alias to that row's track, or to ``None`` where an outer join left a gap.
@@ -1194,7 +1168,7 @@ class _RowRelation:
     join made, so the existing zip/broadcast machinery wires the right streams
     together without learning that joins exist.
 
-    Row order is the join's, never sorted implicitly (RFC-009 § Semantics): the
+    Row order is the join's, never sorted implicitly: the
     LEFT side's order, then — for a FULL join only — the unmatched right rows
     in their own order. `keys` remembers which columns each side was matched
     on, so a NULL track can say what it failed to match.
@@ -1207,7 +1181,7 @@ class _RowRelation:
 
 @dataclass
 class _RowBinding:
-    """``FROM ..., unnest(<input>.<type>) t`` — a compile-time TABLE (RFC-009).
+    """``FROM ..., unnest(<input>.<type>) t`` — a compile-time TABLE.
 
     `rows` is this alias's column of the branch's joined relation, in ROW
     ORDER: the surviving row set, one entry per result row, ``None`` where an
@@ -1216,7 +1190,7 @@ class _RowBinding:
     alias stays aligned), and both happen once per branch before any projection
     lowers. Selecting ``t.track`` over N surviving rows is an N-element array in
     that order, which is the same array value a bare ``f.audio`` produces — the
-    row model and the array model are one mechanism (RFC-009 § Semantics).
+    row model and the array model are one mechanism.
 
     `source` is the INPUT alias the tracks belong to. Everything downstream
     (the ``-i``, its WHERE window, provenance) keys off THAT alias, not the row
@@ -1238,7 +1212,7 @@ _Binding = _InputBinding | _CteBinding | _SourceBinding | _RowBinding
 
 
 def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
-    """One probed stream's row columns (RFC-009 § Columns).
+    """One probed stream's row columns.
 
     Two sources, one table: ``language``/``title`` come from the container TAGS
     (``StreamMeta.metadata``), everything else from a field of the StreamMeta
@@ -1251,9 +1225,8 @@ def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
 
     The enriched fields (``codec``, ``channels``, ``channel_layout``,
     ``bitrate``, ``duration``, ``color_transfer``) are read through
-    :func:`getattr` deliberately: they arrive with plan 060's probe enrichment,
-    which lands independently, and a StreamMeta without them yields NULL
-    columns rather than an AttributeError — exactly what an unprobed field
+    :func:`getattr` deliberately: a StreamMeta built without them yields NULL
+    columns rather than an AttributeError -- exactly what an unprobed field
     yields anyway.
     """
     schema = ROW_SCHEMAS[column]
@@ -1294,11 +1267,10 @@ def _join_keys(on: exp.Expr) -> dict[str, list[str]]:
     return keys
 
 
-# The fill each track type takes when an outer join leaves a gap (RFC-009,
-# "Every stream type unnests; only the fill differs"). Quoted verbatim in the
-# NULL-track hint, so it is spelled the way a user would paste it. `data` is
-# absent deliberately: nothing generates a data track, so there is no fill to
-# suggest.
+# The fill each track type takes when an outer join leaves a gap. Quoted
+# verbatim in the NULL-track hint, so it is spelled the way a user would paste
+# it. `data` is absent deliberately: nothing generates a data track, so there
+# is no fill to suggest.
 _FILL_SPELLINGS: dict[StreamType, str] = {
     "audio": f"{FILTER_NAMESPACE}.anullsrc()",
     "video": f"{FILTER_NAMESPACE}.color()",
@@ -1313,20 +1285,17 @@ _COALESCE_HINT = (
 )
 
 
-# ---------------------------------------------------------------------------
-# the compile-time row predicate evaluator (RFC-009)
-# ---------------------------------------------------------------------------
+# The compile-time row predicate evaluator.
 #
 # Every column of a track row is PROBED metadata, so a predicate over rows is
 # decidable here, at compile time, and never reaches ffmpeg -- the way a
 # `WHERE t BETWEEN` vanishes into `-ss`/`-to`. Standard SQL three-valued logic
 # throughout: a comparison against NULL is UNKNOWN (python `None`), AND/OR/NOT
-# are Kleene, and WHERE keeps a row only when its predicate came back TRUE. So
-# "NULL matches nothing" is not a rule of ours -- it is what falls out.
+# are Kleene, and WHERE keeps a row only when its predicate came back TRUE, so
+# "NULL matches nothing" falls out rather than being a rule of ours.
 #
 # `resolve` already shape- and type-checked everything below; the rejections
-# here are the usual defensive re-checks, and the SqlmpegError they raise is
-# the same one resolve would have.
+# here are defensive re-checks raising the same SqlmpegError resolve would.
 
 
 def _kleene_and(left: bool | None, right: bool | None) -> bool | None:
@@ -1402,23 +1371,21 @@ class _Env:
     # CTE name -> its WHERE window. CTE-ONLY: an INPUT alias's window is a
     # property of its `-i`, not of this branch, so `_collect_trims` records it
     # in `Graph.input_trims` instead and no filter trim is ever spliced for it.
-    # Plan 039: either half may be None (open-ended window).
+    # Either half may be None (an open-ended window).
     trims: dict[str, tuple[int | float | None, int | float | None]] = field(
         default_factory=dict
     )
     # base stream ref -> its trimmed ref, so one filter trim is shared by every
     # consumer of that stream inside this branch (CTE-only, as above).
     trimmed: dict[FrameRef, FrameRef] = field(default_factory=dict)
-    # The branch's joined row set (RFC-009, plan 062), or None until its first
+    # The branch's joined row set, or None until its first
     # `unnest` binds. There is at most ONE: every row table of a branch joins
     # into it, comma sources included (the comma between two unnests is the
     # bounded cross join), so all row aliases stay aligned by construction.
     relation: _RowRelation | None = None
 
 
-# ---------------------------------------------------------------------------
 # ExpandCtx
-# ---------------------------------------------------------------------------
 
 
 class _NodeFactory:
@@ -1447,9 +1414,7 @@ class _NodeFactory:
         return node_id
 
 
-# ---------------------------------------------------------------------------
 # the lowering walk
-# ---------------------------------------------------------------------------
 
 
 class _Lowerer:
@@ -1465,16 +1430,14 @@ class _Lowerer:
         self.graph = Graph(input_paths=list(res.input_paths), sources=dict(res.sources))
         self.ctx = _NodeFactory(self.graph)
         self.cte_columns: dict[str, tuple[_Column, ...]] = {}
-        # Inputs this pass minted itself (RFC-009's `sqlmpeg.empty_captions()`),
+        # Inputs this pass minted itself (`sqlmpeg.empty_captions()`),
         # alias -> its INTERNAL input options. Merged into `Graph.input_options`
         # by `_lower_input_options`, which is the only writer of that field.
         self.minted_input_options: dict[str, dict[str, object]] = {}
-        # RFC-011, plan 067: True for the whole duration of `run_table()`.
-        # Table mode changes exactly one thing about the classic stream
-        # machinery it otherwise reuses verbatim (`_lower_expr` and friends,
-        # for a `.track`/filtered-stream table cell): an outer join's NULL
-        # row is not a rejection there, it is an empty cell (see
-        # `_row_stream`). `run()` (the media path) never sets this.
+        # True for the whole duration of `run_table()`; `run()` never sets it.
+        # Table mode changes exactly one thing about the stream machinery it
+        # otherwise reuses verbatim: an outer join's NULL row is an empty cell
+        # rather than a rejection (see `_row_stream`).
         self.table_mode = False
 
     # -- entry point ------------------------------------------------------
@@ -1483,7 +1446,7 @@ class _Lowerer:
         """Lower every CTE/view once, then one :class:`SinkUnit` per COPY.
 
         The bindings come first and are shared: ``res.ctes`` holds a script's
-        views AND every COPY's own ``WITH``, in written order (RFC-006), and
+        views AND every COPY's own ``WITH``, in written order, and
         each is lowered into THIS graph exactly once. A view read by three
         COPYs therefore mints its nodes once and hands the same refs to all
         three — the fan-out is the split pass's ordinary business, which is
@@ -1506,7 +1469,7 @@ class _Lowerer:
         self.graph.input_options = self._lower_input_options()
         return self.graph
 
-    # -- the COPY sink (RFC-002, RFC-006) ----------------------------------
+    # -- the COPY sink ----------------------------------
 
     def _lower_sink(self, raw: RawSink) -> SinkUnit:
         """One COPY: its own query lowered, its options validated.
@@ -1530,7 +1493,7 @@ class _Lowerer:
             )
         return SinkUnit(outputs=_outputs(columns), path=raw.path, options=options)
 
-    # -- input() named options (RFC-005 SS4, plan 041) ---------------------
+    # -- input() named options ---------------------
 
     def _lower_input_options(self) -> dict[str, dict[str, object]]:
         """Validate every `input('path', name => value, ...)`'s trailing options.
@@ -1578,7 +1541,7 @@ class _Lowerer:
     def _check_concat_columns(
         self, branches: list[exp.Select], flattened: list[list[_Column]]
     ) -> None:
-        """No UNION ALL branch may carry a subtitle/data column (RFC-004).
+        """No UNION ALL branch may carry a subtitle/data column.
 
         ``concat`` is a filtergraph filter and takes ``v`` video plus ``a``
         audio pads — there is no ``s``/``d`` half — so a caption column in a
@@ -1682,13 +1645,12 @@ class _Lowerer:
 
     def _lower_branch(self, select: exp.Select) -> list[_Column]:
         env = self._scope(select)
-        # RFC-009: one WHERE clause, two (now three: plan 064) languages. A
-        # conjunct over track-row columns is decided HERE and never reaches
-        # ffmpeg; a subscript metadata conjunct is a compile-time ASSERTION
-        # (nothing to filter -- the SELECT list already names the exact
-        # stream a subscript picked); a time window is a seek on an input.
-        # Resolve already rejected a conjunct that mixes any two of them, so
-        # the split is total.
+        # One WHERE clause, three languages. A conjunct over track-row columns
+        # is decided HERE and never reaches ffmpeg; a subscript metadata
+        # conjunct is a compile-time ASSERTION (nothing to filter -- the SELECT
+        # list already names the exact stream the subscript picked); a time
+        # window is a seek on an input. Resolve already rejected a conjunct
+        # mixing any two, so the split is total.
         time_conjuncts, row_conjuncts, assertion_conjuncts = self._split_where(select, env)
         self._collect_trims(select, env, time_conjuncts)
         self._filter_rows(row_conjuncts, env, select)
@@ -1702,9 +1664,9 @@ class _Lowerer:
             )
         columns: list[_Column] = []
         for projection in projections:
-            # RFC-004: a star is not an expression, it is a column GENERATOR --
-            # it contributes as many columns as the aliases it names have
-            # streams, so it is expanded here rather than in `_lower_expr`.
+            # A star is not an expression, it is a column GENERATOR: it
+            # contributes as many columns as the aliases it names have
+            # streams, so it expands here rather than in `_lower_expr`.
             qualifier = star_qualifier(projection)
             if qualifier is not None:
                 columns += self._expand_star(qualifier, projection, env, select)
@@ -1717,7 +1679,7 @@ class _Lowerer:
             )
         return columns
 
-    # -- SELECT * / <alias>.* (RFC-004) ------------------------------------
+    # -- SELECT * / <alias>.* ------------------------------------
 
     def _expand_star(
         self, qualifier: str, anchor: exp.Expr, env: _Env, select: exp.Select
@@ -1782,10 +1744,9 @@ class _Lowerer:
     ) -> list[_Column]:
         """Every stream of one input alias, in file order.
 
-        Splat tier, same policy as a bare ``a.audio`` (RFC-001 "Probing
-        policy"): how many streams a file has, and of which types, is a
-        property of the file, so an input that could not be probed is
-        INPUT_NOT_FOUND rather than a guess.
+        Splat tier, same policy as a bare ``a.audio``: how many streams a
+        file has, and of which types, is a property of the file, so an input
+        that could not be probed is INPUT_NOT_FOUND rather than a guess.
         """
         result = self.probes.get(alias)
         path = self.res.input_paths[self.graph.sources[alias]]
@@ -1867,7 +1828,7 @@ class _Lowerer:
                 self._add_table(item, env, select)
         return env
 
-    # -- FROM unnest(<input>.<type>) alias (RFC-009, plan 061) -------------
+    # -- FROM unnest(<input>.<type>) alias -------------
 
     def _add_track_rows(
         self,
@@ -1881,13 +1842,13 @@ class _Lowerer:
         This is the one binding that MUST probe. A row's columns are probed
         metadata and its row COUNT is a property of the file, so an input that
         could not be read cannot be unnested at all -- the same policy, and the
-        same code, a bare ``f.audio`` has (RFC-001 "Probing policy": "cannot
-        enumerate the streams of a file I cannot read" is a natural error).
+        same code, a bare ``f.audio`` has: the streams of a file that cannot be
+        read cannot be enumerated.
 
         No node is minted and no ``-i`` is taken: the rows' streams are the
         INPUT alias's streams, already probed and already mapped, so a row
         table is pure bookkeeping until ``t.track`` is actually selected. That
-        is what makes RFC-009's consume-once rule fall out of ordinary column
+        is what makes the consume-once rule fall out of ordinary column
         selection -- an unmatched row's stream is simply never read.
         """
         alias_node = unnest.args.get("alias")
@@ -1936,7 +1897,7 @@ class _Lowerer:
         )
         self._join_rows(env.relation, alias, rows, join, env, select)
 
-    # -- joining two row tables (RFC-009, plan 062) ------------------------
+    # -- joining two row tables ------------------------
 
     def _join_rows(
         self,
@@ -1950,7 +1911,7 @@ class _Lowerer:
         """Fold one freshly bound row table into the branch's relation.
 
         Ordinary SQL join semantics, evaluated here because every column is
-        probed metadata (RFC-009: "the joins never reach ffmpeg"):
+        probed metadata ("the joins never reach ffmpeg"):
 
         * the FIRST row table simply becomes the relation;
         * a comma between two row tables is the bounded CROSS join;
@@ -1962,7 +1923,7 @@ class _Lowerer:
           is not wanted, is a wider key, not an error;
         * LEFT keeps an unmatched left row with a NULL right side, FULL also
           appends the unmatched RIGHT rows, in their own order, after every
-          left row — which is the whole of RFC-009's row-order rule.
+          left row -- which is the whole of the row-order rule.
         """
         kind = join.kind if join is not None else "cross"
         if not relation.aliases:
@@ -2021,7 +1982,7 @@ class _Lowerer:
         alias_node = table.args.get("alias")
         db = table.args.get("db")
         if isinstance(db, exp.Expr) and _fold(db) == FILTER_NAMESPACE:
-            # `FROM ffmpeg.<source>(...) alias` (RFC-005 §1): resolve already
+            # `FROM ffmpeg.<source>(...) alias`: resolve already
             # shape-checked it and parked the record in `res.source_filters`.
             self._add_source(table, alias_node, env, select)
             return
@@ -2052,12 +2013,12 @@ class _Lowerer:
                     fallback=table,
                     hint=self._known_hint(),
                 )
-            # RFC-006: `FROM master m` binds the view/CTE under a BRANCH-LOCAL
-            # name (resolve checked it shadows nothing in the flat namespace).
-            # The binding records the local name, so `m.v` resolves and every
-            # message about it reads back as the user wrote it; the columns —
-            # and therefore the graph refs — are the same objects either way,
-            # which is what makes the shared subgraph shared.
+            # `FROM master m` binds the view/CTE under a BRANCH-LOCAL name
+            # (resolve checked it shadows nothing in the flat namespace). The
+            # binding records the local name, so `m.v` resolves and messages
+            # read back as written; the columns -- and therefore the graph
+            # refs -- are the same objects either way, which is what makes the
+            # shared subgraph shared.
             local = name
             if isinstance(alias_node, exp.TableAlias) and alias_node.this is not None:
                 local = _fold(alias_node.this)
@@ -2079,7 +2040,7 @@ class _Lowerer:
         )
         return f"known names: {', '.join(known)}" if known else "no aliases are in scope"
 
-    # -- FROM ffmpeg.<source>(...) (RFC-005 §1, plan 042) ------------------
+    # -- FROM ffmpeg.<source>(...) ------------------
 
     def _add_source(
         self,
@@ -2220,7 +2181,7 @@ class _Lowerer:
 
     # -- WHERE ------------------------------------------------------------
 
-    # -- WHERE, split into its three halves (RFC-009, plan 064) ------------
+    # -- WHERE, split into its three halves ------------
 
     def _split_where(
         self, select: exp.Select, env: _Env
@@ -2231,7 +2192,7 @@ class _Lowerer:
         A conjunct is a ROW predicate exactly when it mentions a track-row
         alias, which is unambiguous: a row alias is an alias, and one name
         cannot be two things. A subscript metadata accessor (``Dot`` over
-        ``Bracket``, plan 064) is told apart by SHAPE instead, since its alias
+        ``Bracket``) is told apart by SHAPE instead, since its alias
         is an ordinary input one -- checked first, so a conjunct never falls
         through to the row/time split. Resolve rejected every mixed case, so
         nothing here has to decide what a half-and-half conjunct would mean.
@@ -2273,7 +2234,7 @@ class _Lowerer:
             row_conjuncts.append(conjunct)
         return time_conjuncts, row_conjuncts, assertion_conjuncts
 
-    # -- compile-time row filtering / ordering (RFC-009) -------------------
+    # -- compile-time row filtering / ordering -------------------
 
     def _filter_rows(
         self, conjuncts: list[exp.Expr], env: _Env, select: exp.Select
@@ -2284,7 +2245,7 @@ class _Lowerer:
         never probed simply does not match — no new rule, and no silent guess.
         The surviving set is written back onto the branch's relation, so every
         later ``t.track`` sees it and an unselected row's stream is never
-        touched. Filtering happens AFTER the joins (plan 062), which is where
+        touched. Filtering happens AFTER the joins, which is where
         SQL puts it: dropping a row of an outer join's nullable side before the
         join would silently turn it into an inner one.
         """
@@ -2330,7 +2291,7 @@ class _Lowerer:
         sees a single alias) and for a JOIN's ON (which sees both sides), plan
         062 generalizing 061's single binding.
 
-        Kleene three-valued logic, which is what makes RFC-009's NULL story a
+        Kleene three-valued logic, which is what makes the NULL story a
         non-story: a comparison with a NULL operand is UNKNOWN, UNKNOWN
         propagates through AND/OR/NOT the SQL way, and both callers keep TRUE
         only. A gap row reads NULL in every column, so "NULL matches nothing"
@@ -2464,23 +2425,19 @@ class _Lowerer:
             fallback=select,
         )
 
-    # -- subscript metadata WHERE assertions (RFC-009 addendum, plan 064) --
+    # -- subscript metadata WHERE assertions --
     #
-    # `<alias>.<type>[k].<column>` names ONE probed track, deterministically
-    # (the subscript is bounds-checked, not filtered), so a WHERE conjunct
-    # over it has nothing to DROP the way a row predicate drops rows: the
-    # SELECT list still names the exact stream the subscript picked. It is
-    # therefore an ASSERTION -- checked once, at compile time, against the
-    # probed file -- rather than a filter: TRUE lets compilation proceed
-    # unchanged, and FALSE or UNKNOWN (3VL: a field that was never probed) is
-    # a typed rejection, because an ffmpeg command line has no way to encode
-    # "select nothing" (recipe 29 of docs/examples.md).
+    # `<alias>.<type>[k].<column>` names ONE probed track deterministically
+    # (the subscript is bounds-checked, not filtered), so a WHERE conjunct over
+    # it has nothing to DROP the way a row predicate drops rows. It is an
+    # ASSERTION, checked once at compile time against the probed file: TRUE
+    # proceeds unchanged, FALSE or UNKNOWN (3VL -- a field that was never
+    # probed) is a typed rejection, because an ffmpeg command line cannot
+    # encode "select nothing" (recipe 29 of docs/examples.md).
     #
-    # The boolean algebra is 061's, reused wholesale (`_compare`/
-    # `_kleene_and`/`_kleene_or`/`_literal_of`): the only new piece is where a
-    # leaf's VALUE comes from (`_accessor_value`, probed straight off the
-    # input through the SAME `_row_columns` a track-row table's columns come
-    # from) rather than a joined row set.
+    # The boolean algebra is the row evaluator's, reused wholesale; the only
+    # new piece is where a leaf's VALUE comes from (`_accessor_value`, probed
+    # off the input through the same `_row_columns` a track-row table uses).
 
     def _check_assertions(self, conjuncts: list[exp.Expr], select: exp.Select) -> None:
         for conjunct in conjuncts:
@@ -2559,7 +2516,7 @@ class _Lowerer:
         Resolve already confined this shape to an ordinary INPUT alias (never
         a row or CTE one), so this reads the SAME probed ``StreamMeta`` a bare
         ``<alias>.<type>[k]`` would select, through the SAME `_row_columns` a
-        track-row table's columns come from (plan 061) -- one metadata table,
+        track-row table's columns come from -- one metadata table,
         two ways to name a row of it.
         """
         shape = (
@@ -2636,7 +2593,7 @@ class _Lowerer:
         return columns.get(name)
 
     def _order_rows(self, select: exp.Select, env: _Env) -> None:
-        """Re-sort a row table explicitly (RFC-009's ORDER BY carve-out).
+        """Re-sort a row table explicitly -- the ORDER BY carve-out.
 
         Row order is deterministic WITHOUT this — it is the file's track order,
         which is player-visible surface nothing resorts implicitly — so an
@@ -2693,9 +2650,9 @@ class _Lowerer:
     ) -> None:
         """Record each aliased time range, on the input or on the branch.
 
-        The binding decides where the window goes (RFC-004's input-seek
-        amendment). An INPUT alias owns its own ``-i`` and is globally unique,
-        so at most one window can ever apply to it: it is recorded on the GRAPH
+        The binding decides where the window goes. An INPUT alias owns its own
+        ``-i`` and is globally unique, so at most one window can ever apply to
+        it: it is recorded on the GRAPH
         (``Graph.input_trims``) and becomes ``-ss``/``-to``, seeking every
         stream of that input coherently — captions and unselected streams
         included. A CTE name is a filtergraph pad, so its window is recorded on
@@ -2703,8 +2660,8 @@ class _Lowerer:
         lazily by :meth:`_access`, the first time a stream of that CTE is
         consumed.
 
-        Plan 039 (open-ended windows): a conjunct may supply only a lower
-        bound (``<alias>.t >= x``) or only an upper one (``<alias>.t <= y``),
+        A conjunct may supply only a lower bound (``<alias>.t >= x``) or only
+        an upper one (``<alias>.t <= y``),
         via :func:`sqlmpeg.parser._time_bounds`, which also normalizes the
         mirrored operand order (``x <= <alias>.t`` etc.) and flags a strict
         ``>``/``<`` so it is rejected here too. Two conjuncts for the same
@@ -2715,8 +2672,8 @@ class _Lowerer:
         as elsewhere in this pass).
 
         `conjuncts` is the TIME half of the WHERE clause
-        (:meth:`_split_where`), not the whole of it: RFC-009's row predicates
-        share the clause and are decided on rows, not on the timeline.
+        (:meth:`_split_where`), not the whole of it: row predicates share the
+        clause and are decided on rows, not on the timeline.
         """
         where = select.args.get("where")
         if not isinstance(where, exp.Where) or not conjuncts:
@@ -2822,22 +2779,22 @@ class _Lowerer:
         memoized per stream, so each element of a broadcast array gets exactly
         one trim, shared by all its consumers.
 
-        This is also where a trimmed caption is rejected (RFC-004): the WHERE
+        This is also where a trimmed caption is rejected: the WHERE
         window is collected before any projection lowers, so "is this CTE's
         subtitle/data actually CONSUMED under a trim" is only knowable here, at
         the point the trim would be applied. A CTE's trim is a filtergraph
         ``trim``/``atrim`` pair, which cannot carry subtitle or data streams at
-        all, so for a CTE the rejection is permanent (RFC-004); on an input
+        all, so for a CTE the rejection is permanent; on an input
         alias it does not arise, because there is no filter node to feed.
         """
         window = env.trims.get(alias)
         if window is None:
             if value.type in _PASSTHROUGH_ONLY and alias in self.graph.input_trims:
-                # Measured, not theoretical: ffmpeg does not retime subtitle/data
-                # packets under an input -ss (copy OR transcode; cue times stay
-                # near-original while video rebases to zero), so a seeked caption
-                # track plays out of sync by the seek amount. Reject rather than
-                # ship silent desync. (2026-08-15 investigation; see RFC-004.)
+                # MEASURED 2026-08-15, not theoretical: ffmpeg does not retime
+                # subtitle/data packets under an input -ss (copy OR transcode;
+                # cue times stay near-original while video rebases to zero), so
+                # a seeked caption track plays out of sync by the seek amount.
+                # Reject rather than ship silent desync.
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"'WHERE {alias}.t' cannot trim a selected {value.type} stream: "
@@ -2871,9 +2828,9 @@ class _Lowerer:
     ) -> _Stream:
         """The trimmed counterpart of one stream; a trim is spliced once per stream.
 
-        Plan 039: `window` may have either half absent (open-ended), so the
-        ``trim``/``atrim`` node only gets the args it actually has --
-        ``start=X``, ``end=Y``, or both, same as today.
+        `window` may have either half absent (open-ended), so the
+        ``trim``/``atrim`` node gets only the args it has: ``start=X``,
+        ``end=Y``, or both.
         """
         cached = env.trimmed.get(stream.ref)
         if cached is not None:
@@ -2915,7 +2872,7 @@ class _Lowerer:
             )
         if isinstance(node, exp.Coalesce):
             # Not a call: COALESCE resolves against the ROW model, not the
-            # registry (RFC-009 -- it is how a nullable track column is spelled).
+            # registry -- it is how a nullable track column is spelled.
             return self._lower_coalesce(node, env, select)
         call = _call_parts(node)
         if call is not None:
@@ -3022,8 +2979,8 @@ class _Lowerer:
     ) -> _Value:
         """One column of a track-row table — and only ``track`` is a stream.
 
-        RFC-009 § Output multiplicity: ``t.track`` over N surviving rows is an
-        N-element ARRAY in row order, exactly what a bare ``f.audio`` is, so
+        ``t.track`` over N surviving rows is an N-element ARRAY in row order,
+        exactly what a bare ``f.audio`` is, so
         every existing array rule (splat, broadcast, subscript, zip) applies to
         it unchanged and the downstream passes learn nothing new.
 
@@ -3090,14 +3047,14 @@ class _Lowerer:
     ) -> _Stream:
         """One result row's track — and the NULL rejection when there isn't one.
 
-        RFC-009 § Semantics: "selecting a nullable track column (outer join)
-        without COALESCE is a typed rejection naming the row that was NULL —
-        never a silently missing output". An outer join is the user saying the
+        Selecting a nullable track column (outer join) without COALESCE is a
+        typed rejection naming the row that was NULL, never a silently missing
+        output. An outer join is the user saying the
         counterpart may be absent, so what to put there instead is a decision
         only they can make; ``COALESCE(<column>, <fill>)`` is where they make
         it, and the hint says so with the fill this column's type takes.
 
-        In table mode (RFC-011, plan 067) there is no ffmpeg command to be
+        In table mode there is no ffmpeg command to be
         missing an input for — the NULL row is exactly what an outer join's
         gap IS, and it prints as an empty cell, psql-style, same as any other
         NULL. ``_NULL_STREAM`` is the sentinel :meth:`_value_to_cells` reads
@@ -3155,9 +3112,9 @@ class _Lowerer:
     ) -> tuple[str | None, _TrackRow | None]:
         """The counterpart of a gap: the first row table that DID match here.
 
-        RFC-009 deliverable 4 (plan 062): a fill's provenance is "the paired
-        (non-NULL side's counterpart) row metadata", and its inherited options
-        come from the same row — so a silence-filled French mix stays French.
+        A fill's provenance is the paired (non-NULL counterpart) row's metadata,
+        and its inherited options come from that same row, so a silence-filled
+        French mix stays French.
         Relation order (FROM order) breaks the tie when three tables joined.
         """
         for other in relation.aliases:
@@ -3168,7 +3125,7 @@ class _Lowerer:
                 return other, track
         return None, None
 
-    # -- COALESCE(<row>.track, <fill>) (RFC-009, plan 062) -----------------
+    # -- COALESCE(<row>.track, <fill>) -----------------
 
     def _lower_coalesce(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Value:
         """The accepted spelling for a nullable track column: fill its gaps.
@@ -3176,8 +3133,8 @@ class _Lowerer:
         The result is the same N-element array ``<alias>.track`` is, in the
         same row order — every gap replaced by a generated stand-in. Only the
         gaps mint anything: a join with no unmatched rows compiles to exactly
-        the command the bare column would (RFC-009's consume-once rule, which
-        here means "generate nothing nobody needed").
+        the command the bare column would -- consume-once here means "generate
+        nothing nobody needed".
         """
         binding, fill = self._coalesce_parts(node, env, select)
         relation = binding.relation
@@ -3259,7 +3216,7 @@ class _Lowerer:
         anchor: exp.Expr,
         select: exp.Select,
     ) -> _Stream:
-        """Mint the stand-in for one missing track, per RFC-009's per-type table.
+        """Mint the stand-in for one missing track, per the per-type table.
 
         Two mechanisms, one rule. ``ffmpeg.<source>()`` is a zero-input filter
         node (``anullsrc`` for audio, ``color`` for video), option-checked
@@ -3303,7 +3260,7 @@ class _Lowerer:
         if "duration" in options and "duration" not in args:
             # A generator with no duration runs forever, and "forever" is not
             # what a missing 2-second track means. Inheriting it is the only
-            # correct default (RFC-009), so when the paired row was never
+            # correct default, so when the paired row was never
             # probed for one, the query has to say it.
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
@@ -3392,7 +3349,7 @@ class _Lowerer:
     def _inherited_fill_options(
         self, stream_type: StreamType, paired: _TrackRow | None
     ) -> dict[str, object]:
-        """What the fill copies from the row it stands beside (RFC-009).
+        """What the fill copies from the row it stands beside.
 
         Audio inherits DURATION only in v1 — a silent track's sample rate and
         layout are ffmpeg's own defaults, and amix resamples anyway, so
@@ -3642,8 +3599,8 @@ class _Lowerer:
 
         The one thing lowering cannot do symbolically: an array's LENGTH is a
         property of the file, so an input that could not be probed fails here
-        (RFC-001, "Probing policy" — "cannot enumerate the streams of a file I
-        cannot read" is a natural error, not a policy error).
+        -- the streams of a file that cannot be read cannot be enumerated, a
+        natural error rather than a policy one.
         """
         result = self.probes.get(alias)
         if result is None:
@@ -3770,12 +3727,12 @@ class _Lowerer:
     def _lower_call(
         self, node: exp.Expr, call: _Call, env: _Env, select: exp.Select
     ) -> _Value:
-        """Resolve a call in the registry, and nowhere else (RFC-007).
+        """Resolve a call in the registry, and nowhere else.
 
         One convention, three shapes of filter, tried in the order that makes
         each reachable at all:
 
-        * :data:`ARRAY_RETURNING` (namespaced spelling ONLY, RFC-006) and
+        * :data:`ARRAY_RETURNING` (namespaced spelling ONLY) and
           :data:`N_INPUT` (either spelling) come first, because both tables
           exist precisely for names the v1 pad fence keeps OUT of the registry
           — asking ``get`` about them first would answer "unknown" and the
@@ -3812,7 +3769,7 @@ class _Lowerer:
             )
         return self._lower_dynamic_call(node, name, dynamic, call, env, select)
 
-    # -- the sqlmpeg macro namespace (plan 052) -----------------------------
+    # -- the sqlmpeg macro namespace -----------------------------
 
     def _lower_macro_call(
         self, node: exp.Expr, name: str, call: _Call, env: _Env, select: exp.Select
@@ -3835,7 +3792,7 @@ class _Lowerer:
         """
         input_macro = INPUT_MACROS.get(name)
         if input_macro is not None:
-            # An input-minting macro (RFC-009): no filter node, no arguments,
+            # An input-minting macro: no filter node, no arguments,
             # one passthrough stream of the type it mints.
             if call.args or call.named:
                 raise _error(
@@ -3930,7 +3887,7 @@ class _Lowerer:
         )
 
     def _macro_function_hint(self, name: str) -> str:
-        """Did-you-mean over :data:`MACROS`, RFC-007's small-by-design trio."""
+        """Did-you-mean over :data:`MACROS`, the small-by-design macro set."""
         matches = difflib.get_close_matches(name, macro_names(), n=1, cutoff=0.6)
         if matches:
             return f"did you mean {MACRO_NAMESPACE}.{matches[0]}()?"
@@ -4001,7 +3958,7 @@ class _Lowerer:
             build=build,
         )
 
-    # -- fixed-count N-input filters (plan 051) ----------------------------
+    # -- fixed-count N-input filters ----------------------------
 
     def _n_input_options(self, name: str) -> dict[str, FilterOption] | None:
         """`name`'s option table if it is a callable fixed-count N-input filter.
@@ -4138,7 +4095,7 @@ class _Lowerer:
                 pass
         return spec.fallback
 
-    # -- array-returning filters (RFC-006, plan 047) -----------------------
+    # -- array-returning filters -----------------------
 
     def _array_options(self, name: str) -> dict[str, FilterOption] | None:
         """`name`'s option table if it is a callable array-returning filter.
@@ -4254,7 +4211,7 @@ class _Lowerer:
         call: _Call,
         node: exp.Expr,
     ) -> None:
-        """No function takes a subtitle or data stream (RFC-004).
+        """No function takes a subtitle or data stream.
 
         An ffmpeg filtergraph carries video and audio only, so a caption or
         timed-metadata stream can never be a filter INPUT — in either tier.
@@ -4262,7 +4219,7 @@ class _Lowerer:
         tier 2 as "expects gblur(video)"; both are true but neither says the
         thing that actually matters, which is that no signature could ever
         accept it. ``ParamKind`` and ``DynamicFilter.inputs`` are deliberately
-        left alone (RFC-004: "ParamKind is UNCHANGED"), so this is the one
+        left alone ("ParamKind is UNCHANGED"), so this is the one
         place that knows it.
         """
         for position, kind in enumerate(kinds):
@@ -4300,7 +4257,7 @@ class _Lowerer:
         expected: list[StreamType],
         got: list[str],
     ) -> SqlmpegError:
-        """The stream-signature rejection — UDF_ARG_TYPE's remaining job (RFC-007).
+        """The stream-signature rejection — UDF_ARG_TYPE's remaining job.
 
         Option problems never reach here: they are ``UNKNOWN_FILTER_OPTION`` /
         ``FILTER_OPTION_TYPE`` uniformly, positional or named.
@@ -4460,11 +4417,10 @@ class _Lowerer:
                 for position in range(arity)
             ]
             # A single-stream-input function is 1:1, so its result inherits
-            # that one input's provenance unconditionally. A call over two or
-            # more streams (amix, overlay, xfade) is a join like concat's: it
-            # threads provenance only when every input stream agrees
-            # (_agreed_source) -- mixing two English tracks yields an English
-            # track.
+            # that input's provenance unconditionally. A call over two or more
+            # streams (amix, overlay, xfade) is a join like concat's: it
+            # threads provenance only when every input agrees
+            # (`_agreed_source`).
             if len(positions) == 1:
                 source = streams[positions[0]].at(element).source
             elif len(positions) >= 2:
@@ -4476,7 +4432,7 @@ class _Lowerer:
             return _scalar(expanded[0])
         return _array(returns, expanded)
 
-    # -- named argument validation (RFC-003, both tiers) -------------------
+    # -- named argument validation --
 
     def _filter_options(
         self, filter_name: str, anchor: exp.Expr, fallback: exp.Expr
@@ -4531,9 +4487,8 @@ class _Lowerer:
         `occupied` holds the option names this call already bound
         POSITIONALLY, so ``crop(f, 100, 50, 10, 20, out_w => 5)`` reads as the
         conflict it is rather than silently overriding what the call itself
-        said. A collision is ``FILTER_OPTION_TYPE`` — an option problem, like
-        every other one under RFC-007 — and the fix is to drop one of the two
-        spellings.
+        said. A collision is ``FILTER_OPTION_TYPE``, an option problem like any
+        other, and the fix is to drop one of the two spellings.
 
         The collision check comes FIRST so the message names the conflict
         rather than whatever the registry would say about the name.
@@ -4543,7 +4498,7 @@ class _Lowerer:
         already holds the registry entry (or, for a generated source, knows
         there is no such field to hold — a source is never timeline-capable, so
         the default rejects). It admits ``enable`` BEFORE `options` is consulted
-        (RFC-005 SS2): ffmpeg implements ``enable`` in the filter framework, so
+: ffmpeg implements ``enable`` in the filter framework, so
         it is in no filter's option table and a registry lookup would always
         call it unknown.
         """
@@ -4575,7 +4530,7 @@ class _Lowerer:
         return checked
 
     def _unknown_function_hint(self, name: str) -> str:
-        """Did-you-mean over the registry (RFC-007: there is nothing else)."""
+        """Did-you-mean over the registry (there is nothing else)."""
         registry = self.registry
         if registry is not None and registry.available():
             if registry.get_source(name) is not None:
@@ -4607,7 +4562,7 @@ class _Lowerer:
         if registry is not None and registry.available():
             if registry.get_source(name) is not None:
                 # A generated source IS usable -- in FROM, where it belongs
-                # (RFC-005 §1). Say where rather than "unknown".
+                #. Say where rather than "unknown".
                 return (
                     f"{FILTER_NAMESPACE}.{name} is a generated source, not a "
                     f"function: put it in FROM, e.g. FROM {FILTER_NAMESPACE}."
@@ -4729,18 +4684,17 @@ class _Lowerer:
             return dynamic.output
         return _UNSUPPORTED_KIND
 
-    # -- table/csv queries (RFC-011, plan 067) -----------------------------
+    # -- table/csv queries --
     #
-    # A table query never reaches ffmpeg -- the row model (RFC-009) already
-    # holds every cell at compile time, so this is a second top-level entry
-    # point (`run_table`, parallel to `run`), not a mode bolted onto the
-    # streaming one. It reuses the streaming machinery for anything
-    # STREAM-shaped (`.track`, a filtered stream, COALESCE's fill) by calling
-    # straight into `_lower_expr` with `self.table_mode` set -- the one place
-    # that changes behavior under it is `_row_stream`'s NULL-row rejection,
-    # which becomes an empty cell instead. Metadata columns (row or subscript)
-    # have no streaming representation at all, so those two shapes are
-    # intercepted before `_lower_expr` ever sees them.
+    # A table query never reaches ffmpeg -- the row model holds every cell at
+    # compile time -- so this is a second top-level entry point (`run_table`,
+    # parallel to `run`), not a mode bolted onto the streaming one. It reuses
+    # the streaming machinery for anything STREAM-shaped (`.track`, a filtered
+    # stream, COALESCE's fill) by calling into `_lower_expr` with
+    # `self.table_mode` set; the one behavior that changes under it is
+    # `_row_stream`'s NULL-row rejection, which becomes an empty cell. Metadata
+    # columns have no streaming representation, so those shapes are intercepted
+    # before `_lower_expr` sees them.
 
     def run_table(self) -> list[TableSink]:
         """One :class:`~sqlmpeg.table.TableSink` per COPY, or one bare-select."""
@@ -4760,9 +4714,9 @@ class _Lowerer:
     def _lower_table_sink(self, raw: RawSink) -> TableSink:
         """One csv COPY: its query lowered, ``FORMAT``/``HEADER`` validated.
 
-        Against ``sqlmpeg.sink.CSV_OPTIONS`` -- a separate table from
-        ``SINK_OPTIONS`` (plan 067 deliverable 4), so a media option like
-        ``video_codec`` here is UNKNOWN, not silently accepted.
+        Against ``sqlmpeg.sink.CSV_OPTIONS``, a separate table from
+        ``SINK_OPTIONS``, so a media option like ``video_codec`` here is
+        UNKNOWN rather than silently accepted.
         """
         result = self._lower_table_query(list(raw.branches), raw.query)
         header = False
@@ -4790,7 +4744,7 @@ class _Lowerer:
     def _lower_table_branch(self, select: exp.Select) -> TableResult:
         """One table/csv branch: row cardinality, then every column, per row.
 
-        Cardinality is the branch's shared row relation (RFC-009, plan 062) --
+        Cardinality is the branch's shared row relation --
         every row alias's column stays aligned to it, joins included -- or 1
         for a branch with no ``unnest`` at all (a plain metadata/stream
         SELECT has exactly one row, the same way a bare scalar broadcasts).
@@ -4882,9 +4836,7 @@ class _Lowerer:
             return f"{self.graph.sources[alias]}:{_TYPE_MARKERS[stream_type]}:{index}"
         return ref
 
-# ---------------------------------------------------------------------------
 # provenance & small value helpers
-# ---------------------------------------------------------------------------
 
 
 def _provenance(stream: _Stream) -> dict[str, str]:
@@ -4942,8 +4894,7 @@ def _outputs(columns: list[_Column]) -> list[Output]:
     The SELECT list IS the output stream list, and an array column is several
     streams, so it splats into consecutive Outputs. Every element of an
     aliased array column keeps that alias VERBATIM (no ordinal suffix): the
-    alias names the column, not the stream, and ffmpeg metadata naming is
-    plan 022's business.
+    alias names the column, not the stream.
     """
     return [
         Output(
@@ -5106,9 +5057,9 @@ def _enable_value(
     text, and a bare number would silently mean "always on"/"never on" rather
     than the window the writer had in mind.
 
-    The expression's CONTENT is deliberately unchecked (RFC-005 non-goals): the
-    variable vocabulary is per-filter and is not introspectable, so it is
-    ffmpeg's to validate at run time.
+    The expression's CONTENT is deliberately unchecked: the variable
+    vocabulary is per-filter and not introspectable, so it is ffmpeg's to
+    validate at run time.
     """
     if not timeline:
         raise _error(
@@ -5235,9 +5186,7 @@ def _stream_count(count: int) -> str:
     return f"{count} stream" + ("" if count == 1 else "s")
 
 
-# ---------------------------------------------------------------------------
 # public entry point
-# ---------------------------------------------------------------------------
 
 
 def lower(
@@ -5252,7 +5201,7 @@ def lower(
     ``probe()`` per distinct path); a missing or ``None`` entry means that
     input could not be read, and lowering stays symbolic for it.
 
-    `registry` IS the function surface (RFC-007): the filter set of the ffmpeg
+    `registry` IS the function surface: the filter set of the ffmpeg
     on PATH, introspected lazily. It is a PARAMETER rather than a module lookup
     so that a caller — ``compile_sql``, or a test — decides which ffmpeg (or
     which captured snapshot) this compile resolves against. None, or an empty
@@ -5282,8 +5231,8 @@ def lower_table(
 ) -> list[TableSink]:
     """Lower a resolved TABLE query into its printable result set(s).
 
-    RFC-011, plan 067: the sibling of :func:`lower` for a query with no media
-    destination -- a bare SELECT, or every COPY a ``FORMAT csv`` one. Never
+    The sibling of :func:`lower` for a query with no media destination -- a
+    bare SELECT, or every COPY a ``FORMAT csv`` one. Never
     executes ffmpeg, never inserts splits (there is no filtergraph fan-out to
     consume-once here, only cells). Same probing/registry contract as
     :func:`lower`; raises ``SqlmpegError`` -- and nothing else -- on every
