@@ -37,13 +37,14 @@ from __future__ import annotations
 from . import registry as registry_module
 from .errors import ErrorCode, SqlmpegError
 from .ir import Graph
-from .lower import lower
+from .lower import lower, lower_table
 from .parser import Resolved, parse, resolve
 from .probe import ProbeResult
 from .probe import probe as probe_path
 from .split import insert_splits
+from .table import TableSink
 
-__all__ = ["compile_sql"]
+__all__ = ["classify", "compile_sql", "compile_table_sql"]
 
 
 def _probe_inputs(res: Resolved) -> dict[str, ProbeResult | None]:
@@ -77,6 +78,59 @@ def compile_sql(text: str) -> Graph:
         res = resolve(parse(text))
         probes = _probe_inputs(res)
         return insert_splits(lower(res, probes, registry=registry_module.load()))
+    except SqlmpegError:
+        raise
+    except RecursionError as err:
+        raise SqlmpegError(
+            ErrorCode.INTERNAL,
+            "internal error while compiling (query nests too deeply)",
+            line=1,
+            col=1,
+            hint="please report this query as a bug",
+        ) from err
+    except Exception as err:  # guardrail #7: no panics on user input
+        raise SqlmpegError(
+            ErrorCode.INTERNAL,
+            f"internal error while compiling ({err.__class__.__name__}: {err})",
+            line=1,
+            col=1,
+            hint="please report this query as a bug",
+        ) from err
+
+
+def classify(text: str) -> tuple[bool, bool]:
+    """``(is_table_capable, has_copy)`` for `text` (RFC-011, plan 067).
+
+    Cheap and static: parse + resolve only, no probing. ``is_table_capable``
+    is True when `text` has no media destination -- a bare SELECT (``not
+    has_copy``), or every COPY a ``FORMAT csv`` one. ``-o`` is CLI-only and
+    never reaches here, so a bare SELECT is always table-capable by this
+    check alone -- the CLI decides, from its own ``-o``, whether to actually
+    use :func:`compile_table_sql` or fall back to :func:`compile_sql` for a
+    pure-stream bare SELECT (RFC-011: "``-o`` stays as the implicit media
+    COPY it always morally was").
+
+    Raises ``SqlmpegError`` on a query that does not even resolve.
+    """
+    res = resolve(parse(text))
+    return all(sink.is_csv for sink in res.sinks), bool(res.sinks)
+
+
+def compile_table_sql(text: str) -> list[TableSink]:
+    """Compile SQL `text` into its printable table/csv result set(s).
+
+    The sibling of :func:`compile_sql` for a table query (RFC-011, plan 067):
+    one :class:`~sqlmpeg.table.TableSink` per COPY, or one for a bare SELECT.
+    Metadata columns and NULL-row gaps, both rejections under
+    :func:`compile_sql`, are legal here — that is the whole difference. Every
+    input is still probed opportunistically, same as :func:`compile_sql`.
+
+    Raises ``SqlmpegError`` — and nothing else — on every rejection.
+    """
+    try:
+        res = resolve(parse(text))
+        probes = _probe_inputs(res)
+        return lower_table(res, probes, registry=registry_module.load())
     except SqlmpegError:
         raise
     except RecursionError as err:

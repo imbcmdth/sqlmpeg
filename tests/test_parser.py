@@ -470,6 +470,15 @@ def test_count_star_is_still_an_aggregate_rejection() -> None:
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
 
 
+def test_count_star_over_track_rows_is_still_an_aggregate_rejection() -> None:
+    """RFC-011, plan 067: table mode makes metadata columns legal SELECT
+    outputs, but it does not make sqlmpeg a database -- ``COUNT(*)`` over a
+    row table (a bare SELECT, unconditionally table-capable) is still fenced
+    off exactly like any other aggregate."""
+    err = _reject("SELECT count(*) FROM input('f.mkv') f, unnest(f.audio) t")
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+
+
 # ---------------------------------------------------------------------------
 # resolve — subtitle / data pseudo-columns (RFC-004)
 # ---------------------------------------------------------------------------
@@ -1248,6 +1257,73 @@ def test_copy_from_names_the_supported_form() -> None:
     err = _reject("COPY t FROM 'in.csv'")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert err.hint is not None and "COPY (<query>) TO" in err.hint
+
+
+# ---------------------------------------------------------------------------
+# csv sink classification (RFC-011, plan 067): FORMAT csv, TO STDOUT
+# ---------------------------------------------------------------------------
+
+
+def test_format_csv_marks_the_sink_csv() -> None:
+    sink = _sink(f"COPY ({SINK_QUERY}) TO 'out.csv' WITH (format 'csv')")
+    assert sink.is_csv is True
+    assert sink.path == "out.csv"
+
+
+def test_format_csv_bare_word_also_marks_the_sink_csv() -> None:
+    """``format csv`` (unquoted, a bare Var under sqlglot) folds the same way
+    a quoted string does -- both spellings are stock Postgres COPY syntax."""
+    sink = _sink(f"COPY ({SINK_QUERY}) TO 'out.csv' WITH (format csv)")
+    assert sink.is_csv is True
+
+
+def test_format_csv_is_case_insensitive_unquoted() -> None:
+    sink = _sink(f"COPY ({SINK_QUERY}) TO 'out.csv' WITH (format CSV)")
+    assert sink.is_csv is True
+
+
+def test_media_copy_with_a_non_csv_format_is_not_csv() -> None:
+    """``format`` already means "container format" for a media COPY (an
+    existing SINK_OPTIONS entry) -- only the literal value 'csv' flips it."""
+    sink = _sink(f"COPY ({SINK_QUERY}) TO 'out.mp4' WITH (format 'mp4')")
+    assert sink.is_csv is False
+
+
+def test_copy_without_format_option_is_not_csv() -> None:
+    sink = _sink(f"COPY ({SINK_QUERY}) TO 'out.mkv'")
+    assert sink.is_csv is False
+
+
+def test_to_stdout_is_legal_for_a_csv_sink() -> None:
+    sink = _sink(f"COPY ({SINK_QUERY}) TO STDOUT WITH (format 'csv')")
+    assert sink.is_csv is True
+    assert sink.path is None
+
+
+def test_to_stdout_lowercase_is_also_accepted() -> None:
+    sink = _sink(f"COPY ({SINK_QUERY}) TO stdout WITH (format 'csv')")
+    assert sink.path is None
+
+
+def test_to_stdout_without_format_csv_is_still_rejected() -> None:
+    """A media COPY may not target STDOUT -- the STOP-gate carve-out is
+    csv-only (see test_bad_copy_is_rejected's plain "TO STDOUT" case, which
+    keeps failing the exact same way)."""
+    err = _reject(f"COPY ({SINK_QUERY}) TO STDOUT WITH (video_codec 'libx264')")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "STDOUT" in (err.hint or "") or "file path" in err.message
+
+
+def test_to_a_named_identifier_with_format_csv_is_still_rejected() -> None:
+    """Only the literal word STDOUT is special; anything else unquoted is
+    still not a path, csv or not."""
+    err = _reject(f"COPY ({SINK_QUERY}) TO x WITH (format 'csv')")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_header_option_is_legal_on_a_csv_sink() -> None:
+    sink = _sink(f"COPY ({SINK_QUERY}) TO STDOUT WITH (format 'csv', header true)")
+    assert [option.name for option in sink.options] == ["format", "header"]
 
 
 def test_duplicate_option_is_anchored_on_the_second_one() -> None:
@@ -2051,10 +2127,33 @@ def test_dot_track_is_still_a_stream_not_a_where_value() -> None:
     "column",
     ["language", "title", "codec", "channels", "channel_layout", "index"],
 )
-def test_a_non_track_accessor_is_rejected_as_a_select_output(column: str) -> None:
-    err = _reject(f"SELECT f.audio[1].{column} FROM input('f.mkv') f")
+def test_a_non_track_accessor_is_rejected_as_a_select_output_in_a_media_query(
+    column: str,
+) -> None:
+    # RFC-011, plan 067: this fence is MEDIA-only now -- a bare SELECT (no
+    # COPY) is always at least table-capable, and metadata columns are legal
+    # there (see test_subscript_metadata_output_is_legal_in_table_mode
+    # below). Wrapping in a real media COPY keeps this test on the fence it
+    # means to check.
+    err = _reject(
+        f"COPY (SELECT f.audio[1].{column} FROM input('f.mkv') f) TO 'out.mp4'"
+    )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "is track metadata, not a stream" in err.message
+
+
+@pytest.mark.parametrize(
+    "column",
+    ["language", "title", "codec", "channels", "channel_layout", "index"],
+)
+def test_subscript_metadata_output_is_legal_in_table_mode(column: str) -> None:
+    # A bare SELECT (no COPY at all) is table-capable unconditionally.
+    _resolve(f"SELECT f.audio[1].{column} FROM input('f.mkv') f")
+    # So is a csv COPY.
+    _resolve(
+        f"COPY (SELECT f.audio[1].{column} FROM input('f.mkv') f) "
+        "TO STDOUT WITH (format csv)"
+    )
 
 
 def test_bare_array_metadata_access_is_rejected_in_select() -> None:

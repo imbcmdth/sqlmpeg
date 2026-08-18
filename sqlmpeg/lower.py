@@ -278,7 +278,7 @@ from sqlglot import exp
 from sqlmpeg import binaries
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import validate_option as validate_input_option
-from sqlmpeg.ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType
+from sqlmpeg.ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType, is_src, src_parts
 from sqlmpeg.macros import INPUT_MACROS, MACROS, InputMacro, macro_names
 from sqlmpeg.parser import (
     FILTER_NAMESPACE,
@@ -301,9 +301,11 @@ from sqlmpeg.parser import (
 from sqlmpeg.parser import _ident_name as _fold
 from sqlmpeg.probe import ProbeResult, StreamMeta
 from sqlmpeg.registry import DynamicFilter, FilterOption, Registry, SourceFilter
+from sqlmpeg.sink import validate_csv_option
 from sqlmpeg.sink import validate_option as validate_sink_option
+from sqlmpeg.table import CellValue, StreamCell, TableResult, TableSink
 
-__all__ = ["lower"]
+__all__ = ["lower", "lower_table"]
 
 _FRAME_COLUMN = "frame"
 _TIME_COLUMN = "t"
@@ -740,6 +742,28 @@ def _projection_name(node: exp.Expr) -> str | None:
     return name or None
 
 
+def _table_column_name(node: exp.Expr) -> str:
+    """A table/csv column's header: the ``AS`` alias, else its natural name.
+
+    RFC-011: "the SELECT alias when given, else the column expression's
+    natural name (``language``, ``track``, ...)". A bare row/input column
+    names itself; a subscript metadata accessor names the metadata field it
+    reads (``f.audio[1].language`` -> ``language``, matching a row table's
+    own column of the same name); anything else (a filter call, COALESCE,
+    ...) has no single name to fall back to.
+    """
+    alias = _projection_name(node)
+    if alias is not None:
+        return alias
+    inner = _unwrap(node)
+    if isinstance(inner, exp.Column):
+        return _fold(inner.this)
+    shape = subscript_metadata_shape(inner)
+    if shape is not None:
+        return shape[1]
+    return "column"
+
+
 def _flatten_and(node: exp.Expr | None) -> list[exp.Expr]:
     """Flatten an AND tree into its conjuncts, left to right."""
     out: list[exp.Expr] = []
@@ -1026,6 +1050,13 @@ class _Stream:
     ref: FrameRef
     type: StreamType
     source: StreamMeta | None = None
+
+
+# Table mode only (RFC-011, plan 067): the sentinel `_Stream.ref` for an
+# outer join's NULL row, read back by `_value_to_cells`. Never a real
+# FrameRef -- every well-formed one is non-empty (a node id or a "src:..."
+# ref) -- so there is no ambiguity with an actual stream.
+_NULL_STREAM_REF: FrameRef = ""
 
 
 @dataclass(frozen=True)
@@ -1423,6 +1454,13 @@ class _Lowerer:
         # alias -> its INTERNAL input options. Merged into `Graph.input_options`
         # by `_lower_input_options`, which is the only writer of that field.
         self.minted_input_options: dict[str, dict[str, object]] = {}
+        # RFC-011, plan 067: True for the whole duration of `run_table()`.
+        # Table mode changes exactly one thing about the classic stream
+        # machinery it otherwise reuses verbatim (`_lower_expr` and friends,
+        # for a `.track`/filtered-stream table cell): an outer join's NULL
+        # row is not a rejection there, it is an empty cell (see
+        # `_row_stream`). `run()` (the media path) never sets this.
+        self.table_mode = False
 
     # -- entry point ------------------------------------------------------
 
@@ -3036,9 +3074,18 @@ class _Lowerer:
         counterpart may be absent, so what to put there instead is a decision
         only they can make; ``COALESCE(<column>, <fill>)`` is where they make
         it, and the hint says so with the fill this column's type takes.
+
+        In table mode (RFC-011, plan 067) there is no ffmpeg command to be
+        missing an input for — the NULL row is exactly what an outer join's
+        gap IS, and it prints as an empty cell, psql-style, same as any other
+        NULL. ``_NULL_STREAM`` is the sentinel :meth:`_value_to_cells` reads
+        back into that empty cell; its empty ref can never collide with a
+        real one (every real ref is non-empty).
         """
         if row is not None:
             return row.stream
+        if self.table_mode:
+            return _Stream(ref=_NULL_STREAM_REF, type=binding.type, source=None)
         fill = _FILL_SPELLINGS.get(binding.type)
         hint = (
             f"an outer join leaves gaps; fill them with "
@@ -4606,6 +4653,159 @@ class _Lowerer:
             return dynamic.output
         return _UNSUPPORTED_KIND
 
+    # -- table/csv queries (RFC-011, plan 067) -----------------------------
+    #
+    # A table query never reaches ffmpeg -- the row model (RFC-009) already
+    # holds every cell at compile time, so this is a second top-level entry
+    # point (`run_table`, parallel to `run`), not a mode bolted onto the
+    # streaming one. It reuses the streaming machinery for anything
+    # STREAM-shaped (`.track`, a filtered stream, COALESCE's fill) by calling
+    # straight into `_lower_expr` with `self.table_mode` set -- the one place
+    # that changes behavior under it is `_row_stream`'s NULL-row rejection,
+    # which becomes an empty cell instead. Metadata columns (row or subscript)
+    # have no streaming representation at all, so those two shapes are
+    # intercepted before `_lower_expr` ever sees them.
+
+    def run_table(self) -> list[TableSink]:
+        """One :class:`~sqlmpeg.table.TableSink` per COPY, or one bare-select."""
+        for name, body in self.res.ctes.items():
+            self.cte_columns[name] = tuple(self._lower_query(union_branches(body), body))
+        self.table_mode = True
+        sinks: list[TableSink] = []
+        if self.res.sinks:
+            for raw in self.res.sinks:
+                sinks.append(self._lower_table_sink(raw))
+        else:
+            result = self._lower_table_query(self.res.branches, self.res.select)
+            sinks.append(TableSink(result=result, path=None, csv=False, header=False))
+        self.graph.input_options = self._lower_input_options()
+        return sinks
+
+    def _lower_table_sink(self, raw: RawSink) -> TableSink:
+        """One csv COPY: its query lowered, ``FORMAT``/``HEADER`` validated.
+
+        Against ``sqlmpeg.sink.CSV_OPTIONS`` -- a separate table from
+        ``SINK_OPTIONS`` (plan 067 deliverable 4), so a media option like
+        ``video_codec`` here is UNKNOWN, not silently accepted.
+        """
+        result = self._lower_table_query(list(raw.branches), raw.query)
+        header = False
+        for option in raw.options:
+            line, col = _pos(option.name_node, option.value, raw.path_node)
+            value = validate_csv_option(option.name, _sink_value(option.value), line=line, col=col)
+            if option.name == "header":
+                assert isinstance(value, bool)
+                header = value
+        return TableSink(result=result, path=raw.path, csv=True, header=header)
+
+    def _lower_table_query(self, branches: list[exp.Select], anchor: exp.Expr) -> TableResult:
+        if not branches:
+            raise _error(ErrorCode.UNSUPPORTED_SQL, "query has no SELECT", anchor)
+        if len(branches) > 1:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a table/csv query does not support UNION ALL",
+                branches[1],
+                fallback=anchor,
+                hint="run each branch as its own query",
+            )
+        return self._lower_table_branch(branches[0])
+
+    def _lower_table_branch(self, select: exp.Select) -> TableResult:
+        """One table/csv branch: row cardinality, then every column, per row.
+
+        Cardinality is the branch's shared row relation (RFC-009, plan 062) --
+        every row alias's column stays aligned to it, joins included -- or 1
+        for a branch with no ``unnest`` at all (a plain metadata/stream
+        SELECT has exactly one row, the same way a bare scalar broadcasts).
+        """
+        env = self._scope(select)
+        time_conjuncts, row_conjuncts, assertion_conjuncts = self._split_where(select, env)
+        self._collect_trims(select, env, time_conjuncts)
+        self._filter_rows(row_conjuncts, env, select)
+        self._check_assertions(assertion_conjuncts, select)
+        self._order_rows(select, env)
+
+        cardinality = len(env.relation.tuples) if env.relation is not None else 1
+
+        projections = select.expressions
+        if not projections:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, "SELECT has no output column", fallback=select
+            )
+
+        names: list[str] = []
+        per_column: list[list[CellValue]] = []
+        for projection in projections:
+            if star_qualifier(projection) is not None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "'*' is not supported in a table/csv query",
+                    projection,
+                    fallback=select,
+                    hint="name the columns explicitly",
+                )
+            names.append(_table_column_name(projection))
+            per_column.append(self._table_projection(projection, env, select, cardinality))
+
+        rows = [[per_column[c][r] for c in range(len(names))] for r in range(cardinality)]
+        return TableResult(columns=names, rows=rows)
+
+    def _table_projection(
+        self, projection: exp.Expr, env: _Env, select: exp.Select, cardinality: int
+    ) -> list[CellValue]:
+        """One SELECT column, per row: a metadata value, or a stream cell."""
+        expr = _unwrap(projection)
+        if isinstance(expr, exp.Column):
+            table_node = expr.args.get("table")
+            if table_node is not None:
+                binding = env.bindings.get(_fold(table_node))
+                if isinstance(binding, _RowBinding):
+                    name = _fold(expr.this)
+                    if name != ROW_STREAM_COLUMN:
+                        return self._row_metadata_cells(binding, name, expr, select)
+        shape = subscript_metadata_shape(expr)
+        if shape is not None and shape[1] != ROW_STREAM_COLUMN:
+            metadata_value = self._accessor_value(expr, select)
+            return [metadata_value] * cardinality
+        stream_value = self._lower_expr(projection, env, select)
+        return self._value_to_cells(stream_value, cardinality)
+
+    def _row_metadata_cells(
+        self, binding: _RowBinding, name: str, anchor: exp.Expr, select: exp.Select
+    ) -> list[CellValue]:
+        """A row alias's metadata column, one value per row (NULL for a gap)."""
+        schema = ROW_SCHEMAS[binding.column]
+        if name not in schema:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"unknown column '{binding.alias}.{name}'",
+                anchor,
+                fallback=select,
+                hint=f"{binding.column} track rows expose {', '.join(sorted(schema))}",
+            )
+        return [None if row is None else row.columns.get(name) for row in binding.rows]
+
+    def _value_to_cells(self, value: _Value, cardinality: int) -> list[CellValue]:
+        """A lowered stream `_Value` as one cell per row (a scalar broadcasts)."""
+        if value.is_array:
+            return [self._stream_to_cell(stream) for stream in value.streams]
+        cell = self._stream_to_cell(value.streams[0])
+        return [cell] * cardinality
+
+    def _stream_to_cell(self, stream: _Stream) -> CellValue:
+        if stream.ref == _NULL_STREAM_REF:
+            return None
+        return StreamCell(type=stream.type, spec=self._stream_spec(stream.ref))
+
+    def _stream_spec(self, ref: FrameRef) -> str:
+        """The ffmpeg stream spec (``"0:a:0"``) for a source ref, else the
+        filtergraph node id verbatim (``"n2"``) for a filtered one."""
+        if is_src(ref):
+            alias, stream_type, index = src_parts(ref)
+            return f"{self.graph.sources[alias]}:{_TYPE_MARKERS[stream_type]}:{index}"
+        return ref
+
 # ---------------------------------------------------------------------------
 # provenance & small value helpers
 # ---------------------------------------------------------------------------
@@ -4986,6 +5186,35 @@ def lower(
     """
     try:
         return _Lowerer(res, probes, registry).run()
+    except SqlmpegError:
+        raise
+    except Exception as err:  # backstop: guardrail #7, no panics on user input
+        raise SqlmpegError(
+            ErrorCode.INTERNAL,
+            f"internal error while lowering ({err.__class__.__name__}: {err})",
+            line=1,
+            col=1,
+            hint="please report this query as a bug",
+        ) from err
+
+
+def lower_table(
+    res: Resolved,
+    probes: dict[str, ProbeResult | None],
+    *,
+    registry: Registry | None = None,
+) -> list[TableSink]:
+    """Lower a resolved TABLE query into its printable result set(s).
+
+    RFC-011, plan 067: the sibling of :func:`lower` for a query with no media
+    destination -- a bare SELECT, or every COPY a ``FORMAT csv`` one. Never
+    executes ffmpeg, never inserts splits (there is no filtergraph fan-out to
+    consume-once here, only cells). Same probing/registry contract as
+    :func:`lower`; raises ``SqlmpegError`` -- and nothing else -- on every
+    rejection.
+    """
+    try:
+        return _Lowerer(res, probes, registry).run_table()
     except SqlmpegError:
         raise
     except Exception as err:  # backstop: guardrail #7, no panics on user input

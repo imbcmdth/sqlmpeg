@@ -764,22 +764,35 @@ class RawSinkOption:
 class RawSink:
     """``COPY (query) TO 'path' WITH (...)`` as the parser saw it (RFC-002).
 
-    Shape only: the path is known to be a single string literal and the option
-    names to be unique, but nothing here has been checked against the option
-    table yet. ``sqlmpeg.lower`` turns this into ``sqlmpeg.ir.Sink``.
+    Shape only: the path is known to be a single string literal (or, for a
+    csv sink, possibly absent — ``TO STDOUT``, RFC-011) and the option names
+    to be unique, but nothing here has been checked against the option table
+    yet. ``sqlmpeg.lower`` turns this into ``sqlmpeg.ir.SinkUnit`` (a media
+    COPY) or a table/CSV result (plan 067).
 
     A sink carries the query it wraps (RFC-006): a script has one COPY per
     OUTPUT GROUP, and each group is a whole query of its own. ``query`` and
     ``branches`` are the same pair ``Resolved.select``/``Resolved.branches``
     are for the single-sink case, fully validated — for a one-COPY statement
     they ARE that pair.
+
+    ``is_csv`` (RFC-011, plan 067) is True exactly when ``WITH (...)`` names
+    ``format`` with value ``'csv'`` — Postgres's own rule for what makes a
+    COPY a table sink rather than a media one. It is decided HERE, from the
+    raw option shape alone, because it changes what the wrapped query is even
+    allowed to select (metadata columns become legal SELECT outputs) and
+    whether ``TO STDOUT`` is a legal target — both decided before the option
+    VALUES are otherwise interpreted, which stays lower's job as always.
+    ``path`` is None only for a csv sink's ``TO STDOUT``; a media sink's path
+    is always a real string, unchanged from RFC-002.
     """
 
-    path: str
+    path: str | None
     path_node: exp.Expr
     query: QueryExpr
     branches: tuple[exp.Select, ...]
     options: tuple[RawSinkOption, ...] = ()
+    is_csv: bool = False
 
 
 @dataclass(frozen=True)
@@ -1188,8 +1201,28 @@ def union_branches(query: exp.Expr) -> list[exp.Select]:
 # ---------------------------------------------------------------------------
 
 
-def _sink(copy: exp.Copy) -> tuple[str, exp.Expr, tuple[RawSinkOption, ...], exp.Expr]:
-    """Validate a top-level COPY into ``(path, path node, options, wrapped query)``.
+def _is_csv_format(options: tuple[RawSinkOption, ...]) -> bool:
+    """True if ``WITH (...)`` names ``format`` with value ``csv`` (RFC-011).
+
+    Postgres's own rule: ``FORMAT csv`` is what makes a COPY a table sink,
+    decided from the option SHAPE alone (its value need not even be a
+    correctly-typed one for the discriminator to work — a malformed `format`
+    value just falls through to the normal media interpretation and fails
+    there instead, same as today). ``_ident_name`` folds both spellings
+    (``format csv`` and ``format 'csv'`` — a bare ``Var`` or a string
+    ``Literal``, VERIFIED under sqlglot 30.17) the Postgres way.
+    """
+    for option in options:
+        if option.name == "format":
+            return _ident_name(option.value) == "csv"
+    return False
+
+
+def _sink(
+    copy: exp.Copy,
+) -> tuple[str | None, exp.Expr, tuple[RawSinkOption, ...], exp.Expr, bool]:
+    """Validate a top-level COPY into
+    ``(path, path node, options, wrapped query, is_csv)``.
 
     The pieces rather than a :class:`RawSink`: a sink also carries its
     VALIDATED query (RFC-006), and that validation is the resolver's job, so
@@ -1202,7 +1235,10 @@ def _sink(copy: exp.Copy) -> tuple[str, exp.Expr, tuple[RawSinkOption, ...], exp
       ``COPY ... TO``. It is NOT an expression, so it has no position.
     * ``files`` is a list — ``TO 'a', 'b'`` gives two entries, and ``TO STDOUT``
       / ``TO x`` / ``TO PROGRAM 'cat'`` give an ``exp.Identifier`` rather than a
-      ``Literal``. All of those are rejected here.
+      ``Literal``. A media COPY still rejects anything but a literal path; a
+      CSV COPY (RFC-011, plan 067) additionally accepts ``TO STDOUT`` — the
+      one-word ``exp.Identifier`` case — since a table sink prints, it does
+      not always write a file.
     * ``credentials`` is always an EMPTY ``exp.Credentials()`` — writing an
       actual ``CREDENTIALS (...)`` clause makes sqlglot fall back to
       ``exp.Command`` for the whole statement, which resolve rejects anyway.
@@ -1236,11 +1272,28 @@ def _sink(copy: exp.Copy) -> tuple[str, exp.Expr, tuple[RawSinkOption, ...], exp
             hint=_SINK_HINT,
         )
     target = files[0]
-    if not (isinstance(target, exp.Literal) and target.is_string):
+    if not isinstance(target, exp.Literal | exp.Identifier):
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             "COPY target must be a single-quoted file path",
             target if isinstance(target, exp.Expr) else None,
+            fallback=copy,
+            hint=_SINK_HINT,
+        )
+    options = _sink_options(copy, target)
+    is_csv = _is_csv_format(options)
+
+    path: str | None
+    if isinstance(target, exp.Literal) and target.is_string:
+        path = str(target.this)
+    elif is_csv and isinstance(target, exp.Identifier) and _ident_name(target) == "stdout":
+        path = None
+    else:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "COPY target must be a single-quoted file path"
+            + (", or STDOUT for a csv sink" if is_csv else ""),
+            target,
             fallback=copy,
             hint=_SINK_HINT,
         )
@@ -1255,7 +1308,7 @@ def _sink(copy: exp.Copy) -> tuple[str, exp.Expr, tuple[RawSinkOption, ...], exp
             hint=_SINK_HINT,
         )
 
-    return str(target.this), target, _sink_options(copy, target), query
+    return path, target, options, query, is_csv
 
 
 def _sink_options(copy: exp.Copy, target: exp.Expr) -> tuple[RawSinkOption, ...]:
@@ -1464,9 +1517,11 @@ class _Resolver:
                 continue
             if isinstance(statement, exp.Copy):
                 # RFC-002: peel the COPY wrapper off; what it wraps is
-                # validated exactly like a bare SELECT from here on.
-                path, path_node, options, wrapped = _sink(statement)
-                query, query_branches = self._resolve_query(wrapped)
+                # validated exactly like a bare SELECT from here on -- except
+                # a csv sink (RFC-011, plan 067) is table mode, so metadata
+                # columns are legal SELECT outputs for it and nowhere else.
+                path, path_node, options, wrapped, is_csv = _sink(statement)
+                query, query_branches = self._resolve_query(wrapped, table_mode=is_csv)
                 sinks.append(
                     RawSink(
                         path=path,
@@ -1474,6 +1529,7 @@ class _Resolver:
                         query=query,
                         branches=tuple(query_branches),
                         options=options,
+                        is_csv=is_csv,
                     )
                 )
                 if select is None:
@@ -1497,7 +1553,15 @@ class _Resolver:
                     statement,
                     hint=_SCRIPT_HINT,
                 )
-            select, branches = self._resolve_query(statement)
+            # A bare SELECT (no COPY at all) has no media destination, so it
+            # is always at least table-capable (RFC-011): metadata columns
+            # are legal SELECT outputs here regardless of what `-o` the CLI
+            # eventually supplies (that decision is CLI-layer only, plan
+            # 067). Relaxing this fence never weakens a MEDIA query: the
+            # classic streaming lowerer still enforces "streams are the only
+            # output" on its own, independently, for anything that actually
+            # reaches it (`sqlmpeg.lower._row_value`).
+            select, branches = self._resolve_query(statement, table_mode=True)
 
         if select is None:
             # Reached only by a view-only script: nothing named a destination.
@@ -1523,12 +1587,20 @@ class _Resolver:
             track_rows=self.track_rows,
         )
 
-    def _resolve_query(self, node: exp.Expr) -> tuple[QueryExpr, list[exp.Select]]:
+    def _resolve_query(
+        self, node: exp.Expr, *, table_mode: bool = False
+    ) -> tuple[QueryExpr, list[exp.Select]]:
         """Validate one whole query — a view body, a COPY's, or a bare SELECT.
 
         Its own ``WITH`` is resolved into the shared, ordered binding table
         FIRST, so the names it defines are visible to it and to everything
         written after it, and nothing else.
+
+        ``table_mode`` (RFC-011, plan 067) is True for a bare SELECT and a
+        csv COPY — the two contexts a metadata SELECT output is legal in —
+        and False everywhere else (a media COPY, and any CTE/view body,
+        left conservative since neither is exercised by a table query
+        today).
         """
         query = _unwrap(node)
         if not isinstance(query, exp.Select | exp.Union):
@@ -1542,7 +1614,7 @@ class _Resolver:
         branches = union_branches(query)
         visible = set(self.ctes)
         for branch in branches:
-            self._validate_select(branch, visible)
+            self._validate_select(branch, visible, table_mode=table_mode)
         return query, branches
 
     # -- CREATE VIEW (RFC-006) --------------------------------------------
@@ -1793,7 +1865,9 @@ class _Resolver:
 
     # -- selects ----------------------------------------------------------
 
-    def _validate_select(self, select: exp.Select, visible: set[str]) -> None:
+    def _validate_select(
+        self, select: exp.Select, visible: set[str], *, table_mode: bool = False
+    ) -> None:
         # RFC-009: `ORDER BY` is admitted for TRACK-ROW queries and nowhere
         # else. The carve-out is decided from the FROM clause alone, before any
         # of it is validated, so a branch with no `unnest` keeps the
@@ -1821,7 +1895,7 @@ class _Resolver:
 
         scope = self._collect_scope(select, visible)
         for projection in projections:
-            self._check_columns(projection, scope, select)
+            self._check_columns(projection, scope, select, table_mode=table_mode)
         if isinstance(where, exp.Where):
             self._check_where(where, scope, select)
         order = select.args.get("order")
@@ -2576,16 +2650,23 @@ class _Resolver:
     # -- columns / WHERE --------------------------------------------------
 
     def _check_columns(
-        self, node: exp.Expr, scope: dict[str, str], select: exp.Select
+        self,
+        node: exp.Expr,
+        scope: dict[str, str],
+        select: exp.Select,
+        *,
+        table_mode: bool = False,
     ) -> None:
         for sub in node.walk():
             if isinstance(sub, exp.Dot):
                 # `<alias>.<type>[k].<column>` (plan 064): only `.track` is a
-                # legal SELECT output -- everything else it could name is
-                # metadata, and streams are the only outputs there are.
+                # legal SELECT output in a MEDIA query -- everything else it
+                # could name is metadata, and streams are the only outputs a
+                # media query has. A table/csv query (RFC-011, plan 067) is
+                # the exception: metadata is a legal output there too.
                 shape = subscript_metadata_shape(sub)
                 if shape is not None:
-                    self._check_output_accessor(sub, shape, scope, select)
+                    self._check_output_accessor(sub, shape, scope, select, table_mode=table_mode)
                 continue
             if not isinstance(sub, exp.Column):
                 continue
@@ -2811,17 +2892,22 @@ class _Resolver:
         shape: tuple[exp.Bracket, str],
         scope: dict[str, str],
         select: exp.Select,
+        *,
+        table_mode: bool = False,
     ) -> None:
         """A ``<alias>.<type>[k].<column>`` in SELECT position: only ``.track``.
 
-        Streams are the only SELECT output there is (RFC-001); ``.track`` is
-        sugar for the bracket alone (plan 064) and lowers exactly like it, but
-        every other accessor names a piece of metadata -- a string or a number
-        -- which has nowhere to go on an ffmpeg command line.
+        Streams are the only SELECT output a MEDIA query has (RFC-001);
+        ``.track`` is sugar for the bracket alone (plan 064) and lowers
+        exactly like it, but every other accessor names a piece of metadata
+        -- a string or a number -- which has nowhere to go on an ffmpeg
+        command line. A table/csv query (RFC-011, plan 067) is the one
+        exception: its whole point is printing that metadata, so
+        ``table_mode`` skips this rejection there.
         """
         bracket, name = shape
         column_type = self._check_accessor(bracket, name, dot, scope, select)
-        if column_type != "stream":
+        if column_type != "stream" and not table_mode:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"'.{name}' is track metadata, not a stream, and a SELECT "

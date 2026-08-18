@@ -74,19 +74,34 @@ from pathlib import Path
 
 from . import binaries
 from . import registry as registry_module
-from .compiler import compile_sql
+from .compiler import classify, compile_sql, compile_table_sql
 from .emit import Emitted, build_ffmpeg_args, emit
 from .errors import SqlmpegError
 from .ir import Graph
 from .prompt import build_system_prompt
+from .table import TableSink, render_csv, render_table
 
 __all__ = ["main"]
 
 _DEFAULT_OUT = "out.mp4"
 _DEFAULT_TIMEOUT = 600
 
+# RFC-011, plan 067: `run` is the DEFAULT subcommand, unconditionally -- any
+# argv whose first token is not one of these five names IS run's argv, flags
+# included (`sqlmpeg -f q.sql`). No plausibility gating: a mistyped
+# subcommand falls through to run's SQL parser and dies as a line-anchored
+# PARSE_ERROR, a better diagnostic than a usage line. This also means
+# `sqlmpeg -h` shows run's help, not the top-level one -- an accepted trade,
+# since run IS the default.
+_SUBCOMMANDS = frozenset({"compile", "explain", "validate", "run", "prompt"})
+
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv or argv[0] not in _SUBCOMMANDS:
+        argv = ["run", *argv]
+
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -261,6 +276,39 @@ def _output_paths(out_path: str | None, graph: Graph) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# table/csv queries (RFC-011, plan 067)
+# ---------------------------------------------------------------------------
+
+_TABLE_USAGE_HINT = (
+    "error: compile has nothing to show: this query has no media destination "
+    "(no COPY, no -o); run it instead -- `sqlmpeg run ...` prints its result "
+    "set as a table"
+)
+_CSV_DASH_O_ERROR = (
+    "error: -o does not apply to a COPY ... WITH (FORMAT csv) query; drop -o "
+    "and let the COPY write its own destination"
+)
+
+
+def _print_table_sinks(sinks: list[TableSink]) -> int:
+    """Print (or write) every sink of a table/csv query. `run`'s table half."""
+    for sink in sinks:
+        if not sink.csv:
+            print(render_table(sink.result))
+            continue
+        text = render_csv(sink.result, header=sink.header)
+        if sink.path is None:
+            print(text, end="")  # already newline-terminated per row
+            continue
+        dir_error = _check_output_dir(sink.path)
+        if dir_error is not None:
+            print(dir_error, file=sys.stderr)
+            return 1
+        Path(sink.path).write_text(text, encoding="utf-8")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # subcommands
 # ---------------------------------------------------------------------------
 
@@ -274,6 +322,29 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         graph = compile_sql(text)
         emitted = emit(graph)
     except SqlmpegError as err:
+        # RFC-011: `compile` shows an ffmpeg command, and there may genuinely
+        # be none to show -- a query whose SELECT list has no streaming
+        # representation at all (metadata columns, an un-COALESCEd join gap)
+        # fails HERE, not because it is sinkless. A plain sinkless SELECT of
+        # real streams (recipes 7/19: no COPY, no -o, still a normal ffmpeg
+        # command) is untouched -- it compiled above and never reaches this
+        # branch. Table mode is the fallback, tried only once compilation has
+        # already failed, and only for a query that could even BE one (no
+        # media COPY at all, or every COPY a csv one); its own failure just
+        # surfaces the original error, which is usually the more informative
+        # one (e.g. UNKNOWN_FUNCTION).
+        try:
+            is_table_capable, _has_copy = classify(text)
+        except SqlmpegError:
+            is_table_capable = False
+        if is_table_capable:
+            try:
+                compile_table_sql(text)
+            except SqlmpegError:
+                pass
+            else:
+                print(_TABLE_USAGE_HINT, file=sys.stderr)
+                return 2
         _print_error(err, source=args.query)
         return 1
 
@@ -319,6 +390,22 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     try:
         compile_sql(text)
     except SqlmpegError as err:
+        # RFC-011: unchanged in spirit ("compiles = valid") -- a table/csv
+        # query now compiles too, through its own lenient pipeline, tried
+        # here as a fallback exactly like `compile`'s (see its comment): a
+        # plain sinkless SELECT of real streams already succeeded above and
+        # never reaches this branch.
+        try:
+            is_table_capable, _has_copy = classify(text)
+        except SqlmpegError:
+            is_table_capable = False
+        if is_table_capable:
+            try:
+                compile_table_sql(text)
+            except SqlmpegError:
+                pass
+            else:
+                return 0
         if args.as_json:
             # Machine contract: stdout stays pure JSON, the library error
             # verbatim. The file-hint is human-output sugar only, so it goes
@@ -336,6 +423,28 @@ def _cmd_run(args: argparse.Namespace) -> int:
     text, code = _resolve_query(args)
     if text is None:
         return code
+
+    try:
+        is_table_capable, has_copy = classify(text)
+    except SqlmpegError as err:
+        _print_error(err, source=args.query)
+        return 1
+
+    if is_table_capable and has_copy and args.output is not None:
+        print(_CSV_DASH_O_ERROR, file=sys.stderr)
+        return 2
+
+    # A csv COPY, or a bare SELECT with no `-o`: RFC-011's table/csv path.
+    # `-o` against a bare SELECT falls through to the media path below
+    # unchanged -- "`-o` stays as the implicit media COPY it always morally
+    # was" -- and no ffmpeg is needed at all for the table/csv path itself.
+    if is_table_capable and (has_copy or args.output is None):
+        try:
+            sinks = compile_table_sql(text)
+        except SqlmpegError as err:
+            _print_error(err, source=args.query)
+            return 1
+        return _print_table_sinks(sinks)
 
     try:
         graph: Graph = compile_sql(text)

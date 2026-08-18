@@ -10,7 +10,13 @@ from __future__ import annotations
 import pytest
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.sink import SINK_OPTIONS, SinkOptionSpec, validate_option
+from sqlmpeg.sink import (
+    CSV_OPTIONS,
+    SINK_OPTIONS,
+    SinkOptionSpec,
+    validate_csv_option,
+    validate_option,
+)
 
 # name -> (scope, type) per RFC-002's v1 table, plus RFC-004's subtitle_codec.
 _EXPECTED: dict[str, tuple[str, str]] = {
@@ -189,3 +195,50 @@ def test_validate_option_preserves_line_col() -> None:
     err = excinfo.value
     assert err.line == 3
     assert err.col == 12
+
+
+# ---------------------------------------------------------------------------
+# CSV_OPTIONS / validate_csv_option (RFC-011, plan 067)
+# ---------------------------------------------------------------------------
+
+
+def test_csv_options_has_exactly_format_and_header() -> None:
+    assert set(CSV_OPTIONS) == {"format", "header"}
+    assert CSV_OPTIONS["format"].type == "str"
+    assert CSV_OPTIONS["header"].type == "bool"
+
+
+def test_validate_csv_option_happy_format() -> None:
+    assert validate_csv_option("format", "csv") == "csv"
+
+
+def test_validate_csv_option_happy_header() -> None:
+    assert validate_csv_option("header", True) is True
+    assert validate_csv_option("header", False) is False
+
+
+def test_validate_csv_option_wrong_type() -> None:
+    with pytest.raises(SqlmpegError) as excinfo:
+        validate_csv_option("header", "true")
+    assert excinfo.value.code == ErrorCode.SINK_OPTION_TYPE
+
+
+def test_validate_csv_option_rejects_a_media_option() -> None:
+    """A media-only option (deliverable 4): unknown against CSV_OPTIONS, a
+    SEPARATE table from SINK_OPTIONS -- not silently accepted."""
+    with pytest.raises(SqlmpegError) as excinfo:
+        validate_csv_option("video_codec", "libx264")
+    err = excinfo.value
+    assert err.code == ErrorCode.UNKNOWN_SINK_OPTION
+    assert "video_codec" in err.message
+    assert err.hint is not None
+    assert "video_codec" not in err.hint  # the hint lists CSV_OPTIONS names, not SINK_OPTIONS'
+    assert "format" in err.hint or "header" in err.hint
+
+
+def test_validate_option_rejects_a_csv_only_option() -> None:
+    """The reverse direction already falls out of SINK_OPTIONS never having
+    had `header` in it -- no code change needed, just pinning the behavior."""
+    with pytest.raises(SqlmpegError) as excinfo:
+        validate_option("header", True)
+    assert excinfo.value.code == ErrorCode.UNKNOWN_SINK_OPTION

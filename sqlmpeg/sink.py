@@ -131,11 +131,36 @@ SINK_OPTIONS: dict[str, SinkOptionSpec] = {
 }
 
 
-def _unknown_option_hint(name: str) -> str:
-    matches = difflib.get_close_matches(name, sorted(SINK_OPTIONS), n=1, cutoff=0.6)
+# CSV option table (RFC-011, plan 067): a COPY ... WITH (FORMAT csv, ...) sink
+# takes exactly these two options -- a media option (video_codec, crf, ...)
+# in a csv COPY is a typed rejection against THIS table, not SINK_OPTIONS, and
+# the reverse (a csv-only option like `header` in a media COPY) is already a
+# typed rejection against SINK_OPTIONS today, since `header` was never in it.
+CSV_OPTIONS: dict[str, SinkOptionSpec] = {
+    "format": SinkOptionSpec(
+        name="format",
+        scope="container",
+        type="str",
+        doc="Must be 'csv' -- this is what makes a COPY a table sink.",
+        flag="",
+        per_stream=False,
+    ),
+    "header": SinkOptionSpec(
+        name="header",
+        scope="container",
+        type="bool",
+        doc="Emit a header row of column names (default false).",
+        flag="",
+        per_stream=False,
+    ),
+}
+
+
+def _unknown_option_hint(name: str, table: dict[str, SinkOptionSpec] = SINK_OPTIONS) -> str:
+    matches = difflib.get_close_matches(name, sorted(table), n=1, cutoff=0.6)
     if matches:
         return f"did you mean {matches[0]!r}?"
-    return "known options: " + ", ".join(sorted(SINK_OPTIONS))
+    return "known options: " + ", ".join(sorted(table))
 
 
 def validate_option(
@@ -155,14 +180,41 @@ def validate_option(
     an int is declared, and never confused with the bool case since that is
     checked first).
     """
-    spec = SINK_OPTIONS.get(name)
+    return _validate_against(SINK_OPTIONS, name, value, line=line, col=col)
+
+
+def validate_csv_option(
+    name: str,
+    value: object,
+    *,
+    line: int | None = None,
+    col: int | None = None,
+) -> object:
+    """Validate one COPY ... WITH (name value) pair against CSV_OPTIONS.
+
+    A separate table from ``SINK_OPTIONS`` (RFC-011, plan 067): a media
+    option like ``video_codec`` in a csv COPY is unknown here, and gets its
+    own typed rejection rather than borrowing the media one.
+    """
+    return _validate_against(CSV_OPTIONS, name, value, line=line, col=col)
+
+
+def _validate_against(
+    table: dict[str, SinkOptionSpec],
+    name: str,
+    value: object,
+    *,
+    line: int | None,
+    col: int | None,
+) -> object:
+    spec = table.get(name)
     if spec is None:
         raise SqlmpegError(
             ErrorCode.UNKNOWN_SINK_OPTION,
             f"unknown sink option {name!r}",
             line=line,
             col=col,
-            hint=_unknown_option_hint(name),
+            hint=_unknown_option_hint(name, table),
         )
 
     if spec.type == "bool":

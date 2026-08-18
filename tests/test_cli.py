@@ -24,6 +24,14 @@ from sqlmpeg.ir import Graph, Output, SinkUnit
 VALID_QUERY = "SELECT scale(a.frame, 640, 480) FROM input('x.mp4') a"
 BAD_QUERY = "SELECT nope(a.frame) FROM input('x.mp4') a"
 
+# For tests that monkeypatch cli.compile_sql to return a hand-built, already
+# -sinked Graph (see _sinked_graph/_multi_sink_graph below): the REAL text
+# still goes through cli.classify() first (RFC-011, plan 067), so it must
+# itself look like a media query -- a real COPY, not FORMAT csv -- for
+# `run`'s new table/csv branch to stay out of the way and reach the
+# monkeypatched compile_sql at all.
+SINKED_QUERY = f"COPY ({VALID_QUERY}) TO 'ignored.mkv'"
+
 
 def _write_sql(tmp_path: Path, text: str, name: str = "query.sql") -> str:
     path = tmp_path / name
@@ -196,6 +204,45 @@ def test_compile_graph_only_still_works_for_a_multi_sink_script(
     code = cli.main(["compile", "--graph-only", VALID_QUERY, "-o", "override.mp4"])
     assert code == 0
     assert capsys.readouterr().out == "\n"  # pure passthrough graph
+
+
+# ---------------------------------------------------------------------------
+# compile on a table/csv query (RFC-011, plan 067)
+# ---------------------------------------------------------------------------
+
+
+TABLE_QUERY = "SELECT t.language FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t"
+
+
+def test_compile_on_a_table_query_is_a_typed_usage_message(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Metadata columns have no ffmpeg command to show; `compile` says so and
+    points at `run` instead of trying (and failing) to produce one."""
+    code = cli.main(["compile", TABLE_QUERY])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert "run" in captured.err
+
+
+def test_compile_dash_o_still_works_on_a_bare_stream_select(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A bare SELECT that COULD produce a command still can, with -o -- RFC-
+    011's "`-o` stays as the implicit media COPY it always morally was"."""
+    code = cli.main(["compile", VALID_QUERY, "-o", "out.mp4"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "ffmpeg" in captured.out
+
+
+def test_validate_accepts_a_table_query(capsys: pytest.CaptureFixture[str]) -> None:
+    code = cli.main(["validate", TABLE_QUERY])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_explain_shows_the_sinks_list(capsys: pytest.CaptureFixture[str]) -> None:
@@ -490,7 +537,7 @@ def test_run_uses_sink_path_when_no_dash_o(
     monkeypatch.setattr(cli, "compile_sql", lambda text: _sinked_graph("sink.mkv"))
     monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: None)
 
-    code = cli.main(["run", VALID_QUERY])
+    code = cli.main(["run", SINKED_QUERY])
     captured = capsys.readouterr()
     # Reaching the ffmpeg-not-found check (rather than the exit-2 usage error
     # below) proves -o was resolved from the sink path and execution proceeded.
@@ -512,11 +559,68 @@ def test_run_dash_o_overrides_sink_path(
     assert "not found" in captured.err
 
 
-def test_run_no_output_and_no_sink_is_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+def test_run_bare_select_with_no_dash_o_prints_a_table(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """RFC-011, plan 067: a sinkless SELECT with no `-o` is a TABLE query now
+    -- it used to be the "no output path" usage error this test's name still
+    remembers. `-o` (test_run_dash_o_overrides_sink_path et al.) still runs
+    it as media, unchanged."""
     code = cli.main(["run", VALID_QUERY])
     captured = capsys.readouterr()
+    assert code == 0
+    assert "(1 row)" in captured.out
+    assert "<video" in captured.out
+
+
+def test_run_csv_copy_to_stdout(capsys: pytest.CaptureFixture[str]) -> None:
+    sql = (
+        "COPY (SELECT t.language, t.codec FROM "
+        "input('tests/fixtures/av2.mp4') f, unnest(f.audio) t) "
+        "TO STDOUT WITH (format 'csv', header true)"
+    )
+    code = cli.main(["run", sql])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out == "language,codec\neng,aac\nfra,aac\n"
+
+
+def test_run_csv_copy_to_a_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    out_path = tmp_path / "tracks.csv"
+    sql = (
+        "COPY (SELECT t.language, t.codec FROM "
+        f"input('tests/fixtures/av2.mp4') f, unnest(f.audio) t) "
+        f"TO '{out_path.as_posix()}' WITH (format 'csv')"
+    )
+    code = cli.main(["run", sql])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out == ""  # nothing printed -- it went to the file
+    assert out_path.read_text(encoding="utf-8") == "eng,aac\nfra,aac\n"
+
+
+def test_run_csv_copy_defaults_header_false(capsys: pytest.CaptureFixture[str]) -> None:
+    sql = (
+        "COPY (SELECT t.language FROM input('tests/fixtures/av2.mp4') f, "
+        "unnest(f.audio) t) TO STDOUT WITH (format 'csv')"
+    )
+    code = cli.main(["run", sql])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out == "eng\nfra\n"  # no header row
+
+
+def test_run_dash_o_against_a_csv_copy_is_a_usage_error(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sql = (
+        "COPY (SELECT t.language FROM input('x') f, unnest(f.audio) t) "
+        "TO STDOUT WITH (format 'csv')"
+    )
+    code = cli.main(["run", sql, "-o", "out.mp4"])
+    captured = capsys.readouterr()
     assert code == 2
-    assert "no output path" in captured.err
+    assert "-o" in captured.err
 
 
 def test_run_dash_o_against_a_multi_sink_script_is_a_usage_error(
@@ -539,7 +643,7 @@ def test_run_of_a_multi_sink_script_reaches_the_ffmpeg_check(
         cli, "compile_sql", lambda text: _multi_sink_graph(("720.mp4", {}), ("360.mp4", {}))
     )
     monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: None)
-    code = cli.main(["run", VALID_QUERY])
+    code = cli.main(["run", SINKED_QUERY])
     captured = capsys.readouterr()
     assert code == 1
     assert "not found" in captured.err
@@ -553,7 +657,7 @@ def test_run_checks_every_sinks_output_directory(
         cli, "compile_sql", lambda text: _multi_sink_graph(("720.mp4", {}), (missing, {}))
     )
     monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
-    code = cli.main(["run", VALID_QUERY])
+    code = cli.main(["run", SINKED_QUERY])
     captured = capsys.readouterr()
     assert code == 1
     assert "does not exist" in captured.err
@@ -596,7 +700,56 @@ def test_no_subcommand_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
     assert code == 2
 
 
-def test_unknown_subcommand_exits_2() -> None:
-    with pytest.raises(SystemExit) as exc_info:
-        cli.main(["bogus"])
-    assert exc_info.value.code == 2
+def test_unknown_subcommand_falls_through_to_run_and_fails_as_sql(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """RFC-011, plan 067: `run` is the default subcommand, unconditionally --
+    no plausibility gating. A mistyped subcommand is not special-cased; it is
+    just run's SQL text, and dies as an ordinary compile error (exit 1), a
+    better diagnostic than a bare usage line."""
+    code = cli.main(["bogus"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "error:" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# default subcommand (RFC-011, plan 067)
+# ---------------------------------------------------------------------------
+
+
+def test_flag_first_argv_dispatches_to_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``sqlmpeg -f query.sql`` (no ``run`` token, flags first) is exactly
+    what the cookbook recipes show and what test_examples.py exercises end
+    to end; this pins the same dispatch directly against a table query."""
+    query = _write_sql(
+        tmp_path,
+        "SELECT t.index FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t",
+    )
+    code = cli.main(["-f", query])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "(2 rows)" in captured.out
+
+
+def test_bare_inline_sql_with_no_subcommand_dispatches_to_run(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = cli.main([VALID_QUERY])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "(1 row)" in captured.out
+
+
+def test_explicit_run_and_default_dispatch_agree(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    query = _write_sql(tmp_path, VALID_QUERY)
+    code_explicit = cli.main(["run", "-f", query])
+    explicit_out = capsys.readouterr().out
+    code_default = cli.main(["-f", query])
+    default_out = capsys.readouterr().out
+    assert code_explicit == code_default == 0
+    assert explicit_out == default_out
