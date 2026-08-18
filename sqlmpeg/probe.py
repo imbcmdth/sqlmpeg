@@ -27,6 +27,18 @@ _TIMEOUT_SECONDS = 5.0
 
 @dataclass(frozen=True)
 class StreamMeta:
+    """RFC-009 "Columns": audio rows carry channels/channel_layout/sample_rate,
+    video rows carry width/height/fps/color_transfer; codec/bitrate/duration
+    are common to both. Every new field is opportunistic like the rest of
+    this module -- absent or wrong-typed in ffprobe's JSON means None, never
+    a raised exception (see `_int_opt`/`_float_opt`/`_str_opt`).
+
+    The plan 060 fields all default to None so pre-existing call sites that
+    build a `StreamMeta` directly (e.g. test_lower.py's fake-probe helper,
+    firewalled from this plan) keep compiling unchanged -- None is exactly
+    what they mean anyway (opportunistic, "not supplied").
+    """
+
     type: StreamType
     index: int  # per-type, 0-based (0:a:<index>)
     metadata: dict[str, str]  # language/title tags, when present
@@ -34,11 +46,18 @@ class StreamMeta:
     height: int | None
     fps: str | None  # e.g. "30000/1001", verbatim from ffprobe avg_frame_rate
     sample_rate: int | None
+    codec: str | None = None  # ffprobe codec_name, verbatim
+    channels: int | None = None  # audio only
+    channel_layout: str | None = None  # audio only, e.g. "stereo"
+    bitrate: int | None = None  # ffprobe bit_rate, as int
+    duration: float | None = None  # per-stream duration in seconds
+    color_transfer: str | None = None  # video only; the HDR discriminator
 
 
 @dataclass(frozen=True)
 class ProbeResult:
     streams: list[StreamMeta]  # file order
+    duration: float | None = None  # container-level, from -show_format
 
     def by_type(self, t: StreamType) -> list[StreamMeta]:
         return [s for s in self.streams if s.type == t]
@@ -81,7 +100,16 @@ def probe(path: str) -> ProbeResult | None:
     if ffprobe is None:
         return None
 
-    argv = [ffprobe, "-v", "error", "-print_format", "json", "-show_streams", real]
+    argv = [
+        ffprobe,
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_streams",
+        "-show_format",
+        real,
+    ]
     try:
         result = subprocess.run(
             argv,
@@ -126,6 +154,10 @@ def _parse_streams(data: object) -> ProbeResult | None:
                 return None
             codec_type = raw["codec_type"]
 
+            codec = _str_opt(raw, "codec_name")
+            bitrate = _int_opt(raw, "bit_rate")
+            duration = _float_opt(raw, "duration")
+
             if codec_type == "video":
                 metadata = _tags(raw)
                 streams.append(
@@ -137,6 +169,12 @@ def _parse_streams(data: object) -> ProbeResult | None:
                         height=int(raw["height"]) if "height" in raw else None,
                         fps=str(raw["avg_frame_rate"]) if "avg_frame_rate" in raw else None,
                         sample_rate=None,
+                        codec=codec,
+                        channels=None,
+                        channel_layout=None,
+                        bitrate=bitrate,
+                        duration=duration,
+                        color_transfer=_str_opt(raw, "color_transfer"),
                     )
                 )
                 video_idx += 1
@@ -151,6 +189,12 @@ def _parse_streams(data: object) -> ProbeResult | None:
                         height=None,
                         fps=None,
                         sample_rate=int(raw["sample_rate"]) if "sample_rate" in raw else None,
+                        codec=codec,
+                        channels=_int_opt(raw, "channels"),
+                        channel_layout=_str_opt(raw, "channel_layout"),
+                        bitrate=bitrate,
+                        duration=duration,
+                        color_transfer=None,
                     )
                 )
                 audio_idx += 1
@@ -165,6 +209,12 @@ def _parse_streams(data: object) -> ProbeResult | None:
                         height=None,
                         fps=None,
                         sample_rate=None,
+                        codec=codec,
+                        channels=None,
+                        channel_layout=None,
+                        bitrate=bitrate,
+                        duration=duration,
+                        color_transfer=None,
                     )
                 )
                 subtitle_idx += 1
@@ -179,14 +229,59 @@ def _parse_streams(data: object) -> ProbeResult | None:
                         height=None,
                         fps=None,
                         sample_rate=None,
+                        codec=codec,
+                        channels=None,
+                        channel_layout=None,
+                        bitrate=bitrate,
+                        duration=duration,
+                        color_transfer=None,
                     )
                 )
                 data_idx += 1
             # other codec_type values (attachment, ...) are ignored.
 
-        return ProbeResult(streams=streams)
+        container_duration = None
+        raw_format = data.get("format")
+        if isinstance(raw_format, dict):
+            container_duration = _float_opt(raw_format, "duration")
+
+        return ProbeResult(streams=streams, duration=container_duration)
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _int_opt(raw: dict[str, object], key: str) -> int | None:
+    """`raw[key]` as `int`, or None if absent, None-valued, or unparseable.
+
+    Never raises: a per-field escape hatch so one malformed value nulls only
+    that column instead of failing the whole probe (unlike the outer
+    try/except in `_parse_streams`, which nulls the entire result).
+    """
+    value = raw.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_opt(raw: dict[str, object], key: str) -> float | None:
+    """`raw[key]` as `float`, or None if absent, None-valued, or unparseable."""
+    value = raw.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _str_opt(raw: dict[str, object], key: str) -> str | None:
+    """`raw[key]` as `str`, or None if absent or None-valued."""
+    if key not in raw or raw[key] is None:
+        return None
+    return str(raw[key])
 
 
 def _tags(raw: dict[str, object]) -> dict[str, str]:

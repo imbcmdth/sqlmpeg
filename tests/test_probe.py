@@ -28,9 +28,12 @@ FAKE_JSON = json.dumps(
             {
                 "index": 0,
                 "codec_type": "video",
+                "codec_name": "h264",
                 "width": 320,
                 "height": 240,
                 "avg_frame_rate": "15/1",
+                "bit_rate": "210584",
+                "duration": "2.000000",
                 "tags": {"language": "eng"},
             },
             {
@@ -40,10 +43,16 @@ FAKE_JSON = json.dumps(
             {
                 "index": 2,
                 "codec_type": "audio",
+                "codec_name": "aac",
                 "sample_rate": "44100",
+                "channels": 2,
+                "channel_layout": "stereo",
+                "bit_rate": "128000",
+                "duration": "2.000000",
                 "tags": {"language": "eng", "title": "Track 1"},
             },
-        ]
+        ],
+        "format": {"duration": "2.000000"},
     }
 )
 
@@ -174,6 +183,9 @@ def test_maps_fields_including_subtitle_streams(
     # RFC-004: subtitle streams are mapped, not ignored, so all three streams
     # in FAKE_JSON (video, subtitle, audio) show up.
     assert len(result.streams) == 3
+    # RFC-009 §Plumbing item 1: ProbeResult grows a container-level duration
+    # from -show_format.
+    assert result.duration == 2.0
 
     video = result.by_type("video")
     audio = result.by_type("audio")
@@ -187,6 +199,12 @@ def test_maps_fields_including_subtitle_streams(
             height=240,
             fps="15/1",
             sample_rate=None,
+            codec="h264",
+            channels=None,
+            channel_layout=None,
+            bitrate=210584,
+            duration=2.0,
+            color_transfer=None,
         )
     ]
     assert audio == [
@@ -198,6 +216,12 @@ def test_maps_fields_including_subtitle_streams(
             height=None,
             fps=None,
             sample_rate=44100,
+            codec="aac",
+            channels=2,
+            channel_layout="stereo",
+            bitrate=128000,
+            duration=2.0,
+            color_transfer=None,
         )
     ]
     assert subtitle == [
@@ -209,6 +233,12 @@ def test_maps_fields_including_subtitle_streams(
             height=None,
             fps=None,
             sample_rate=None,
+            codec=None,
+            channels=None,
+            channel_layout=None,
+            bitrate=None,
+            duration=None,
+            color_transfer=None,
         )
     ]
 
@@ -285,6 +315,116 @@ def test_per_type_index_counted_in_file_order(
     assert [s.index for s in result.streams] == [0, 0, 1]
 
 
+# --- probe enrichment (RFC-009, plan 060): opportunistic, never raises -----
+
+
+def test_enrichment_fields_absent_default_to_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """None of the new fields present in ffprobe's JSON -> every one is None,
+    and parsing the REST of the stream still succeeds (opportunistic)."""
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    minimal_json = json.dumps({"streams": [{"codec_type": "video", "width": 320}]})
+    _fake_run(monkeypatch, stdout=minimal_json)
+
+    result = probe(str(f))
+    assert result is not None
+    assert result.duration is None  # no "format" key at all
+    v = result.streams[0]
+    assert v.width == 320  # unaffected sibling field still parses
+    assert v.codec is None
+    assert v.channels is None
+    assert v.channel_layout is None
+    assert v.bitrate is None
+    assert v.duration is None
+    assert v.color_transfer is None
+
+
+def test_enrichment_fields_wrong_typed_default_to_none_not_a_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ffprobe occasionally reports 'N/A' for bit_rate/duration; a bad value
+    nulls only that field -- it must not blank the whole probe result the way
+    the outer `_parse_streams` try/except would."""
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    bad_json = json.dumps(
+        {
+            "streams": [
+                {
+                    "codec_type": "audio",
+                    "sample_rate": "44100",
+                    "channels": "not-a-number",
+                    "bit_rate": "N/A",
+                    "duration": "N/A",
+                }
+            ],
+            "format": {"duration": "N/A"},
+        }
+    )
+    _fake_run(monkeypatch, stdout=bad_json)
+
+    result = probe(str(f))
+    assert result is not None
+    assert result.duration is None
+    a = result.streams[0]
+    assert a.sample_rate == 44100  # existing int-coercion field: unaffected
+    assert a.channels is None
+    assert a.bitrate is None
+    assert a.duration is None
+
+
+def test_enrichment_fields_present_are_parsed_with_correct_types(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    hdr_json = json.dumps(
+        {
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "hevc",
+                    "bit_rate": "5000000",
+                    "duration": "12.5",
+                    "color_transfer": "smpte2084",
+                }
+            ],
+            "format": {"duration": "12.5"},
+        }
+    )
+    _fake_run(monkeypatch, stdout=hdr_json)
+
+    result = probe(str(f))
+    assert result is not None
+    assert result.duration == 12.5
+    v = result.streams[0]
+    assert v.codec == "hevc"
+    assert v.bitrate == 5000000
+    assert isinstance(v.bitrate, int)
+    assert v.duration == 12.5
+    assert v.color_transfer == "smpte2084"
+    assert v.channels is None  # video row: audio-only field stays None
+    assert v.channel_layout is None
+
+
+def test_container_duration_absent_when_format_key_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch, stdout=json.dumps({"streams": []}))
+
+    result = probe(str(f))
+    assert result is not None
+    assert result.duration is None
+
+
 # --- caching (monkeypatched, offline) ---------------------------------------
 
 
@@ -347,6 +487,7 @@ def test_argv_is_a_list_with_expected_flags(
     assert "-v" in argv and "error" in argv
     assert "-print_format" in argv and "json" in argv
     assert "-show_streams" in argv
+    assert "-show_format" in argv  # RFC-009: needed for ProbeResult.duration
 
 
 # --- real ffprobe against generated fixtures --------------------------------
@@ -418,6 +559,51 @@ def test_probe_av_fixture_has_video_and_audio(_fixtures: Path) -> None:
     assert audio[0].width is None
     assert audio[0].height is None
     assert audio[0].fps is None
+
+
+@pytest.mark.exec
+def test_probe_av_eng_fixture_language_and_duration(_fixtures: Path) -> None:
+    """av-eng.mp4 (RFC-009): one eng-tagged audio track, ~2s -- both the
+    per-stream and the container-level duration."""
+    result = probe(str(_fixtures / "av-eng.mp4"))
+    assert result is not None
+    assert result.duration == pytest.approx(2.0, abs=0.2)
+
+    audio = result.by_type("audio")
+    assert len(audio) == 1
+    assert audio[0].metadata.get("language") == "eng"
+    assert audio[0].duration == pytest.approx(2.0, abs=0.2)
+    assert audio[0].codec is not None
+
+
+@pytest.mark.exec
+def test_probe_stereo_fixture_channel_layout(_fixtures: Path) -> None:
+    """stereo.mp4 (RFC-009): a real 2-channel `join` mux, channel_layout=stereo."""
+    result = probe(str(_fixtures / "stereo.mp4"))
+    assert result is not None
+
+    audio = result.by_type("audio")
+    assert len(audio) == 1
+    assert audio[0].channels == 2
+    assert audio[0].channel_layout == "stereo"
+
+
+@pytest.mark.exec
+def test_probe_av2_fixture_bitrate_and_codec(_fixtures: Path) -> None:
+    """av2.mp4 (RFC-009): video + two audio tracks, all with a real codec name
+    and a positive bitrate from ffprobe."""
+    result = probe(str(_fixtures / "av2.mp4"))
+    assert result is not None
+
+    video = result.by_type("video")
+    audio = result.by_type("audio")
+    assert len(video) == 1
+    assert len(audio) == 2
+
+    for stream in (*video, *audio):
+        assert stream.codec  # non-empty codec name
+        assert stream.bitrate is not None
+        assert stream.bitrate > 0
 
 
 @pytest.mark.exec

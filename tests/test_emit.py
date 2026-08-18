@@ -110,7 +110,12 @@ def test_single_node_graph() -> None:
 
 
 def test_readme_example_shape() -> None:
-    """WITH pip AS (scale(crop(b.frame,...), 0.5)) SELECT overlay(a.frame, pip.frame, 20, 20)."""
+    """WITH pip AS (scale(crop(b.frame,...), 0.5)) SELECT overlay(a.frame, pip.frame, 20, 20).
+
+    `a` and `b` are both untrimmed, option-free aliases of the SAME path, so
+    plan 060's input dedup folds them onto one `-i`: both source refs render
+    as `[0:v:0]` (see emit.py's "Input dedup" docstring section).
+    """
     g = _graph(
         [
             _node("n1", "crop", {"w": 600, "h": 200, "x": 1200, "y": 50}, ["src:b:v:0"]),
@@ -123,9 +128,10 @@ def test_readme_example_shape() -> None:
     )
     e = emit(g)
     assert e.filter_complex == (
-        "[1:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];"
+        "[0:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];"
         "[0:v:0][n2]overlay=x=20:y=20[out0]"
     )
+    assert e.inputs == ["game.mp4"]  # deduped: one -i, not two
     # one comma-chain (crop,scale) and one semicolon between the two chains
     assert e.filter_complex.count(";") == 1
     assert ",scale=" in e.filter_complex
@@ -792,6 +798,7 @@ def test_no_outputs_is_internal_error() -> None:
 
 
 def test_build_ffmpeg_args_exact_list() -> None:
+    """`a`/`b` dedup onto one `-i` (plan 060): see test_readme_example_shape."""
     g = _graph(
         [
             _node("n1", "crop", {"w": 600, "h": 200, "x": 1200, "y": 50}, ["src:b:v:0"]),
@@ -807,10 +814,8 @@ def test_build_ffmpeg_args_exact_list() -> None:
         "ffmpeg",
         "-i",
         "game.mp4",
-        "-i",
-        "game.mp4",
         "-filter_complex",
-        "[1:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];"
+        "[0:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];"
         "[0:v:0][n2]overlay=x=20:y=20[out0]",
         "-map",
         "[out0]",
@@ -993,7 +998,10 @@ def test_build_ffmpeg_args_out_path_overrides_sink_path() -> None:
 
 
 def test_build_ffmpeg_args_no_sink_graph_unchanged_byte_for_byte() -> None:
-    """Regression pin: a sinkless graph's args are byte-for-byte what plan 027 found."""
+    """Regression pin: a sinkless graph's args are byte-for-byte what plan 027 found.
+
+    `a`/`b` dedup onto one `-i` (plan 060): see test_readme_example_shape.
+    """
     g = _graph(
         [
             _node("n1", "crop", {"w": 600, "h": 200, "x": 1200, "y": 50}, ["src:b:v:0"]),
@@ -1010,10 +1018,8 @@ def test_build_ffmpeg_args_no_sink_graph_unchanged_byte_for_byte() -> None:
         "ffmpeg",
         "-i",
         "game.mp4",
-        "-i",
-        "game.mp4",
         "-filter_complex",
-        "[1:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];"
+        "[0:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];"
         "[0:v:0][n2]overlay=x=20:y=20[out0]",
         "-map",
         "[out0]",
@@ -1784,6 +1790,119 @@ def test_two_aliases_disagreeing_on_one_inputs_option_set_is_internal_error() ->
 
 
 # ---------------------------------------------------------------------------
+# input dedup (RFC-009, plan 060): untrimmed same-path same-options aliases
+# share one -i; a mismatched option set or a trim window blocks it.
+# ---------------------------------------------------------------------------
+
+
+def test_dedup_fires_for_untrimmed_same_path_no_options() -> None:
+    """Two aliases, same path, no options, no trim -> one -i."""
+    g = _graph(
+        [],
+        [_out("src:x:v:0"), _out("src:y:v:0")],
+        input_paths=["a.mp4", "a.mp4"],
+        sources={"x": 0, "y": 1},
+    )
+    e = emit(g)
+    assert e.inputs == ["a.mp4"]
+    args = build_ffmpeg_args(e, "out.mp4")
+    assert args.count("-i") == 1
+    assert args[:3] == ["ffmpeg", "-i", "a.mp4"]
+
+
+def test_dedup_fires_for_matching_options_and_renders_them_once() -> None:
+    """Same path, IDENTICAL options on both aliases -> one -i, options once."""
+    g = _graph(
+        [],
+        [_out("src:x:v:0"), _out("src:y:v:0")],
+        input_paths=["a.mp4", "a.mp4"],
+        sources={"x": 0, "y": 1},
+        input_options={"x": {"loop": True}, "y": {"loop": True}},
+    )
+    e = emit(g)
+    assert e.inputs == ["a.mp4"]
+    args = build_ffmpeg_args(e, "out.mp4")
+    assert args.count("-i") == 1
+    assert args.count("-loop") == 1
+    assert args[:5] == ["ffmpeg", "-loop", "1", "-i", "a.mp4"]
+
+
+def test_dedup_is_blocked_by_mismatched_options() -> None:
+    """Same path, DIFFERENT (or absent-vs-present) options -> two -i's."""
+    g = _graph(
+        [],
+        [_out("src:x:v:0"), _out("src:y:v:0")],
+        input_paths=["a.mp4", "a.mp4"],
+        sources={"x": 0, "y": 1},
+        input_options={"x": {"loop": True}},
+    )
+    e = emit(g)
+    assert e.inputs == ["a.mp4", "a.mp4"]
+    assert build_ffmpeg_args(e, "out.mp4").count("-i") == 2
+
+
+def test_dedup_is_blocked_by_a_trim_window() -> None:
+    """Same path, one alias trimmed -> two -i's, even though nothing conflicts.
+
+    Mirrors cookbook recipe 17 (the concat splice): the same file appears
+    under two aliases with two different windows and must keep two `-i`'s.
+    This is the minimal version -- only one side is trimmed at all.
+    """
+    g = _graph(
+        [],
+        [_out("src:x:v:0"), _out("src:y:v:0")],
+        input_paths=["a.mp4", "a.mp4"],
+        sources={"x": 0, "y": 1},
+        input_trims={"x": (0, 5)},
+    )
+    e = emit(g)
+    assert e.inputs == ["a.mp4", "a.mp4"]
+    assert build_ffmpeg_args(e, "out.mp4").count("-i") == 2
+
+
+def test_dedup_is_blocked_by_two_different_trim_windows() -> None:
+    """The splice shape itself: same file, two DIFFERENT windows -> two -i's."""
+    g = _graph(
+        [],
+        [_out("src:x:v:0"), _out("src:y:v:0")],
+        input_paths=["a.mp4", "a.mp4"],
+        sources={"x": 0, "y": 1},
+        input_trims={"x": (None, 5), "y": (5, None)},
+    )
+    e = emit(g)
+    assert e.inputs == ["a.mp4", "a.mp4"]
+    args = build_ffmpeg_args(e, "out.mp4")
+    assert args.count("-i") == 2
+    assert args[:6] == ["ffmpeg", "-to", "5", "-i", "a.mp4", "-ss"]
+
+
+def test_dedup_only_merges_matching_pairs_in_a_three_input_graph() -> None:
+    """x/z share a.mp4 untrimmed and merge; y's b.mp4 stays on its own -i."""
+    g = _graph(
+        [],
+        [_out("src:x:v:0"), _out("src:y:v:0"), _out("src:z:v:0")],
+        input_paths=["a.mp4", "b.mp4", "a.mp4"],
+        sources={"x": 0, "y": 1, "z": 2},
+    )
+    e = emit(g)
+    assert e.inputs == ["a.mp4", "b.mp4"]
+    assert build_ffmpeg_args(e, "out.mp4").count("-i") == 2
+
+
+def test_dedup_renumbers_source_specs_onto_the_shared_slot() -> None:
+    """Both aliases' stream specs resolve to the SAME (merged) input index."""
+    g = _graph(
+        [_node("n1", "hflip", {}, ["src:x:v:0"])],
+        [_out("n1"), _out("src:y:v:0")],
+        input_paths=["a.mp4", "a.mp4"],
+        sources={"x": 0, "y": 1},
+    )
+    e = emit(g)
+    assert e.filter_complex == "[0:v:0]hflip[out0]"
+    assert e.maps[1].target == "0:v:0"  # y's passthrough map, same merged index
+
+
+# ---------------------------------------------------------------------------
 # real ffmpeg sanity check (exec-marked)
 # ---------------------------------------------------------------------------
 
@@ -1860,6 +1979,28 @@ def test_passthrough_map_runs_under_real_ffmpeg(tmp_path: Path) -> None:
     )
     e = emit(g)
     out_path = tmp_path / "passthrough.mp4"
+    _run_ffmpeg(build_ffmpeg_args(e, str(out_path)))
+
+    assert _probe_codec_types(out_path) == ["video", "audio"]
+
+
+@pytest.mark.exec
+def test_a_deduped_compile_runs_under_real_ffmpeg(tmp_path: Path) -> None:
+    """Two untrimmed, option-free aliases of the SAME real file (plan 060):
+    one decoded input feeds both a filtered chain and a passthrough map."""
+    _require_ffmpeg_and_fixture()
+    g = _graph(
+        [_node("n1", "hflip", {}, ["src:x:v:0"])],
+        [_out("n1"), _out("src:y:a:0", "audio", metadata={"language": "eng"})],
+        input_paths=[str(_AV), str(_AV)],
+        sources={"x": 0, "y": 1},
+    )
+    e = emit(g)
+    assert e.inputs == [str(_AV)]  # deduped onto one -i
+    args = build_ffmpeg_args(e, str(tmp_path / "deduped.mp4"))
+    assert args.count("-i") == 1
+
+    out_path = tmp_path / "deduped.mp4"
     _run_ffmpeg(build_ffmpeg_args(e, str(out_path)))
 
     assert _probe_codec_types(out_path) == ["video", "audio"]

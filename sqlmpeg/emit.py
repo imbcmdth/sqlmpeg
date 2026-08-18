@@ -107,7 +107,38 @@ output pad and has no other inputs; such runs are joined with ``,`` and only
 the head's input labels and the tail's output labels are rendered. Chains are
 joined with ``;`` (no whitespace). The README example therefore emits::
 
-    [1:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];[0:v:0][n2]overlay=x=20:y=20[out0]
+    [0:v:0]crop=w=600:h=200:x=1200:y=50,scale=w=iw*0.5:h=-2[n2];[0:v:0][n2]overlay=x=20:y=20[out0]
+
+(both source refs read ``[0:v:0]``: the README's two aliases name the same
+untrimmed ``game.mp4``, so input dedup, below, folds them onto one ``-i``.)
+
+Input dedup (RFC-009 "Carried from RFC-008", plan 060)
+--------------------------------------------------------
+Two ``INPUT`` aliases over the SAME path, with the SAME (validated,
+normalized) ``input_options`` and NO ``input_trims`` window on either one,
+share a single ``-i``: :func:`_dedup_inputs` runs first, before anything
+else in :func:`emit`, and folds such aliases' ``Graph.sources`` entries onto
+one ``input_paths`` slot (first occurrence wins the slot's position).  A
+trimmed alias is NEVER merged, even against an identical trim window on
+another alias -- the concat splice (two aliases, two DIFFERENT windows, same
+file; cookbook recipe 17) needs two distinct ``-i``'s to seek independently,
+and this pass does not try to tell "two windows that happen to match" apart
+from "two windows that must stay apart", so it conservatively never merges a
+trimmed input at all.
+
+This is a POST-LOWER normalization, not a lowering decision: trims are only
+known once `sqlmpeg.lower` has resolved every ``WHERE <alias>.t`` window
+into ``Graph.input_trims`` (RFC-004), so a merge test that has to check "no
+trim window" cannot run any earlier than emit's own entry point without
+either duplicating that resolution or coupling this pass to lower's internal
+state. Doing it here also means the pass never touches `sqlmpeg.parser` or
+`sqlmpeg.lower` (both owned by a concurrently-developed RFC-009 wave): it
+operates purely on the finished :class:`~sqlmpeg.ir.Graph`, the same object
+:func:`emit` already takes as input, by re-keying ``sources``/``input_paths``
+-- exactly the resolution :func:`_src_spec` already does per source ref, so
+no FrameRef, node, or label needs to change. The pre-dedup graph (e.g. from
+``sqlmpeg ir``) still shows one input slot per alias -- only the rendered
+``-i`` list and the indices baked into the filtergraph are deduped.
 
 Zero-input nodes (RFC-005 §1, plan 042)
 ---------------------------------------
@@ -142,7 +173,7 @@ values do NOT: they are passed as argv words, not parsed as a filtergraph.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .errors import ErrorCode, SqlmpegError
 from .inputs import INPUT_OPTIONS, InputOptionSpec
@@ -240,6 +271,66 @@ class Emitted:
         return [mapping for group in self.groups for mapping in group.maps]
 
 
+_MergeKey = tuple[str, tuple[tuple[str, object], ...]]
+
+
+def _merge_key(g: Graph, index: int, aliases: list[str], trimmed: set[str]) -> _MergeKey | None:
+    """This input slot's dedup key, or None if it can never merge (RFC-009).
+
+    None for any slot carrying a trimmed alias -- a trim is a property of
+    that alias's own ``-i`` (RFC-004), so two windows are never folded
+    together even when they happen to be equal (see the module docstring's
+    "Input dedup" section: telling "coincidentally equal" apart from "must
+    stay apart" is not attempted). Otherwise the key is the path plus the
+    resolved options every alias on this slot set, sorted by option name --
+    two slots merge only when both match exactly.
+    """
+    if any(alias in trimmed for alias in aliases):
+        return None
+    options: dict[str, object] = {}
+    for alias in aliases:
+        options.update(g.input_options.get(alias, {}))
+    return (g.input_paths[index], tuple(sorted(options.items())))
+
+
+def _dedup_inputs(g: Graph) -> Graph:
+    """Fold untrimmed same-path same-options aliases onto one ``-i`` (RFC-009).
+
+    See the module docstring's "Input dedup" section for why this runs here,
+    at the top of :func:`emit`, rather than in `sqlmpeg.lower`. Aliases keep
+    their names; only ``Graph.sources`` (alias -> input index) and
+    ``Graph.input_paths`` are rewritten, in first-occurrence order, so every
+    other pass (labels, chains, fanout) needs no change -- they already
+    resolve a source ref's input index through ``g.sources`` at render time.
+    Returns `g` unchanged (same object) when nothing merges.
+    """
+    aliases_by_index: dict[int, list[str]] = {}
+    for alias, index in g.sources.items():
+        aliases_by_index.setdefault(index, []).append(alias)
+
+    trimmed = set(g.input_trims.keys())
+
+    key_to_new_index: dict[_MergeKey, int] = {}
+    old_to_new_index: dict[int, int] = {}
+    new_input_paths: list[str] = []
+    for index, path in enumerate(g.input_paths):
+        key = _merge_key(g, index, aliases_by_index.get(index, []), trimmed)
+        if key is not None and key in key_to_new_index:
+            old_to_new_index[index] = key_to_new_index[key]
+            continue
+        new_index = len(new_input_paths)
+        new_input_paths.append(path)
+        old_to_new_index[index] = new_index
+        if key is not None:
+            key_to_new_index[key] = new_index
+
+    if len(new_input_paths) == len(g.input_paths):
+        return g
+
+    new_sources = {alias: old_to_new_index[index] for alias, index in g.sources.items()}
+    return replace(g, input_paths=new_input_paths, sources=new_sources)
+
+
 def emit(g: Graph) -> Emitted:
     """Render `g` as an ffmpeg filtergraph plus its output map list.
 
@@ -249,7 +340,12 @@ def emit(g: Graph) -> Emitted:
     an ``Output`` counts as a consumer, in whichever group it sits, so a pad
     feeding both a node and an output, or two outputs naming the same pad, is
     a split-pass bug).
+
+    Runs :func:`_dedup_inputs` first (RFC-009): untrimmed aliases that share
+    a path and input options collapse onto one ``-i`` before anything else
+    below reads ``g.sources``/``g.input_paths``.
     """
+    g = _dedup_inputs(g)
     _verify_topological(g)
 
     nodes = list(g.nodes.values())
@@ -282,9 +378,14 @@ def _output_group(g: Graph, unit: SinkUnit, labels: dict[str, str]) -> OutputGro
 def _input_windows(g: Graph) -> list[tuple[float | None, float | None] | None]:
     """``g.input_trims`` (alias-keyed) resolved into a per-``-i`` list.
 
-    An alias owns exactly one input slot (``g.sources``), so a window on an
-    alias is a window on that ``-i``. The result is parallel to
-    ``g.input_paths``: entry `i` is that input's ``(start, end)``, or None.
+    Each alias's window applies to whichever input slot ``g.sources`` sends
+    it to; the result is parallel to ``g.input_paths``: entry `i` is that
+    input's ``(start, end)``, or None. Ordinarily one alias owns a slot, but
+    plan 060's ``_dedup_inputs`` never merges a trimmed alias's slot with
+    another's, so two aliases sharing a slot here (a hand-built ``Graph``,
+    not something dedup produces) are only tolerated when their windows
+    agree exactly -- a genuine mismatch is still the lower/split bug this
+    guards against.
     """
     windows: list[tuple[float | None, float | None] | None] = [None] * len(g.input_paths)
     for alias, window in g.input_trims.items():
@@ -308,12 +409,15 @@ def _input_windows(g: Graph) -> list[tuple[float | None, float | None] | None]:
 def _input_option_list(g: Graph) -> list[dict[str, object]]:
     """``g.input_options`` (alias-keyed) resolved into a per-``-i`` list.
 
-    An alias owns exactly one input slot (``g.sources``), so this is the
-    exact same resolution ``_input_windows`` does for trims -- entry `i` is
-    that input's options dict (insertion-ordered), empty for an input that
-    set none.
+    Same resolution ``_input_windows`` does for trims -- entry `i` is that
+    input's options dict (insertion-ordered), empty for an input that set
+    none. Two aliases sharing a slot (plan 060's dedup merges untrimmed,
+    same-path, same-options aliases onto one) is fine exactly when their
+    option sets agree; a real mismatch on one slot is still a lower/split
+    bug, same as `_input_windows`.
     """
     options: list[dict[str, object]] = [{} for _ in g.input_paths]
+    seen: list[bool] = [False for _ in g.input_paths]
     for alias, alias_options in g.input_options.items():
         index = g.sources.get(alias)
         if index is None:
@@ -322,12 +426,14 @@ def _input_option_list(g: Graph) -> list[dict[str, object]]:
             raise _internal(
                 f"input options on alias {alias!r} map to out-of-range input index {index}"
             )
-        if options[index]:
+        candidate = dict(alias_options)
+        if seen[index] and options[index] != candidate:
             raise _internal(
                 f"input {index} carries two different option sets; each alias "
                 "must own its own -i (lower/split bug)"
             )
-        options[index] = dict(alias_options)
+        options[index] = candidate
+        seen[index] = True
     return options
 
 
