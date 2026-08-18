@@ -199,6 +199,7 @@ __all__ = [
     "resolve",
     "star_qualifier",
     "subscript_index",
+    "subscript_metadata_shape",
     "union_branches",
 ]
 
@@ -365,6 +366,11 @@ _ROW_ORDER_HINT = (
     "ORDER BY sorts track rows by their metadata columns, "
     "e.g. ORDER BY t.language, t.channels DESC"
 )
+_SUBSCRIPT_WHERE_HINT = (
+    "a subscript metadata predicate compares <alias>.<type>[k].<column> against "
+    "a literal: =, !=, <, <=, >, >=, BETWEEN, IS [NOT] NULL, joined with "
+    "AND/OR/NOT"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +467,48 @@ def subscript_index(bracket: exp.Bracket) -> int | None:
     if not _DIGITS_RE.match(text):
         return None
     return int(text) + _INDEX_OFFSET
+
+
+# ---------------------------------------------------------------------------
+# subscript metadata accessors: <alias>.<type>[k].<column> (RFC-009 addendum,
+# plan 064)
+# ---------------------------------------------------------------------------
+
+
+def subscript_metadata_shape(node: exp.Expr) -> tuple[exp.Bracket, str] | None:
+    """Recognize ``<alias>.<type>[k].<column>``; return ``(bracket, name)``.
+
+    VERIFIED under sqlglot 30.17 ``read="postgres"`` (plan 064): both
+    ``f.audio[1].language`` and the strictly-Postgres cast spelling
+    ``(f.audio[1]).language`` arrive as ``exp.Dot(this=Bracket(...) |
+    Paren(Bracket(...)), expression=Identifier(<name>))`` — identical
+    semantics, told apart only by an extra ``Paren`` this unwraps. Returns
+    ``None`` for anything else, ``f.audio.language`` (no subscript, a plain
+    3-part ``exp.Column``) included — that shape never reaches here at all.
+    """
+    if not isinstance(node, exp.Dot):
+        return None
+    inner = node.this
+    if isinstance(inner, exp.Paren):
+        inner = inner.this
+    if not isinstance(inner, exp.Bracket):
+        return None
+    ident = node.args.get("expression")
+    if not isinstance(ident, exp.Identifier):
+        return None
+    return inner, _ident_name(ident)
+
+
+def _accessor_label(bracket: exp.Bracket, name: str) -> str:
+    """``<alias>.<type>[k].<name>``, written the way a user would paste it."""
+    inner = bracket.this
+    alias = "?"
+    array_column = "?"
+    if isinstance(inner, exp.Column):
+        alias = _ident_name(inner.args.get("table"))
+        array_column = _ident_name(inner.this)
+    index = subscript_index(bracket)
+    return f"{alias}.{array_column}[{index}].{name}"
 
 
 # ---------------------------------------------------------------------------
@@ -914,6 +962,37 @@ def _unwrap_paren(node: exp.Expr) -> exp.Expr:
     while isinstance(node, exp.Paren) and isinstance(node.this, exp.Expr):
         node = node.this
     return node
+
+
+def _bare_array_error(sub: exp.Column, fallback: exp.Expr) -> SqlmpegError | None:
+    """``<alias>.<type>.<name>`` (no subscript) is a 3-part ``exp.Column``.
+
+    Probed metadata belongs to ONE track; an array of them has none of its
+    own, so this shape is always wrong (plan 064) rather than merely a
+    qualified name the generic rejection would also catch -- a dedicated
+    check gives the specific fix (subscript one track, or unnest the array)
+    instead of the generic "qualified column names" message.
+    """
+    db_node = sub.args.get("db")
+    table_node = sub.args.get("table")
+    if (
+        isinstance(db_node, exp.Expr)
+        and not sub.args.get("catalog")
+        and isinstance(table_node, exp.Expr)
+        and _ident_name(table_node) in _UNNEST_COLUMNS
+    ):
+        alias = _ident_name(db_node)
+        array_column = _ident_name(table_node)
+        return _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{alias}.{array_column}.{sub.name}' needs a subscript: an array "
+            "has no metadata of its own",
+            sub,
+            fallback=fallback,
+            hint=f"subscript one track ({alias}.{array_column}[1].{sub.name}) or "
+            f"unnest the whole array (unnest({alias}.{array_column}) t)",
+        )
+    return None
 
 
 def _referenced_aliases(node: exp.Expr) -> set[str]:
@@ -2500,8 +2579,19 @@ class _Resolver:
         self, node: exp.Expr, scope: dict[str, str], select: exp.Select
     ) -> None:
         for sub in node.walk():
+            if isinstance(sub, exp.Dot):
+                # `<alias>.<type>[k].<column>` (plan 064): only `.track` is a
+                # legal SELECT output -- everything else it could name is
+                # metadata, and streams are the only outputs there are.
+                shape = subscript_metadata_shape(sub)
+                if shape is not None:
+                    self._check_output_accessor(sub, shape, scope, select)
+                continue
             if not isinstance(sub, exp.Column):
                 continue
+            bare_array = _bare_array_error(sub, select)
+            if bare_array is not None:
+                raise bare_array
             if sub.args.get("db") or sub.args.get("catalog"):
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -2584,15 +2674,351 @@ class _Resolver:
             )
         return column_type
 
+    # -- subscript metadata accessors: <alias>.<type>[k].<column> (RFC-009
+    # addendum, plan 064) --------------------------------------------------
+
+    def _check_accessor(
+        self,
+        bracket: exp.Bracket,
+        name: str,
+        anchor: exp.Expr,
+        scope: dict[str, str],
+        fallback: exp.Expr,
+    ) -> str:
+        """Validate one ``<alias>.<type>[k].<name>`` accessor; return its type.
+
+        Returns ``"stream"`` for ``.track`` (sugar for the bracket alone) or
+        one of :data:`ROW_SCHEMAS`'s column types otherwise. Shared by every
+        context an accessor can appear in -- SELECT (only ``.track`` survives
+        there) and WHERE (061's row grammar, reused rather than reinvented
+        for a plain input alias's subscript) -- so the alias/array/subscript/
+        column checks are written exactly once.
+        """
+        inner = bracket.this
+        if not isinstance(inner, exp.Column):  # defensive: _check_subscript checked it
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a subscript metadata accessor needs a stream column",
+                bracket,
+                fallback=fallback,
+                hint=_SUBSCRIPT_HINT,
+            )
+        table_node = inner.args.get("table")
+        if table_node is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"unqualified column '{inner.name}'",
+                inner,
+                fallback=fallback,
+                hint=_ALIAS_HINT,
+            )
+        alias = _ident_name(table_node)
+        kind = scope.get(alias)
+        array_column = _ident_name(inner.this)
+        if kind != "input":
+            raise self._accessor_alias_error(
+                alias, kind, array_column, name, table_node, scope, fallback
+            )
+        if array_column not in _UNNEST_COLUMNS:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{array_column}' has no per-track metadata",
+                inner,
+                fallback=fallback,
+                hint=f"metadata accessors need an array column: "
+                f"{_listed_columns(_UNNEST_COLUMNS)}",
+            )
+        if subscript_index(bracket) is None:  # defensive: _check_subscript checked it
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "stream subscript must be a positive integer literal",
+                bracket,
+                fallback=fallback,
+                hint=_SUBSCRIPT_HINT,
+            )
+        schema = ROW_SCHEMAS[array_column]
+        column_type = schema.get(name)
+        if column_type is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"unknown column '{alias}.{array_column}[...].{name}'",
+                anchor,
+                fallback=fallback,
+                hint=f"{array_column} track rows expose {_listed_columns(schema)}",
+            )
+        return column_type
+
+    def _accessor_alias_error(
+        self,
+        alias: str,
+        kind: str | None,
+        array_column: str,
+        name: str,
+        table_node: exp.Expr,
+        scope: dict[str, str],
+        fallback: exp.Expr,
+    ) -> SqlmpegError:
+        """Why ``alias`` cannot carry a subscript metadata accessor.
+
+        A CTE or a generated source has no probed metadata (the same reason
+        neither can be ``unnest``ed, RFC-009 § Fences); a row alias already
+        IS the metadata table and wants its own columns directly, not another
+        subscript layer on top. Empirically decided (plan 064): none of the
+        three has anything a subscript accessor could read, so each gets its
+        own clear rejection rather than a half-working fallback.
+        """
+        if kind == "cte":
+            return _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{array_column}[...].{name}' has no metadata: "
+                f"'{alias}' is a CTE, and a CTE's columns carry no probed metadata",
+                table_node,
+                fallback=fallback,
+                hint="subscript metadata comes from the probed file; reference "
+                "the input directly instead of through a CTE built over it",
+            )
+        if kind == "source":
+            return _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{array_column}[...].{name}' has no metadata: "
+                f"'{alias}' is a generated source, and nothing was probed for it",
+                table_node,
+                fallback=fallback,
+                hint="a generated source's shape comes from its own options, "
+                "not from probed metadata",
+            )
+        if kind == "row":
+            return _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}' is already a track-row table; use its metadata "
+                f"columns directly ({alias}.{name}), not a subscript",
+                table_node,
+                fallback=fallback,
+                hint=f"a row table's columns ARE the per-track metadata; write "
+                f"{alias}.{name} instead of {alias}.{array_column}[...].{name}",
+            )
+        return _error(
+            ErrorCode.UNKNOWN_ALIAS,
+            f"unknown alias '{alias}'",
+            table_node,
+            fallback=fallback,
+            hint=self._known_hint(scope),
+        )
+
+    def _check_output_accessor(
+        self,
+        dot: exp.Dot,
+        shape: tuple[exp.Bracket, str],
+        scope: dict[str, str],
+        select: exp.Select,
+    ) -> None:
+        """A ``<alias>.<type>[k].<column>`` in SELECT position: only ``.track``.
+
+        Streams are the only SELECT output there is (RFC-001); ``.track`` is
+        sugar for the bracket alone (plan 064) and lowers exactly like it, but
+        every other accessor names a piece of metadata -- a string or a number
+        -- which has nowhere to go on an ffmpeg command line.
+        """
+        bracket, name = shape
+        column_type = self._check_accessor(bracket, name, dot, scope, select)
+        if column_type != "stream":
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'.{name}' is track metadata, not a stream, and a SELECT "
+                "column is an output stream",
+                dot,
+                fallback=select,
+                hint=f"streams are the only output: select '.{ROW_STREAM_COLUMN}' "
+                "(or drop the accessor, it is the default) and filter on "
+                "metadata in WHERE instead",
+            )
+
+    def _subscript_operand(
+        self,
+        bracket: exp.Bracket,
+        name: str,
+        anchor: exp.Expr,
+        scope: dict[str, str],
+        where: exp.Where,
+    ) -> str:
+        """Check one WHERE accessor operand and return its type; reject ``.track``."""
+        column_type = self._check_accessor(bracket, name, anchor, scope, where)
+        if column_type == "stream":
+            label = _accessor_label(bracket, name)
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{label}' is a stream, not a value to compare",
+                anchor,
+                fallback=where,
+                hint="filter on the metadata columns, e.g. WHERE "
+                f"{_accessor_label(bracket, 'language')} = 'eng'",
+            )
+        return column_type
+
+    def _check_subscript_conjunct(
+        self, conjunct: exp.Expr, scope: dict[str, str], where: exp.Where
+    ) -> bool:
+        """Shape-check `conjunct` if it holds a subscript metadata accessor.
+
+        RFC-009 addendum (plan 064): ``<alias>.<type>[k].<column>`` compares
+        like a row column -- same grammar, same static literal typing -- but
+        the alias is an ordinary INPUT alias, not an unnest row, so it is told
+        apart by SHAPE (a ``Dot`` over a ``Bracket``) rather than by which kind
+        of name it is. A loose column reference elsewhere in the same
+        conjunct -- typically the time window, ``<alias>.t`` -- means the
+        conjunct mixes the two languages, the same rejection
+        :meth:`_check_row_conjunct` gives a row/non-row mix.
+        """
+        shapes = [
+            subscript_metadata_shape(sub)
+            for sub in conjunct.walk()
+            if isinstance(sub, exp.Dot)
+        ]
+        accessors = [shape for shape in shapes if shape is not None]
+        if not accessors:
+            return False
+        covered = {id(bracket.this) for bracket, _ in accessors}
+        for sub in conjunct.walk():
+            if isinstance(sub, exp.Column) and id(sub) not in covered:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "a WHERE predicate cannot mix subscript metadata accessors "
+                    "with the time window",
+                    conjunct,
+                    fallback=where,
+                    hint="subscript metadata is checked at compile time and a "
+                    "time window is a seek on the input; write them as "
+                    "separate AND conjuncts",
+                )
+        self._check_subscript_predicate(conjunct, scope, where)
+        return True
+
+    def _check_subscript_predicate(
+        self, node: exp.Expr, scope: dict[str, str], where: exp.Where
+    ) -> None:
+        """One compile-time subscript metadata predicate, recursively.
+
+        The same closed grammar :meth:`_check_row_predicate` checks --
+        AND/OR/NOT over comparisons of one accessor against one literal, plus
+        BETWEEN and IS [NOT] NULL -- with an accessor (a ``Dot``-over-
+        ``Bracket`` shape) standing where a row column stood there.
+        """
+        node = _unwrap_paren(node)
+        if isinstance(node, exp.And | exp.Or):
+            self._check_subscript_predicate(node.this, scope, where)
+            expression = node.args.get("expression")
+            if not isinstance(expression, exp.Expr):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "malformed WHERE predicate",
+                    node,
+                    fallback=where,
+                    hint=_SUBSCRIPT_WHERE_HINT,
+                )
+            self._check_subscript_predicate(expression, scope, where)
+            return
+        if isinstance(node, exp.Not):
+            if not isinstance(node.this, exp.Expr):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "malformed WHERE predicate",
+                    node,
+                    fallback=where,
+                    hint=_SUBSCRIPT_WHERE_HINT,
+                )
+            self._check_subscript_predicate(node.this, scope, where)
+            return
+        if isinstance(node, exp.Is):
+            operand = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
+            shape = subscript_metadata_shape(operand) if isinstance(operand, exp.Expr) else None
+            if not isinstance(node.args.get("expression"), exp.Null) or shape is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "only 'IS NULL' and 'IS NOT NULL' are supported",
+                    node,
+                    fallback=where,
+                    hint=_SUBSCRIPT_WHERE_HINT,
+                )
+            assert operand is not None
+            self._subscript_operand(shape[0], shape[1], operand, scope, where)
+            return
+        if isinstance(node, exp.Between):
+            if node.args.get("symmetric"):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "BETWEEN SYMMETRIC is not supported",
+                    node,
+                    fallback=where,
+                    hint=_SUBSCRIPT_WHERE_HINT,
+                )
+            operand = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
+            shape = subscript_metadata_shape(operand) if isinstance(operand, exp.Expr) else None
+            if shape is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "BETWEEN needs a subscript metadata accessor on its left",
+                    node,
+                    fallback=where,
+                    hint=_SUBSCRIPT_WHERE_HINT,
+                )
+            assert operand is not None
+            column_type = self._subscript_operand(shape[0], shape[1], operand, scope, where)
+            label = _accessor_label(shape[0], shape[1])
+            for bound in (node.args.get("low"), node.args.get("high")):
+                self._check_literal_type(
+                    bound, column_type, label, where, hint=_SUBSCRIPT_WHERE_HINT
+                )
+            return
+        if isinstance(node, exp.EQ | exp.NEQ | exp.GT | exp.GTE | exp.LT | exp.LTE):
+            left = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
+            right = node.args.get("expression")
+            right = _unwrap_paren(right) if isinstance(right, exp.Expr) else None
+            left_shape = subscript_metadata_shape(left) if isinstance(left, exp.Expr) else None
+            right_shape = (
+                subscript_metadata_shape(right) if isinstance(right, exp.Expr) else None
+            )
+            if left_shape is not None:
+                shape, operand, literal = left_shape, left, right
+            else:
+                shape, operand, literal = right_shape, right, left
+            if shape is None or operand is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "a subscript metadata comparison needs an accessor on one side",
+                    node,
+                    fallback=where,
+                    hint=_SUBSCRIPT_WHERE_HINT,
+                )
+            column_type = self._subscript_operand(shape[0], shape[1], operand, scope, where)
+            label = _accessor_label(shape[0], shape[1])
+            self._check_literal_type(
+                literal, column_type, label, where, hint=_SUBSCRIPT_WHERE_HINT
+            )
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "unsupported WHERE predicate",
+            node,
+            fallback=where,
+            hint=_SUBSCRIPT_WHERE_HINT,
+        )
+
     def _check_where(
         self, where: exp.Where, scope: dict[str, str], select: exp.Select
     ) -> None:
         conjuncts: list[exp.Expr] = []
         self._flatten_and(where.this, conjuncts, select)
+        for conjunct in conjuncts:
+            for sub in conjunct.walk():
+                if isinstance(sub, exp.Column):
+                    bare_array = _bare_array_error(sub, where)
+                    if bare_array is not None:
+                        raise bare_array
         conjuncts = [
             conjunct
             for conjunct in conjuncts
             if not self._check_row_conjunct(conjunct, scope, where)
+            and not self._check_subscript_conjunct(conjunct, scope, where)
         ]
 
         # alias -> {"low": <literal>, "high": <literal>}, accumulated across
@@ -2888,16 +3314,30 @@ class _Resolver:
         column_type: str,
         where: exp.Expr,
     ) -> None:
-        """A row predicate's other operand: a literal of the column's own type.
-
-        Static typing on purpose (RFC-009's NULL rule cuts the other way): an
-        absent metadata field makes the VALUE null, never the column untyped,
-        so comparing a text column to a number is a mistake whatever the file
-        turned out to contain. A negative number arrives as ``exp.Neg`` wrapping
-        the literal, exactly as it does for a positional filter argument.
-        """
+        """A row predicate's other operand: a literal of the column's own type."""
         alias = _ident_name(column.args.get("table"))
         name = _ident_name(column.this)
+        self._check_literal_type(node, column_type, f"{alias}.{name}", where)
+
+    def _check_literal_type(
+        self,
+        node: exp.Expr | None,
+        column_type: str,
+        label: str,
+        where: exp.Expr,
+        *,
+        hint: str = _ROW_WHERE_HINT,
+    ) -> None:
+        """A compile-time predicate's other operand: a literal of ``label``'s type.
+
+        Shared by row-column predicates (RFC-009, plan 061) and subscript
+        metadata predicates (plan 064) -- the whole point of both being
+        static typing, not a probed-value coincidence: an absent metadata
+        field makes the VALUE null, never the column untyped, so comparing a
+        text column to a number is a mistake whatever the file turned out to
+        contain. A negative number arrives as ``exp.Neg`` wrapping the
+        literal, exactly as it does for a positional filter argument.
+        """
         node = _unwrap_paren(node) if isinstance(node, exp.Expr) else None
         if isinstance(node, exp.Neg) and isinstance(node.this, exp.Expr):
             node = _unwrap_paren(node.this)
@@ -2908,18 +3348,18 @@ class _Resolver:
             got = "a string" if node.is_string else "a number"
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{alias}.{name}' is {column_type}, but the comparison value is {got}",
+                f"'{label}' is {column_type}, but the comparison value is {got}",
                 node,
                 fallback=where,
-                hint=f"compare '{alias}.{name}' against "
+                hint=f"compare '{label}' against "
                 + ("a quoted string" if wanted_string else "a number"),
             )
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            f"'{alias}.{name}' can only be compared against a literal",
+            f"'{label}' can only be compared against a literal",
             node,
             fallback=where,
-            hint=_ROW_WHERE_HINT,
+            hint=hint,
         )
 
     # -- ORDER BY over track-row columns (RFC-009) -------------------------

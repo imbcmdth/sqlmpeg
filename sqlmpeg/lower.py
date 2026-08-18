@@ -294,6 +294,7 @@ from sqlmpeg.parser import (
     kwarg_name,
     star_qualifier,
     subscript_index,
+    subscript_metadata_shape,
     union_branches,
 )
 from sqlmpeg.parser import _ident_name as _fold
@@ -713,6 +714,19 @@ def _unwrap(node: exp.Expr) -> exp.Expr:
                 node = inner
                 continue
         return node
+
+
+def _strip_track_sugar(node: exp.Expr) -> exp.Expr:
+    """``<alias>.<type>[k].track`` is sugar for ``<alias>.<type>[k]`` (plan 064):
+    the SAME stream, spelled with the accessor that names it explicitly.
+    Every other accessor a subscript metadata shape could name is metadata,
+    not a stream, and resolve already confines those to WHERE, so this is the
+    only substitution a stream-expression position ever needs.
+    """
+    shape = subscript_metadata_shape(node)
+    if shape is not None and shape[1] == ROW_STREAM_COLUMN:
+        return shape[0]
+    return node
 
 
 def _projection_name(node: exp.Expr) -> str | None:
@@ -1615,13 +1629,17 @@ class _Lowerer:
 
     def _lower_branch(self, select: exp.Select) -> list[_Column]:
         env = self._scope(select)
-        # RFC-009: one WHERE clause, two languages. A conjunct over track-row
-        # columns is decided HERE and never reaches ffmpeg; a time window is a
-        # seek on an input. Resolve already rejected a conjunct that mixes them,
-        # so the split is total.
-        time_conjuncts, row_conjuncts = self._split_where(select, env)
+        # RFC-009: one WHERE clause, two (now three: plan 064) languages. A
+        # conjunct over track-row columns is decided HERE and never reaches
+        # ffmpeg; a subscript metadata conjunct is a compile-time ASSERTION
+        # (nothing to filter -- the SELECT list already names the exact
+        # stream a subscript picked); a time window is a seek on an input.
+        # Resolve already rejected a conjunct that mixes any two of them, so
+        # the split is total.
+        time_conjuncts, row_conjuncts, assertion_conjuncts = self._split_where(select, env)
         self._collect_trims(select, env, time_conjuncts)
         self._filter_rows(row_conjuncts, env, select)
+        self._check_assertions(assertion_conjuncts, select)
         self._order_rows(select, env)
 
         projections = select.expressions
@@ -2142,24 +2160,35 @@ class _Lowerer:
 
     # -- WHERE ------------------------------------------------------------
 
-    # -- WHERE, split into its two halves (RFC-009) ------------------------
+    # -- WHERE, split into its three halves (RFC-009, plan 064) ------------
 
     def _split_where(
         self, select: exp.Select, env: _Env
-    ) -> tuple[list[exp.Expr], list[exp.Expr]]:
-        """This branch's WHERE conjuncts, as ``(time windows, row predicates)``.
+    ) -> tuple[list[exp.Expr], list[exp.Expr], list[exp.Expr]]:
+        """This branch's WHERE conjuncts, as ``(time windows, row predicates,
+        subscript metadata assertions)``.
 
         A conjunct is a ROW predicate exactly when it mentions a track-row
         alias, which is unambiguous: a row alias is an alias, and one name
-        cannot be two things. Resolve rejected the mixed case, so nothing here
-        has to decide what a half-and-half conjunct would mean.
+        cannot be two things. A subscript metadata accessor (``Dot`` over
+        ``Bracket``, plan 064) is told apart by SHAPE instead, since its alias
+        is an ordinary input one -- checked first, so a conjunct never falls
+        through to the row/time split. Resolve rejected every mixed case, so
+        nothing here has to decide what a half-and-half conjunct would mean.
         """
         where = select.args.get("where")
         if not isinstance(where, exp.Where):
-            return [], []
+            return [], [], []
         time_conjuncts: list[exp.Expr] = []
         row_conjuncts: list[exp.Expr] = []
+        assertion_conjuncts: list[exp.Expr] = []
         for conjunct in _flatten_and(where.this):
+            if any(
+                isinstance(sub, exp.Dot) and subscript_metadata_shape(sub) is not None
+                for sub in conjunct.walk()
+            ):
+                assertion_conjuncts.append(conjunct)
+                continue
             aliases = {
                 _fold(sub.args["table"])
                 for sub in conjunct.walk()
@@ -2182,7 +2211,7 @@ class _Lowerer:
                     hint="filter each unnest separately",
                 )
             row_conjuncts.append(conjunct)
-        return time_conjuncts, row_conjuncts
+        return time_conjuncts, row_conjuncts, assertion_conjuncts
 
     # -- compile-time row filtering / ordering (RFC-009) -------------------
 
@@ -2374,6 +2403,177 @@ class _Lowerer:
             value,
             fallback=select,
         )
+
+    # -- subscript metadata WHERE assertions (RFC-009 addendum, plan 064) --
+    #
+    # `<alias>.<type>[k].<column>` names ONE probed track, deterministically
+    # (the subscript is bounds-checked, not filtered), so a WHERE conjunct
+    # over it has nothing to DROP the way a row predicate drops rows: the
+    # SELECT list still names the exact stream the subscript picked. It is
+    # therefore an ASSERTION -- checked once, at compile time, against the
+    # probed file -- rather than a filter: TRUE lets compilation proceed
+    # unchanged, and FALSE or UNKNOWN (3VL: a field that was never probed) is
+    # a typed rejection, because an ffmpeg command line has no way to encode
+    # "select nothing" (recipe 29 of docs/examples.md).
+    #
+    # The boolean algebra is 061's, reused wholesale (`_compare`/
+    # `_kleene_and`/`_kleene_or`/`_literal_of`): the only new piece is where a
+    # leaf's VALUE comes from (`_accessor_value`, probed straight off the
+    # input through the SAME `_row_columns` a track-row table's columns come
+    # from) rather than a joined row set.
+
+    def _check_assertions(self, conjuncts: list[exp.Expr], select: exp.Select) -> None:
+        for conjunct in conjuncts:
+            if self._eval_assertion(conjunct, select) is not True:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "WHERE assertion failed at compile time: "
+                    f"{conjunct.sql(dialect='postgres')}",
+                    conjunct,
+                    fallback=select,
+                    hint="a subscript metadata predicate is checked once, "
+                    "against the probed file, and a false or unprobed ('NULL') "
+                    "result refuses to compile rather than silently shipping "
+                    "the wrong track; fix the query or the input",
+                )
+
+    def _eval_assertion(self, node: exp.Expr, select: exp.Select) -> bool | None:
+        """One subscript metadata predicate, Kleene three-valued, like `_eval_row`."""
+        node = _unwrap(node)
+        if isinstance(node, exp.And | exp.Or):
+            left = self._eval_assertion(node.this, select)
+            expression = node.args.get("expression")
+            if not isinstance(expression, exp.Expr):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL, "malformed WHERE predicate", node,
+                    fallback=select,
+                )
+            right = self._eval_assertion(expression, select)
+            return (
+                _kleene_and(left, right)
+                if isinstance(node, exp.And)
+                else _kleene_or(left, right)
+            )
+        if isinstance(node, exp.Not) and isinstance(node.this, exp.Expr):
+            inner = self._eval_assertion(node.this, select)
+            return None if inner is None else not inner
+        if isinstance(node, exp.Is):
+            value = self._accessor_value(node.this, select)
+            is_null = value is None
+            return not is_null if node.args.get("negate") else is_null
+        if isinstance(node, exp.Between):
+            value = self._accessor_value(node.this, select)
+            low = self._literal_of(node.args.get("low"), select)
+            high = self._literal_of(node.args.get("high"), select)
+            return _kleene_and(
+                _compare(exp.GTE(), value, low), _compare(exp.LTE(), value, high)
+            )
+        if isinstance(node, exp.EQ | exp.NEQ | exp.GT | exp.GTE | exp.LT | exp.LTE):
+            left_node = node.this
+            right_node = node.args.get("expression")
+            left_shape = (
+                subscript_metadata_shape(_unwrap(left_node))
+                if isinstance(left_node, exp.Expr)
+                else None
+            )
+            if left_shape is not None:
+                return _compare(
+                    node,
+                    self._accessor_value(left_node, select),
+                    self._literal_of(right_node, select),
+                )
+            mirrored = _MIRRORED_COMPARISONS[type(node)]()
+            return _compare(
+                mirrored,
+                self._accessor_value(right_node, select),
+                self._literal_of(left_node, select),
+            )
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL, "unsupported WHERE predicate", node,
+            fallback=select,
+        )
+
+    def _accessor_value(self, node: exp.Expr | None, select: exp.Select) -> RowValue:
+        """The probed value one ``<alias>.<type>[k].<column>`` accessor names.
+
+        Resolve already confined this shape to an ordinary INPUT alias (never
+        a row or CTE one), so this reads the SAME probed ``StreamMeta`` a bare
+        ``<alias>.<type>[k]`` would select, through the SAME `_row_columns` a
+        track-row table's columns come from (plan 061) -- one metadata table,
+        two ways to name a row of it.
+        """
+        shape = (
+            subscript_metadata_shape(_unwrap(node)) if isinstance(node, exp.Expr) else None
+        )
+        if shape is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a subscript metadata predicate compares an accessor against "
+                "a literal",
+                node if isinstance(node, exp.Expr) else None,
+                fallback=select,
+            )
+        bracket, name = shape
+        inner = bracket.this
+        if not isinstance(inner, exp.Column):  # defensive: resolve checked the shape
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, "malformed subscript metadata accessor",
+                bracket, fallback=select,
+            )
+        table_node = inner.args.get("table")
+        alias = _fold(table_node) if table_node is not None else ""
+        array_column = _fold(inner.this)
+        stream_type = _ARRAY_COLUMNS.get(array_column)
+        if stream_type is None:  # defensive: resolve checked the array column
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{array_column}' has no per-track metadata",
+                inner,
+                fallback=select,
+            )
+        index = subscript_index(bracket)
+        if index is None:  # defensive: resolve checked the subscript
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "stream subscript must be a positive integer literal",
+                bracket,
+                fallback=select,
+                hint=_SUBSCRIPT_HINT,
+            )
+        if name == ROW_STREAM_COLUMN:  # defensive: resolve rejects `.track` here
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{array_column}[{index}].{ROW_STREAM_COLUMN}' is a "
+                "stream, not a value to compare",
+                bracket,
+                fallback=select,
+            )
+        result = self.probes.get(alias)
+        if result is None:
+            path = self._path_of(alias)
+            raise _error(
+                ErrorCode.INPUT_NOT_FOUND,
+                f"cannot check '{alias}.{array_column}[{index}].{name}' of "
+                f"'{path}': file not found or unreadable",
+                bracket,
+                fallback=select,
+                hint="subscript metadata is probed from the file, and only a "
+                "readable input has any; the WHERE assertion cannot be checked",
+            )
+        streams = result.by_type(stream_type)
+        if not 1 <= index <= len(streams):
+            have = f"{len(streams)} {stream_type} stream" + ("" if len(streams) == 1 else "s")
+            raise _error(
+                ErrorCode.STREAM_NOT_FOUND,
+                f"'{alias}.{array_column}[{index}]' does not exist: "
+                f"'{self._path_of(alias)}' has {have}",
+                bracket,
+                fallback=select,
+                hint=_SUBSCRIPT_HINT,
+            )
+        meta = streams[index - 1]
+        columns = _row_columns(meta, array_column)
+        return columns.get(name)
 
     def _order_rows(self, select: exp.Select, env: _Env) -> None:
         """Re-sort a row table explicitly (RFC-009's ORDER BY carve-out).
@@ -2641,7 +2841,7 @@ class _Lowerer:
     # -- expressions ------------------------------------------------------
 
     def _lower_expr(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Value:
-        node = _unwrap(node)
+        node = _strip_track_sugar(_unwrap(node))
         if isinstance(node, exp.Bracket | exp.Column):
             alias, value = self._base_stream(node, env, select)
             return self._access(env, alias, value, node, select)
@@ -4352,7 +4552,7 @@ class _Lowerer:
         ``scale(gblur(a.frame, 2), 640, 480)`` sees the inner call's output
         pad type.
         """
-        node = _unwrap(node)
+        node = _strip_track_sugar(_unwrap(node))
         if isinstance(node, exp.Literal):
             return "str" if node.is_string else "num"
         if (

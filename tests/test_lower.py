@@ -5767,6 +5767,114 @@ def test_a_track_row_query_runs_end_to_end(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# subscript metadata WHERE assertions (RFC-009 addendum, plan 064)
+# ---------------------------------------------------------------------------
+#
+# Same synthetic probes `_row_probes`/`_ROW_TRACKS` already builds for the
+# unnest row tests: track 1 (index 0) is `eng`/2ch/stereo/aac, track 2
+# (index 1) is `fra`/6ch/5.1/ac3, track 3 (index 2) carries no language tag
+# and no probed bitrate -- exactly the NULL case 3VL needs.
+
+
+def _assertion_query(predicate: str) -> str:
+    return f"SELECT f.audio[1] FROM input('f.mkv') f WHERE {predicate}"
+
+
+def test_a_true_assertion_compiles_exactly_like_no_where_at_all() -> None:
+    g = _lower(_assertion_query("f.audio[1].language = 'eng'"), _row_probes())
+    plain = _lower("SELECT f.audio[1] FROM input('f.mkv') f", _row_probes())
+    assert _outputs(g) == _outputs(plain) == [("src:f:a:0", "audio", None)]
+    assert _filters(g) == []
+
+
+def test_a_false_assertion_is_a_typed_rejection() -> None:
+    err = _reject_lower(
+        _assertion_query("f.audio[1].language = 'fra'"), _row_probes()
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "WHERE assertion failed" in err.message
+
+
+def test_an_unprobed_field_makes_the_assertion_unknown_not_true() -> None:
+    # `bitrate` was never set on track 1: UNKNOWN is not TRUE, so this still
+    # refuses to compile -- "NULL matches nothing" applies to assertions too.
+    err = _reject_lower(_assertion_query("f.audio[1].bitrate > 0"), _row_probes())
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "WHERE assertion failed" in err.message
+
+
+def test_is_null_reads_the_unprobed_field_correctly() -> None:
+    g = _lower(_assertion_query("f.audio[1].bitrate IS NULL"), _row_probes())
+    assert _outputs(g) == [("src:f:a:0", "audio", None)]
+
+
+@pytest.mark.parametrize(
+    ("predicate", "expected"),
+    [
+        ("f.audio[1].language = 'eng'", True),
+        ("f.audio[2].language = 'eng'", False),
+        ("f.audio[1].channels = 2", True),
+        ("f.audio[2].channels > 2", True),
+        ("f.audio[1].index = 1", True),
+        ("f.audio[1].index = 2", False),
+        ("f.audio[1].language = 'eng' AND f.audio[1].channels = 2", True),
+        ("f.audio[1].language = 'eng' AND f.audio[1].channels = 6", False),
+        ("f.audio[1].language = 'fra' OR f.audio[2].language = 'fra'", True),
+        ("NOT (f.audio[1].language = 'fra')", True),
+        ("NOT (f.audio[1].language = 'eng')", False),
+        ("f.audio[1].channels BETWEEN 1 AND 3", True),
+        ("f.audio[3].language IS NULL", True),
+        ("f.audio[1].language IS NOT NULL", True),
+        ("f.audio[3].language IS NOT NULL", False),
+    ],
+)
+def test_the_subscript_assertion_evaluator(predicate: str, expected: bool) -> None:
+    if expected:
+        g = _lower(_assertion_query(predicate), _row_probes())
+        assert _outputs(g) == [("src:f:a:0", "audio", None)]
+    else:
+        err = _reject_lower(_assertion_query(predicate), _row_probes())
+        assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_assertion_subscript_out_of_range_is_stream_not_found() -> None:
+    err = _reject_lower(_assertion_query("f.audio[9].language = 'eng'"), _row_probes())
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+
+
+def test_assertion_over_an_unprobed_input_is_input_not_found() -> None:
+    err = _reject_lower(_assertion_query("f.audio[1].language = 'eng'"), {"f": None})
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+
+
+def test_a_time_window_and_an_assertion_coexist_as_separate_conjuncts() -> None:
+    g = _lower(
+        _assertion_query("f.t BETWEEN 1 AND 2 AND f.audio[1].language = 'eng'"),
+        _row_probes(),
+    )
+    assert _outputs(g) == [("src:f:a:0", "audio", None)]
+
+
+def test_dot_track_sugar_lowers_identically_to_the_bare_bracket() -> None:
+    sugar = _lower(
+        "SELECT f.audio[1].track FROM input('f.mkv') f", _row_probes()
+    )
+    plain = _lower("SELECT f.audio[1] FROM input('f.mkv') f", _row_probes())
+    assert _outputs(sugar) == _outputs(plain) == [("src:f:a:0", "audio", None)]
+
+
+def test_dot_track_sugar_works_as_a_call_argument_too() -> None:
+    sugar = _lower(
+        "SELECT scale(f.video[1].track, 640, 480) FROM input('f.mkv') f",
+        _row_probes(),
+    )
+    plain = _lower(
+        "SELECT scale(f.video[1], 640, 480) FROM input('f.mkv') f", _row_probes()
+    )
+    assert _filters(sugar) == _filters(plain) == ["scale"]
+
+
+# ---------------------------------------------------------------------------
 # track-row JOINs and COALESCE fills (RFC-009, plan 062)
 # ---------------------------------------------------------------------------
 #

@@ -2014,6 +2014,158 @@ def test_the_other_streaming_fences_are_untouched_by_the_carve_out() -> None:
 
 
 # ---------------------------------------------------------------------------
+# subscript metadata accessors: <alias>.<type>[k].<column> (RFC-009 addendum,
+# plan 064)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["f.audio[1].language", "(f.audio[1]).language"],
+)
+def test_both_subscript_metadata_spellings_are_admitted(spelling: str) -> None:
+    # The bracket-dot and the strictly-Postgres paren-dot forms are the same
+    # shape, VERIFIED under sqlglot 30.17 (module docstring); either compiles
+    # cleanly as a WHERE assertion.
+    _resolve(f"SELECT f.audio[1] FROM input('f.mkv') f WHERE {spelling} = 'eng'")
+
+
+def test_dot_track_is_sugar_for_the_bare_bracket_in_select() -> None:
+    res = _resolve("SELECT f.audio[1].track FROM input('f.mkv') f")
+    projection = res.branches[0].expressions[0]
+    assert isinstance(projection, exp.Dot)
+
+
+def test_dot_track_is_still_a_stream_not_a_where_value() -> None:
+    # `.track` parses fine in WHERE position too -- it is simply rejected for
+    # the same reason a row table's bare `t.track` is: a stream is not
+    # something to compare.
+    err = _reject(
+        "SELECT f.audio[1] FROM input('f.mkv') f WHERE f.audio[1].track = 1"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is a stream, not a value to compare" in err.message
+
+
+@pytest.mark.parametrize(
+    "column",
+    ["language", "title", "codec", "channels", "channel_layout", "index"],
+)
+def test_a_non_track_accessor_is_rejected_as_a_select_output(column: str) -> None:
+    err = _reject(f"SELECT f.audio[1].{column} FROM input('f.mkv') f")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is track metadata, not a stream" in err.message
+
+
+def test_bare_array_metadata_access_is_rejected_in_select() -> None:
+    err = _reject("SELECT f.audio.language FROM input('f.mkv') f")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "needs a subscript" in err.message
+    assert err.hint is not None and "unnest" in err.hint
+
+
+def test_bare_array_metadata_access_is_rejected_in_where() -> None:
+    err = _reject(
+        "SELECT f.audio[1] FROM input('f.mkv') f WHERE f.audio.language = 'eng'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "needs a subscript" in err.message
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "f.audio[1].language = 'eng'",
+        "'eng' = f.audio[1].language",
+        "f.audio[1].language != 'eng'",
+        "f.audio[1].channels > 2",
+        "f.audio[1].channels >= 2",
+        "f.audio[1].channels < 6",
+        "f.audio[1].bitrate BETWEEN 1000 AND 2000",
+        "f.audio[1].language IS NULL",
+        "f.audio[1].title IS NOT NULL",
+        "NOT (f.audio[1].language = 'eng')",
+        "f.audio[1].language = 'eng' AND f.audio[2].language = 'fra'",
+        "(f.audio[1].language = 'eng' OR f.audio[1].language IS NULL) "
+        "AND f.audio[1].channels = 2",
+    ],
+)
+def test_subscript_metadata_predicates_are_admitted(predicate: str) -> None:
+    _resolve(f"SELECT f.audio[1] FROM input('f.mkv') f WHERE {predicate}")
+
+
+def test_a_subscript_predicate_is_typed_against_the_static_column_type() -> None:
+    err = _reject(
+        "SELECT f.audio[1] FROM input('f.mkv') f WHERE f.audio[1].channels = 'stereo'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is number" in err.message
+    err = _reject(
+        "SELECT f.audio[1] FROM input('f.mkv') f WHERE f.audio[1].language = 5"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is text" in err.message
+
+
+def test_a_conjunct_may_not_mix_a_subscript_accessor_with_the_time_window() -> None:
+    err = _reject(
+        "SELECT f.audio[1] FROM input('f.mkv') f "
+        "WHERE f.audio[1].language = 'eng' OR f.t >= 1"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot mix subscript metadata accessors" in err.message
+
+
+def test_a_time_window_and_a_subscript_predicate_coexist_as_separate_conjuncts() -> None:
+    _resolve(
+        "SELECT f.audio[1] FROM input('f.mkv') f "
+        "WHERE f.t BETWEEN 1 AND 2 AND f.audio[1].language = 'eng'"
+    )
+
+
+@pytest.mark.parametrize(
+    ("column", "predicate"),
+    [
+        ("video", "f.video[1].width = 640"),
+        ("subtitle", "f.subtitle[1].language = 'eng'"),
+        ("data", "f.data[1].index = 1"),
+    ],
+)
+def test_video_subtitle_and_data_subscript_accessors_resolve(
+    column: str, predicate: str
+) -> None:
+    _resolve(f"SELECT f.{column}[1] FROM input('f.mkv') f WHERE {predicate}")
+
+
+def test_a_subscript_accessor_over_a_cte_is_rejected() -> None:
+    err = _reject(
+        "WITH c AS (SELECT a.frame FROM input('a.mkv') a) "
+        "SELECT c.frame FROM c WHERE c.frame[1].language = 'eng'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is a CTE" in err.message
+
+
+def test_a_subscript_accessor_over_a_generated_source_is_rejected() -> None:
+    err = _reject(
+        "SELECT s.video[1] FROM ffmpeg.testsrc(duration => 2) s "
+        "WHERE s.video[1].language = 'eng'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is a generated source" in err.message
+
+
+def test_a_subscript_accessor_over_a_row_alias_is_rejected() -> None:
+    # In SELECT position, so the row-language WHERE grammar (which claims
+    # anything mentioning a row alias first) is not what intercepts this.
+    err = _reject(
+        "SELECT t.track[1].language FROM input('f.mkv') f, unnest(f.audio) t"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "already a track-row table" in err.message
+
+
+# ---------------------------------------------------------------------------
 # guardrail #7: no panics on user input
 # ---------------------------------------------------------------------------
 

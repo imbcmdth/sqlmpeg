@@ -26,6 +26,8 @@ WHERE t.language = 'eng' AND t.channel_layout = 'stereo'
 
 A field ffprobe didn't report is NULL, and NULL behaves the way SQL says it behaves: it equals nothing, it compares to nothing, and `WHERE` drops the row. An untagged track simply never matches `t.language = 'eng'` - and never matches `t.language != 'eng'` either. `IS NULL` / `IS NOT NULL` ask the question directly.
 
+The row columns are also reachable straight off a subscript, no unnest needed: `f.audio[1].language` is the first track's tag (the strictly-Postgres spelling `(f.audio[1]).language` works too, and `f.audio[1]` itself is sugar for `f.audio[1].track`). In a `WHERE` this is an **assertion** rather than a filter - a subscript names one specific track, so `WHERE f.audio[1].language = 'eng'` means "I believe track 1 is English; refuse to compile if not". [Cookbook recipe 29](examples.md#29-assert-what-youre-shipping) is the worked version.
+
 `ORDER BY` over row columns re-sorts the tracks (multi-key, `NULLS FIRST`/`LAST` honored, Postgres defaults). It is allowed only here, where the rows are compile-time metadata - frames still never sort, and the `NO_STREAMING_EQUIVALENT` fence on everything else hasn't moved. Without an `ORDER BY`, rows keep the file's own track order. That default is deliberate: track order is player-visible surface (players open the first audio track), so nothing reorders it behind your back.
 
 ## Joins: aligning tracks across files
