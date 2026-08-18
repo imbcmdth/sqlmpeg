@@ -84,11 +84,11 @@ ffmpeg -i film.mkv -filter_complex '[0:v:0]scale=width=1920:height=-2[n1];[0:a:0
 
 A view is to statements what a CTE is to branches: `master` decodes and filters `film.mkv` exactly once - `scale` and `volume` each appear a single time in the graph above - and the split pass hands out however many pads its readers need (`split=2` for the two video consumers, `asplit=3` for the three audio ones). Alias it in `FROM` (`FROM master m`) exactly like a CTE; view, CTE and alias names share one flat, script-wide namespace, and a view that nothing ever reads is a typo, rejected outright. `-o` on the CLI only makes sense with one destination - against a script with more than one COPY it's a usage error naming the sinks it found, so give each COPY its own path instead.
 
-There's much more - watermarks, GIFs, subtitle muxing, multiband compression, generated test media - and it all lives in the **[cookbook](docs/examples.md)**: thirty-two real tasks, simple to complex, every shown output rerun and byte-checked by the test suite.
+There's much more - watermarks, GIFs, subtitle muxing, multiband compression, generated test media - and it all lives in the **[cookbook](docs/examples.md)**: thirty-three real tasks, simple to complex, every shown output rerun and byte-checked by the test suite - and most of them parameterized with `-v` variables, so they run against your files as-is.
 
 ## CLI reference
 
-All four query commands take the SQL as text right on the command line (`sqlmpeg compile "SELECT ..."`), or from a file with `-f query.sql` (`-f -` reads stdin). Exactly one of the two.
+All four query commands take the SQL as text right on the command line (`sqlmpeg compile "SELECT ..."`), or from a file with `-f query.sql` (`-f -` reads stdin). Exactly one of the two. All four also take `-v name=value` (repeatable - psql's flag, psql's syntax): `:'name'` in the query becomes the value as an escaped string literal, bare `:name` becomes it raw, and an undefined variable is a compile-time error. A query file plus `-v` is a reusable program; [queries/](queries/) collects ready-made ones.
 
 | command | what it does | flags |
 |---|---|---|

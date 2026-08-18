@@ -152,6 +152,12 @@ FROM input('y.mp4') b
 
 **Meaning:** The catch-all for syntactically valid SQL outside the dialect that isn't one of the more specific codes above. No streaming-vs-batch philosophy involved; the surface just doesn't include it. This is the most common code in practice. Most of `sqlmpeg/parser.py`'s rejections use it: multiple statements, unsupported clause keys, explicit `JOIN` syntax (comma cross-joins only), aliased or nested subqueries, `WITH RECURSIVE`, malformed or duplicate CTE/alias names, an empty `WHERE`, a non-positive or non-literal array subscript, or a top-level statement that isn't a `SELECT`/`UNION ALL`. (`SELECT *` and `<alias>.*` compile now, so they are off this list; see [docs/trimming.md](trimming.md) for the caption rejections below.)
 
+One CLI-layer rejection lands here: a query referencing a `:'variable'` (psql-style, filled by `-v name=value`) that no `-v` defined. psql lets an undefined variable pass through as literal text and fail later; sqlmpeg rejects it at the reference, with the defined names in the hint when there are any:
+
+```json
+{"line": 1, "col": 30, "code": "UNSUPPORTED_SQL", "message": "undefined variable ':source'", "hint": "define it with -v name=value"}
+```
+
 One probed-reality rejection lands here: a stream ffprobe reports NO codec for (some DASH manifests' WebVTT tracks arrive this way - ffmpeg's demuxer sees them but cannot name them, an open ffmpeg limitation measured through 9.0) selected into a media sink. Such a stream can be neither copied (no tag to write) nor transcoded (no decoder to invoke), so the run is guaranteed to die at header-write; sqlmpeg knows at compile time and says so at compile time. Table queries are exempt on purpose - a codec-less track shows up as a row with a NULL codec column, which is how you discover it:
 
 ```json
