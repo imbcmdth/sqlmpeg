@@ -125,6 +125,8 @@ ffmpeg -i stereo.mp4 -filter_complex '[0:a:0]channelsplit[n10][n11];[n10]volume=
 
 In the other direction, three N-input filters take however many streams you hand them: `amix`, `hstack`, and `vstack`. Their `inputs` option is set from the stream count automatically (that `amix=inputs=2` above), and passing `inputs` a number that disagrees with the streams you actually passed is a typed error naming both.
 
+When the QUESTION is which tracks to hand a filter in the first place - select by language, align two files' track sets, fill the gaps with silence - that is the track-row surface: `unnest`, metadata columns, and compile-time joins, in [docs/tracks.md](tracks.md).
+
 ## The scope fence
 
 Not everything ffmpeg reports is callable:

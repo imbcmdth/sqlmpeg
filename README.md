@@ -84,7 +84,7 @@ ffmpeg -i film.mkv -filter_complex '[0:v:0]scale=width=1920:height=-2[n1];[0:a:0
 
 A view is to statements what a CTE is to branches: `master` decodes and filters `film.mkv` exactly once - `scale` and `volume` each appear a single time in the graph above - and the split pass hands out however many pads its readers need (`split=2` for the two video consumers, `asplit=3` for the three audio ones). Alias it in `FROM` (`FROM master m`) exactly like a CTE; view, CTE and alias names share one flat, script-wide namespace, and a view that nothing ever reads is a typo, rejected outright. `-o` on the CLI only makes sense with one destination - against a script with more than one COPY it's a usage error naming the sinks it found, so give each COPY its own path instead.
 
-There's much more - watermarks, GIFs, subtitle muxing, multiband compression, generated test media - and it all lives in the **[cookbook](docs/examples.md)**: twenty-two real tasks, simple to complex, every shown command recompiled and byte-checked by the test suite.
+There's much more - watermarks, GIFs, subtitle muxing, multiband compression, generated test media - and it all lives in the **[cookbook](docs/examples.md)**: twenty-eight real tasks, simple to complex, every shown command recompiled and byte-checked by the test suite.
 
 ## CLI reference
 
@@ -104,6 +104,7 @@ One flag comes up everywhere: `--no-probe` skips ffprobe for a byte-reproducible
 
 - **Streams are columns.** Every input exposes `<alias>.video`, `<alias>.audio`, `<alias>.subtitle`, `<alias>.data` (1-based subscripts; `<alias>.frame` is sugar for `video[1]`), and **the SELECT list is the output stream list** - one column, one `-map`, in order, nothing implicit. A bare subscript no function touches stays a stream copy. `input()` takes per-input options (`loop => true` keeps a still image alive). `SELECT *` keeps everything.
 - **Bare arrays broadcast.** `atempo(v.audio, 1.25)` fans out one node per track, each output keeping its language tag. Two arrays in one call zip elementwise.
+- **Tracks are rows when you need them.** `unnest(f.audio)` turns a track array into a compile-time table whose columns are the probed metadata, so picking a track is `WHERE t.language = 'eng'` and aligning two files' tracks is a real SQL `JOIN` - inner, left, or full outer, with generated silence (or an empty caption track) standing in for what a file lacks. Every join is decided at compile time; ffmpeg only sees the wiring. [docs/tracks.md](docs/tracks.md) has the whole story.
 - **Trims are seeks.** `WHERE a.t BETWEEN 5 AND 60` (or either bound alone, open-ended) becomes `-ss`/`-to` on that alias's `-i`: fast, all stream types at once, stream-copy still possible. Decoded streams cut frame-accurate; copied ones snap to a keyframe. The measurements, and the caption caveat, are in [docs/trimming.md](docs/trimming.md).
 - **Every filter, one convention.** All ~450 filters in your ffmpeg build are callable: streams first, then options - positionally in the exact order `ffmpeg -help filter=<name>` prints them, by name (`unsharp(a.frame, luma_amount => 1.5)`), or both. Every option is type-checked against what the binary reports. `ffmpeg.<name>(...)` always means the raw filter, including the eleven names Postgres grammar would otherwise eat; `sqlmpeg.<name>(...)` holds exactly three macros for jobs no single filter does (`delay`, `speed`, `blur_regions`). A few multi-output filters (`channelsplit`, `acrossover`, `extractplanes`) return arrays. [docs/filters.md](docs/filters.md) has the whole story.
 - **Generated sources live in FROM.** `ffmpeg.sine(frequency => 440, duration => 1) s` is a table function, not a file - the compiled command has no `-i` at all.
@@ -132,4 +133,4 @@ The prompt's filter reference is rendered from the same registry the compiler re
 
 ---
 
-Docs: [cookbook](docs/examples.md) · [filters](docs/filters.md) · [trimming](docs/trimming.md) · [error contract](docs/errors.md) · [project spec](sqlmpeg-project.md)
+Docs: [cookbook](docs/examples.md) · [filters](docs/filters.md) · [track rows](docs/tracks.md) · [trimming](docs/trimming.md) · [error contract](docs/errors.md) · [project spec](sqlmpeg-project.md)
