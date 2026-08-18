@@ -152,6 +152,12 @@ FROM input('y.mp4') b
 
 **Meaning:** The catch-all for syntactically valid SQL outside the dialect that isn't one of the more specific codes above. No streaming-vs-batch philosophy involved; the surface just doesn't include it. This is the most common code in practice. Most of `sqlmpeg/parser.py`'s rejections use it: multiple statements, unsupported clause keys, explicit `JOIN` syntax (comma cross-joins only), aliased or nested subqueries, `WITH RECURSIVE`, malformed or duplicate CTE/alias names, an empty `WHERE`, a non-positive or non-literal array subscript, or a top-level statement that isn't a `SELECT`/`UNION ALL`. (`SELECT *` and `<alias>.*` compile now, so they are off this list; see [docs/trimming.md](trimming.md) for the caption rejections below.)
 
+One probed-reality rejection lands here: a stream ffprobe reports NO codec for (some DASH manifests' WebVTT tracks arrive this way - ffmpeg's demuxer sees them but cannot name them, an open ffmpeg limitation measured through 9.0) selected into a media sink. Such a stream can be neither copied (no tag to write) nor transcoded (no decoder to invoke), so the run is guaranteed to die at header-write; sqlmpeg knows at compile time and says so at compile time. Table queries are exempt on purpose - a codec-less track shows up as a row with a NULL codec column, which is how you discover it:
+
+```json
+{"line": 1, "col": 26, "code": "UNSUPPORTED_SQL", "message": "'s.track' (row 1) has no identifiable codec: ffmpeg's demuxer reports none, so the stream can be neither copied nor transcoded and no container can carry it", "hint": "drop it from the SELECT (a query with no COPY can still inspect it as a table row, codec column NULL); if it is a subtitle track, extract it with a tool that can read it and mux the resulting file as its own input() instead"}
+```
+
 Two argument-shape rejections land here: a named argument written out of place (a positional after a named one, or the same name twice - standard Postgres rules), and a named argument on a `sqlmpeg.<name>` macro, whose signature is positional only:
 
 ```json

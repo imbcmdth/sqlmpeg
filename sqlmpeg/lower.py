@@ -654,6 +654,13 @@ class _NInputFilter:
     output: StreamType  # its single output pad
     option: str  # the option whose value IS the input-pad count
     fallback: int  # count when the option is neither written nor introspectable
+    # Write the count onto the node even when it equals the fallback. True for
+    # the filters that are N-input on EVERY ffmpeg (amix: pins carry
+    # `inputs=2`); False for ones that grew the option in a later ffmpeg
+    # (acrossfade, N->A since ffmpeg 9) -- omitting the defaulted count keeps
+    # the compiled command valid on builds whose acrossfade has no such
+    # option at all.
+    emit_default: bool = True
 
 
 N_INPUT: dict[str, _NInputFilter] = {
@@ -663,6 +670,14 @@ N_INPUT: dict[str, _NInputFilter] = {
     ),
     "vstack": _NInputFilter(
         name="vstack", stream="video", output="video", option="inputs", fallback=2
+    ),
+    "acrossfade": _NInputFilter(
+        name="acrossfade",
+        stream="audio",
+        output="audio",
+        option="inputs",
+        fallback=2,
+        emit_default=False,
     ),
 }
 
@@ -1791,6 +1806,13 @@ class _Lowerer:
                 anchor,
                 fallback=select,
                 hint="an empty expansion would select nothing; drop the star",
+            )
+        for meta in result.streams:
+            self._reject_codecless(
+                meta,
+                f"'{alias}.*' includes '{alias}.{meta.type}[{meta.index + 1}]', which",
+                anchor,
+                select,
             )
         return [
             _Column(
@@ -3083,6 +3105,12 @@ class _Lowerer:
         real one (every real ref is non-empty).
         """
         if row is not None:
+            self._reject_codecless(
+                row.stream.source,
+                f"'{binding.alias}.{ROW_STREAM_COLUMN}' (row {position + 1})",
+                anchor,
+                select,
+            )
             return row.stream
         if self.table_mode:
             return _Stream(ref=_NULL_STREAM_REF, type=binding.type, source=None)
@@ -3547,7 +3575,11 @@ class _Lowerer:
             zero_based = index - 1
 
         self._check_bounds(alias, stream_type, zero_based, anchor, select)
-        return _scalar(self._source_stream(alias, stream_type, zero_based))
+        stream = self._source_stream(alias, stream_type, zero_based)
+        self._reject_codecless(
+            stream.source, f"'{alias}.{stream_type}[{zero_based + 1}]'", anchor, select
+        )
+        return _scalar(stream)
 
     def _source_stream(self, alias: str, stream_type: StreamType, index: int) -> _Stream:
         """One raw input stream, tagged with its probed metadata when there is any."""
@@ -3568,6 +3600,40 @@ class _Lowerer:
         if not 0 <= index < len(streams):
             return None
         return streams[index]
+
+    def _reject_codecless(
+        self,
+        meta: StreamMeta | None,
+        display: str,
+        anchor: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """A probed stream ffmpeg could not IDENTIFY cannot reach a media sink.
+
+        ffprobe reporting no codec at all (e.g. a DASH manifest's WebVTT
+        AdaptationSets, which ffmpeg's demuxer sees but cannot name) means
+        ffmpeg can neither copy the stream (no tag to write) nor transcode it
+        (no decoder to invoke) -- the run is GUARANTEED to die at header-write
+        with "Could not find tag for codec none". We know at compile time, so
+        we say so at compile time. Table queries are exempt on purpose: rows
+        with a NULL codec column are how you DISCOVER these tracks. An
+        unprobed input (meta None) is exempt too -- nothing is known, so
+        nothing is knowably broken.
+        """
+        if self.table_mode or meta is None or meta.codec is not None:
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"{display} has no identifiable codec: ffmpeg's demuxer reports "
+            f"none, so the stream can be neither copied nor transcoded and no "
+            f"container can carry it",
+            anchor,
+            fallback=select,
+            hint="drop it from the SELECT (a query with no COPY can still "
+            "inspect it as a table row, codec column NULL); if it is a "
+            "subtitle track, extract it with a tool that can read it and mux "
+            "the resulting file as its own input() instead",
+        )
 
     def _enumerate(
         self, alias: str, stream_type: StreamType, anchor: exp.Expr, select: exp.Select
@@ -3602,10 +3668,12 @@ class _Lowerer:
                 fallback=select,
                 hint="an empty stream array would select nothing; drop the column",
             )
-        return _array(
-            stream_type,
-            (self._source_stream(alias, stream_type, k) for k in range(count)),
-        )
+        streams = [self._source_stream(alias, stream_type, k) for k in range(count)]
+        for k, stream in enumerate(streams):
+            self._reject_codecless(
+                stream.source, f"'{alias}.{stream_type}[{k + 1}]'", anchor, select
+            )
+        return _array(stream_type, streams)
 
     def _cte_value(
         self,
@@ -3946,6 +4014,12 @@ class _Lowerer:
         """
         if name not in N_INPUT or self.registry is None:
             return None
+        if self.registry.get(name) is not None:
+            # THIS ffmpeg has the filter in-fence (acrossfade was an ordinary
+            # AA->A filter before ffmpeg 9 made it variadic): the registry's
+            # own pad signature is the truth here, and the N_INPUT rescue is
+            # only for builds whose pad fence excluded the name.
+            return None
         return self.registry.fenced_options(name)
 
     def _lower_n_input_call(
@@ -4011,10 +4085,12 @@ class _Lowerer:
                 fallback=select,
                 hint=_N_INPUT_HINT,
             )
-        # The count is always written onto the node, defaulted or not: ffmpeg
-        # needs `inputs=N` in the filtergraph to grow the pads, and emit only
-        # renders args this dict carries.
-        args[spec.option] = count
+        # Write the count onto the node unless this spec omits a defaulted one
+        # (`emit_default`): ffmpeg only NEEDS `inputs=N` to grow pads beyond
+        # the option's default of 2, and for a filter that is variadic only on
+        # newer builds the omitted default is what keeps the command portable.
+        if spec.emit_default or spec.option in args or count != spec.fallback:
+            args[spec.option] = count
         streams = {
             position: self._lower_expr(arg, env, select)
             for position, arg in enumerate(call.args[:count])

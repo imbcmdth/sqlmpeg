@@ -80,14 +80,14 @@ def _probe_result(videos: int = 1, audios: int = 1) -> ProbeResult:
     streams = [
         StreamMeta(
             type="video", index=i, metadata={}, width=320, height=240,
-            fps="15/1", sample_rate=None,
+            fps="15/1", sample_rate=None, codec="h264",
         )
         for i in range(videos)
     ]
     streams += [
         StreamMeta(
             type="audio", index=i, metadata={}, width=None, height=None,
-            fps=None, sample_rate=44100,
+            fps=None, sample_rate=44100, codec="aac",
         )
         for i in range(audios)
     ]

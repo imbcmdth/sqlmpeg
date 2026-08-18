@@ -47,7 +47,7 @@ from sqlmpeg.compiler import compile_sql
 from sqlmpeg.emit import build_ffmpeg_args, emit
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.ir import Graph, StreamType
-from sqlmpeg.lower import lower
+from sqlmpeg.lower import lower, lower_table
 from sqlmpeg.parser import parse, resolve
 from sqlmpeg.probe import ProbeResult, StreamMeta
 from sqlmpeg.registry import Registry, load_reference
@@ -167,7 +167,7 @@ def _probe_result(
             height=240,
             fps="15/1",
             sample_rate=None,
-            codec=None,
+            codec="h264",
             channels=None,
             channel_layout=None,
             bitrate=None,
@@ -185,7 +185,7 @@ def _probe_result(
             height=None,
             fps=None,
             sample_rate=44100,
-            codec=None,
+            codec="aac",
             channels=None,
             channel_layout=None,
             bitrate=None,
@@ -230,7 +230,7 @@ def _layout_probe(
                 height=240 if letter == "v" else None,
                 fps="15/1" if letter == "v" else None,
                 sample_rate=44100 if letter == "a" else None,
-                codec=None,
+                codec={"v": "h264", "a": "aac", "s": "subrip", "d": "bin_data"}[letter],
                 channels=None,
                 channel_layout=None,
                 bitrate=None,
@@ -636,6 +636,47 @@ def test_a_repeated_scalar_is_fanned_out_by_the_split_pass() -> None:
     assert g.nodes["src_b_a_0_split"].args == {"n": 2}
     assert g.nodes["n1"].inputs == ["src:a:a:0", "src_b_a_0_split:0"]
     assert g.nodes["n2"].inputs == ["src:a:a:1", "src_b_a_0_split:1"]
+
+
+def test_an_in_registry_acrossfade_wins_over_the_n_input_table() -> None:
+    """acrossfade is AA->A on the snapshot's ffmpeg (pre-9) and variadic
+    N->A on ffmpeg 9. The N_INPUT entry must NOT shadow a registry that has
+    the filter in-fence: on old builds it is an ordinary two-input call, no
+    `inputs` option written (older acrossfade has no such option)."""
+    g = _lower(
+        "SELECT acrossfade(a.audio[1], b.audio[1], duration => 1) "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        {"a": _probe_result(audios=1), "b": _probe_result(audios=1)},
+    )
+    node = next(iter(g.nodes.values()))
+    assert node.filter == "acrossfade"
+    assert node.args == {"duration": 1}
+
+
+@pytest.mark.exec
+def test_a_variadic_acrossfade_omits_the_defaulted_count_and_writes_a_real_one() -> None:
+    """On a build where acrossfade is variadic (ffmpeg 9+: fenced N->A with
+    an `inputs` option), the N_INPUT rescue kicks in -- and emits `inputs`
+    only beyond the default of 2, so the two-stream command stays valid on
+    every ffmpeg (cookbook recipe 13's pin is version-stable)."""
+    live = registry_module.load()
+    if live.get("acrossfade") is not None:
+        pytest.skip(
+            "this ffmpeg's acrossfade is a fixed two-input filter; the "
+            "variadic N_INPUT path only exists on builds that fence it"
+        )
+    two = compile_sql(
+        "SELECT acrossfade(a.audio[1], a.audio[2], duration => 1) "
+        "FROM input('tests/fixtures/av2.mp4') a"
+    )
+    three = compile_sql(
+        "SELECT acrossfade(a.audio[1], a.audio[2], a.audio[1], duration => 1, inputs => 3) "
+        "FROM input('tests/fixtures/av2.mp4') a"
+    )
+    two_node = next(n for n in two.nodes.values() if n.filter == "acrossfade")
+    three_node = next(n for n in three.nodes.values() if n.filter == "acrossfade")
+    assert "inputs" not in two_node.args
+    assert three_node.args["inputs"] == 3
 
 
 def test_zip_length_mismatch_is_a_broadcast_mismatch() -> None:
@@ -5417,11 +5458,14 @@ def _track(
     title: str | None = None,
     **fields: object,
 ) -> StreamMeta:
-    """One synthetic probed stream, every unset field NULL.
+    """One synthetic probed stream, every unset field NULL except `codec`.
 
     Keyword `fields` name StreamMeta attributes directly (``channels=2``,
     ``codec='aac'``), so a row test names only the columns it is about and
-    everything else comes back as the NULL an unprobed field yields.
+    everything else comes back as the NULL an unprobed field yields. `codec`
+    alone gets a realistic per-type default: a probed stream with NO codec is
+    the ffmpeg-cannot-carry-it case, rejected for media queries, and a test
+    wanting that case says ``codec=None`` explicitly.
     """
     metadata: dict[str, str] = {}
     if language is not None:
@@ -5433,7 +5477,9 @@ def _track(
         "height": None,
         "fps": None,
         "sample_rate": None,
-        "codec": None,
+        "codec": {"video": "h264", "audio": "aac", "subtitle": "subrip", "data": "bin_data"}[
+            stream_type
+        ],
         "channels": None,
         "channel_layout": None,
         "bitrate": None,
@@ -5464,6 +5510,58 @@ def _row_query(where: str = "", order: str = "", column: str = "audio") -> str:
         + (f" WHERE {where}" if where else "")
         + (f" ORDER BY {order}" if order else "")
     )
+
+
+def test_a_codecless_stream_is_rejected_before_ffmpeg_can_die_on_it() -> None:
+    """A probed stream ffprobe reports NO codec for (a DASH manifest's WebVTT
+    AdaptationSets, measured 2026-08-18 on ffmpeg 7.1 through 9.0) cannot be
+    copied or transcoded; the mux is guaranteed to fail at header-write. We
+    know at compile time, so the rejection happens at compile time."""
+    probes = _row_probes(_track("video", 0), _track("data", 0, language="en", codec=None))
+    err = _reject_lower("SELECT f.data[1] FROM input('f.mpd') f", probes)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "no identifiable codec" in err.message
+    assert "table row" in (err.hint or "")
+
+
+def test_a_codecless_stream_poisons_the_bare_array_too() -> None:
+    probes = _row_probes(_track("data", 0, codec="bin_data"), _track("data", 1, codec=None))
+    err = _reject_lower("SELECT f.data FROM input('f.mpd') f", probes)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "f.data[2]" in err.message
+
+
+def test_a_codecless_stream_is_named_through_select_star() -> None:
+    probes = _row_probes(_track("video", 0), _track("data", 0, codec=None))
+    err = _reject_lower("SELECT * FROM input('f.mpd') f", probes)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.*' includes 'f.data[1]'" in err.message
+
+
+def test_a_codecless_row_track_is_rejected_for_media_queries() -> None:
+    probes = _row_probes(_track("data", 0, language="en", codec=None))
+    err = _reject_lower(_row_query(column="data"), probes)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "no identifiable codec" in err.message
+
+
+def test_a_codecless_row_is_still_inspectable_as_a_table() -> None:
+    """The exemption that makes the rejection honest: a table query SHOWS the
+    codec-less tracks (codec column NULL) -- that is how you find out."""
+    probes = _row_probes(_track("data", 0, language="en", codec=None))
+    sinks = lower_table(
+        resolve(parse("SELECT t.track, t.language, t.codec FROM input('f.mpd') f, unnest(f.data) t")),
+        probes,
+    )
+    assert len(sinks) == 1
+    assert len(sinks[0].result.rows) == 1
+
+
+def test_an_unprobed_input_is_not_accused_of_codeclessness() -> None:
+    """meta None means NOTHING is known -- nothing is knowably broken, and the
+    explicit subscript keeps compiling unchecked, as it always has."""
+    g = _lower("SELECT f.data[1] FROM input('f.mpd') f", {"f": None})
+    assert _refs(g) == ["src:f:d:0"]
 
 
 def test_unnest_yields_one_array_element_per_track_in_file_order() -> None:
