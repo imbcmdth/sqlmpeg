@@ -214,8 +214,36 @@ def test_compile_graph_only_still_works_for_a_multi_sink_script(
 TABLE_QUERY = "SELECT t.language FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t"
 
 
+@pytest.fixture
+def _two_track_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A synthetic probe for the unnest-based CLI tests.
+
+    The default tier must be deterministic on a bare machine (no ffprobe, no
+    generated fixtures -- CI runs it before installing either), and a row
+    query needs probed rows; so the rows are synthetic. The fixture PATH in
+    the queries is illustrative, never read.
+    """
+    from sqlmpeg import compiler
+    from sqlmpeg.probe import ProbeResult, StreamMeta
+
+    def _track(index: int, language: str) -> StreamMeta:
+        return StreamMeta(
+            type="audio",
+            index=index,
+            metadata={"language": language},
+            width=None,
+            height=None,
+            fps=None,
+            sample_rate=44100,
+            codec="aac",
+        )
+
+    result = ProbeResult(streams=[_track(0, "eng"), _track(1, "fra")])
+    monkeypatch.setattr(compiler, "probe_path", lambda path: result)
+
+
 def test_compile_on_a_table_query_is_a_typed_usage_message(
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], _two_track_probe: None
 ) -> None:
     """Metadata columns have no ffmpeg command to show; `compile` says so and
     points at `run` instead of trying (and failing) to produce one."""
@@ -237,7 +265,9 @@ def test_compile_dash_o_still_works_on_a_bare_stream_select(
     assert "ffmpeg" in captured.out
 
 
-def test_validate_accepts_a_table_query(capsys: pytest.CaptureFixture[str]) -> None:
+def test_validate_accepts_a_table_query(
+    capsys: pytest.CaptureFixture[str], _two_track_probe: None
+) -> None:
     code = cli.main(["validate", TABLE_QUERY])
     captured = capsys.readouterr()
     assert code == 0
@@ -573,7 +603,9 @@ def test_run_bare_select_with_no_dash_o_prints_a_table(
     assert "<video" in captured.out
 
 
-def test_run_csv_copy_to_stdout(capsys: pytest.CaptureFixture[str]) -> None:
+def test_run_csv_copy_to_stdout(
+    capsys: pytest.CaptureFixture[str], _two_track_probe: None
+) -> None:
     sql = (
         "COPY (SELECT t.language, t.codec FROM "
         "input('tests/fixtures/av2.mp4') f, unnest(f.audio) t) "
@@ -585,7 +617,9 @@ def test_run_csv_copy_to_stdout(capsys: pytest.CaptureFixture[str]) -> None:
     assert captured.out == "language,codec\neng,aac\nfra,aac\n"
 
 
-def test_run_csv_copy_to_a_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_run_csv_copy_to_a_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], _two_track_probe: None
+) -> None:
     out_path = tmp_path / "tracks.csv"
     sql = (
         "COPY (SELECT t.language, t.codec FROM "
@@ -599,7 +633,9 @@ def test_run_csv_copy_to_a_file(tmp_path: Path, capsys: pytest.CaptureFixture[st
     assert out_path.read_text(encoding="utf-8") == "eng,aac\nfra,aac\n"
 
 
-def test_run_csv_copy_defaults_header_false(capsys: pytest.CaptureFixture[str]) -> None:
+def test_run_csv_copy_defaults_header_false(
+    capsys: pytest.CaptureFixture[str], _two_track_probe: None
+) -> None:
     sql = (
         "COPY (SELECT t.language FROM input('tests/fixtures/av2.mp4') f, "
         "unnest(f.audio) t) TO STDOUT WITH (format 'csv')"
@@ -719,7 +755,7 @@ def test_unknown_subcommand_falls_through_to_run_and_fails_as_sql(
 
 
 def test_flag_first_argv_dispatches_to_run(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], _two_track_probe: None
 ) -> None:
     """``sqlmpeg -f query.sql`` (no ``run`` token, flags first) is exactly
     what the cookbook recipes show and what test_examples.py exercises end
