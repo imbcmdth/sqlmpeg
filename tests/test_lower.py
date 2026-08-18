@@ -167,6 +167,12 @@ def _probe_result(
             height=240,
             fps="15/1",
             sample_rate=None,
+            codec=None,
+            channels=None,
+            channel_layout=None,
+            bitrate=None,
+            duration=None,
+            color_transfer=None,
         )
         for i in range(videos)
     ]
@@ -179,6 +185,12 @@ def _probe_result(
             height=None,
             fps=None,
             sample_rate=44100,
+            codec=None,
+            channels=None,
+            channel_layout=None,
+            bitrate=None,
+            duration=None,
+            color_transfer=None,
         )
         for i in range(audios)
     ]
@@ -218,6 +230,12 @@ def _layout_probe(
                 height=240 if letter == "v" else None,
                 fps="15/1" if letter == "v" else None,
                 sample_rate=44100 if letter == "a" else None,
+                codec=None,
+                channels=None,
+                channel_layout=None,
+                bitrate=None,
+                duration=None,
+                color_transfer=None,
             )
         )
     return ProbeResult(streams=streams)
@@ -5400,6 +5418,348 @@ def test_a_view_based_query_runs(_av_fixture: str, tmp_path: Path) -> None:
         f"COPY (SELECT half.v, half.a FROM half) TO '{out.as_posix()}' WITH (crf 30);"
     )
     args = build_ffmpeg_args(emit(compile_sql(query)), None)
+    args.insert(1, "-y")
+    result = subprocess.run(args, capture_output=True, text=True, timeout=60.0)
+    assert result.returncode == 0, result.stderr
+    assert out.exists()
+
+
+# ---------------------------------------------------------------------------
+# track rows: unnest, row columns, WHERE, ORDER BY (RFC-009, plan 061)
+# ---------------------------------------------------------------------------
+#
+# Synthetic probes throughout: what a row table holds is decided entirely by
+# the StreamMeta it was built from, so a hand-built ProbeResult exercises the
+# whole row model -- including the NULL columns an unprobed field produces --
+# without any file on disk. The end-to-end shapes are the cookbook's business
+# (recipes 23/24, exec tier).
+
+
+def _track(
+    stream_type: StreamType,
+    index: int,
+    *,
+    language: str | None = None,
+    title: str | None = None,
+    **fields: object,
+) -> StreamMeta:
+    """One synthetic probed stream, every unset field NULL.
+
+    Keyword `fields` name StreamMeta attributes directly (``channels=2``,
+    ``codec='aac'``), so a row test names only the columns it is about and
+    everything else comes back as the NULL an unprobed field yields.
+    """
+    metadata: dict[str, str] = {}
+    if language is not None:
+        metadata["language"] = language
+    if title is not None:
+        metadata["title"] = title
+    defaults: dict[str, object] = {
+        "width": None,
+        "height": None,
+        "fps": None,
+        "sample_rate": None,
+        "codec": None,
+        "channels": None,
+        "channel_layout": None,
+        "bitrate": None,
+        "duration": None,
+        "color_transfer": None,
+    }
+    defaults.update(fields)
+    return StreamMeta(  # type: ignore[arg-type]
+        type=stream_type, index=index, metadata=metadata, **defaults
+    )
+
+
+_ROW_TRACKS = [
+    _track("video", 0),
+    _track("audio", 0, language="eng", channels=2, channel_layout="stereo", codec="aac"),
+    _track("audio", 1, language="fra", channels=6, channel_layout="5.1", codec="ac3"),
+    _track("audio", 2, channels=2, codec="aac"),  # no language tag at all
+]
+
+
+def _row_probes(*streams: StreamMeta) -> dict[str, ProbeResult | None]:
+    return {"f": ProbeResult(streams=list(streams) if streams else list(_ROW_TRACKS))}
+
+
+def _row_query(where: str = "", order: str = "", column: str = "audio") -> str:
+    return (
+        f"SELECT t.track FROM input('f.mkv') f, unnest(f.{column}) t"
+        + (f" WHERE {where}" if where else "")
+        + (f" ORDER BY {order}" if order else "")
+    )
+
+
+def test_unnest_yields_one_array_element_per_track_in_file_order() -> None:
+    g = _lower(_row_query(), _row_probes())
+    assert _outputs(g) == [
+        ("src:f:a:0", "audio", None),
+        ("src:f:a:1", "audio", None),
+        ("src:f:a:2", "audio", None),
+    ]
+    # Pure passthrough: no filter node, so the streams are stream-copyable.
+    assert _filters(g) == []
+
+
+def test_each_row_carries_its_own_stream_meta_as_provenance() -> None:
+    g = _lower(_row_query(), _row_probes())
+    assert [o.metadata for o in g.outputs] == [
+        {"language": "eng"},
+        {"language": "fra"},
+        {},
+    ]
+
+
+def test_a_where_over_a_row_column_keeps_only_the_matching_rows() -> None:
+    g = _lower(_row_query("t.language = 'eng'"), _row_probes())
+    assert _outputs(g) == [("src:f:a:0", "audio", None)]
+
+
+def test_a_where_that_matches_nothing_is_a_typed_rejection() -> None:
+    err = _reject_lower(_row_query("t.language = 'deu'"), _row_probes())
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "selects nothing" in err.message
+
+
+def test_null_matches_nothing_including_inequality() -> None:
+    # The third track has no language tag, so every comparison against it is
+    # UNKNOWN -- `!= 'eng'` does not rescue it, which is the whole SQL rule.
+    g = _lower(_row_query("t.language != 'eng'"), _row_probes())
+    assert _outputs(g) == [("src:f:a:1", "audio", None)]
+
+
+def test_is_null_and_is_not_null_select_the_two_halves() -> None:
+    g = _lower(_row_query("t.language IS NULL"), _row_probes())
+    assert _outputs(g) == [("src:f:a:2", "audio", None)]
+    g = _lower(_row_query("t.language IS NOT NULL"), _row_probes())
+    assert _outputs(g) == [("src:f:a:0", "audio", None), ("src:f:a:1", "audio", None)]
+
+
+def test_an_unprobed_field_is_null_for_every_row() -> None:
+    # `bitrate` was never set on any synthetic track.
+    err = _reject_lower(_row_query("t.bitrate > 0"), _row_probes())
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    g = _lower(_row_query("t.bitrate IS NULL"), _row_probes())
+    assert len(g.outputs) == 3
+
+
+@pytest.mark.parametrize(
+    ("predicate", "expected"),
+    [
+        ("t.channels = 2", ["src:f:a:0", "src:f:a:2"]),
+        ("t.channels > 2", ["src:f:a:1"]),
+        ("t.channels >= 2", ["src:f:a:0", "src:f:a:1", "src:f:a:2"]),
+        ("t.channels < 6", ["src:f:a:0", "src:f:a:2"]),
+        ("t.channels BETWEEN 2 AND 5", ["src:f:a:0", "src:f:a:2"]),
+        ("2 = t.channels", ["src:f:a:0", "src:f:a:2"]),
+        ("6 > t.channels", ["src:f:a:0", "src:f:a:2"]),
+        ("t.codec = 'aac' AND t.channels = 2", ["src:f:a:0", "src:f:a:2"]),
+        ("t.language = 'eng' OR t.language = 'fra'", ["src:f:a:0", "src:f:a:1"]),
+        ("NOT (t.channels = 2)", ["src:f:a:1"]),
+        ("t.index = 1", ["src:f:a:0"]),
+        ("t.index = 3", ["src:f:a:2"]),
+    ],
+)
+def test_the_compile_time_predicate_evaluator(
+    predicate: str, expected: list[str]
+) -> None:
+    g = _lower(_row_query(predicate), _row_probes())
+    assert [o.ref for o in g.outputs] == expected
+
+
+def test_not_over_an_unknown_stays_unknown() -> None:
+    # NOT UNKNOWN is UNKNOWN, so the untagged track is dropped by BOTH of these.
+    for predicate in ("t.language = 'eng'", "NOT (t.language = 'eng')"):
+        g = _lower(_row_query(predicate), _row_probes())
+        assert "src:f:a:2" not in [o.ref for o in g.outputs]
+
+
+def test_row_index_is_one_based_and_agrees_with_the_subscript() -> None:
+    rows = _lower(_row_query("t.index = 2"), _row_probes())
+    plain = _lower("SELECT f.audio[2] FROM input('f.mkv') f", _row_probes())
+    assert _outputs(rows) == _outputs(plain) == [("src:f:a:1", "audio", None)]
+
+
+def test_order_by_resorts_the_rows_at_compile_time() -> None:
+    g = _lower(_row_query(order="t.channels DESC"), _row_probes())
+    # 6ch first, then the two 2ch in their original (stable) order.
+    assert [o.ref for o in g.outputs] == ["src:f:a:1", "src:f:a:0", "src:f:a:2"]
+
+
+def test_order_by_puts_nulls_where_postgres_puts_them() -> None:
+    # ASC -> NULLS LAST, DESC -> NULLS FIRST, both filled in by sqlglot.
+    g = _lower(_row_query(order="t.language"), _row_probes())
+    assert [o.ref for o in g.outputs] == ["src:f:a:0", "src:f:a:1", "src:f:a:2"]
+    g = _lower(_row_query(order="t.language DESC"), _row_probes())
+    assert [o.ref for o in g.outputs] == ["src:f:a:2", "src:f:a:1", "src:f:a:0"]
+    g = _lower(_row_query(order="t.language ASC NULLS FIRST"), _row_probes())
+    assert [o.ref for o in g.outputs] == ["src:f:a:2", "src:f:a:0", "src:f:a:1"]
+
+
+def test_order_by_applies_keys_left_to_right() -> None:
+    probes = _row_probes(
+        _track("audio", 0, language="eng", channels=6),
+        _track("audio", 1, language="fra", channels=2),
+        _track("audio", 2, language="eng", channels=2),
+    )
+    g = _lower(_row_query(order="t.language, t.channels"), probes)
+    assert [o.ref for o in g.outputs] == ["src:f:a:2", "src:f:a:0", "src:f:a:1"]
+
+
+def test_where_and_order_by_compose() -> None:
+    g = _lower(_row_query("t.codec = 'aac'", "t.index DESC"), _row_probes())
+    assert [o.ref for o in g.outputs] == ["src:f:a:2", "src:f:a:0"]
+
+
+def test_row_order_is_the_files_track_order_without_an_order_by() -> None:
+    probes = _row_probes(
+        _track("audio", 0, language="zza"),
+        _track("audio", 1, language="aaa"),
+    )
+    g = _lower(_row_query(), probes)
+    assert [o.metadata for o in g.outputs] == [{"language": "zza"}, {"language": "aaa"}]
+
+
+def test_subtitle_rows_work_the_same_and_stay_passthrough() -> None:
+    probes = _row_probes(
+        _track("subtitle", 0, language="eng"),
+        _track("subtitle", 1, language="fra"),
+    )
+    g = _lower(
+        "SELECT s.track FROM input('f.mkv') f, unnest(f.subtitle) s "
+        "WHERE s.language = 'eng'",
+        probes,
+    )
+    assert _outputs(g) == [("src:f:s:0", "subtitle", None)]
+    assert _filters(g) == []
+
+
+def test_video_rows_carry_the_video_schema() -> None:
+    probes = _row_probes(
+        _track("video", 0, width=1920, height=1080, color_transfer="smpte2084"),
+        _track("video", 1, width=640, height=360),
+    )
+    g = _lower(_row_query("t.width >= 1280", column="video"), probes)
+    assert _outputs(g) == [("src:f:v:0", "video", None)]
+    g = _lower(_row_query("t.color_transfer = 'smpte2084'", column="video"), probes)
+    assert _outputs(g) == [("src:f:v:0", "video", None)]
+
+
+def test_selecting_a_metadata_column_is_a_typed_rejection() -> None:
+    err = _reject_lower(
+        "SELECT t.language FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is track metadata, not a stream" in err.message
+    assert err.hint is not None and "<alias>.track" in err.hint
+
+
+def test_unnesting_an_unprobeable_input_is_a_typed_rejection() -> None:
+    err = _reject_lower(_row_query(), {"f": None})
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+    assert "cannot unnest 'f.audio'" in err.message
+
+
+def test_unnesting_an_empty_array_selects_nothing() -> None:
+    err = _reject_lower(_row_query(), _row_probes(_track("video", 0)))
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "selects nothing" in err.message
+
+
+def test_a_star_cannot_expand_a_row_table() -> None:
+    err = _reject_lower(
+        "SELECT t.* FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot expand the track-row table" in err.message
+
+
+def test_the_track_column_is_an_array_and_subscripts_like_one() -> None:
+    g = _lower(
+        "SELECT t.track[2] FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
+    )
+    assert _outputs(g) == [("src:f:a:1", "audio", None)]
+    err = _reject_lower(
+        "SELECT t.track[9] FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
+    )
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "'t' has 3 rows" in err.message
+
+
+def test_the_track_array_broadcasts_a_call_like_any_other_array() -> None:
+    g = _lower(
+        "SELECT volume(t.track, 0.5) FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.channels = 2",
+        _row_probes(),
+    )
+    assert _filters(g) == ["volume", "volume"]
+    assert [o.metadata for o in g.outputs] == [{"language": "eng"}, {}]
+
+
+def test_a_row_query_works_inside_a_cte_body() -> None:
+    g = _lower(
+        "WITH picked AS ("
+        "  SELECT t.track AS a FROM input('f.mkv') f, unnest(f.audio) t "
+        "  WHERE t.channel_layout = 'stereo'"
+        ") SELECT picked.a FROM picked",
+        _row_probes(),
+    )
+    # The CTE column keeps its AS name inside the body; the outer bare
+    # `picked.a` reference names nothing, exactly as for any other CTE column.
+    assert _outputs(g) == [("src:f:a:0", "audio", None)]
+
+
+def test_a_row_query_works_in_a_union_all_branch() -> None:
+    probes = _row_probes()
+    probes["g"] = probes["f"]
+    g = _lower(
+        "SELECT f.video[1], t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.language = 'eng' "
+        "UNION ALL "
+        "SELECT g.video[1], u.track FROM input('g.mkv') g, unnest(g.audio) u "
+        "WHERE u.language = 'fra'",
+        probes,
+    )
+    assert _filters(g) == ["concat"]
+
+
+def test_a_time_window_still_reaches_the_input_of_a_row_query() -> None:
+    g = _lower(_row_query("f.t BETWEEN 1 AND 2 AND t.language = 'eng'"), _row_probes())
+    assert g.input_trims == {"f": (1, 2)}
+    assert _outputs(g) == [("src:f:a:0", "audio", None)]
+
+
+def test_a_seeked_caption_row_is_still_rejected() -> None:
+    # The caption-seek fence keys off the INPUT alias, and a row table's
+    # streams belong to that input -- so the rejection survives the indirection.
+    probes = _row_probes(_track("subtitle", 0, language="eng"))
+    err = _reject_lower(
+        "SELECT s.track FROM input('f.mkv') f, unnest(f.subtitle) s "
+        "WHERE f.t >= 1 AND s.language = 'eng'",
+        probes,
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot trim a selected subtitle stream" in err.message
+
+
+@pytest.mark.exec
+def test_a_track_row_query_runs_end_to_end(tmp_path: Path) -> None:
+    """Real probe, real ffmpeg: picking a track by its language actually runs.
+
+    av2.mp4 carries an `eng` and a `fra` audio track, so this is the cookbook's
+    recipe 23 shape with the compiled command actually executed -- the row set
+    is decided from a real ffprobe, and what comes out is one stream-copied
+    English track.
+    """
+    out = tmp_path / "eng.m4a"
+    query = (
+        f"SELECT t.track FROM input('{(FIXTURES_DIR / 'av2.mp4').as_posix()}') f, "
+        "unnest(f.audio) t WHERE t.language = 'eng'"
+    )
+    args = build_ffmpeg_args(emit(compile_sql(query)), str(out))
+    assert "-map" in args and "0:a:0" in args
     args.insert(1, "-y")
     result = subprocess.run(args, capture_output=True, text=True, timeout=60.0)
     assert result.returncode == 0, result.stderr

@@ -485,7 +485,7 @@ WHERE t.language = 'eng'
 
 ```
 $ sqlmpeg compile -f query.sql -o eng.m4a
-ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy eng.m4a
+ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng eng.m4a
 ```
 
 Audio rows carry `language`, `title`, `codec`, `channels`, `channel_layout`, `sample_rate`, `bitrate` and `duration`; video rows carry `width`, `height`, `fps` and friends instead. A track nobody probed has NULL in every metadata column, and NULL matches nothing - standard SQL, no new rules.
@@ -502,7 +502,7 @@ WHERE s.language = 'eng'
 
 ```
 $ sqlmpeg compile -f query.sql -o subs.srt
-ffmpeg -i tests/fixtures/avs.mkv -map 0:s:0 -c:0 copy subs.srt
+ffmpeg -i tests/fixtures/avs.mkv -map 0:s:0 -c:0 copy -metadata:s:0 language=eng subs.srt
 ```
 
 ## 25. Mix two files' tracks pairwise, matched by language

@@ -1574,6 +1574,348 @@ def test_an_aliased_name_may_not_collide_with_another_from_entry() -> None:
 
 
 # ---------------------------------------------------------------------------
+# track rows: FROM unnest(<input>.<type>) alias  (RFC-009, plan 061)
+# ---------------------------------------------------------------------------
+
+
+def test_unnest_binds_a_track_row_table() -> None:
+    res = _resolve(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.language = 'eng'"
+    )
+    assert list(res.track_rows) == ["t"]
+    rows = res.track_rows["t"]
+    assert (rows.alias, rows.source, rows.column) == ("t", "f", "audio")
+    # A row table takes no `-i` of its own: the tracks belong to the input.
+    assert res.sources == {"f": 0}
+    assert res.input_paths == ["f.mkv"]
+
+
+@pytest.mark.parametrize("column", ["video", "audio", "subtitle", "data"])
+def test_every_stream_array_unnests(column: str) -> None:
+    res = _resolve(
+        f"SELECT t.track FROM input('f.mkv') f, unnest(f.{column}) t"
+    )
+    assert res.track_rows["t"].column == column
+
+
+def test_unnest_accepts_the_as_spelling_and_folds_the_alias() -> None:
+    res = _resolve("SELECT T.track FROM input('f.mkv') f, unnest(f.AUDIO) AS T")
+    assert list(res.track_rows) == ["t"]
+    assert res.track_rows["t"].column == "audio"
+
+
+def test_two_unnests_of_one_input_are_two_row_tables() -> None:
+    res = _resolve(
+        "SELECT a.track, b.track FROM input('f.mkv') f, "
+        "unnest(f.audio) a, unnest(f.video) b"
+    )
+    assert [(name, rows.column) for name, rows in res.track_rows.items()] == [
+        ("a", "audio"),
+        ("b", "video"),
+    ]
+
+
+def test_unnest_binds_inside_a_cte_body_and_a_union_branch() -> None:
+    res = _resolve(
+        "WITH x AS (SELECT t.track AS a FROM input('f.mkv') f, unnest(f.audio) t) "
+        "SELECT x.a FROM x"
+    )
+    assert res.track_rows["t"].source == "f"
+    res = _resolve(
+        "SELECT t.track FROM input('a.mkv') f, unnest(f.audio) t "
+        "UNION ALL "
+        "SELECT u.track FROM input('b.mkv') g, unnest(g.audio) u"
+    )
+    assert sorted(res.track_rows) == ["t", "u"]
+
+
+def test_a_row_alias_shares_the_one_flat_namespace() -> None:
+    err = _reject(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t, unnest(f.video) t"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "duplicate name 't'" in err.message
+    err = _reject("SELECT t.track FROM input('f.mkv') t, unnest(t.audio) t")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "duplicate name 't'" in err.message
+
+
+def test_unnest_requires_an_alias() -> None:
+    err = _reject("SELECT t.track FROM input('f.mkv') f, unnest(f.audio)")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "requires an alias" in err.message
+
+
+def test_unnest_rejects_a_column_alias_list() -> None:
+    err = _reject("SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t(x)")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "column aliases" in err.message
+
+
+def test_unnest_rejects_with_ordinality() -> None:
+    err = _reject(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) WITH ORDINALITY t"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "ORDINALITY" in err.message
+    assert err.hint is not None and "index" in err.hint
+
+
+@pytest.mark.parametrize(
+    "argument",
+    ["f.audio[1]", "f.frame", "f.t", "'audio'", "f.*", "unnest(f.audio)"],
+)
+def test_unnest_takes_a_bare_stream_array_and_nothing_else(argument: str) -> None:
+    err = _reject(f"SELECT t.track FROM input('f.mkv') f, unnest({argument}) t")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_unnest_rejects_more_than_one_argument() -> None:
+    err = _reject(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio, f.video) t"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "exactly one stream array" in err.message
+
+
+def test_unnest_only_sees_comma_sources_written_before_it() -> None:
+    # Postgres scopes an implicit-LATERAL function call to the FROM items
+    # written before it, so this genuinely does not see `f`.
+    err = _reject("SELECT t.track FROM unnest(f.audio) t, input('f.mkv') f")
+    assert err.code is ErrorCode.UNKNOWN_ALIAS
+    assert "unknown alias 'f'" in err.message
+
+
+def test_unnest_needs_an_input_not_a_cte_or_a_generated_source() -> None:
+    err = _reject(
+        "WITH c AS (SELECT a.audio AS tracks FROM input('f.mkv') a) "
+        "SELECT t.track FROM c, unnest(c.tracks) t"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "only an input's stream array can be unnested" in err.message
+    err = _reject(
+        "SELECT t.track FROM ffmpeg.anullsrc(duration => 2) s, unnest(s.audio) t"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "only an input's stream array can be unnested" in err.message
+
+
+def test_explicit_join_between_unnests_is_still_rejected_in_this_wave() -> None:
+    # RFC-009 admits JOIN between unnest tables; wave 062 implements it. Until
+    # then the pre-existing fence stands, and says so.
+    err = _reject(
+        "SELECT a.track FROM input('a.mkv') f, input('b.mkv') g, "
+        "unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "explicit JOIN syntax is not supported" in err.message
+
+
+# -- row columns ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        "track", "index", "language", "title", "codec", "channels",
+        "channel_layout", "sample_rate", "bitrate", "duration",
+    ],
+)
+def test_audio_row_columns_resolve(column: str) -> None:
+    sql = (
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        f"WHERE t.{column} IS NOT NULL"
+    )
+    if column == "track":
+        err = _reject(sql)
+        assert err.code is ErrorCode.UNSUPPORTED_SQL
+        assert "is a stream, not a value to compare" in err.message
+    else:
+        assert _resolve(sql).track_rows["t"].column == "audio"
+
+
+@pytest.mark.parametrize(
+    "column", ["width", "height", "fps", "color_transfer", "bitrate", "duration"]
+)
+def test_video_row_columns_resolve(column: str) -> None:
+    _resolve(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.video) t "
+        f"WHERE t.{column} IS NOT NULL"
+    )
+
+
+def test_a_row_column_is_checked_against_its_stream_types_schema() -> None:
+    # `channels` is an audio column; a video row has no such thing.
+    err = _reject(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.video) t WHERE t.channels = 2"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 't.channels'" in err.message
+    assert err.hint is not None and "video track rows expose" in err.hint
+    # ... and a subtitle row carries only the five common ones.
+    err = _reject(
+        "SELECT s.track FROM input('f.mkv') f, unnest(f.subtitle) s WHERE s.width = 1"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 's.width'" in err.message
+
+
+def test_an_unknown_row_column_in_the_select_list_is_rejected() -> None:
+    err = _reject("SELECT t.nope FROM input('f.mkv') f, unnest(f.audio) t")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 't.nope'" in err.message
+
+
+# -- WHERE over row columns -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "t.language = 'eng'",
+        "'eng' = t.language",
+        "t.language != 'eng'",
+        "t.channels > 2",
+        "t.channels >= 2",
+        "t.channels < 6",
+        "t.channels <= 6",
+        "t.bitrate BETWEEN 1000 AND 2000",
+        "t.duration <= 2.5",
+        "t.bitrate >= -1",
+        "t.language IS NULL",
+        "t.title IS NOT NULL",
+        "NOT (t.language = 'eng')",
+        "t.language = 'eng' AND t.channel_layout = 'stereo'",
+        "(t.language = 'eng' OR t.language IS NULL) AND t.channels = 2",
+    ],
+)
+def test_row_predicates_are_admitted(predicate: str) -> None:
+    _resolve(
+        f"SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t WHERE {predicate}"
+    )
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "t.language LIKE 'e%'",
+        "t.language IN ('eng', 'fra')",
+        "t.channels BETWEEN SYMMETRIC 2 AND 6",
+        "t.channels = t.sample_rate",
+        "t.language IS TRUE",
+    ],
+)
+def test_unsupported_row_predicates_are_rejected(predicate: str) -> None:
+    err = _reject(
+        f"SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t WHERE {predicate}"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_a_row_predicate_is_typed_against_the_static_column_type() -> None:
+    err = _reject(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.channels = 'stereo'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t.channels' is number" in err.message
+    err = _reject(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t WHERE t.language = 5"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t.language' is text" in err.message
+
+
+def test_a_row_predicate_may_not_compare_the_stream_column() -> None:
+    err = _reject(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t WHERE t.track = 1"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is a stream, not a value to compare" in err.message
+
+
+def test_a_time_window_and_a_row_predicate_coexist_as_separate_conjuncts() -> None:
+    res = _resolve(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE f.t BETWEEN 1 AND 2 AND t.language = 'eng'"
+    )
+    assert res.track_rows["t"].source == "f"
+
+
+def test_a_conjunct_may_not_mix_a_row_column_with_another_alias() -> None:
+    err = _reject(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.language = 'eng' OR f.t >= 1"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot mix track-row columns" in err.message
+
+
+def test_a_conjunct_may_reference_only_one_row_table() -> None:
+    err = _reject(
+        "SELECT a.track FROM input('f.mkv') f, unnest(f.audio) a, unnest(f.video) b "
+        "WHERE a.language = b.language"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "only one track-row table" in err.message
+
+
+def test_a_time_window_over_an_input_still_rejects_a_non_t_column() -> None:
+    # The time half of the WHERE clause is untouched by the row half.
+    err = _reject(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t WHERE f.video >= 1"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "only the time column 'f.t' can be filtered" in err.message
+
+
+# -- ORDER BY: the one carve-out in the streaming fence ---------------------
+
+
+def test_order_by_is_admitted_over_track_row_columns() -> None:
+    res = _resolve(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "ORDER BY t.language, t.channels DESC"
+    )
+    order = res.branches[0].args["order"]
+    assert isinstance(order, exp.Order)
+    # sqlglot fills the Postgres NULL defaults in for us: ASC -> NULLS LAST,
+    # DESC -> NULLS FIRST. Honoring the flags verbatim IS Postgres semantics.
+    assert [bool(o.args.get("desc")) for o in order.expressions] == [False, True]
+    assert [bool(o.args.get("nulls_first")) for o in order.expressions] == [False, True]
+
+
+def test_order_by_without_any_unnest_is_still_fenced() -> None:
+    err = _reject("SELECT f.audio[1] FROM input('f.mkv') f ORDER BY f.t")
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+    assert err.hint == "remove the ORDER BY clause"
+
+
+@pytest.mark.parametrize("key", ["f.t", "1", "t.track"])
+def test_order_by_a_non_row_column_is_rejected_even_in_a_row_query(key: str) -> None:
+    err = _reject(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        f"ORDER BY {key}"
+    )
+    assert err.code in (
+        ErrorCode.NO_STREAMING_EQUIVALENT,
+        ErrorCode.UNSUPPORTED_SQL,
+    )
+
+
+def test_the_other_streaming_fences_are_untouched_by_the_carve_out() -> None:
+    for clause, code in (
+        ("GROUP BY t.language", ErrorCode.NO_STREAMING_EQUIVALENT),
+        ("LIMIT 1", ErrorCode.NO_STREAMING_EQUIVALENT),
+    ):
+        err = _reject(
+            "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t " + clause
+        )
+        assert err.code is code
+
+
+# ---------------------------------------------------------------------------
 # guardrail #7: no panics on user input
 # ---------------------------------------------------------------------------
 

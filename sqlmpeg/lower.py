@@ -282,11 +282,14 @@ from sqlmpeg.macros import MACROS
 from sqlmpeg.parser import (
     FILTER_NAMESPACE,
     MACRO_NAMESPACE,
+    ROW_SCHEMAS,
+    ROW_STREAM_COLUMN,
     RawSink,
     RawSource,
     Resolved,
     _pos,
     _time_bounds,
+    from_items,
     kwarg_name,
     star_qualifier,
     subscript_index,
@@ -359,6 +362,11 @@ _PASSTHROUGH_HINT = (
 _SOURCE_DURATION_HINT = (
     "a generated source has no timeline to seek into; give it a length with "
     "its own option instead, e.g. ffmpeg.anullsrc(duration => 30) s"
+)
+_ROW_METADATA_HINT = (
+    "a track row's metadata columns are what you FILTER, JOIN and SORT rows by; "
+    "the only column that is a stream — and therefore the only one that can be "
+    "an output — is <alias>.track"
 )
 _CAPTION_TRIM_HINT = (
     "trim the video/audio without selecting the subtitle/data columns, or select "
@@ -1096,7 +1104,165 @@ class _SourceBinding:
         return f"{FILTER_NAMESPACE}.{self.name}"
 
 
-_Binding = _InputBinding | _CteBinding | _SourceBinding
+# A track-row metadata value: NULL (unprobed input, or a field this file does
+# not carry) or the probed scalar. Never a stream — `track` is not in here.
+RowValue = str | int | float | None
+
+
+@dataclass(frozen=True)
+class _TrackRow:
+    """One row of an ``unnest`` table: the track, plus its metadata columns.
+
+    `stream` IS the ``track`` column, and its ``_Stream.source`` is the very
+    ``StreamMeta`` `columns` was read from — a row's provenance and its columns
+    are the same probed fact, seen twice.
+    """
+
+    stream: _Stream
+    columns: dict[str, RowValue]
+
+
+@dataclass
+class _RowBinding:
+    """``FROM ..., unnest(<input>.<type>) t`` — a compile-time TABLE (RFC-009).
+
+    `rows` is the surviving row set, in ROW ORDER, and it is what the WHERE
+    predicate and the ORDER BY rewrite: filtering drops rows, sorting permutes
+    them, and both happen once per branch before any projection lowers.
+    Selecting ``t.track`` over N surviving rows is an N-element array in that
+    order, which is the same array value a bare ``f.audio`` produces — the row
+    model and the array model are one mechanism (RFC-009 § Semantics).
+
+    `source` is the INPUT alias the tracks belong to. Everything downstream
+    (the ``-i``, its WHERE window, provenance) keys off THAT alias, not the row
+    one: a row table takes no input slot of its own.
+    """
+
+    alias: str
+    source: str
+    column: str  # the array that was unnested: video/audio/subtitle/data
+    type: StreamType
+    rows: tuple[_TrackRow, ...]
+
+
+_Binding = _InputBinding | _CteBinding | _SourceBinding | _RowBinding
+
+
+def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
+    """One probed stream's row columns (RFC-009 § Columns).
+
+    Two sources, one table: ``language``/``title`` come from the container TAGS
+    (``StreamMeta.metadata``), everything else from a field of the StreamMeta
+    itself. An absent field is NULL, which is the whole NULL story — there is
+    no other way for a row column to be null.
+
+    ``index`` is +1'd: ``StreamMeta.index`` is the 0-based per-type index the
+    IR ref uses, and the SQL surface is 1-based everywhere (``f.audio[1]``), so
+    ``WHERE t.index = 1`` and ``f.audio[1]`` name the same track.
+
+    The enriched fields (``codec``, ``channels``, ``channel_layout``,
+    ``bitrate``, ``duration``, ``color_transfer``) are read through
+    :func:`getattr` deliberately: they arrive with plan 060's probe enrichment,
+    which lands independently, and a StreamMeta without them yields NULL
+    columns rather than an AttributeError — exactly what an unprobed field
+    yields anyway.
+    """
+    schema = ROW_SCHEMAS[column]
+    values: dict[str, RowValue] = {
+        "index": meta.index + 1,
+        "language": meta.metadata.get("language"),
+        "title": meta.metadata.get("title"),
+        "width": meta.width,
+        "height": meta.height,
+        "fps": meta.fps,
+        "sample_rate": meta.sample_rate,
+    }
+    for name in ("codec", "channels", "channel_layout", "bitrate", "duration",
+                 "color_transfer"):
+        probed = getattr(meta, name, None)
+        values[name] = probed if isinstance(probed, str | int | float) else None
+    return {name: values.get(name) for name in schema if name != ROW_STREAM_COLUMN}
+
+
+# ---------------------------------------------------------------------------
+# the compile-time row predicate evaluator (RFC-009)
+# ---------------------------------------------------------------------------
+#
+# Every column of a track row is PROBED metadata, so a predicate over rows is
+# decidable here, at compile time, and never reaches ffmpeg -- the way a
+# `WHERE t BETWEEN` vanishes into `-ss`/`-to`. Standard SQL three-valued logic
+# throughout: a comparison against NULL is UNKNOWN (python `None`), AND/OR/NOT
+# are Kleene, and WHERE keeps a row only when its predicate came back TRUE. So
+# "NULL matches nothing" is not a rule of ours -- it is what falls out.
+#
+# `resolve` already shape- and type-checked everything below; the rejections
+# here are the usual defensive re-checks, and the SqlmpegError they raise is
+# the same one resolve would have.
+
+
+def _kleene_and(left: bool | None, right: bool | None) -> bool | None:
+    if left is False or right is False:
+        return False
+    if left is None or right is None:
+        return None
+    return True
+
+
+def _kleene_or(left: bool | None, right: bool | None) -> bool | None:
+    if left is True or right is True:
+        return True
+    if left is None or right is None:
+        return None
+    return False
+
+
+# `<literal> OP <column>` is the same predicate as `<column> OP' <literal>`
+# with the ordering operators inverted; the two equality ones are their own
+# mirror. sqlglot does NOT normalize operand order at parse time (the same
+# thing `_time_bounds` handles for time bounds), so the mirror is explicit.
+_MIRRORED_COMPARISONS: dict[type[exp.Expr], type[exp.Expr]] = {
+    exp.EQ: exp.EQ,
+    exp.NEQ: exp.NEQ,
+    exp.GT: exp.LT,
+    exp.GTE: exp.LTE,
+    exp.LT: exp.GT,
+    exp.LTE: exp.GTE,
+}
+
+
+def _sort_key(value: RowValue) -> tuple[int, str, float]:
+    """A total, type-stable sort key for one non-NULL row-column value.
+
+    A column's type is static, so the two branches never actually compete
+    within one sort — the tuple shape is what keeps the comparison total
+    anyway, rather than letting a surprising value raise a TypeError deep
+    inside ``list.sort``.
+    """
+    if isinstance(value, str):
+        return (0, value, 0.0)
+    return (1, "", float(value if value is not None else 0))
+
+
+def _compare(node: exp.Expr, left: RowValue, right: RowValue) -> bool | None:
+    """One comparison under SQL NULL semantics; None is UNKNOWN, never False."""
+    if left is None or right is None:
+        return None
+    if isinstance(node, exp.EQ):
+        return left == right
+    if isinstance(node, exp.NEQ):
+        return left != right
+    if isinstance(left, str) != isinstance(right, str):
+        # Unreachable via resolve (a column's type is static and the literal
+        # was checked against it), and an ordering comparison across the two
+        # would be a python TypeError rather than an answer.
+        return None
+    if isinstance(node, exp.GT):
+        return left > right  # type: ignore[operator]
+    if isinstance(node, exp.GTE):
+        return left >= right  # type: ignore[operator]
+    if isinstance(node, exp.LT):
+        return left < right  # type: ignore[operator]
+    return left <= right  # type: ignore[operator]
 
 
 @dataclass
@@ -1367,7 +1533,14 @@ class _Lowerer:
 
     def _lower_branch(self, select: exp.Select) -> list[_Column]:
         env = self._scope(select)
-        self._collect_trims(select, env)
+        # RFC-009: one WHERE clause, two languages. A conjunct over track-row
+        # columns is decided HERE and never reaches ffmpeg; a time window is a
+        # seek on an input. Resolve already rejected a conjunct that mixes them,
+        # so the split is total.
+        time_conjuncts, row_conjuncts = self._split_where(select, env)
+        self._collect_trims(select, env, time_conjuncts)
+        self._filter_rows(row_conjuncts, env, select)
+        self._order_rows(select, env)
 
         projections = select.expressions
         if not projections:
@@ -1426,6 +1599,19 @@ class _Lowerer:
 
         columns: list[_Column] = []
         for binding in bindings:
+            if isinstance(binding, _RowBinding):
+                # A row table's columns are mostly metadata, and a star over
+                # them would have to mean "the track column" -- which is what
+                # `<alias>.track` already says, unambiguously.
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'*' cannot expand the track-row table '{binding.alias}': "
+                    "most of its columns are metadata, not streams",
+                    anchor,
+                    fallback=select,
+                    hint=f"select the stream column: {binding.alias}."
+                    f"{ROW_STREAM_COLUMN}",
+                )
             if isinstance(binding, _InputBinding):
                 columns += self._star_input(binding.alias, anchor, env, select)
             elif isinstance(binding, _SourceBinding):
@@ -1514,13 +1700,80 @@ class _Lowerer:
                 fallback=select,
                 hint="add FROM input('clip.mp4') a",
             )
-        self._add_table(from_.this, env, select)
-        joins = select.args.get("joins") or []
-        for join in joins:
-            if not isinstance(join, exp.Join):
-                raise _error(ErrorCode.UNSUPPORTED_SQL, "malformed FROM clause", fallback=select)
-            self._add_table(join.this, env, select)
+        for item in from_items(select):
+            if isinstance(item, exp.Unnest):
+                self._add_track_rows(item, env, select)
+            else:
+                self._add_table(item, env, select)
         return env
+
+    # -- FROM unnest(<input>.<type>) alias (RFC-009, plan 061) -------------
+
+    def _add_track_rows(
+        self, unnest: exp.Unnest, env: _Env, select: exp.Select
+    ) -> None:
+        """Bind one track-row table: every track of the array becomes a row.
+
+        This is the one binding that MUST probe. A row's columns are probed
+        metadata and its row COUNT is a property of the file, so an input that
+        could not be read cannot be unnested at all -- the same policy, and the
+        same code, a bare ``f.audio`` has (RFC-001 "Probing policy": "cannot
+        enumerate the streams of a file I cannot read" is a natural error).
+
+        No node is minted and no ``-i`` is taken: the rows' streams are the
+        INPUT alias's streams, already probed and already mapped, so a row
+        table is pure bookkeeping until ``t.track`` is actually selected. That
+        is what makes RFC-009's consume-once rule fall out of ordinary column
+        selection -- an unmatched row's stream is simply never read.
+        """
+        alias_node = unnest.args.get("alias")
+        alias = (
+            _fold(alias_node.this)
+            if isinstance(alias_node, exp.TableAlias) and alias_node.this is not None
+            else ""
+        )
+        raw = self.res.track_rows.get(alias)
+        if raw is None:  # defensive: resolve records every row alias
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "malformed unnest in FROM",
+                unnest,
+                fallback=select,
+                hint="unnest one input's stream array, e.g. unnest(f.audio) t",
+            )
+        stream_type = _ARRAY_COLUMNS[raw.column]
+        result = self.probes.get(raw.source)
+        if result is None:
+            raise _error(
+                ErrorCode.INPUT_NOT_FOUND,
+                f"cannot unnest '{raw.source}.{raw.column}' of "
+                f"'{self._path_of(raw.source)}': file not found or unreadable",
+                unnest,
+                fallback=select,
+                hint=f"unnest lists the tracks of a file and reads their "
+                f"metadata, and only a readable input has either; subscript "
+                f"one stream instead, e.g. {raw.source}.{raw.column}[1]",
+            )
+        env.bindings[alias] = _RowBinding(
+            alias=alias,
+            source=raw.source,
+            column=raw.column,
+            type=stream_type,
+            rows=tuple(
+                _TrackRow(
+                    stream=self._source_stream(raw.source, stream_type, position),
+                    columns=_row_columns(meta, raw.column),
+                )
+                for position, meta in enumerate(result.by_type(stream_type))
+            ),
+        )
+
+    def _path_of(self, alias: str) -> str:
+        """The path behind an input alias, for a message about its file."""
+        index = self.graph.sources.get(alias)
+        if index is None or not 0 <= index < len(self.res.input_paths):
+            return alias
+        return self.res.input_paths[index]
 
     def _add_table(self, table: exp.Expr | None, env: _Env, select: exp.Select) -> None:
         if not isinstance(table, exp.Table):
@@ -1585,7 +1838,10 @@ class _Lowerer:
 
     def _known_hint(self) -> str:
         known = sorted(
-            set(self.cte_columns) | set(self.graph.sources) | set(self.res.source_filters)
+            set(self.cte_columns)
+            | set(self.graph.sources)
+            | set(self.res.source_filters)
+            | set(self.res.track_rows)
         )
         return f"known names: {', '.join(known)}" if known else "no aliases are in scope"
 
@@ -1730,7 +1986,245 @@ class _Lowerer:
 
     # -- WHERE ------------------------------------------------------------
 
-    def _collect_trims(self, select: exp.Select, env: _Env) -> None:
+    # -- WHERE, split into its two halves (RFC-009) ------------------------
+
+    def _split_where(
+        self, select: exp.Select, env: _Env
+    ) -> tuple[list[exp.Expr], list[exp.Expr]]:
+        """This branch's WHERE conjuncts, as ``(time windows, row predicates)``.
+
+        A conjunct is a ROW predicate exactly when it mentions a track-row
+        alias, which is unambiguous: a row alias is an alias, and one name
+        cannot be two things. Resolve rejected the mixed case, so nothing here
+        has to decide what a half-and-half conjunct would mean.
+        """
+        where = select.args.get("where")
+        if not isinstance(where, exp.Where):
+            return [], []
+        time_conjuncts: list[exp.Expr] = []
+        row_conjuncts: list[exp.Expr] = []
+        for conjunct in _flatten_and(where.this):
+            aliases = {
+                _fold(sub.args["table"])
+                for sub in conjunct.walk()
+                if isinstance(sub, exp.Column) and sub.args.get("table") is not None
+            }
+            rows = {
+                alias
+                for alias in aliases
+                if isinstance(env.bindings.get(alias), _RowBinding)
+            }
+            if not rows:
+                time_conjuncts.append(conjunct)
+                continue
+            if aliases - rows or len(rows) > 1:  # defensive: resolve rejected both
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "a WHERE predicate may reference only one track-row table",
+                    conjunct,
+                    fallback=where,
+                    hint="filter each unnest separately",
+                )
+            row_conjuncts.append(conjunct)
+        return time_conjuncts, row_conjuncts
+
+    # -- compile-time row filtering / ordering (RFC-009) -------------------
+
+    def _filter_rows(
+        self, conjuncts: list[exp.Expr], env: _Env, select: exp.Select
+    ) -> None:
+        """Keep the rows whose predicate is TRUE; drop UNKNOWN and FALSE alike.
+
+        Standard SQL: WHERE admits TRUE only, so a row whose metadata field was
+        never probed simply does not match — no new rule, and no silent guess.
+        The surviving set is written back onto the binding, so every later
+        ``t.track`` sees it and an unselected row's stream is never touched.
+        """
+        for conjunct in conjuncts:
+            binding = self._row_binding_of(conjunct, env, select)
+            binding.rows = tuple(
+                row
+                for row in binding.rows
+                if self._eval_row(conjunct, binding, row, select) is True
+            )
+
+    def _row_binding_of(
+        self, node: exp.Expr, env: _Env, select: exp.Select
+    ) -> _RowBinding:
+        """The single row table `node`'s columns belong to (checked upstream)."""
+        for sub in node.walk():
+            if not isinstance(sub, exp.Column):
+                continue
+            table_node = sub.args.get("table")
+            if table_node is None:
+                continue
+            binding = env.bindings.get(_fold(table_node))
+            if isinstance(binding, _RowBinding):
+                return binding
+        raise _error(  # defensive: the caller only passes row expressions
+            ErrorCode.UNSUPPORTED_SQL,
+            "unsupported track-row expression",
+            node,
+            fallback=select,
+        )
+
+    def _eval_row(
+        self,
+        node: exp.Expr,
+        binding: _RowBinding,
+        row: _TrackRow,
+        select: exp.Select,
+    ) -> bool | None:
+        """One predicate against one row: TRUE, FALSE, or UNKNOWN (``None``).
+
+        Kleene three-valued logic, which is what makes RFC-009's NULL story a
+        non-story: a comparison with a NULL operand is UNKNOWN, UNKNOWN
+        propagates through AND/OR/NOT the SQL way, and :meth:`_filter_rows`
+        keeps TRUE only.
+        """
+        node = _unwrap(node)
+        if isinstance(node, exp.And | exp.Or):
+            left = self._eval_row(node.this, binding, row, select)
+            expression = node.args.get("expression")
+            if not isinstance(expression, exp.Expr):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL, "malformed WHERE predicate", node,
+                    fallback=select,
+                )
+            right = self._eval_row(expression, binding, row, select)
+            return (
+                _kleene_and(left, right)
+                if isinstance(node, exp.And)
+                else _kleene_or(left, right)
+            )
+        if isinstance(node, exp.Not) and isinstance(node.this, exp.Expr):
+            inner = self._eval_row(node.this, binding, row, select)
+            return None if inner is None else not inner
+        if isinstance(node, exp.Is):
+            value = self._row_value_of(node.this, binding, row, select)
+            is_null = value is None
+            return not is_null if node.args.get("negate") else is_null
+        if isinstance(node, exp.Between):
+            value = self._row_value_of(node.this, binding, row, select)
+            low = self._literal_of(node.args.get("low"), select)
+            high = self._literal_of(node.args.get("high"), select)
+            return _kleene_and(
+                _compare(exp.GTE(), value, low), _compare(exp.LTE(), value, high)
+            )
+        if isinstance(node, exp.EQ | exp.NEQ | exp.GT | exp.GTE | exp.LT | exp.LTE):
+            left_node = node.this
+            right_node = node.args.get("expression")
+            if isinstance(_unwrap(left_node), exp.Column):
+                return _compare(
+                    node,
+                    self._row_value_of(left_node, binding, row, select),
+                    self._literal_of(right_node, select),
+                )
+            # `'eng' = t.language` compares the same pair the other way round,
+            # and every operator here is its own mirror when the operands swap
+            # -- except the ordering four, which invert.
+            mirrored = _MIRRORED_COMPARISONS[type(node)]()
+            return _compare(
+                mirrored,
+                self._row_value_of(right_node, binding, row, select),
+                self._literal_of(left_node, select),
+            )
+        raise _error(  # defensive: resolve accepted only the shapes above
+            ErrorCode.UNSUPPORTED_SQL,
+            "unsupported WHERE predicate",
+            node,
+            fallback=select,
+        )
+
+    def _row_value_of(
+        self,
+        node: exp.Expr | None,
+        binding: _RowBinding,
+        row: _TrackRow,
+        select: exp.Select,
+    ) -> RowValue:
+        """The value of one ``<row alias>.<column>`` reference in `row`."""
+        column = _unwrap(node) if isinstance(node, exp.Expr) else None
+        if not isinstance(column, exp.Column):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a track-row predicate compares a row column against a literal",
+                column,
+                fallback=select,
+            )
+        name = _fold(column.this)
+        if name not in row.columns:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"unknown column '{binding.alias}.{column.name}'",
+                column,
+                fallback=select,
+                hint=f"{binding.column} track rows expose "
+                f"{', '.join(sorted(ROW_SCHEMAS[binding.column]))}",
+            )
+        return row.columns[name]
+
+    def _literal_of(self, node: exp.Expr | None, select: exp.Select) -> RowValue:
+        """A row predicate's literal operand as a python scalar."""
+        value = _unwrap(node) if isinstance(node, exp.Expr) else None
+        if isinstance(value, exp.Neg) and isinstance(value.this, exp.Expr):
+            return -_number(_unwrap(value.this), ErrorCode.UNSUPPORTED_SQL)
+        if isinstance(value, exp.Literal):
+            if value.is_string:
+                return str(value.this)
+            return _number(value, ErrorCode.UNSUPPORTED_SQL)
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "a track-row predicate compares a row column against a literal",
+            value,
+            fallback=select,
+        )
+
+    def _order_rows(self, select: exp.Select, env: _Env) -> None:
+        """Re-sort a row table explicitly (RFC-009's ORDER BY carve-out).
+
+        Row order is deterministic WITHOUT this — it is the file's track order,
+        which is player-visible surface nothing resorts implicitly — so an
+        ORDER BY is the user saying otherwise, and it applies at compile time
+        to the row list, never to frames.
+
+        Multi-key sorting is done one key at a time from LAST to FIRST over
+        python's stable sort, which is exactly SQL's key precedence. NULLs are
+        partitioned out rather than sorted, because they have no order: their
+        position is ``nulls_first``, which sqlglot fills in from the Postgres
+        defaults (ASC -> NULLS LAST, DESC -> NULLS FIRST) whether or not the
+        query spelled it.
+        """
+        order = select.args.get("order")
+        if not isinstance(order, exp.Order):
+            return
+        for ordered in reversed(order.expressions):
+            if not isinstance(ordered, exp.Ordered):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL, "malformed ORDER BY", fallback=order
+                )
+            binding = self._row_binding_of(ordered, env, select)
+            key = _unwrap(ordered.this)
+            if not isinstance(key, exp.Column):  # defensive: resolve checked it
+                raise _error(
+                    ErrorCode.NO_STREAMING_EQUIVALENT,
+                    "ORDER BY has no streaming equivalent",
+                    ordered,
+                    fallback=order,
+                )
+            name = _fold(key.this)
+            nulls = [row for row in binding.rows if row.columns.get(name) is None]
+            rest = [row for row in binding.rows if row.columns.get(name) is not None]
+            rest.sort(
+                key=lambda row: _sort_key(row.columns[name]),
+                reverse=bool(ordered.args.get("desc")),
+            )
+            ranked = nulls + rest if ordered.args.get("nulls_first") else rest + nulls
+            binding.rows = tuple(ranked)
+
+    def _collect_trims(
+        self, select: exp.Select, env: _Env, conjuncts: list[exp.Expr]
+    ) -> None:
         """Record each aliased time range, on the input or on the branch.
 
         The binding decides where the window goes (RFC-004's input-seek
@@ -1753,12 +2247,16 @@ class _Lowerer:
         of the same kind, so this only ever fills in the other half. Every
         check below duplicates one resolve already made (defensive re-check,
         as elsewhere in this pass).
+
+        `conjuncts` is the TIME half of the WHERE clause
+        (:meth:`_split_where`), not the whole of it: RFC-009's row predicates
+        share the clause and are decided on rows, not on the timeline.
         """
         where = select.args.get("where")
-        if not isinstance(where, exp.Where):
+        if not isinstance(where, exp.Where) or not conjuncts:
             return
         windows: dict[str, tuple[int | float | None, int | float | None]] = {}
-        for conjunct in _flatten_and(where.this):
+        for conjunct in conjuncts:
             parsed = _time_bounds(conjunct)
             if parsed is None:
                 raise _error(
@@ -2037,7 +2535,77 @@ class _Lowerer:
             return alias, self._input_value(alias, name, index, anchor, select)
         if isinstance(binding, _SourceBinding):
             return alias, self._source_value(binding, name, index, anchor, select)
+        if isinstance(binding, _RowBinding):
+            # Under the INPUT alias, not the row one: a row table has no window
+            # of its own, and every rule about the streams (`-i`, `-ss`, the
+            # caption-seek rejection) is a property of the file they came from.
+            return binding.source, self._row_value(binding, name, index, anchor, select)
         return alias, self._cte_value(binding, name, index, anchor, select)
+
+    def _row_value(
+        self,
+        binding: _RowBinding,
+        name: str,
+        index: int | None,
+        anchor: exp.Expr,
+        select: exp.Select,
+    ) -> _Value:
+        """One column of a track-row table — and only ``track`` is a stream.
+
+        RFC-009 § Output multiplicity: ``t.track`` over N surviving rows is an
+        N-element ARRAY in row order, exactly what a bare ``f.audio`` is, so
+        every existing array rule (splat, broadcast, subscript, zip) applies to
+        it unchanged and the downstream passes learn nothing new.
+
+        A metadata column is not an output: streams are the only outputs there
+        are, and ``SELECT t.language`` names a string. That is a typed
+        rejection rather than a stringly-typed output, and its hint says what
+        metadata columns ARE for.
+        """
+        schema = ROW_SCHEMAS[binding.column]
+        if name not in schema:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"unknown column '{binding.alias}.{name}'",
+                anchor,
+                fallback=select,
+                hint=f"{binding.column} track rows expose "
+                f"{', '.join(sorted(schema))}",
+            )
+        if name != ROW_STREAM_COLUMN:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{binding.alias}.{name}' is track metadata, not a stream, and "
+                "a SELECT column is an output stream",
+                anchor,
+                fallback=select,
+                hint=_ROW_METADATA_HINT,
+            )
+        if not binding.rows:
+            raise _error(
+                ErrorCode.STREAM_NOT_FOUND,
+                f"'{binding.alias}.{ROW_STREAM_COLUMN}' selects nothing: no "
+                f"{binding.column} track of '{self._path_of(binding.source)}' "
+                "survived",
+                anchor,
+                fallback=select,
+                hint="an empty row set would select no streams; widen the WHERE, "
+                "or check that the file has the tracks you expect",
+            )
+        streams = [row.stream for row in binding.rows]
+        if index is None:
+            return _array(binding.type, streams)
+        if not 1 <= index <= len(streams):
+            have = f"{len(streams)} row" + ("" if len(streams) == 1 else "s")
+            raise _error(
+                ErrorCode.STREAM_NOT_FOUND,
+                f"'{binding.alias}.{ROW_STREAM_COLUMN}[{index}]' does not exist: "
+                f"'{binding.alias}' has {have}",
+                anchor,
+                fallback=select,
+                hint=_SUBSCRIPT_HINT,
+            )
+        return _scalar(streams[index - 1])
 
     def _source_value(
         self,
