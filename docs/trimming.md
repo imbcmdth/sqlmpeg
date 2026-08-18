@@ -9,7 +9,7 @@ WHERE a.t BETWEEN 5 AND 60
 ```
 
 ```
-$ sqlmpeg compile --no-probe "SELECT a.video[1] FROM input('clip.mp4') a WHERE a.t BETWEEN 5 AND 60"
+$ sqlmpeg compile "SELECT a.video[1] FROM input('clip.mp4') a WHERE a.t BETWEEN 5 AND 60"
 ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -c:0 copy out.mp4
 ```
 
@@ -28,7 +28,7 @@ WHERE a.t >= 120
 ```
 
 ```
-$ sqlmpeg compile --no-probe "SELECT a.video[1] FROM input('clip.mp4') a WHERE a.t >= 120"
+$ sqlmpeg compile "SELECT a.video[1] FROM input('clip.mp4') a WHERE a.t >= 120"
 ffmpeg -ss 120 -i clip.mp4 -map 0:v:0 -c:0 copy out.mp4
 ```
 

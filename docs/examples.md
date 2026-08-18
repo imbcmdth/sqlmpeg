@@ -1,6 +1,6 @@
 # Cookbook
 
-Real tasks, in roughly the order people meet them. Each recipe is the question as it's usually asked, the query that answers it, and the exact ffmpeg command that query compiles to. Every command on this page is real output - a test recompiles all of them and diffs byte for byte, so if a recipe is here, it works.
+Real tasks, in roughly the order people meet them. Each recipe is the question as it's usually asked, the query that answers it, and exactly what sqlmpeg prints for it - the compiled ffmpeg command for a media query, the result table or CSV for a metadata one. Every shown output on this page is real - a test reruns all of them and diffs byte for byte, so if a recipe is here, it works.
 
 ## 1. Transcode a file to H.264/AAC
 

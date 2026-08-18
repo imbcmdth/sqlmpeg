@@ -58,6 +58,8 @@ An outer join keeps rows only one side has, and the gap side's `track` is NULL. 
 
 A fill carries the paired row's tags as provenance, so a silence-filled French slot still emits `-metadata:s:N language=fra` and players still see a French track.
 
+And before committing to any of it, you can LOOK at the rows: a SELECT with no COPY prints the result set as a table (stream cells as placeholders, an outer join's gaps as empty cells), and `COPY ... TO STDOUT WITH (FORMAT csv)` makes it scriptable - [cookbook recipes 30-32](examples.md#30-look-at-a-files-tracks-as-a-table) show all three.
+
 The founding use case ties it together - concatenating two files where one lacks a track. `concat` demands identical segment shapes, so each `UNION ALL` branch runs the same outer join and selects its own side, fills included. The worked version, byte-checked against the real compiler, is [cookbook recipe 27](examples.md#27-concatenate-files-with-different-track-counts); recipes 23 through 28 cover the rest of this page's surface the same way.
 
 ## The fences, briefly

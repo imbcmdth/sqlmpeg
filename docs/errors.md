@@ -36,7 +36,7 @@ SELECT a.video[1] FROM input('x.mp4' a
 
 **Meaning:** A call names a function that is not a filter the installed ffmpeg reports (`sqlmpeg/registry.py`, see [docs/filters.md](filters.md)) and not one of the three `sqlmpeg.<name>` macros. Checked for the outer call and for nested calls used as arguments.
 
-**Fires when:** the name resolves nowhere - a typo, a filter your ffmpeg build doesn't ship, or no ffmpeg on `PATH` to ask (an empty registry makes every filter name unknown; the hint says so).
+**Fires when:** the name resolves nowhere - a typo, or a filter your ffmpeg build doesn't ship. (An empty registry - possible only if the ffmpeg provisioner failed - makes every filter name unknown, and the hint says exactly that.)
 
 **Example query:**
 
@@ -51,7 +51,7 @@ FROM input('x.mp4') a
 {"line": 1, "col": 8, "code": "UNKNOWN_FUNCTION", "message": "unknown function gblu()", "hint": "did you mean gblur()?"}
 ```
 
-The hint is a did-you-mean match against every filter name the installed ffmpeg reports. A `sqlmpeg.<name>` call matches against the three macros the same way (`sqlmpeg.dela()` suggests `sqlmpeg.delay()`). With no ffmpeg on `PATH` the hint states the real problem instead of guessing: the function surface IS your installed ffmpeg's filter set, so install one or put it on `PATH`.
+The hint is a did-you-mean match against every filter name the installed ffmpeg reports. A `sqlmpeg.<name>` call matches against the three macros the same way (`sqlmpeg.dela()` suggests `sqlmpeg.delay()`). Should the registry come up empty - which since ffmpeg became a managed requirement means the provisioner failed - the hint states that real problem instead of guessing: check `static-ffmpeg` installed correctly, or put a system ffmpeg on `PATH`.
 
 ## UNKNOWN_ALIAS
 
@@ -201,7 +201,7 @@ COPY (SELECT b.frame FROM input('x.mp4') b) TO 'out.mp4';
 
 ## STREAM_NOT_FOUND
 
-**Meaning:** A subscript (`<alias>.video[k]` / `<alias>.audio[k]`, or the recorded bound of a CTE array column) is out of range for the streams actually present. Only reachable against a probed input (local, readable, `ffprobe` on `PATH`, `--no-probe` not passed) or against a CTE array column whose length was recorded when it lowered. An explicit subscript against an unprobed input compiles unchecked and lets ffmpeg deliver the bad news at run time instead.
+**Meaning:** A subscript (`<alias>.video[k]` / `<alias>.audio[k]`, or the recorded bound of a CTE array column) is out of range for the streams actually present. Only reachable against a probed input (local, readable) or against a CTE array column whose length was recorded when it lowered. An explicit subscript against an unprobed input compiles unchecked and lets ffmpeg deliver the bad news at run time instead.
 
 **Fires when:** the subscript is positive and 1-based but exceeds the probed file's per-type stream count, exceeds a CTE array column's recorded length, or the whole array is empty (splatting `.audio` on a video-only file would select nothing, which is never what was meant).
 
@@ -220,7 +220,7 @@ FROM input('tests/fixtures/av.mp4') a
 
 ## INPUT_NOT_FOUND
 
-**Meaning:** A bare array (`<alias>.video` / `<alias>.audio`, splatted into the SELECT list or broadcast through a function) needs the file's actual stream count to expand, and the input could not be probed: missing, unreadable, a URL, or `--no-probe` was passed. "Cannot enumerate the streams of a file I cannot read" gets its own honest error rather than hiding inside a generic probing-failure code.
+**Meaning:** A bare array (`<alias>.video` / `<alias>.audio`, splatted into the SELECT list or broadcast through a function) needs the file's actual stream count to expand, and the input could not be probed: missing, unreadable, or a URL. "Cannot enumerate the streams of a file I cannot read" gets its own honest error rather than hiding inside a generic probing-failure code.
 
 **Fires when:** a bare array appears over an input with no probe result.
 
@@ -326,7 +326,7 @@ FROM input('x.mp4') a
 
 The anchor lands on the option's VALUE: sqlglot records no token position on the `exp.Var` holding a named argument's name (the same gap `COPY ... WITH` option names have), so `line`/`col` point at the `5`.
 
-Machine-dependence is the entire point of this code: a query using it compiles only where that ffmpeg does. With no ffmpeg at all the failure comes earlier, as `UNKNOWN_FUNCTION` on the filter name itself.
+Machine-dependence is the entire point of this code: a query using it compiles only where that ffmpeg does. With no working ffmpeg at all (a failed provisioner) the failure comes earlier, as `UNKNOWN_FUNCTION` on the filter name itself.
 
 **Also fires for `enable`:** `enable` is never a real option of any filter (it is framework-level, see [docs/filters.md](filters.md)), so the validator special-cases the name instead of looking it up — but it names this same code, worded to say so, when the target filter isn't one your ffmpeg flags as timeline-capable (the `T` column of `ffmpeg -filters`):
 
