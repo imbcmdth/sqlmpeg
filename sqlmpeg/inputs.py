@@ -75,6 +75,31 @@ INPUT_OPTIONS: dict[str, InputOptionSpec] = {
 }
 
 
+# INTERNAL per-input options (RFC-009, plan 062): flags the COMPILER sets on an
+# input it minted itself, never something user SQL can name. They are kept OUT
+# of `INPUT_OPTIONS` deliberately -- that table is the user-facing surface and
+# drives docs, the prompt and `input('path', name => value)` validation, none
+# of which should learn about a flag no query can write. `validate_option`
+# therefore still rejects these names as unknown; only `option_spec` (which
+# emit renders through) knows they exist.
+#
+# `format` is what `sqlmpeg.empty_captions()` needs: a `data:` URI carries no
+# extension, so the demuxer has to be named (`-f webvtt -i "data:..."`).
+_INTERNAL_INPUT_OPTIONS: dict[str, InputOptionSpec] = {
+    "format": InputOptionSpec(
+        name="format",
+        type="str",
+        doc="Force the demuxer of a compiler-minted input (internal).",
+        flag="-f",
+    ),
+}
+
+
+def option_spec(name: str) -> InputOptionSpec | None:
+    """The spec emit renders `name` with: user-facing table first, then internal."""
+    return INPUT_OPTIONS.get(name) or _INTERNAL_INPUT_OPTIONS.get(name)
+
+
 def _unknown_option_hint(name: str) -> str:
     matches = difflib.get_close_matches(name, sorted(INPUT_OPTIONS), n=1, cutoff=0.6)
     if matches:

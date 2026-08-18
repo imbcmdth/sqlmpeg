@@ -16,6 +16,7 @@ offline-fallback tests do.
 
 from __future__ import annotations
 
+import base64
 import shutil
 import subprocess
 from pathlib import Path
@@ -25,8 +26,10 @@ import pytest
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.emit import build_ffmpeg_args, emit
 from sqlmpeg.errors import ErrorCode, SqlmpegError
+from sqlmpeg.inputs import INPUT_OPTIONS, option_spec
 from sqlmpeg.ir import Graph
 from sqlmpeg.lower import lower
+from sqlmpeg.macros import INPUT_MACROS, MACROS
 from sqlmpeg.parser import parse, resolve
 from sqlmpeg.probe import ProbeResult, StreamMeta
 from sqlmpeg.registry import Registry, load_reference
@@ -320,3 +323,48 @@ def test_ad_insert_composition_execs(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert out_path.exists()
     assert _ffprobe_duration(out_path) > 0
+
+
+# ---------------------------------------------------------------------------
+# the input-minting macro: sqlmpeg.empty_captions() (RFC-009, plan 062)
+# ---------------------------------------------------------------------------
+
+
+def test_empty_captions_is_an_input_macro_not_a_filter_one() -> None:
+    """It lowers to an ``-i``, not to a node: no ffmpeg filter generates a
+    subtitle stream, because a filtergraph carries no subtitle pads at all."""
+    assert "empty_captions" not in MACROS
+    macro = INPUT_MACROS["empty_captions"]
+    assert (macro.output, macro.format) == ("subtitle", "webvtt")
+    # "WEBVTT\n\n" -- a valid WebVTT file with zero cues, and nothing else.
+    assert base64.b64decode(macro.path.split(",", 1)[1]) == b"WEBVTT\n\n"
+
+
+def test_empty_captions_mints_an_input_with_no_registry_at_all() -> None:
+    g = _lower("SELECT sqlmpeg.empty_captions() FROM input('x.mp4') a")
+    assert not g.nodes
+    assert g.input_paths[1] == INPUT_MACROS["empty_captions"].path
+    assert g.input_options["sqlmpeg.empty_captions#2"] == {"format": "webvtt"}
+    assert [(o.ref, o.type) for o in g.outputs] == [
+        ("src:sqlmpeg.empty_captions#2:s:0", "subtitle")
+    ]
+
+
+def test_empty_captions_takes_no_arguments() -> None:
+    err = _reject("SELECT sqlmpeg.empty_captions(2) FROM input('x.mp4') a")
+    assert err.code == ErrorCode.UNSUPPORTED_SQL
+    assert "takes no arguments" in err.message
+
+
+def test_the_macro_namespace_hint_names_the_input_macro_too() -> None:
+    err = _reject("SELECT sqlmpeg.zzz(a.frame, 2) FROM input('x.mp4') a")
+    assert "empty_captions" in (err.hint or "")
+
+
+def test_a_minted_input_is_not_a_user_facing_input_option() -> None:
+    """`format` renders like any other per-input flag but cannot be written:
+    it is not in the table `input('path', name => value)` validates against."""
+    assert "format" not in INPUT_OPTIONS
+    assert option_spec("format") is not None
+    err = _reject("SELECT a.frame FROM input('x.mp4', format => 'webvtt') a")
+    assert err.code == ErrorCode.UNKNOWN_INPUT_OPTION

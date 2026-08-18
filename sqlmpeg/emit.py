@@ -81,6 +81,12 @@ options, then seek flags, then ``-i`` -- is what sqlmpeg always emits). A bool
 value of ``False`` (e.g. ``loop => false``) is never rendered, same as a sink
 option's False bool.
 
+An option name is resolved through ``sqlmpeg.inputs.option_spec``, not the
+user-facing table alone: lower mints inputs of its own (RFC-009's
+``sqlmpeg.empty_captions()``, whose ``data:`` URI needs ``-f webvtt``) and
+carries their flags as INTERNAL input options, which render exactly like any
+other but are not nameable from SQL.
+
 Pad label scheme
 ----------------
 Every node output pad gets exactly one label, derived from the node id
@@ -176,7 +182,7 @@ import re
 from dataclasses import dataclass, field, replace
 
 from .errors import ErrorCode, SqlmpegError
-from .inputs import INPUT_OPTIONS, InputOptionSpec
+from .inputs import InputOptionSpec, option_spec
 from .ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType, is_src, src_parts
 from .sink import SINK_OPTIONS, SinkOptionSpec
 
@@ -548,7 +554,9 @@ def _render_input_option_value(spec: InputOptionSpec, value: object) -> str | No
 def _render_input_options(options: dict[str, object]) -> list[str]:
     args: list[str] = []
     for name, value in options.items():
-        spec = INPUT_OPTIONS[name]
+        spec = option_spec(name)
+        if spec is None:  # defensive: lower validated every name it wrote
+            raise _internal(f"unknown input option {name!r} reached emit")
         rendered = _render_input_option_value(spec, value)
         if rendered is None:
             continue

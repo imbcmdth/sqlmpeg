@@ -141,7 +141,21 @@ Notes for downstream passes (lower):
   ``LEFT JOIN`` -> ``side='LEFT'``; ``RIGHT JOIN`` -> ``side='RIGHT'``;
   ``FULL OUTER JOIN`` -> ``side='FULL', kind='OUTER'``; ``FULL JOIN`` ->
   ``side='FULL'`` with NO ``kind``; ``CROSS JOIN`` -> ``kind='CROSS'`` with no
-  ``side`` and no ``on``. A comma source carries none of the five.
+  ``side`` and no ``on``. A comma source carries none of the five. Re-VERIFIED
+  for plan 062: ``INNER JOIN`` -> ``kind='INNER'`` (no ``side``),
+  ``LEFT OUTER JOIN`` -> ``side='LEFT', kind='OUTER'``, ``NATURAL JOIN`` ->
+  ``method='NATURAL'``, ``USING (col)`` -> ``using=[Identifier]``.
+
+* ``JOIN`` between two ``unnest`` tables (RFC-009, plan 062) is admitted —
+  INNER (``JOIN`` / ``INNER JOIN``), ``LEFT [OUTER]`` and ``FULL [OUTER]``,
+  each with a mandatory ``ON`` — and nowhere else: a join whose right side is
+  not an ``unnest``, or that stands before any row table has been bound, keeps
+  the old blanket rejection, and so do ``RIGHT``, ``CROSS``, ``NATURAL`` and
+  ``USING``. :func:`from_entries` pairs each FROM item with the
+  :class:`RawRowJoin` describing how it attaches (``"cross"`` for a comma
+  source), which is what lower evaluates the join from. The ``ON`` predicate is
+  061's row grammar with one addition: both operands may be row COLUMNS (of any
+  row tables in scope), which is the whole point — ``a.language = b.language``.
 
 * ``ORDER BY`` over track-row columns (RFC-009) is the ONE carve-out in the
   ``NO_STREAMING_EQUIVALENT`` fence: ``Select.args["order"]`` is admitted only
@@ -174,9 +188,12 @@ __all__ = [
     "RawSink",
     "RawSinkOption",
     "RawSource",
+    "RawRowJoin",
     "RawSourceOption",
     "RawTrackRows",
     "Resolved",
+    "from_entries",
+    "from_items",
     "kwarg_name",
     "parse",
     "resolve",
@@ -332,6 +349,17 @@ _UNNEST_HINT = (
 _ROW_WHERE_HINT = (
     "a track-row predicate compares one row column against a literal: "
     "=, !=, <, <=, >, >=, BETWEEN, IS [NOT] NULL, joined with AND/OR/NOT"
+)
+_JOIN_HINT = (
+    "JOIN matches the ROWS of two unnest tables: FROM input('a.mkv') f, "
+    "input('b.mkv') g, unnest(f.audio) a JOIN unnest(g.audio) b ON "
+    "a.language = b.language (INNER, LEFT [OUTER] and FULL [OUTER] only); "
+    "at input level, FROM stays a comma cross-join"
+)
+_JOIN_ON_HINT = (
+    "an ON predicate compares track-row columns against each other or against "
+    "a literal: =, !=, <, <=, >, >=, BETWEEN, IS [NOT] NULL, joined with "
+    "AND/OR/NOT"
 )
 _ROW_ORDER_HINT = (
     "ORDER BY sorts track rows by their metadata columns, "
@@ -775,6 +803,23 @@ class RawSource:
 
 
 @dataclass(frozen=True)
+class RawRowJoin:
+    """How one FROM item attaches to the ones before it (RFC-009, plan 062).
+
+    `kind` is ``"cross"`` (a comma source — and, between two row tables, the
+    bounded compile-time cross join), ``"inner"``, ``"left"``, ``"full"``, or
+    ``"right"`` (which exists only to be rejected by name). `on` is the JOIN's
+    predicate, already shape-checked by resolve and evaluated by lower; `node`
+    is the ``exp.Join`` itself, the anchor for anything either pass rejects
+    about the join rather than about one of its operands.
+    """
+
+    kind: str
+    on: exp.Expr | None
+    node: exp.Join
+
+
+@dataclass(frozen=True)
 class RawTrackRows:
     """``unnest(<source>.<column>) <alias>`` in FROM (RFC-009, plan 061).
 
@@ -895,23 +940,57 @@ def _describe_unnest_arg(node: object) -> str:
     return "that"
 
 
-def from_items(select: exp.Select) -> list[exp.Expr]:
-    """The FROM items of one branch, in written order.
+def _join_spec(join: exp.Join) -> RawRowJoin:
+    """How one ``exp.Join`` entry attaches its item, from its own args.
+
+    Pure shape reading, no validation (resolve does that): the ``side``/``kind``
+    matrix in the module docstring, folded into the four kinds lower evaluates
+    plus ``"right"``, which exists only so resolve can reject it by name. A
+    comma source carries none of the args and is ``"cross"`` — the bounded
+    compile-time cross join between two row tables (RFC-009 § Fences).
+    """
+    side = str(join.args.get("side") or "").upper()
+    kind = str(join.args.get("kind") or "").upper()
+    on = join.args.get("on")
+    if side == "LEFT":
+        name = "left"
+    elif side == "FULL":
+        name = "full"  # `FULL JOIN` and `FULL OUTER JOIN` are the same join
+    elif side == "RIGHT":
+        name = "right"
+    elif kind == "CROSS":
+        name = "cross"
+    elif kind == "INNER" or on is not None:
+        name = "inner"
+    else:
+        name = "cross"
+    return RawRowJoin(
+        kind=name, on=on if isinstance(on, exp.Expr) else None, node=join
+    )
+
+
+def from_entries(select: exp.Select) -> list[tuple[exp.Expr, RawRowJoin | None]]:
+    """The FROM items of one branch, each with the join that attached it.
 
     VERIFIED under sqlglot 30.17 ``read="postgres"``: the FIRST item is
-    ``From.this`` and every later one — comma source or explicit JOIN alike —
-    is the ``this`` of an ``exp.Join`` in ``Select.args["joins"]``. Whether a
-    join entry is a comma or a real JOIN is a question about the JOIN's OWN
-    args (``side``/``kind``/``on``/``using``), not about this list.
+    ``From.this`` (join ``None`` — nothing attaches it) and every later one —
+    comma source or explicit JOIN alike — is the ``this`` of an ``exp.Join`` in
+    ``Select.args["joins"]``, whose own args say which kind it is
+    (:func:`_join_spec`).
     """
-    items: list[exp.Expr] = []
+    entries: list[tuple[exp.Expr, RawRowJoin | None]] = []
     from_ = select.args.get("from_")
     if isinstance(from_, exp.From) and isinstance(from_.this, exp.Expr):
-        items.append(from_.this)
+        entries.append((from_.this, None))
     for join in select.args.get("joins") or []:
         if isinstance(join, exp.Join) and isinstance(join.this, exp.Expr):
-            items.append(join.this)
-    return items
+            entries.append((join.this, _join_spec(join)))
+    return entries
+
+
+def from_items(select: exp.Select) -> list[exp.Expr]:
+    """The FROM items of one branch, in written order (join specs dropped)."""
+    return [item for item, _ in from_entries(select)]
 
 
 def _has_unnest(select: exp.Select) -> bool:
@@ -1826,18 +1905,211 @@ class _Resolver:
         for join in joins:
             if not isinstance(join, exp.Join):
                 raise _error(ErrorCode.UNSUPPORTED_SQL, "malformed FROM clause", fallback=select)
-            for key in ("on", "using", "side", "kind", "method", "match_condition"):
-                value = join.args.get(key)
-                if value:
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        "explicit JOIN syntax is not supported",
-                        _first_expression(value),
-                        fallback=join,
-                        hint="use a comma cross-join: FROM a, b",
-                    )
+            spec = _join_spec(join)
+            explicit = spec.kind != "cross" or any(
+                join.args.get(key)
+                for key in ("on", "using", "side", "kind", "method", "match_condition")
+            )
+            if explicit:
+                self._check_join(join, spec, scope, select)
             self._add_from_item(join.this, scope, visible)
+            if spec.on is not None:
+                # AFTER the right side is bound: an ON names both operands.
+                self._check_join_predicate(spec.on, scope, join)
         return scope
+
+    # -- JOIN between track-row tables (RFC-009, plan 062) -----------------
+
+    def _check_join(
+        self,
+        join: exp.Join,
+        spec: RawRowJoin,
+        scope: dict[str, str],
+        select: exp.Select,
+    ) -> None:
+        """Admit one explicit JOIN, which only track-row tables may use.
+
+        RFC-009 § Fences: "JOIN syntax is admitted between unnest tables ONLY —
+        input-level FROM stays comma-cross-join". Everything a track-row join
+        cannot be (a stream-level operand, RIGHT, CROSS, NATURAL, USING) keeps
+        the blanket rejection plan 061 gave every JOIN, with the hint saying
+        which spelling to reach for instead.
+        """
+        for key in ("using", "method", "match_condition"):
+            value = join.args.get(key)
+            if value:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{'USING' if key == 'using' else 'this JOIN form'} is not "
+                    "supported",
+                    _first_expression(value),
+                    fallback=join,
+                    hint=_JOIN_HINT,
+                )
+        if not isinstance(join.this, exp.Unnest) or "row" not in scope.values():
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "explicit JOIN syntax is supported between unnest(...) track-row "
+                "tables only",
+                _first_expression(
+                    join.args.get("on")
+                    or join.args.get("side")
+                    or join.args.get("kind")
+                ),
+                fallback=join,
+                hint=_JOIN_HINT,
+            )
+        if spec.kind == "right":
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "RIGHT JOIN is not supported",
+                fallback=join,
+                hint="swap the two unnest tables and write LEFT JOIN, or use "
+                "FULL OUTER JOIN — row order follows the LEFT side",
+            )
+        if spec.kind == "cross":
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "CROSS JOIN is not supported",
+                fallback=join,
+                hint="a comma between two unnest tables IS the cross join: "
+                "FROM ..., unnest(f.audio) a, unnest(g.audio) b",
+            )
+        if spec.on is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a track-row JOIN requires an ON predicate",
+                fallback=join,
+                hint="match the rows on their metadata, e.g. "
+                "ON a.language = b.language",
+            )
+        self._check_expression(spec.on, select)
+
+    def _check_join_predicate(
+        self, node: exp.Expr, scope: dict[str, str], join: exp.Join
+    ) -> None:
+        """One ON predicate: 061's row grammar, plus column-to-column comparison.
+
+        The addition over :meth:`_check_row_predicate` is the whole reason JOIN
+        exists — ``a.language = b.language`` compares two row COLUMNS — so the
+        two operands may now both be columns, and then their static types must
+        match (a text column never equals a numeric one, whatever the files
+        turned out to contain). Everything else is the same closed grammar:
+        AND/OR/NOT over comparisons, BETWEEN and IS [NOT] NULL, with only
+        track-row columns and literals as operands.
+        """
+        node = _unwrap_paren(node)
+        if isinstance(node, exp.And | exp.Or):
+            self._check_join_predicate(node.this, scope, join)
+            expression = node.args.get("expression")
+            if not isinstance(expression, exp.Expr):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "malformed ON predicate",
+                    node,
+                    fallback=join,
+                    hint=_JOIN_ON_HINT,
+                )
+            self._check_join_predicate(expression, scope, join)
+            return
+        if isinstance(node, exp.Not):
+            if not isinstance(node.this, exp.Expr):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "malformed ON predicate",
+                    node,
+                    fallback=join,
+                    hint=_JOIN_ON_HINT,
+                )
+            self._check_join_predicate(node.this, scope, join)
+            return
+        if isinstance(node, exp.Is):
+            column = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
+            if not isinstance(node.args.get("expression"), exp.Null) or not isinstance(
+                column, exp.Column
+            ):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "only 'IS NULL' and 'IS NOT NULL' are supported",
+                    node,
+                    fallback=join,
+                    hint=_JOIN_ON_HINT,
+                )
+            self._row_operand(column, scope, join)
+            return
+        if isinstance(node, exp.Between):
+            if node.args.get("symmetric"):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "BETWEEN SYMMETRIC is not supported",
+                    node,
+                    fallback=join,
+                    hint=_JOIN_ON_HINT,
+                )
+            column = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
+            if not isinstance(column, exp.Column):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "BETWEEN needs a track-row column on its left",
+                    node,
+                    fallback=join,
+                    hint=_JOIN_ON_HINT,
+                )
+            column_type = self._row_operand(column, scope, join)
+            for bound in (node.args.get("low"), node.args.get("high")):
+                self._check_join_operand(bound, column, column_type, scope, join)
+            return
+        if isinstance(node, exp.EQ | exp.NEQ | exp.GT | exp.GTE | exp.LT | exp.LTE):
+            left = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
+            right = node.args.get("expression")
+            right = _unwrap_paren(right) if isinstance(right, exp.Expr) else None
+            column, other = (left, right) if isinstance(left, exp.Column) else (right, left)
+            if not isinstance(column, exp.Column):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "an ON predicate compares track-row columns",
+                    node,
+                    fallback=join,
+                    hint=_JOIN_ON_HINT,
+                )
+            column_type = self._row_operand(column, scope, join)
+            self._check_join_operand(other, column, column_type, scope, join)
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "unsupported ON predicate",
+            node,
+            fallback=join,
+            hint=_JOIN_ON_HINT,
+        )
+
+    def _check_join_operand(
+        self,
+        node: exp.Expr | None,
+        column: exp.Column,
+        column_type: str,
+        scope: dict[str, str],
+        join: exp.Join,
+    ) -> None:
+        """An ON comparison's other operand: another row column, or a literal."""
+        other = _unwrap_paren(node) if isinstance(node, exp.Expr) else None
+        if isinstance(other, exp.Column):
+            other_type = self._row_operand(other, scope, join)
+            if other_type != column_type:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{_ident_name(column.args.get('table'))}."
+                    f"{_ident_name(column.this)}' is {column_type} and "
+                    f"'{_ident_name(other.args.get('table'))}."
+                    f"{_ident_name(other.this)}' is {other_type}, so they can "
+                    "never match",
+                    other,
+                    fallback=join,
+                    hint="join columns of the same kind, e.g. "
+                    "ON a.language = b.language",
+                )
+            return
+        self._check_row_literal(node, column, column_type, join)
 
     def _add_from_item(
         self, item: exp.Expr | None, scope: dict[str, str], visible: set[str]

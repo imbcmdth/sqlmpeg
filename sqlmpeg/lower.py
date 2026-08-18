@@ -278,18 +278,19 @@ from sqlglot import exp
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import validate_option as validate_input_option
 from sqlmpeg.ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType
-from sqlmpeg.macros import MACROS
+from sqlmpeg.macros import INPUT_MACROS, MACROS, InputMacro, macro_names
 from sqlmpeg.parser import (
     FILTER_NAMESPACE,
     MACRO_NAMESPACE,
     ROW_SCHEMAS,
     ROW_STREAM_COLUMN,
+    RawRowJoin,
     RawSink,
     RawSource,
     Resolved,
     _pos,
     _time_bounds,
-    from_items,
+    from_entries,
     kwarg_name,
     star_qualifier,
     subscript_index,
@@ -1123,15 +1124,39 @@ class _TrackRow:
 
 
 @dataclass
+class _RowRelation:
+    """One branch's joined row set: every unnest table, aligned (plan 062).
+
+    `tuples` is the relation itself — one dict per result ROW, mapping each row
+    alias to that row's track, or to ``None`` where an outer join left a gap.
+    All of a branch's row tables share this one object, which is what keeps
+    ``a.track`` and ``b.track`` aligned: element `i` of each is the pair the
+    join made, so the existing zip/broadcast machinery wires the right streams
+    together without learning that joins exist.
+
+    Row order is the join's, never sorted implicitly (RFC-009 § Semantics): the
+    LEFT side's order, then — for a FULL join only — the unmatched right rows
+    in their own order. `keys` remembers which columns each side was matched
+    on, so a NULL track can say what it failed to match.
+    """
+
+    aliases: list[str] = field(default_factory=list)
+    tuples: list[dict[str, _TrackRow | None]] = field(default_factory=list)
+    keys: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass
 class _RowBinding:
     """``FROM ..., unnest(<input>.<type>) t`` — a compile-time TABLE (RFC-009).
 
-    `rows` is the surviving row set, in ROW ORDER, and it is what the WHERE
-    predicate and the ORDER BY rewrite: filtering drops rows, sorting permutes
-    them, and both happen once per branch before any projection lowers.
-    Selecting ``t.track`` over N surviving rows is an N-element array in that
-    order, which is the same array value a bare ``f.audio`` produces — the row
-    model and the array model are one mechanism (RFC-009 § Semantics).
+    `rows` is this alias's column of the branch's joined relation, in ROW
+    ORDER: the surviving row set, one entry per result row, ``None`` where an
+    outer join found no counterpart. It is what the WHERE predicate and the
+    ORDER BY rewrite (both act on the shared :class:`_RowRelation`, so every
+    alias stays aligned), and both happen once per branch before any projection
+    lowers. Selecting ``t.track`` over N surviving rows is an N-element array in
+    that order, which is the same array value a bare ``f.audio`` produces — the
+    row model and the array model are one mechanism (RFC-009 § Semantics).
 
     `source` is the INPUT alias the tracks belong to. Everything downstream
     (the ``-i``, its WHERE window, provenance) keys off THAT alias, not the row
@@ -1142,7 +1167,11 @@ class _RowBinding:
     source: str
     column: str  # the array that was unnested: video/audio/subtitle/data
     type: StreamType
-    rows: tuple[_TrackRow, ...]
+    relation: _RowRelation
+
+    @property
+    def rows(self) -> tuple[_TrackRow | None, ...]:
+        return tuple(row.get(self.alias) for row in self.relation.tuples)
 
 
 _Binding = _InputBinding | _CteBinding | _SourceBinding | _RowBinding
@@ -1182,6 +1211,46 @@ def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
         probed = getattr(meta, name, None)
         values[name] = probed if isinstance(probed, str | int | float) else None
     return {name: values.get(name) for name in schema if name != ROW_STREAM_COLUMN}
+
+
+def _join_keys(on: exp.Expr) -> dict[str, list[str]]:
+    """Which columns each row alias was matched on, from a JOIN's ON predicate.
+
+    Bookkeeping for one message only: a NULL track says what it failed to
+    match (``no 'b' row matched a.language='fra'``), and that needs the key
+    columns of the side that DID match. Order is written order, deduplicated.
+    """
+    keys: dict[str, list[str]] = {}
+    for sub in on.walk():
+        if not isinstance(sub, exp.Column):
+            continue
+        table_node = sub.args.get("table")
+        if table_node is None:
+            continue
+        names = keys.setdefault(_fold(table_node), [])
+        name = _fold(sub.this)
+        if name not in names:
+            names.append(name)
+    return keys
+
+
+# The fill each track type takes when an outer join leaves a gap (RFC-009,
+# "Every stream type unnests; only the fill differs"). Quoted verbatim in the
+# NULL-track hint, so it is spelled the way a user would paste it. `data` is
+# absent deliberately: nothing generates a data track, so there is no fill to
+# suggest.
+_FILL_SPELLINGS: dict[StreamType, str] = {
+    "audio": f"{FILTER_NAMESPACE}.anullsrc()",
+    "video": f"{FILTER_NAMESPACE}.color()",
+    "subtitle": f"{MACRO_NAMESPACE}.empty_captions()",
+}
+
+_COALESCE_HINT = (
+    "COALESCE fills an outer join's gaps: COALESCE(b.track, "
+    f"{FILTER_NAMESPACE}.anullsrc(duration => 2)) for audio, "
+    f"{FILTER_NAMESPACE}.color() for video, "
+    f"{MACRO_NAMESPACE}.empty_captions() for captions"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1280,6 +1349,11 @@ class _Env:
     # base stream ref -> its trimmed ref, so one filter trim is shared by every
     # consumer of that stream inside this branch (CTE-only, as above).
     trimmed: dict[FrameRef, FrameRef] = field(default_factory=dict)
+    # The branch's joined row set (RFC-009, plan 062), or None until its first
+    # `unnest` binds. There is at most ONE: every row table of a branch joins
+    # into it, comma sources included (the comma between two unnests is the
+    # bounded cross join), so all row aliases stay aligned by construction.
+    relation: _RowRelation | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1331,6 +1405,10 @@ class _Lowerer:
         self.graph = Graph(input_paths=list(res.input_paths), sources=dict(res.sources))
         self.ctx = _NodeFactory(self.graph)
         self.cte_columns: dict[str, tuple[_Column, ...]] = {}
+        # Inputs this pass minted itself (RFC-009's `sqlmpeg.empty_captions()`),
+        # alias -> its INTERNAL input options. Merged into `Graph.input_options`
+        # by `_lower_input_options`, which is the only writer of that field.
+        self.minted_input_options: dict[str, dict[str, object]] = {}
 
     # -- entry point ------------------------------------------------------
 
@@ -1405,6 +1483,10 @@ class _Lowerer:
                 )
             if options:
                 result[alias] = options
+        # Compiler-minted inputs last: their options are INTERNAL (`-f webvtt`
+        # for an `empty_captions` data: URI), already validated by construction,
+        # and their aliases cannot collide with a user one.
+        result.update(self.minted_input_options)
         return result
 
     # -- a query (one SELECT, or a UNION ALL of them) ----------------------
@@ -1700,9 +1782,9 @@ class _Lowerer:
                 fallback=select,
                 hint="add FROM input('clip.mp4') a",
             )
-        for item in from_items(select):
+        for item, join in from_entries(select):
             if isinstance(item, exp.Unnest):
-                self._add_track_rows(item, env, select)
+                self._add_track_rows(item, join, env, select)
             else:
                 self._add_table(item, env, select)
         return env
@@ -1710,7 +1792,11 @@ class _Lowerer:
     # -- FROM unnest(<input>.<type>) alias (RFC-009, plan 061) -------------
 
     def _add_track_rows(
-        self, unnest: exp.Unnest, env: _Env, select: exp.Select
+        self,
+        unnest: exp.Unnest,
+        join: RawRowJoin | None,
+        env: _Env,
+        select: exp.Select,
     ) -> None:
         """Bind one track-row table: every track of the array becomes a row.
 
@@ -1754,19 +1840,89 @@ class _Lowerer:
                 f"metadata, and only a readable input has either; subscript "
                 f"one stream instead, e.g. {raw.source}.{raw.column}[1]",
             )
+        rows = [
+            _TrackRow(
+                stream=self._source_stream(raw.source, stream_type, position),
+                columns=_row_columns(meta, raw.column),
+            )
+            for position, meta in enumerate(result.by_type(stream_type))
+        ]
+        if env.relation is None:
+            env.relation = _RowRelation()
         env.bindings[alias] = _RowBinding(
             alias=alias,
             source=raw.source,
             column=raw.column,
             type=stream_type,
-            rows=tuple(
-                _TrackRow(
-                    stream=self._source_stream(raw.source, stream_type, position),
-                    columns=_row_columns(meta, raw.column),
-                )
-                for position, meta in enumerate(result.by_type(stream_type))
-            ),
+            relation=env.relation,
         )
+        self._join_rows(env.relation, alias, rows, join, env, select)
+
+    # -- joining two row tables (RFC-009, plan 062) ------------------------
+
+    def _join_rows(
+        self,
+        relation: _RowRelation,
+        alias: str,
+        rows: list[_TrackRow],
+        join: RawRowJoin | None,
+        env: _Env,
+        select: exp.Select,
+    ) -> None:
+        """Fold one freshly bound row table into the branch's relation.
+
+        Ordinary SQL join semantics, evaluated here because every column is
+        probed metadata (RFC-009: "the joins never reach ffmpeg"):
+
+        * the FIRST row table simply becomes the relation;
+        * a comma between two row tables is the bounded CROSS join;
+        * ``ON`` is 061's three-valued evaluator, and a pair is kept only when
+          it comes back TRUE — so a NULL key matches nothing, without that
+          being a rule of ours;
+        * multiplicity is real: a left row matching two right rows pairs with
+          BOTH (two result rows, hence two output streams). The fix, when that
+          is not wanted, is a wider key, not an error;
+        * LEFT keeps an unmatched left row with a NULL right side, FULL also
+          appends the unmatched RIGHT rows, in their own order, after every
+          left row — which is the whole of RFC-009's row-order rule.
+        """
+        kind = join.kind if join is not None else "cross"
+        if not relation.aliases:
+            relation.aliases.append(alias)
+            relation.tuples = [{alias: row} for row in rows]
+            return
+        if join is not None and join.on is not None:
+            for key_alias, names in _join_keys(join.on).items():
+                for name in names:
+                    if name not in relation.keys.setdefault(key_alias, []):
+                        relation.keys[key_alias].append(name)
+
+        combined: list[dict[str, _TrackRow | None]] = []
+        matched: set[int] = set()
+        for left in relation.tuples:
+            paired = False
+            for position, row in enumerate(rows):
+                candidate: dict[str, _TrackRow | None] = {**left, alias: row}
+                if kind != "cross" and (
+                    join is None
+                    or join.on is None
+                    or self._eval_row(join.on, env, candidate, select) is not True
+                ):
+                    continue
+                combined.append(candidate)
+                matched.add(position)
+                paired = True
+            if not paired and kind in ("left", "full"):
+                combined.append({**left, alias: None})
+        if kind == "full":
+            empty: dict[str, _TrackRow | None] = {name: None for name in relation.aliases}
+            combined += [
+                {**empty, alias: row}
+                for position, row in enumerate(rows)
+                if position not in matched
+            ]
+        relation.aliases.append(alias)
+        relation.tuples = combined
 
     def _path_of(self, alias: str) -> str:
         """The path behind an input alias, for a message about its file."""
@@ -2037,16 +2193,19 @@ class _Lowerer:
 
         Standard SQL: WHERE admits TRUE only, so a row whose metadata field was
         never probed simply does not match — no new rule, and no silent guess.
-        The surviving set is written back onto the binding, so every later
-        ``t.track`` sees it and an unselected row's stream is never touched.
+        The surviving set is written back onto the branch's relation, so every
+        later ``t.track`` sees it and an unselected row's stream is never
+        touched. Filtering happens AFTER the joins (plan 062), which is where
+        SQL puts it: dropping a row of an outer join's nullable side before the
+        join would silently turn it into an inner one.
         """
         for conjunct in conjuncts:
-            binding = self._row_binding_of(conjunct, env, select)
-            binding.rows = tuple(
+            relation = self._row_binding_of(conjunct, env, select).relation
+            relation.tuples = [
                 row
-                for row in binding.rows
-                if self._eval_row(conjunct, binding, row, select) is True
-            )
+                for row in relation.tuples
+                if self._eval_row(conjunct, env, row, select) is True
+            ]
 
     def _row_binding_of(
         self, node: exp.Expr, env: _Env, select: exp.Select
@@ -2071,43 +2230,49 @@ class _Lowerer:
     def _eval_row(
         self,
         node: exp.Expr,
-        binding: _RowBinding,
-        row: _TrackRow,
+        env: _Env,
+        rows: dict[str, _TrackRow | None],
         select: exp.Select,
     ) -> bool | None:
-        """One predicate against one row: TRUE, FALSE, or UNKNOWN (``None``).
+        """One predicate against one result row: TRUE, FALSE, UNKNOWN (``None``).
+
+        `rows` maps every row alias in scope to that result row's track, or to
+        None where an outer join left a gap — one evaluator for WHERE (which
+        sees a single alias) and for a JOIN's ON (which sees both sides), plan
+        062 generalizing 061's single binding.
 
         Kleene three-valued logic, which is what makes RFC-009's NULL story a
         non-story: a comparison with a NULL operand is UNKNOWN, UNKNOWN
-        propagates through AND/OR/NOT the SQL way, and :meth:`_filter_rows`
-        keeps TRUE only.
+        propagates through AND/OR/NOT the SQL way, and both callers keep TRUE
+        only. A gap row reads NULL in every column, so "NULL matches nothing"
+        covers the gaps too, for free.
         """
         node = _unwrap(node)
         if isinstance(node, exp.And | exp.Or):
-            left = self._eval_row(node.this, binding, row, select)
+            left = self._eval_row(node.this, env, rows, select)
             expression = node.args.get("expression")
             if not isinstance(expression, exp.Expr):
                 raise _error(
-                    ErrorCode.UNSUPPORTED_SQL, "malformed WHERE predicate", node,
+                    ErrorCode.UNSUPPORTED_SQL, "malformed row predicate", node,
                     fallback=select,
                 )
-            right = self._eval_row(expression, binding, row, select)
+            right = self._eval_row(expression, env, rows, select)
             return (
                 _kleene_and(left, right)
                 if isinstance(node, exp.And)
                 else _kleene_or(left, right)
             )
         if isinstance(node, exp.Not) and isinstance(node.this, exp.Expr):
-            inner = self._eval_row(node.this, binding, row, select)
+            inner = self._eval_row(node.this, env, rows, select)
             return None if inner is None else not inner
         if isinstance(node, exp.Is):
-            value = self._row_value_of(node.this, binding, row, select)
+            value = self._row_value_of(node.this, env, rows, select)
             is_null = value is None
             return not is_null if node.args.get("negate") else is_null
         if isinstance(node, exp.Between):
-            value = self._row_value_of(node.this, binding, row, select)
-            low = self._literal_of(node.args.get("low"), select)
-            high = self._literal_of(node.args.get("high"), select)
+            value = self._row_value_of(node.this, env, rows, select)
+            low = self._operand_of(node.args.get("low"), env, rows, select)
+            high = self._operand_of(node.args.get("high"), env, rows, select)
             return _kleene_and(
                 _compare(exp.GTE(), value, low), _compare(exp.LTE(), value, high)
             )
@@ -2117,8 +2282,8 @@ class _Lowerer:
             if isinstance(_unwrap(left_node), exp.Column):
                 return _compare(
                     node,
-                    self._row_value_of(left_node, binding, row, select),
-                    self._literal_of(right_node, select),
+                    self._row_value_of(left_node, env, rows, select),
+                    self._operand_of(right_node, env, rows, select),
                 )
             # `'eng' = t.language` compares the same pair the other way round,
             # and every operator here is its own mirror when the operands swap
@@ -2126,12 +2291,12 @@ class _Lowerer:
             mirrored = _MIRRORED_COMPARISONS[type(node)]()
             return _compare(
                 mirrored,
-                self._row_value_of(right_node, binding, row, select),
-                self._literal_of(left_node, select),
+                self._row_value_of(right_node, env, rows, select),
+                self._operand_of(left_node, env, rows, select),
             )
         raise _error(  # defensive: resolve accepted only the shapes above
             ErrorCode.UNSUPPORTED_SQL,
-            "unsupported WHERE predicate",
+            "unsupported row predicate",
             node,
             fallback=select,
         )
@@ -2139,21 +2304,37 @@ class _Lowerer:
     def _row_value_of(
         self,
         node: exp.Expr | None,
-        binding: _RowBinding,
-        row: _TrackRow,
+        env: _Env,
+        rows: dict[str, _TrackRow | None],
         select: exp.Select,
     ) -> RowValue:
-        """The value of one ``<row alias>.<column>`` reference in `row`."""
+        """One ``<row alias>.<column>`` reference, read out of this result row.
+
+        A gap (the alias maps to None, because an outer join found no
+        counterpart) reads NULL in every column — the one thing an absent row
+        can honestly say about itself.
+        """
         column = _unwrap(node) if isinstance(node, exp.Expr) else None
         if not isinstance(column, exp.Column):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                "a track-row predicate compares a row column against a literal",
+                "a track-row predicate compares a row column against a literal "
+                "or another row column",
                 column,
                 fallback=select,
             )
+        table_node = column.args.get("table")
+        binding = env.bindings.get(_fold(table_node)) if table_node is not None else None
+        if not isinstance(binding, _RowBinding):  # defensive: resolve checked it
+            raise _error(
+                ErrorCode.UNKNOWN_ALIAS,
+                f"unknown track-row alias '{_fold(table_node)}'",
+                column,
+                fallback=select,
+                hint=self._known_hint(),
+            )
         name = _fold(column.this)
-        if name not in row.columns:
+        if name not in ROW_SCHEMAS[binding.column] or name == ROW_STREAM_COLUMN:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"unknown column '{binding.alias}.{column.name}'",
@@ -2162,7 +2343,21 @@ class _Lowerer:
                 hint=f"{binding.column} track rows expose "
                 f"{', '.join(sorted(ROW_SCHEMAS[binding.column]))}",
             )
-        return row.columns[name]
+        row = rows.get(binding.alias)
+        return None if row is None else row.columns.get(name)
+
+    def _operand_of(
+        self,
+        node: exp.Expr | None,
+        env: _Env,
+        rows: dict[str, _TrackRow | None],
+        select: exp.Select,
+    ) -> RowValue:
+        """A comparison's other operand: another row column, or a literal."""
+        value = _unwrap(node) if isinstance(node, exp.Expr) else None
+        if isinstance(value, exp.Column):
+            return self._row_value_of(value, env, rows, select)
+        return self._literal_of(node, select)
 
     def _literal_of(self, node: exp.Expr | None, select: exp.Select) -> RowValue:
         """A row predicate's literal operand as a python scalar."""
@@ -2213,14 +2408,25 @@ class _Lowerer:
                     fallback=order,
                 )
             name = _fold(key.this)
-            nulls = [row for row in binding.rows if row.columns.get(name) is None]
-            rest = [row for row in binding.rows if row.columns.get(name) is not None]
+            relation = binding.relation
+
+            def value_of(
+                row: dict[str, _TrackRow | None],
+                alias: str = binding.alias,
+                name: str = name,
+            ) -> RowValue:
+                track = row.get(alias)
+                return None if track is None else track.columns.get(name)
+
+            nulls = [row for row in relation.tuples if value_of(row) is None]
+            rest = [row for row in relation.tuples if value_of(row) is not None]
             rest.sort(
-                key=lambda row: _sort_key(row.columns[name]),
+                key=lambda row: _sort_key(value_of(row)),
                 reverse=bool(ordered.args.get("desc")),
             )
-            ranked = nulls + rest if ordered.args.get("nulls_first") else rest + nulls
-            binding.rows = tuple(ranked)
+            relation.tuples = (
+                nulls + rest if ordered.args.get("nulls_first") else rest + nulls
+            )
 
     def _collect_trims(
         self, select: exp.Select, env: _Env, conjuncts: list[exp.Expr]
@@ -2447,6 +2653,10 @@ class _Lowerer:
                 fallback=select,
                 hint="a stream has exactly one type",
             )
+        if isinstance(node, exp.Coalesce):
+            # Not a call: COALESCE resolves against the ROW model, not the
+            # registry (RFC-009 -- it is how a nullable track column is spelled).
+            return self._lower_coalesce(node, env, select)
         call = _call_parts(node)
         if call is not None:
             return self._lower_call(node, call, env, select)
@@ -2592,7 +2802,10 @@ class _Lowerer:
                 hint="an empty row set would select no streams; widen the WHERE, "
                 "or check that the file has the tracks you expect",
             )
-        streams = [row.stream for row in binding.rows]
+        streams = [
+            self._row_stream(binding, row, position, anchor, select)
+            for position, row in enumerate(binding.rows)
+        ]
         if index is None:
             return _array(binding.type, streams)
         if not 1 <= index <= len(streams):
@@ -2606,6 +2819,341 @@ class _Lowerer:
                 hint=_SUBSCRIPT_HINT,
             )
         return _scalar(streams[index - 1])
+
+    def _row_stream(
+        self,
+        binding: _RowBinding,
+        row: _TrackRow | None,
+        position: int,
+        anchor: exp.Expr,
+        select: exp.Select,
+    ) -> _Stream:
+        """One result row's track — and the NULL rejection when there isn't one.
+
+        RFC-009 § Semantics: "selecting a nullable track column (outer join)
+        without COALESCE is a typed rejection naming the row that was NULL —
+        never a silently missing output". An outer join is the user saying the
+        counterpart may be absent, so what to put there instead is a decision
+        only they can make; ``COALESCE(<column>, <fill>)`` is where they make
+        it, and the hint says so with the fill this column's type takes.
+        """
+        if row is not None:
+            return row.stream
+        raise _error(
+            ErrorCode.STREAM_NOT_FOUND,
+            f"'{binding.alias}.{ROW_STREAM_COLUMN}' is NULL in row {position + 1}: "
+            f"{self._unmatched_text(binding, position)}",
+            anchor,
+            fallback=select,
+            hint=f"an outer join leaves gaps; fill them with "
+            f"COALESCE({binding.alias}.{ROW_STREAM_COLUMN}, "
+            f"{_FILL_SPELLINGS[binding.type]})",
+        )
+
+    def _unmatched_text(self, binding: _RowBinding, position: int) -> str:
+        """What the missing row failed to match, named from its paired row."""
+        relation = binding.relation
+        row = relation.tuples[position]
+        paired_alias, paired = self._paired_row(relation, row, binding.alias)
+        keys = relation.keys.get(paired_alias or "", [])
+        if paired is None or not keys:
+            return f"the join found no {binding.column} row of '{binding.alias}'"
+        described = ", ".join(
+            f"{paired_alias}.{key}={paired.columns.get(key)!r}" for key in keys
+        )
+        return f"no '{binding.alias}' row matched {described}"
+
+    def _paired_row(
+        self,
+        relation: _RowRelation,
+        row: dict[str, _TrackRow | None],
+        alias: str,
+    ) -> tuple[str | None, _TrackRow | None]:
+        """The counterpart of a gap: the first row table that DID match here.
+
+        RFC-009 deliverable 4 (plan 062): a fill's provenance is "the paired
+        (non-NULL side's counterpart) row metadata", and its inherited options
+        come from the same row — so a silence-filled French mix stays French.
+        Relation order (FROM order) breaks the tie when three tables joined.
+        """
+        for other in relation.aliases:
+            if other == alias:
+                continue
+            track = row.get(other)
+            if track is not None:
+                return other, track
+        return None, None
+
+    # -- COALESCE(<row>.track, <fill>) (RFC-009, plan 062) -----------------
+
+    def _lower_coalesce(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Value:
+        """The accepted spelling for a nullable track column: fill its gaps.
+
+        The result is the same N-element array ``<alias>.track`` is, in the
+        same row order — every gap replaced by a generated stand-in. Only the
+        gaps mint anything: a join with no unmatched rows compiles to exactly
+        the command the bare column would (RFC-009's consume-once rule, which
+        here means "generate nothing nobody needed").
+        """
+        binding, fill = self._coalesce_parts(node, env, select)
+        relation = binding.relation
+        if not relation.tuples:
+            raise _error(
+                ErrorCode.STREAM_NOT_FOUND,
+                f"'{binding.alias}.{ROW_STREAM_COLUMN}' selects nothing: no "
+                f"{binding.column} track of '{self._path_of(binding.source)}' "
+                "survived",
+                node,
+                fallback=select,
+                hint="an empty row set would select no streams; widen the WHERE, "
+                "or check that the file has the tracks you expect",
+            )
+        streams: list[_Stream] = []
+        for row in relation.tuples:
+            track = row.get(binding.alias)
+            if track is not None:
+                # The real track goes through `_access` exactly as a bare
+                # `<alias>.track` would, so the input's WHERE window (and the
+                # caption-seek rejection) still applies to it.
+                streams.append(
+                    self._access(
+                        env, binding.source, _scalar(track.stream), node, select
+                    ).streams[0]
+                )
+                continue
+            _, paired = self._paired_row(relation, row, binding.alias)
+            streams.append(self._lower_fill(fill, binding, paired, node, select))
+        return _array(binding.type, streams)
+
+    def _coalesce_parts(
+        self, node: exp.Expr, env: _Env, select: exp.Select
+    ) -> tuple[_RowBinding, exp.Expr]:
+        """``(the track column's row table, the fill expression)``, or a rejection.
+
+        Deliberately narrow: COALESCE exists in this dialect for exactly one
+        job — standing something in for an outer join's missing track — so it
+        takes a track-row stream column and one fill, and nothing else. It
+        creates no nodes, which is what lets :meth:`_classify` call it on an
+        argument before deciding whether to lower it.
+        """
+        arguments = [
+            argument
+            for argument in [node.this, *node.expressions]
+            if isinstance(argument, exp.Expr)
+        ]
+        if len(arguments) != 2:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"COALESCE takes a track column and one fill, got "
+                f"{len(arguments)} argument{'' if len(arguments) == 1 else 's'}",
+                node,
+                fallback=select,
+                hint=_COALESCE_HINT,
+            )
+        column = _unwrap(arguments[0])
+        binding: _Binding | None = None
+        if isinstance(column, exp.Column):
+            table_node = column.args.get("table")
+            if table_node is not None:
+                binding = env.bindings.get(_fold(table_node))
+        if not isinstance(binding, _RowBinding) or _fold(column.this) != ROW_STREAM_COLUMN:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "COALESCE's first argument is a track-row stream column, got "
+                f"{_describe(arguments[0])}",
+                arguments[0],
+                fallback=select,
+                hint=_COALESCE_HINT,
+            )
+        return binding, arguments[1]
+
+    def _lower_fill(
+        self,
+        node: exp.Expr,
+        binding: _RowBinding,
+        paired: _TrackRow | None,
+        anchor: exp.Expr,
+        select: exp.Select,
+    ) -> _Stream:
+        """Mint the stand-in for one missing track, per RFC-009's per-type table.
+
+        Two mechanisms, one rule. ``ffmpeg.<source>()`` is a zero-input filter
+        node (``anullsrc`` for audio, ``color`` for video), option-checked
+        against the installed ffmpeg exactly like a source in FROM;
+        ``sqlmpeg.empty_captions()`` is an INPUT, because a filtergraph carries
+        no subtitle pads to generate one on. Either way the fill inherits from
+        the PAIRED row — the counterpart that did match — both its options
+        (:meth:`_inherited_fill_options`) and its provenance, so a
+        silence-filled French mix is still tagged French.
+        """
+        call = _call_parts(node) if isinstance(node, exp.Expr) else None
+        if call is None or call.args or not (call.namespaced or call.is_macro):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"a COALESCE fill is a generated stand-in, got {_describe(node)}",
+                node,
+                fallback=select,
+                hint=self._fill_hint(binding),
+            )
+        source_meta = paired.stream.source if paired is not None else None
+        name = call.name.lower()
+        if call.is_macro:
+            return self._lower_macro_fill(node, name, call, binding, source_meta, select)
+        source = self._source_filter(
+            RawSource(alias="", name=name, options=(), call_node=node), select
+        )
+        self._check_fill_type(source.output, call.display, binding, node, select)
+        options = self._filter_options(name, node, select)
+        args = self._check_named_args(
+            name,
+            options,
+            call.named,
+            node,
+            owner=f"{FILTER_NAMESPACE}.{name}",
+            occupied=set(),
+        )
+        for option, value in self._inherited_fill_options(binding.type, paired).items():
+            if value is None or option in args or option not in options:
+                continue
+            args[option] = value
+        if "duration" in options and "duration" not in args:
+            # A generator with no duration runs forever, and "forever" is not
+            # what a missing 2-second track means. Inheriting it is the only
+            # correct default (RFC-009), so when the paired row was never
+            # probed for one, the query has to say it.
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() has no duration to stand in for: the paired "
+                f"track's duration was never probed",
+                node,
+                fallback=select,
+                hint=f"give the fill one, e.g. {call.display}(duration => 2)",
+            )
+        return _Stream(
+            ref=self.ctx.node(name, args, [], [source.output]),
+            type=source.output,
+            source=source_meta,
+        )
+
+    def _lower_macro_fill(
+        self,
+        node: exp.Expr,
+        name: str,
+        call: _Call,
+        binding: _RowBinding,
+        source_meta: StreamMeta | None,
+        select: exp.Select,
+    ) -> _Stream:
+        """``sqlmpeg.empty_captions()`` as a fill: an input, with the pair's tags."""
+        macro = INPUT_MACROS.get(name)
+        if macro is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL
+                if name in MACROS
+                else ErrorCode.UNKNOWN_FUNCTION,
+                f"{call.display}() cannot stand in for a missing track"
+                if name in MACROS
+                else f"unknown function {call.display}()",
+                node,
+                fallback=select,
+                hint=self._fill_hint(binding),
+            )
+        if call.named:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{call.display}() takes no arguments: an empty caption track "
+                "has nothing to configure",
+                call.named[0].value,
+                fallback=node,
+                hint=f"write {call.display}()",
+            )
+        self._check_fill_type(macro.output, call.display, binding, node, select)
+        return _Stream(
+            ref=self._mint_input(macro), type=macro.output, source=source_meta
+        )
+
+    def _check_fill_type(
+        self,
+        output: StreamType,
+        display: str,
+        binding: _RowBinding,
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """A fill stands in for a track, so it has to BE one of the same type."""
+        if output == binding.type:
+            return
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{display}() generates a {output} stream, but "
+            f"'{binding.alias}.{ROW_STREAM_COLUMN}' is {binding.type}",
+            node,
+            fallback=select,
+            hint=self._fill_hint(binding),
+        )
+
+    def _fill_hint(self, binding: _RowBinding) -> str:
+        spelling = _FILL_SPELLINGS.get(binding.type)
+        if spelling is None:
+            return (
+                f"nothing generates a {binding.type} track, so there is no fill "
+                f"for '{binding.alias}.{ROW_STREAM_COLUMN}'; select it from a "
+                "join that always matches"
+            )
+        return (
+            f"the fill for a {binding.type} track is {spelling}; its options "
+            "inherit from the paired row unless you give them"
+        )
+
+    def _inherited_fill_options(
+        self, stream_type: StreamType, paired: _TrackRow | None
+    ) -> dict[str, object]:
+        """What the fill copies from the row it stands beside (RFC-009).
+
+        Audio inherits DURATION only in v1 — a silent track's sample rate and
+        layout are ffmpeg's own defaults, and amix resamples anyway, so
+        inventing them would put options in the command nobody wrote. Video
+        inherits size, rate and duration, because a black frame of the wrong
+        size or rate is not a stand-in for the picture that is missing.
+        An option the query set explicitly always wins (the caller only fills
+        the ones it did not).
+        """
+        if paired is None:
+            return {}
+        columns = paired.columns
+        if stream_type == "audio":
+            return {"duration": columns.get("duration")}
+        if stream_type == "video":
+            width = columns.get("width")
+            height = columns.get("height")
+            size = (
+                f"{int(width)}x{int(height)}"
+                if isinstance(width, int | float) and isinstance(height, int | float)
+                else None
+            )
+            return {
+                "size": size,
+                "rate": columns.get("fps"),
+                "duration": columns.get("duration"),
+            }
+        return {}
+
+    def _mint_input(self, macro: InputMacro) -> FrameRef:
+        """Add the macro's own ``-i`` to the graph and ref its single stream.
+
+        The alias is spelled so no query can ever collide with it (a dot AND a
+        ``#``, neither legal in an unquoted identifier), because it is not a
+        name anything resolves — it exists only so the graph's alias-keyed
+        input tables (``sources``, ``input_options``) can carry the slot. The
+        internal ``format`` option is what puts ``-f webvtt`` before the
+        ``data:`` URI; see ``sqlmpeg.inputs.option_spec``.
+        """
+        index = len(self.graph.input_paths)
+        alias = f"{MACRO_NAMESPACE}.{macro.name}#{index + 1}"
+        self.graph.input_paths.append(macro.path)
+        self.graph.sources[alias] = index
+        self.minted_input_options[alias] = {"format": macro.format}
+        return f"src:{alias}:{_TYPE_MARKERS[macro.output]}:0"
 
     def _source_value(
         self,
@@ -2961,6 +3509,23 @@ class _Lowerer:
         off `positions`/`streams`, so a macro's single stream argument
         broadcasts elementwise exactly like any registry call's would.
         """
+        input_macro = INPUT_MACROS.get(name)
+        if input_macro is not None:
+            # An input-minting macro (RFC-009): no filter node, no arguments,
+            # one passthrough stream of the type it mints.
+            if call.args or call.named:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{call.display}() takes no arguments",
+                    node,
+                    fallback=select,
+                    hint=f"write {call.display}()",
+                )
+            return _scalar(
+                _Stream(
+                    ref=self._mint_input(input_macro), type=input_macro.output
+                )
+            )
         macro = MACROS.get(name)
         if macro is None:
             raise _error(
@@ -3042,12 +3607,12 @@ class _Lowerer:
 
     def _macro_function_hint(self, name: str) -> str:
         """Did-you-mean over :data:`MACROS`, RFC-007's small-by-design trio."""
-        matches = difflib.get_close_matches(name, sorted(MACROS), n=1, cutoff=0.6)
+        matches = difflib.get_close_matches(name, macro_names(), n=1, cutoff=0.6)
         if matches:
             return f"did you mean {MACRO_NAMESPACE}.{matches[0]}()?"
         return (
             f"{MACRO_NAMESPACE}.<name> is one of sqlmpeg's own macros -- "
-            f"{', '.join(sorted(MACROS))} -- not an ffmpeg filter; filters live "
+            f"{', '.join(macro_names())} -- not an ffmpeg filter; filters live "
             f"bare or under {FILTER_NAMESPACE}.<filter>(...)"
         )
 
@@ -3791,10 +4356,16 @@ class _Lowerer:
             return self._base_stream(node, env, select)[1].type
         if isinstance(node, exp.Cast):
             return _UNSUPPORTED_KIND
+        if isinstance(node, exp.Coalesce):
+            # A filled track column is a stream of the row table's own type,
+            # which is knowable without lowering anything (no fill is minted).
+            return self._coalesce_parts(node, env, select)[0].type
         call = _call_parts(node)
         if call is not None:
             name = call.name.lower()
             if call.is_macro:
+                if name in INPUT_MACROS:
+                    return INPUT_MACROS[name].output
                 macro = MACROS.get(name)
                 if macro is None:
                     raise _error(

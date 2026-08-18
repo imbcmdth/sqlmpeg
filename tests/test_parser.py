@@ -9,6 +9,7 @@ from sqlmpeg.parser import (
     RawSink,
     RawSource,
     Resolved,
+    from_entries,
     parse,
     resolve,
     star_qualifier,
@@ -1701,15 +1702,112 @@ def test_unnest_needs_an_input_not_a_cte_or_a_generated_source() -> None:
     assert "only an input's stream array can be unnested" in err.message
 
 
-def test_explicit_join_between_unnests_is_still_rejected_in_this_wave() -> None:
-    # RFC-009 admits JOIN between unnest tables; wave 062 implements it. Until
-    # then the pre-existing fence stands, and says so.
-    err = _reject(
+# -- JOIN between track-row tables (RFC-009, plan 062) ----------------------
+
+
+def _joined(join: str = "JOIN", on: str = "ON a.language = b.language") -> str:
+    return (
         "SELECT a.track FROM input('a.mkv') f, input('b.mkv') g, "
-        "unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language"
+        f"unnest(f.audio) a {join} unnest(g.audio) b {on}"
+    )
+
+
+@pytest.mark.parametrize(
+    "join",
+    ["JOIN", "INNER JOIN", "LEFT JOIN", "LEFT OUTER JOIN", "FULL JOIN", "FULL OUTER JOIN"],
+)
+def test_admitted_join_forms_between_unnest_tables(join: str) -> None:
+    """FULL arrives with AND without `kind='OUTER'`; both are the same join."""
+    assert sorted(_resolve(_joined(join)).track_rows) == ["a", "b"]
+
+
+def test_from_entries_reports_each_items_join_kind() -> None:
+    select = parse(_joined("FULL OUTER JOIN"))
+    assert isinstance(select, exp.Select)
+    entries = from_entries(select)
+    assert [None if join is None else join.kind for _, join in entries] == [
+        None,  # `FROM input('a.mkv') f` is not attached by anything
+        "cross",  # a comma source
+        "cross",  # `, unnest(f.audio) a`
+        "full",
+    ]
+
+
+def test_a_join_may_match_on_several_keys_and_on_a_literal() -> None:
+    sql = _joined(
+        on="ON a.language = b.language AND a.channels = b.channels "
+        "AND b.codec != 'ac3'"
+    )
+    assert sorted(_resolve(sql).track_rows) == ["a", "b"]
+
+
+def test_a_join_on_columns_of_different_types_is_rejected() -> None:
+    err = _reject(_joined(on="ON a.language = b.channels"))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "so they can never match" in err.message
+
+
+def test_a_join_cannot_match_on_the_track_column() -> None:
+    err = _reject(_joined(on="ON a.track = b.track"))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is a stream, not a value to compare" in err.message
+
+
+def test_a_join_with_no_on_is_the_comma_cross_join() -> None:
+    """VERIFIED (sqlglot 30.17): `a JOIN b` with no ON parses to an exp.Join
+    carrying nothing but `this` -- byte for byte what a comma source produces.
+    The two are indistinguishable in the AST, so a bare JOIN between two row
+    tables IS the bounded cross join, not a rejection we could even spell."""
+    select = parse(_joined(on=""))
+    assert isinstance(select, exp.Select)
+    assert [None if join is None else join.kind for _, join in from_entries(select)][
+        -1
+    ] == "cross"
+    assert sorted(_resolve(_joined(on="")).track_rows) == ["a", "b"]
+
+
+def test_an_on_predicate_may_not_name_a_non_row_alias() -> None:
+    err = _reject(_joined(on="ON a.language = f.t"))
+    assert err.code is ErrorCode.UNKNOWN_ALIAS
+
+
+def test_unsupported_on_shapes_are_rejected() -> None:
+    err = _reject(_joined(on="ON a.language LIKE b.language"))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unsupported ON predicate" in err.message
+
+
+@pytest.mark.parametrize(
+    ("join", "on", "message"),
+    [
+        ("RIGHT JOIN", "ON a.language = b.language", "RIGHT JOIN is not supported"),
+        ("CROSS JOIN", "", "CROSS JOIN is not supported"),
+        ("NATURAL JOIN", "", "this JOIN form is not supported"),
+        ("JOIN", "USING (language)", "USING is not supported"),
+    ],
+)
+def test_join_forms_outside_the_admitted_set(join: str, on: str, message: str) -> None:
+    err = _reject(_joined(join, on))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert message in err.message
+
+
+def test_join_is_still_rejected_between_stream_level_sources() -> None:
+    # RFC-009 § Fences: input-level FROM stays a comma cross-join.
+    err = _reject(
+        "SELECT f.video[1] FROM input('a.mkv') f JOIN input('b.mkv') g ON f.t = g.t"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "explicit JOIN syntax is not supported" in err.message
+    assert "between unnest(...) track-row tables only" in err.message
+
+
+def test_join_is_rejected_when_its_left_side_is_not_a_row_table() -> None:
+    err = _reject(
+        "SELECT a.track FROM input('a.mkv') f, input('b.mkv') g "
+        "JOIN unnest(g.audio) a ON a.language = 'eng'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "between unnest(...) track-row tables only" in err.message
 
 
 # -- row columns ------------------------------------------------------------

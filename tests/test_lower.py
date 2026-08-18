@@ -5764,3 +5764,414 @@ def test_a_track_row_query_runs_end_to_end(tmp_path: Path) -> None:
     result = subprocess.run(args, capture_output=True, text=True, timeout=60.0)
     assert result.returncode == 0, result.stderr
     assert out.exists()
+
+
+# ---------------------------------------------------------------------------
+# track-row JOINs and COALESCE fills (RFC-009, plan 062)
+# ---------------------------------------------------------------------------
+#
+# Synthetic probes again: a join is decided entirely by the probed columns, so
+# two hand-built ProbeResults exercise every join kind, the multiplicity rule
+# and every fill without a file on disk. The end-to-end shapes are the
+# cookbook's (recipes 25-28, exec tier).
+
+
+def _pair_probes(
+    left: list[StreamMeta] | None = None,
+    right: list[StreamMeta] | None = None,
+) -> dict[str, ProbeResult | None]:
+    """Two files: `f` with an eng and a fra track, `g` with eng only."""
+    return {
+        "f": ProbeResult(
+            streams=list(left)
+            if left is not None
+            else [
+                _track("audio", 0, language="eng", duration=2.0),
+                _track("audio", 1, language="fra", duration=2.0),
+            ]
+        ),
+        "g": ProbeResult(
+            streams=list(right)
+            if right is not None
+            else [_track("audio", 0, language="eng", duration=2.0)]
+        ),
+    }
+
+
+def _join_query(
+    projection: str = "a.track, b.track",
+    join: str = "JOIN",
+    on: str = "ON a.language = b.language",
+    where: str = "",
+    order: str = "",
+    column: str = "audio",
+) -> str:
+    return (
+        f"SELECT {projection} FROM input('f.mkv') f, input('g.mkv') g, "
+        f"unnest(f.{column}) a {join} unnest(g.{column}) b {on}"
+        + (f" WHERE {where}" if where else "")
+        + (f" ORDER BY {order}" if order else "")
+    )
+
+
+def _refs(g: Graph) -> list[str]:
+    return [output.ref for output in g.outputs]
+
+
+def test_an_inner_join_pairs_rows_by_their_metadata() -> None:
+    g = _lower(_join_query(), _pair_probes())
+    # One result row (eng/eng); fra matched nothing, so its stream is never read.
+    assert _refs(g) == ["src:f:a:0", "src:g:a:0"]
+
+
+def test_result_row_order_is_the_left_sides_track_order() -> None:
+    probes = _pair_probes(
+        right=[
+            _track("audio", 0, language="fra", duration=2.0),
+            _track("audio", 1, language="eng", duration=2.0),
+        ]
+    )
+    g = _lower(_join_query(), probes)
+    # `g` stores fra first, but the rows follow `f`: eng, then fra. (Outputs are
+    # column-major -- `a.track`'s array, then `b.track`'s -- so the PAIRING is
+    # element k of one against element k of the other.)
+    assert _refs(g) == ["src:f:a:0", "src:f:a:1", "src:g:a:1", "src:g:a:0"]
+
+
+def test_join_multiplicity_is_real_join_semantics() -> None:
+    """RFC-009: a row matching two rows on the other side pairs with BOTH --
+    that REPLACES RFC-008's duplicate-tag rejection. Two pairs, two outputs."""
+    probes = _pair_probes(
+        right=[
+            _track("audio", 0, language="eng", channel_layout="stereo", duration=2.0),
+            _track("audio", 1, language="eng", channel_layout="5.1", duration=2.0),
+        ]
+    )
+    g = _lower(_join_query(), probes)
+    assert _refs(g) == ["src:f:a:0", "src:f:a:0", "src:g:a:0", "src:g:a:1"]
+    # ...and the fix, when that is not what was wanted, is a wider key -- which
+    # here matches nothing at all (`f`'s tracks carry no layout), and an empty
+    # row set selects no streams, exactly as it does without a join.
+    err = _reject_lower(
+        _join_query(on="ON a.language = b.language AND a.channel_layout = b.channel_layout"),
+        probes,
+    )
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "selects nothing" in err.message
+
+
+def test_a_null_key_matches_nothing() -> None:
+    probes = _pair_probes(
+        left=[_track("audio", 0, duration=2.0)],  # no language tag at all
+        right=[_track("audio", 0, duration=2.0)],
+    )
+    g = _lower(_join_query(projection="a.track", join="LEFT JOIN"), probes)
+    err = _reject_lower(_join_query(projection="b.track", join="LEFT JOIN"), probes)
+    assert _refs(g) == ["src:f:a:0"]  # the left row survives, unpaired
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+
+
+def test_a_left_join_keeps_unmatched_left_rows() -> None:
+    g = _lower(_join_query(projection="a.track", join="LEFT JOIN"), _pair_probes())
+    assert _refs(g) == ["src:f:a:0", "src:f:a:1"]
+
+
+def test_a_full_join_appends_unmatched_right_rows_in_their_own_order() -> None:
+    probes = _pair_probes(
+        right=[
+            _track("audio", 0, language="deu", duration=2.0),
+            _track("audio", 1, language="eng", duration=2.0),
+        ]
+    )
+    # Rows are eng (matched), fra (unmatched left), then the unmatched RIGHT
+    # row -- whose `a.track` is NULL, which is what this rejection is about.
+    err = _reject_lower(
+        _join_query(projection="a.track", join="FULL OUTER JOIN"), probes
+    )
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "is NULL in row 3" in err.message
+    assert "b.language='deu'" in err.message
+    assert "COALESCE(a.track" in (err.hint or "")
+    # Filled, the whole row order shows: the matched pair, the unmatched LEFT
+    # row (silence on the right), then the unmatched RIGHT row appended last.
+    filled = _lower(
+        _join_query(
+            projection="COALESCE(b.track, ffmpeg.anullsrc(duration => 1))",
+            join="FULL OUTER JOIN",
+        ),
+        probes,
+    )
+    fills = [node.id for node in filled.nodes.values()]
+    assert _refs(filled) == ["src:g:a:1", fills[0], "src:g:a:0"]
+
+
+def test_full_join_with_and_without_the_outer_keyword_are_one_join() -> None:
+    probes = _pair_probes()
+    with_kind = _lower(_join_query(projection="a.track", join="FULL OUTER JOIN"), probes)
+    without = _lower(_join_query(projection="a.track", join="FULL JOIN"), probes)
+    assert _refs(with_kind) == _refs(without) == ["src:f:a:0", "src:f:a:1"]
+
+
+def test_a_comma_between_two_unnests_is_the_cross_join() -> None:
+    g = _lower(
+        "SELECT a.track, b.track FROM input('f.mkv') f, input('g.mkv') g, "
+        "unnest(f.audio) a, unnest(g.audio) b",
+        _pair_probes(
+            right=[
+                _track("audio", 0, language="eng", duration=2.0),
+                _track("audio", 1, language="fra", duration=2.0),
+            ]
+        ),
+    )
+    assert _refs(g) == [
+        "src:f:a:0", "src:f:a:0", "src:f:a:1", "src:f:a:1",
+        "src:g:a:0", "src:g:a:1", "src:g:a:0", "src:g:a:1",
+    ]
+
+
+def test_where_filters_the_joined_rows_not_the_tables() -> None:
+    """A predicate on the nullable side runs AFTER the join, so `IS NULL` finds
+    the gaps -- pushing it down would have turned the outer join into an inner
+    one and dropped exactly the rows it is about."""
+    g = _lower(
+        _join_query(
+            projection="a.track", join="FULL OUTER JOIN", where="b.language IS NULL"
+        ),
+        _pair_probes(),
+    )
+    assert _refs(g) == ["src:f:a:1"]  # only the unpaired French row
+
+
+def test_order_by_re_sorts_the_joined_rows_and_keeps_the_pairing() -> None:
+    g = _lower(_join_query(order="a.language DESC"), _pair_probes(
+        right=[
+            _track("audio", 0, language="eng", duration=2.0),
+            _track("audio", 1, language="fra", duration=2.0),
+        ]
+    ))
+    assert _refs(g) == ["src:f:a:1", "src:f:a:0", "src:g:a:1", "src:g:a:0"]
+
+
+# -- COALESCE fills ---------------------------------------------------------
+
+
+def _fill_query(fill: str, projection: str = "COALESCE(b.track, {fill})") -> str:
+    return _join_query(
+        projection=projection.format(fill=fill), join="FULL OUTER JOIN"
+    )
+
+
+def test_an_audio_fill_inherits_only_the_paired_rows_duration() -> None:
+    g = _lower(_fill_query("ffmpeg.anullsrc()"), _pair_probes())
+    fills = [node for node in g.nodes.values() if node.filter == "anullsrc"]
+    assert _refs(g) == ["src:g:a:0", fills[0].id]
+    # Duration inherited from the fra row it stands beside -- and NOTHING else:
+    # no sample_rate, no channel_layout the query never wrote.
+    assert fills[0].args == {"duration": 2.0}
+    assert fills[0].inputs == []
+
+
+def test_an_explicit_fill_option_wins_over_the_inherited_one() -> None:
+    g = _lower(_fill_query("ffmpeg.anullsrc(duration => 5)"), _pair_probes())
+    fills = [node for node in g.nodes.values() if node.filter == "anullsrc"]
+    assert fills[0].args == {"duration": 5}
+
+
+def test_a_fill_with_no_duration_to_inherit_is_a_typed_rejection() -> None:
+    probes = _pair_probes(
+        left=[
+            _track("audio", 0, language="eng"),
+            _track("audio", 1, language="fra"),  # never probed for a duration
+        ]
+    )
+    err = _reject_lower(_fill_query("ffmpeg.anullsrc()"), probes)
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "no duration to stand in for" in err.message
+    assert "duration => 2" in (err.hint or "")
+
+
+def test_a_fill_takes_the_paired_rows_tags_as_its_provenance() -> None:
+    g = _lower(
+        _join_query(
+            projection="amix(a.track, COALESCE(b.track, ffmpeg.anullsrc()))",
+            join="FULL OUTER JOIN",
+        ),
+        _pair_probes(),
+    )
+    # The silence-filled mix keeps the French tag: it came from the side that
+    # existed, so `_agreed_source` still sees two streams saying `fra`.
+    assert [output.metadata for output in g.outputs] == [
+        {"language": "eng"},
+        {"language": "fra"},
+    ]
+
+
+def test_a_join_with_no_gaps_mints_no_fill_at_all() -> None:
+    probes = _pair_probes(
+        right=[
+            _track("audio", 0, language="eng", duration=2.0),
+            _track("audio", 1, language="fra", duration=2.0),
+        ]
+    )
+    g = _lower(_fill_query("ffmpeg.anullsrc()"), probes)
+    assert _refs(g) == ["src:g:a:0", "src:g:a:1"]
+    assert not g.nodes  # consume-once: nothing needed a stand-in
+
+
+def test_a_video_fill_inherits_size_rate_and_duration() -> None:
+    probes: dict[str, ProbeResult | None] = {
+        "f": ProbeResult(
+            streams=[
+                _track("video", 0, language="eng", width=320, height=240,
+                       fps="25/1", duration=2.0),
+                _track("video", 1, language="fra", width=640, height=480,
+                       fps="30/1", duration=3.0),
+            ]
+        ),
+        "g": ProbeResult(
+            streams=[_track("video", 0, language="eng", width=320, height=240,
+                            fps="25/1", duration=2.0)]
+        ),
+    }
+    g = _lower(
+        _join_query(
+            projection="COALESCE(b.track, ffmpeg.color())",
+            join="FULL OUTER JOIN",
+            column="video",
+        ),
+        probes,
+    )
+    fills = [node for node in g.nodes.values() if node.filter == "color"]
+    assert fills[0].args == {"size": "640x480", "rate": "30/1", "duration": 3.0}
+
+
+def test_a_fill_of_the_wrong_type_for_the_column_is_udf_arg_type() -> None:
+    err = _reject_lower(_fill_query("ffmpeg.color()"), _pair_probes())
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "generates a video stream, but 'b.track' is audio" in err.message
+    assert "anullsrc" in (err.hint or "")
+
+
+def test_a_caption_gap_fills_with_an_empty_captions_input() -> None:
+    probes: dict[str, ProbeResult | None] = {
+        "f": ProbeResult(
+            streams=[
+                _track("subtitle", 0, language="eng"),
+                _track("subtitle", 1, language="fra"),
+            ]
+        ),
+        "g": ProbeResult(streams=[_track("subtitle", 0, language="eng")]),
+    }
+    g = _lower(
+        _join_query(
+            projection="COALESCE(b.track, sqlmpeg.empty_captions())",
+            join="FULL OUTER JOIN",
+            column="subtitle",
+        ),
+        probes,
+    )
+    minted = "sqlmpeg.empty_captions#3"
+    # An INPUT, not a filter node: a filtergraph carries no subtitle pads.
+    assert not g.nodes
+    assert g.input_paths[2] == "data:text/vtt;base64,V0VCVlRUCgo="
+    assert g.sources[minted] == 2
+    assert g.input_options[minted] == {"format": "webvtt"}
+    assert _refs(g) == ["src:g:s:0", f"src:{minted}:s:0"]
+    # ...and it takes the paired row's tag, which is the whole point of it.
+    assert [output.metadata for output in g.outputs] == [
+        {"language": "eng"},
+        {"language": "fra"},
+    ]
+
+
+def test_the_empty_captions_input_renders_its_format_flag_before_the_i() -> None:
+    probes: dict[str, ProbeResult | None] = {
+        "f": ProbeResult(
+            streams=[
+                _track("subtitle", 0, language="eng"),
+                _track("subtitle", 1, language="fra"),
+            ]
+        ),
+        "g": ProbeResult(streams=[_track("subtitle", 0, language="eng")]),
+    }
+    g = _lower(
+        _join_query(
+            projection="COALESCE(b.track, sqlmpeg.empty_captions())",
+            join="FULL OUTER JOIN",
+            column="subtitle",
+        ),
+        probes,
+    )
+    args = build_ffmpeg_args(emit(g), "out.mkv")
+    assert args[args.index("-f") + 1] == "webvtt"
+    assert args[args.index("-f") + 2] == "-i"
+    assert args[args.index("-f") + 3] == "data:text/vtt;base64,V0VCVlRUCgo="
+
+
+def test_a_coalesce_fill_must_be_a_generated_stand_in() -> None:
+    err = _reject_lower(_fill_query("f.audio[1]"), _pair_probes())
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a COALESCE fill is a generated stand-in" in err.message
+
+
+def test_coalesces_first_argument_is_a_track_column() -> None:
+    err = _reject_lower(
+        _join_query(
+            projection="COALESCE(f.audio[1], ffmpeg.anullsrc())",
+            join="FULL OUTER JOIN",
+        ),
+        _pair_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "first argument is a track-row stream column" in err.message
+
+
+def test_coalesce_takes_exactly_two_arguments() -> None:
+    err = _reject_lower(
+        _join_query(
+            projection="COALESCE(b.track, ffmpeg.anullsrc(), ffmpeg.anullsrc())",
+            join="FULL OUTER JOIN",
+        ),
+        _pair_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "takes a track column and one fill" in err.message
+
+
+@pytest.mark.exec
+def test_a_joined_track_query_runs_end_to_end(tmp_path: Path) -> None:
+    """Real probes, real ffmpeg: the pairwise mix of recipe 25's shape, run.
+
+    av2.mp4 and av3.mp4 each carry an `eng` and a `fra` track in a different
+    order, so this proves the join wired eng to eng -- and that the compiled
+    command is one ffmpeg actually accepts.
+    """
+    out = tmp_path / "mixed.mka"
+    query = (
+        "SELECT amix(a.track, b.track) FROM "
+        f"input('{(FIXTURES_DIR / 'av2.mp4').as_posix()}') f, "
+        f"input('{(FIXTURES_DIR / 'av3.mp4').as_posix()}') g, "
+        "unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language"
+    )
+    args = build_ffmpeg_args(emit(compile_sql(query)), str(out))
+    args.insert(1, "-y")
+    result = subprocess.run(args, capture_output=True, text=True, timeout=60.0)
+    assert result.returncode == 0, result.stderr
+    assert out.exists()
+
+
+@pytest.mark.exec
+def test_an_empty_captions_fill_muxes_a_real_track(tmp_path: Path) -> None:
+    """The measured claim, re-measured: `-f webvtt -i "data:..."` really does
+    mux a taggable, zero-cue subtitle stream (2026-08-17, ffmpeg 7.1)."""
+    out = tmp_path / "subs.mkv"
+    query = (
+        "SELECT s.track, sqlmpeg.empty_captions() FROM "
+        f"input('{(FIXTURES_DIR / 'avs.mkv').as_posix()}') f, "
+        "unnest(f.subtitle) s WHERE s.language = 'eng'"
+    )
+    args = build_ffmpeg_args(emit(compile_sql(query)), str(out))
+    args.insert(1, "-y")
+    result = subprocess.run(args, capture_output=True, text=True, timeout=60.0)
+    assert result.returncode == 0, result.stderr
+    assert out.exists()

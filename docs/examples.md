@@ -534,7 +534,7 @@ FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
 
 ```
 $ sqlmpeg compile -f query.sql -o full.mka
-ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex '[0:a:0][1:a:0]amix=inputs=2[out0];anullsrc=duration=2[n3];[0:a:1][n3]amix=inputs=2[out1]' -map '[out0]' -metadata:s:0 language=eng -map '[out1]' -metadata:s:1 language=fra full.mka
+ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex 'anullsrc=duration=2[n1];[0:a:0][1:a:0]amix=inputs=2[out0];[0:a:1][n1]amix=inputs=2[out1]' -map '[out0]' -metadata:s:0 language=eng -map '[out1]' -metadata:s:1 language=fra full.mka
 ```
 
 The second file has no French, so the French mix gets silence in that slot - and keeps its `fra` tag, because the tag came from the side that existed.
@@ -555,7 +555,7 @@ FROM input('tests/fixtures/av2.mp4') f2, input('tests/fixtures/av-eng.mp4') g2,
 
 ```
 $ sqlmpeg compile -f query.sql -o joined.mp4
-ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex 'anullsrc=duration=2[n5];[0:v:0][0:a:0][0:a:1][1:v:0][1:a:0][n5]concat=n=2:v=1:a=2[out0][out1][out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra joined.mp4
+ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex 'anullsrc=duration=2[n1];[0:v:0][0:a:0][0:a:1][1:v:0][1:a:0][n1]concat=n=2:v=1:a=2[out0][out1][out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra joined.mp4
 ```
 
 Both branches share one join shape, so both agree on track order, and eng concatenates with eng. Each file appears in two branches but gets ONE `-i`: untrimmed aliases over the same path share an input.

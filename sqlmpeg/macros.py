@@ -28,7 +28,15 @@ from dataclasses import dataclass, field
 
 from sqlmpeg.ir import StreamType
 
-__all__ = ["MACROS", "Macro", "MacroParam", "NodeBuilder"]
+__all__ = [
+    "INPUT_MACROS",
+    "MACROS",
+    "InputMacro",
+    "Macro",
+    "MacroParam",
+    "NodeBuilder",
+    "macro_names",
+]
 
 # One node-minting call: filter name, its args, its input refs, its output pad
 # types -> the new node's ref (pad 0). Exactly `_NodeFactory.node`'s shape, so
@@ -135,3 +143,53 @@ MACROS: dict[str, Macro] = {
         kind_hints={"audio": _ADELAY_HINT},
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# input-minting macros (RFC-009, plan 062)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InputMacro:
+    """A macro that lowers to an extra ``-i``, not to a filter node.
+
+    The one kind of stream a filtergraph cannot generate: ffmpeg has no
+    "empty subtitle source" filter, because a filtergraph carries no subtitle
+    pads at all (RFC-004's passthrough-only rule). So the stand-in for a
+    missing caption track is minted as an INPUT instead -- `format` forces the
+    demuxer, `path` is a self-contained ``data:`` URI, and the result is an
+    ordinary passthrough subtitle stream that takes tags like any other.
+
+    `format` flows to emit through an INTERNAL per-input option (see
+    ``sqlmpeg.inputs.internal_option``); it is not part of the user-facing
+    ``INPUT_OPTIONS`` table, because there is no ``input('x', format => ...)``
+    surface -- this is the compiler minting its own input.
+    """
+
+    name: str
+    output: StreamType
+    path: str
+    format: str
+
+
+# "WEBVTT\n\n", base64'd: a valid WebVTT file with zero cues. Measured
+# 2026-08-17 against ffmpeg 7.1 -- `-f webvtt -i "data:text/vtt;base64,
+# V0VCVlRUCgo="` muxes a real, taggable subtitle stream carrying no cues, and
+# ffmpeg's own `data:` protocol keeps the compiled command self-contained (no
+# temp file is written, nothing is shipped alongside the command).
+_EMPTY_VTT_URI = "data:text/vtt;base64,V0VCVlRUCgo="
+
+INPUT_MACROS: dict[str, InputMacro] = {
+    "empty_captions": InputMacro(
+        name="empty_captions",
+        output="subtitle",
+        path=_EMPTY_VTT_URI,
+        format="webvtt",
+    ),
+}
+
+
+def macro_names() -> list[str]:
+    """Every ``sqlmpeg.<name>`` there is, both kinds, sorted."""
+    return sorted({*MACROS, *INPUT_MACROS})
