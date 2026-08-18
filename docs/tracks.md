@@ -4,6 +4,10 @@ Every real library has the file with the tracks in the wrong order, the one with
 
 One thing to hold onto: **everything on this page happens at compile time.** The columns are ffprobe results, so every predicate is decidable while compiling, and no join, filter, or sort survives into the ffmpeg command. What ffmpeg receives is the wiring these decisions produced, the same way a `WHERE t BETWEEN` window vanishes into `-ss`/`-to`. Nothing here decodes a frame, and none of it works on an input ffprobe cannot read (that is a typed rejection, not a guess).
 
+## The shape of the model
+
+An `input()` alias is one row with four array columns - `video`, `audio`, `subtitle`, `data` - because that is what a container file IS. `unnest` is the standard SQL move from that nested shape to rows. On the way out, no re-nesting is required: the query's result is being written into a container, and containers are flat ordered stream lists, so the sink serializes the result the way `COPY ... TO ... (FORMAT csv)` serializes a relation into lines. (The splat itself has Postgres precedent too: a set-returning `unnest` in a SELECT list explodes into rows there as well.) Nested in, relational in the middle, flat out - each end is the honest shape of a media file.
+
 ## Rows and columns
 
 `unnest(<alias>.audio)` (or `.video`, `.subtitle`, `.data`) in `FROM` makes a table with one row per track. It needs an alias, like every table in the dialect, and its argument must be a bare array of an input declared earlier in the same FROM list - stock Postgres scoping, where a function call in FROM may reference the tables before it:

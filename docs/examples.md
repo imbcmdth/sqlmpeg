@@ -9,15 +9,15 @@ The most-asked ffmpeg question there is. Select the streams, name the codecs in 
 ```sql
 COPY (
   SELECT f.video[1], f.audio[1]
-  FROM input('film.mkv') f
-) TO 'film.mp4' WITH (
+  FROM input(:'source') f
+) TO :'dest' WITH (
   video_codec 'libx264', crf 20, preset 'slow',
   audio_codec 'aac', audio_bitrate '192k', faststart true
 )
 ```
 
 ```
-$ sqlmpeg compile -f query.sql
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=film.mp4
 ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -preset:0 slow -c:1 aac -b:1 192k -movflags +faststart film.mp4
 ```
 
@@ -43,12 +43,12 @@ The SELECT list is the output. Select only the audio and that's the whole file -
 ```sql
 COPY (
   SELECT f.audio[1]
-  FROM input('film.mkv') f
-) TO 'soundtrack.m4a'
+  FROM input(:'source') f
+) TO :'dest'
 ```
 
 ```
-$ sqlmpeg compile -f query.sql
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=soundtrack.m4a
 ffmpeg -i film.mkv -map 0:a:0 -c:0 copy soundtrack.m4a
 ```
 
@@ -58,12 +58,12 @@ ffmpeg -i film.mkv -map 0:a:0 -c:0 copy soundtrack.m4a
 
 ```sql
 SELECT a.video[1], a.audio[1]
-FROM input('clip.mp4') a
+FROM input(:'source') a
 WHERE a.t BETWEEN 5 AND 60
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o cut.mp4
+$ sqlmpeg compile -f query.sql -o cut.mp4 -v source=clip.mp4
 ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy cut.mp4
 ```
 
@@ -72,13 +72,13 @@ When the exact cut point matters, re-encode: a decoded stream trims frame-accura
 ```sql
 COPY (
   SELECT a.video[1], a.audio[1]
-  FROM input('clip.mp4') a
+  FROM input(:'source') a
   WHERE a.t BETWEEN 5 AND 60
-) TO 'cut.mp4' WITH (video_codec 'libx264', crf 18, audio_codec 'aac')
+) TO :'dest' WITH (video_codec 'libx264', crf 18, audio_codec 'aac')
 ```
 
 ```
-$ sqlmpeg compile -f query.sql
+$ sqlmpeg compile -f query.sql -v source=clip.mp4 -v dest=cut.mp4
 ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 18 -c:1 aac cut.mp4
 ```
 
@@ -88,11 +88,11 @@ ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 18 -c:
 
 ```pgsql
 SELECT scale(f.frame, 1280, -2), f.audio[1]
-FROM input('film.mp4') f
+FROM input(:'source') f
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o small.mp4
+$ sqlmpeg compile -f query.sql -o small.mp4 -v source=film.mp4
 ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=1280:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy small.mp4
 ```
 
@@ -100,11 +100,11 @@ Or express the width relative to the input - any string-typed option takes an ff
 
 ```pgsql
 SELECT scale(f.frame, 'iw/2', -2), f.audio[1]
-FROM input('film.mp4') f
+FROM input(:'source') f
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o half.mp4
+$ sqlmpeg compile -f query.sql -o half.mp4 -v source=film.mp4
 ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=iw/2:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy half.mp4
 ```
 
@@ -114,11 +114,11 @@ For quarter turns, ffmpeg's `transpose` is the right tool (it swaps the axes rat
 
 ```pgsql
 SELECT transpose(v.frame, dir => 'clock'), v.audio[1]
-FROM input('phone.mp4') v
+FROM input(:'source') v
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o upright.mp4
+$ sqlmpeg compile -f query.sql -o upright.mp4 -v source=phone.mp4
 ffmpeg -i phone.mp4 -filter_complex '[0:v:0]transpose=dir=clock[out0]' -map '[out0]' -map 0:a:0 -c:1 copy upright.mp4
 ```
 
@@ -128,11 +128,11 @@ Any of your ffmpeg's filters is callable directly, options by name, checked agai
 
 ```pgsql
 SELECT unsharp(a.frame, luma_msize_x => 7, luma_amount => 1.5), a.audio[1]
-FROM input('clip.mp4') a
+FROM input(:'source') a
 ```
 
 ```
-$ sqlmpeg compile -f query.sql
+$ sqlmpeg compile -f query.sql -v source=clip.mp4
 ffmpeg -i clip.mp4 -filter_complex '[0:v:0]unsharp=luma_msize_x=7:luma_amount=1.5[out0]' -map '[out0]' -map 0:a:0 -c:1 copy out.mp4
 ```
 
@@ -141,13 +141,13 @@ ffmpeg -i clip.mp4 -filter_complex '[0:v:0]unsharp=luma_msize_x=7:luma_amount=1.
 `UNION ALL` is ffmpeg's concat. SQL requires the branches to agree on column count, type and order, and that is exactly concat's segment contract - the interleaving that's so easy to get wrong by hand is generated for you:
 
 ```sql
-SELECT a.video[1], a.audio[1] FROM input('part1.mp4') a
+SELECT a.video[1], a.audio[1] FROM input(:'first') a
 UNION ALL
-SELECT b.video[1], b.audio[1] FROM input('part2.mp4') b
+SELECT b.video[1], b.audio[1] FROM input(:'second') b
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o joined.mp4
+$ sqlmpeg compile -f query.sql -o joined.mp4 -v first=part1.mp4 -v second=part2.mp4
 ffmpeg -i part1.mp4 -i part2.mp4 -filter_complex '[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[out0][out1]' -map '[out0]' -map '[out1]' joined.mp4
 ```
 
@@ -170,11 +170,11 @@ ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex '[0:v
 
 ```pgsql
 SELECT overlay(f.frame, logo.frame, '(W-w)/2', '(H-h)/2'), f.audio[1]
-FROM input('film.mp4') f, input('watermark.png', loop => true) logo
+FROM input(:'main') f, input(:'overlay', loop => true) logo
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o branded.mp4
+$ sqlmpeg compile -f query.sql -o branded.mp4 -v main=film.mp4 -v overlay=watermark.png
 ffmpeg -i film.mp4 -loop 1 -i watermark.png -filter_complex '[0:v:0][1:v:0]overlay=x=(W-w)/2:y=(H-h)/2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy branded.mp4
 ```
 
@@ -185,12 +185,12 @@ A subtitle file is just another input. Select its track next to your video and a
 ```sql
 COPY (
   SELECT f.video[1], f.audio[1], s.subtitle[1]
-  FROM input('film.mp4') f, input('subs.en.vtt') s
-) TO 'captioned.mp4' WITH (subtitle_codec 'mov_text')
+  FROM input(:'main') f, input(:'subs') s
+) TO :'dest' WITH (subtitle_codec 'mov_text')
 ```
 
 ```
-$ sqlmpeg compile -f query.sql
+$ sqlmpeg compile -f query.sql -v main=film.mp4 -v subs=subs.en.vtt -v dest=captioned.mp4
 ffmpeg -i film.mp4 -i subs.en.vtt -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 1:s:0 -c:2 mov_text captioned.mp4
 ```
 
@@ -199,12 +199,12 @@ Extraction is the same idea with a shorter SELECT list - the container implies t
 ```sql
 COPY (
   SELECT f.subtitle[1]
-  FROM input('film.mkv') f
-) TO 'subs.en.srt'
+  FROM input(:'source') f
+) TO :'dest'
 ```
 
 ```
-$ sqlmpeg compile -f query.sql
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=subs.en.srt
 ffmpeg -i film.mkv -map 0:s:0 -c:0 copy subs.en.srt
 ```
 
@@ -214,11 +214,11 @@ Different from muxing a track: `subtitles()` is a video filter that renders the 
 
 ```pgsql
 SELECT subtitles(f.frame, 'subs.en.srt'), f.audio[1]
-FROM input('film.mp4') f
+FROM input(:'source') f
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o burned.mp4
+$ sqlmpeg compile -f query.sql -o burned.mp4 -v source=film.mp4
 ffmpeg -i film.mp4 -filter_complex '[0:v:0]subtitles=filename=subs.en.srt[out0]' -map '[out0]' -map 0:a:0 -c:1 copy burned.mp4
 ```
 
@@ -227,12 +227,12 @@ ffmpeg -i film.mp4 -filter_complex '[0:v:0]subtitles=filename=subs.en.srt[out0]'
 Two functions because the two stream types speed up differently: `sqlmpeg.speed` restamps video frames, `atempo` resamples audio while keeping the pitch (so nobody turns into a chipmunk):
 
 ```pgsql
-SELECT sqlmpeg.speed(f.frame, 2), atempo(f.audio[1], 2)
-FROM input('film.mp4') f
+SELECT sqlmpeg.speed(f.frame, :factor), atempo(f.audio[1], :factor)
+FROM input(:'source') f
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o fast.mp4
+$ sqlmpeg compile -f query.sql -o fast.mp4 -v source=film.mp4 -v factor=2
 ffmpeg -i film.mp4 -filter_complex '[0:v:0]setpts=PTS/2[out0];[0:a:0]atempo=tempo=2[out1]' -map '[out0]' -map '[out1]' fast.mp4
 ```
 
@@ -243,11 +243,11 @@ ffmpeg -i film.mp4 -filter_complex '[0:v:0]setpts=PTS/2[out0];[0:a:0]atempo=temp
 ```pgsql
 SELECT xfade(a.frame, b.frame, duration => 1, offset => 9),
        acrossfade(a.audio[1], b.audio[1], duration => 1)
-FROM input('one.mp4') a, input('two.mp4') b
+FROM input(:'first') a, input(:'second') b
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o dissolve.mp4
+$ sqlmpeg compile -f query.sql -o dissolve.mp4 -v first=one.mp4 -v second=two.mp4
 ffmpeg -i one.mp4 -i two.mp4 -filter_complex '[0:v:0][1:v:0]xfade=duration=1:offset=9[out0];[0:a:0][1:a:0]acrossfade=duration=1[out1]' -map '[out0]' -map '[out1]' dissolve.mp4
 ```
 
@@ -258,14 +258,14 @@ The good-looking way needs two passes over the frames - one to build a palette, 
 ```pgsql
 WITH small AS (
   SELECT fps(scale(v.frame, 480, -2), 12) AS frame
-  FROM input('clip.mp4') v
+  FROM input(:'source') v
 )
 SELECT paletteuse(small.frame, palettegen(small.frame))
 FROM small
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o clip.gif
+$ sqlmpeg compile -f query.sql -o clip.gif -v source=clip.mp4
 ffmpeg -i clip.mp4 -filter_complex '[0:v:0]scale=width=480:height=-2,fps=fps=12,split=2[n2_split0][n2_split1];[n2_split0]palettegen[n3];[n2_split1][n3]paletteuse[out0]' -map '[out0]' clip.gif
 ```
 
@@ -275,11 +275,11 @@ Swapping is just selecting video from one input and audio from another:
 
 ```sql
 SELECT v.video[1], m.audio[1]
-FROM input('film.mp4') v, input('voiceover.wav') m
+FROM input(:'main') v, input(:'voice') m
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o dubbed.mp4
+$ sqlmpeg compile -f query.sql -o dubbed.mp4 -v main=film.mp4 -v voice=voiceover.wav
 ffmpeg -i film.mp4 -i voiceover.wav -map 0:v:0 -c:0 copy -map 1:a:0 -c:1 copy dubbed.mp4
 ```
 
@@ -287,11 +287,11 @@ Keeping both, with the music turned down, is a mix:
 
 ```pgsql
 SELECT v.video[1], amix(v.audio[1], volume(m.audio[1], 0.2))
-FROM input('film.mp4') v, input('music.m4a') m
+FROM input(:'main') v, input(:'music') m
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o scored.mp4
+$ sqlmpeg compile -f query.sql -o scored.mp4 -v main=film.mp4 -v music=music.m4a
 ffmpeg -i film.mp4 -i music.m4a -filter_complex '[1:a:0]volume=volume=0.2[n1];[0:a:0][n1]amix=inputs=2[out1]' -map 0:v:0 -c:0 copy -map '[out1]' scored.mp4
 ```
 
@@ -299,11 +299,11 @@ Real ducking - music that dips when someone speaks - is a sidechain compressor k
 
 ```pgsql
 SELECT v.video[1], amix(v.audio[1], sidechaincompress(m.audio[1], v.audio[1], threshold => 0.03, ratio => 8))
-FROM input('film.mp4') v, input('music.m4a') m
+FROM input(:'main') v, input(:'music') m
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o ducked.mp4
+$ sqlmpeg compile -f query.sql -o ducked.mp4 -v main=film.mp4 -v music=music.m4a
 ffmpeg -i film.mp4 -i music.m4a -filter_complex '[0:a:0]asplit=2[src_v_a_0_split0][src_v_a_0_split1];[1:a:0][src_v_a_0_split0]sidechaincompress=threshold=0.03:ratio=8[n1];[src_v_a_0_split1][n1]amix=inputs=2[out1]' -map 0:v:0 -c:0 copy -map '[out1]' ducked.mp4
 ```
 
@@ -313,11 +313,11 @@ A quarter-size camera in the bottom-right corner, 20 pixels off each edge - the 
 
 ```pgsql
 SELECT overlay(f.frame, scale(c.frame, 'iw/4', -2), 'W-w-20', 'H-h-20'), f.audio[1]
-FROM input('film.mp4') f, input('camera.mp4') c
+FROM input(:'main') f, input(:'overlay') c
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o pip.mp4
+$ sqlmpeg compile -f query.sql -o pip.mp4 -v main=film.mp4 -v overlay=camera.mp4
 ffmpeg -i film.mp4 -i camera.mp4 -filter_complex '[1:v:0]scale=width=iw/4:height=-2[n1];[0:v:0][n1]overlay=x=W-w-20:y=H-h-20[out0]' -map '[out0]' -map 0:a:0 -c:1 copy pip.mp4
 ```
 
@@ -326,15 +326,15 @@ ffmpeg -i film.mp4 -i camera.mp4 -filter_complex '[1:v:0]scale=width=iw/4:height
 The splice: cut away to the insert, then resume. The same file appears under two aliases with two windows, and the tail's `>= 120` means "to the end" with no made-up end time:
 
 ```sql
-SELECT f.video[1], f.audio[1] FROM input('film.mp4') f WHERE f.t <= 120
+SELECT f.video[1], f.audio[1] FROM input(:'main') f WHERE f.t <= :cut
 UNION ALL
-SELECT ad.video[1], ad.audio[1] FROM input('promo.mp4') ad
+SELECT ad.video[1], ad.audio[1] FROM input(:'insert') ad
 UNION ALL
-SELECT g.video[1], g.audio[1] FROM input('film.mp4') g WHERE g.t >= 120
+SELECT g.video[1], g.audio[1] FROM input(:'main') g WHERE g.t >= :cut
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o spliced.mp4
+$ sqlmpeg compile -f query.sql -o spliced.mp4 -v main=film.mp4 -v insert=promo.mp4 -v cut=120
 ffmpeg -to 120 -i film.mp4 -i promo.mp4 -ss 120 -i film.mp4 -filter_complex '[0:v:0][0:a:0][1:v:0][1:a:0][2:v:0][2:a:0]concat=n=3:v=1:a=1[out0][out1]' -map '[out0]' -map '[out1]' spliced.mp4
 ```
 
@@ -342,11 +342,11 @@ Or keep the main video playing and overlay the insert on top: a delayed video st
 
 ```pgsql
 SELECT overlay(f.frame, sqlmpeg.delay(promo.frame, 120), 20, 20), f.audio[1]
-FROM input('film.mp4') f, input('promo.mp4') promo
+FROM input(:'main') f, input(:'insert') promo
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o overlaid.mp4
+$ sqlmpeg compile -f query.sql -o overlaid.mp4 -v main=film.mp4 -v insert=promo.mp4
 ffmpeg -i film.mp4 -i promo.mp4 -filter_complex '[1:v:0]format=pix_fmts=yuva420p,tpad=start_duration=120:stop=1:color=black@0[n2];[0:v:0][n2]overlay=x=20:y=20[out0]' -map '[out0]' -map 0:a:0 -c:1 copy overlaid.mp4
 ```
 
@@ -370,11 +370,11 @@ ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:a:0]loudnorm=I=-23[out1];[0
 
 ```pgsql
 SELECT sqlmpeg.blur_regions(f.frame, 900, 60, 320, 180, 20), f.audio[1]
-FROM input('interview.mp4') f
+FROM input(:'source') f
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o anonymized.mp4
+$ sqlmpeg compile -f query.sql -o anonymized.mp4 -v source=interview.mp4
 ffmpeg -i interview.mp4 -filter_complex '[0:v:0]split=2[src_f_v_0_split0][src_f_v_0_split1];[src_f_v_0_split0]crop=out_w=320:out_h=180:x=900:y=60,gblur=sigma=20[n2];[src_f_v_0_split1][n2]overlay=x=900:y=60[out0]' -map '[out0]' -map 0:a:0 -c:1 copy anonymized.mp4
 ```
 
@@ -382,11 +382,11 @@ To apply an effect only during a time window, `enable` is the switch - no trimmi
 
 ```pgsql
 SELECT gblur(a.frame, 12, enable => 'between(t,0.5,1.5)')
-FROM input('clip.mp4') a
+FROM input(:'source') a
 ```
 
 ```
-$ sqlmpeg compile -f query.sql
+$ sqlmpeg compile -f query.sql -v source=clip.mp4
 ffmpeg -i clip.mp4 -filter_complex '[0:v:0]gblur=sigma=12:enable=between(t\,0.5\,1.5)[out0]' -map '[out0]' out.mp4
 ```
 
@@ -408,7 +408,7 @@ ffmpeg -filter_complex 'testsrc2=duration=10:size=1280x720:rate=30[out0];sine=fr
 They also solve a quieter problem: `UNION ALL` branches must match column for column, so appending a slate to a clip needs a silent audio track from somewhere. `anullsrc` is that somewhere:
 
 ```pgsql
-SELECT f.video[1], f.audio[1] FROM input('clip.mp4') f
+SELECT f.video[1], f.audio[1] FROM input(:'source') f
 UNION ALL
 SELECT t.video[1], s.audio[1]
 FROM ffmpeg.color(color => 'black', duration => 3, size => '1280x720', rate => 30) t,
@@ -416,7 +416,7 @@ FROM ffmpeg.color(color => 'black', duration => 3, size => '1280x720', rate => 3
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o with-slate.mp4
+$ sqlmpeg compile -f query.sql -o with-slate.mp4 -v source=clip.mp4
 ffmpeg -i clip.mp4 -filter_complex 'color=color=black:duration=3:size=1280x720:rate=30[n1];anullsrc=duration=3[n2];[0:v:0][0:a:0][n1][n2]concat=n=2:v=1:a=1[out0][out1]' -map '[out0]' -map '[out1]' with-slate.mp4
 ```
 
@@ -426,11 +426,11 @@ A few filters return a whole array, sized by one of their own options. `channels
 
 ```pgsql
 SELECT ffmpeg.channelsplit(a.audio[1])
-FROM input('stereo.mp4') a
+FROM input(:'source') a
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o channels.mkv
+$ sqlmpeg compile -f query.sql -o channels.mkv -v source=stereo.mp4
 ffmpeg -i stereo.mp4 -filter_complex '[0:a:0]channelsplit[out0][out1]' -map '[out0]' -map '[out1]' channels.mkv
 ```
 
@@ -439,7 +439,7 @@ ffmpeg -i stereo.mp4 -filter_complex '[0:a:0]channelsplit[out0][out1]' -map '[ou
 ```pgsql
 WITH bands AS (
   SELECT ffmpeg.acrossover(a.audio[1], split => '300 3000') AS b
-  FROM input('song.m4a') a
+  FROM input(:'source') a
 )
 SELECT amix(amix(acompressor(bands.b[1], threshold => 0.1, ratio => 4),
                  acompressor(bands.b[2], threshold => 0.05, ratio => 6)),
@@ -448,7 +448,7 @@ FROM bands
 ```
 
 ```
-$ sqlmpeg compile -f query.sql -o mastered.m4a
+$ sqlmpeg compile -f query.sql -o mastered.m4a -v source=song.m4a
 ffmpeg -i song.m4a -filter_complex '[0:a:0]acrossover=split=300\ 3000[n10][n11][n12];[n10]acompressor=threshold=0.1:ratio=4[n2];[n11]acompressor=threshold=0.05:ratio=6[n3];[n2][n3]amix=inputs=2[n4];[n12]acompressor=threshold=0.1:ratio=4[n5];[n4][n5]amix=inputs=2[out0]' -map '[out0]' mastered.m4a
 ```
 
@@ -459,17 +459,17 @@ A `CREATE VIEW` is a named, shared piece of the graph, and each `COPY` after it 
 ```pgsql
 CREATE VIEW branded AS
   SELECT overlay(f.frame, logo.frame, 'W-w-20', 20) AS v, f.audio[1] AS a
-  FROM input('film.mp4') f, input('watermark.png', loop => true) logo;
+  FROM input(:'main') f, input(:'overlay', loop => true) logo;
 
 COPY (SELECT scale(b.v, 1280, -2) AS v, b.a FROM branded b)
-TO 'web.mp4' WITH (video_codec 'libx264', crf 21, audio_codec 'aac');
+TO :'web' WITH (video_codec 'libx264', crf 21, audio_codec 'aac');
 
 COPY (SELECT b.a FROM branded b)
-TO 'podcast.m4a' WITH (audio_codec 'aac', audio_bitrate '128k')
+TO :'podcast' WITH (audio_codec 'aac', audio_bitrate '128k')
 ```
 
 ```
-$ sqlmpeg compile -f query.sql
+$ sqlmpeg compile -f query.sql -v main=film.mp4 -v overlay=watermark.png -v web=web.mp4 -v podcast=podcast.m4a
 ffmpeg -i film.mp4 -loop 1 -i watermark.png -filter_complex '[0:v:0][1:v:0]overlay=x=W-w-20:y=20,scale=width=1280:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:0 libx264 -crf:0 21 -c:1 aac web.mp4 -map 0:a:0 -c:0 aac -b:0 128k podcast.m4a
 ```
 
