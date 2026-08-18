@@ -20,6 +20,13 @@ The SELECT list is the result set; **COPY is what makes it a file**.
   a typed usage message pointing at `run` (there is no command to show).
   `validate` unchanged. `explain` unchanged (IR dump; a table query's
   graph is just small).
+- **Naked invocation is `run`** (amended per maintainer): a first CLI
+  argument that is not a known subcommand dispatches to `run`, so
+  `sqlmpeg "SELECT * FROM input('f.mkv') f, unnest(f.audio) t"` prints
+  its table with zero ceremony, pgcli-style. Same for `sqlmpeg -f q.sql`.
+  Unknown-subcommand typos keep failing loudly: dispatch only when the
+  first token starts a plausible query/flag (`SELECT`/`WITH`/`COPY`/
+  `CREATE`/`-`), else the existing usage error.
 
 ## Table mode
 
@@ -32,8 +39,10 @@ The SELECT list is the result set; **COPY is what makes it a file**.
 - Any sink-less SELECT prints, streams-as-placeholders included:
   `SELECT a.track, b.track FROM … FULL OUTER JOIN …` as a table IS the
   join inspector.
-- Format: psql homage — aligned columns, header, `(N rows)` footer.
-  Exact bytes pinned by the TDD recipes.
+- Format: psql homage — aligned columns, ` | ` separators, the dashed
+  header rule, `(N rows)` footer. Plain ASCII (not pgcli's unicode
+  boxes): pins diff cleanly and pipes survive any console. Exact bytes
+  pinned by the TDD recipes.
 - Column headers: the SELECT alias when given, else the column
   expression's natural name (`language`, `track`, …).
 
