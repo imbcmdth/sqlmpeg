@@ -47,6 +47,7 @@ _SOURCES: dict[str, str] = {
 _AV_NAME = "av.mp4"
 _AV2_NAME = "av2.mp4"
 _AV3_NAME = "av3.mp4"
+_AV_ENG_NAME = "av-eng.mp4"
 _STEREO_NAME = "stereo.mp4"
 _SUBS_NAME = "subs.en.vtt"
 _AVS_NAME = "avs.mkv"
@@ -143,6 +144,27 @@ def _generate_av3() -> None:
     )
 
 
+def _generate_av_eng() -> None:
+    """testsrc2 video + ONE language-tagged audio track (sine 660, eng).
+
+    The track-alignment fixture (RFC-009): same video shape as av2.mp4 (so a
+    UNION ALL of the two is a legal concat) but a strict SUBSET of its audio -
+    English only, no French - which is exactly the mismatch the track-row
+    joins exist to fill.
+    """
+    _run(
+        FIXTURES_DIR / _AV_ENG_NAME,
+        [
+            "-f", "lavfi", "-i", f"testsrc2=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
+            "-f", "lavfi", "-i", f"sine=frequency=660:duration={_DURATION}",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-metadata:s:a:0", "language=eng",
+            "-pix_fmt", "yuv420p",
+            "-shortest",
+        ],
+    )
+
+
 def _generate_stereo() -> None:
     """testsrc2 video + ONE two-channel audio track: 440 Hz left, 880 Hz right.
 
@@ -230,6 +252,7 @@ def main() -> int:
     _generate_av()
     _generate_av2()
     _generate_av3()
+    _generate_av_eng()
     _generate_stereo()
     subs_path = _generate_subs_vtt()
     _generate_avs(subs_path)

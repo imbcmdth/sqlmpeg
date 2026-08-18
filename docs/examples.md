@@ -472,3 +472,108 @@ TO 'podcast.m4a' WITH (audio_codec 'aac', audio_bitrate '128k')
 $ sqlmpeg compile -f query.sql
 ffmpeg -i film.mp4 -loop 1 -i watermark.png -filter_complex '[0:v:0][1:v:0]overlay=x=W-w-20:y=20,scale=width=1280:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:0 libx264 -crf:0 21 -c:1 aac web.mp4 -map 0:a:0 -c:0 aac -b:0 128k podcast.m4a
 ```
+
+## 23. Pick a track by what it is, not where it sits
+
+`unnest` turns a track array into rows - one per track, with the probed metadata as real columns - and a `WHERE` over those columns is track selection that says what you mean. No more counting streams in ffprobe output to learn that English is `[2]` this time:
+
+```pgsql
+SELECT t.track
+FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+WHERE t.language = 'eng'
+```
+
+```
+$ sqlmpeg compile -f query.sql -o eng.m4a
+ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy eng.m4a
+```
+
+Audio rows carry `language`, `title`, `codec`, `channels`, `channel_layout`, `sample_rate`, `bitrate` and `duration`; video rows carry `width`, `height`, `fps` and friends instead. A track nobody probed has NULL in every metadata column, and NULL matches nothing - standard SQL, no new rules.
+
+## 24. Extract captions by language
+
+Caption arrays unnest the same way (columns: `language`, `title`, `codec`), so pulling the English subtitles out of a many-language file is a `WHERE`, not a subscript:
+
+```pgsql
+SELECT s.track
+FROM input('tests/fixtures/avs.mkv') f, unnest(f.subtitle) s
+WHERE s.language = 'eng'
+```
+
+```
+$ sqlmpeg compile -f query.sql -o subs.srt
+ffmpeg -i tests/fixtures/avs.mkv -map 0:s:0 -c:0 copy subs.srt
+```
+
+## 25. Mix two files' tracks pairwise, matched by language
+
+Two multi-language files, and every track should mix with its counterpart - English with English, French with French, whatever order each file stores them in. That is a JOIN, written exactly the way Postgres writes it, evaluated entirely at compile time (the metadata is probed, so ffmpeg only ever sees the wiring the join decided):
+
+```pgsql
+SELECT amix(a.track, b.track)
+FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av3.mp4') g,
+     unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language
+```
+
+```
+$ sqlmpeg compile -f query.sql -o mixed.mka
+ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex '[0:a:0][1:a:0]amix=inputs=2[out0];[0:a:1][1:a:1]amix=inputs=2[out1]' -map '[out0]' -metadata:s:0 language=eng -map '[out1]' -metadata:s:1 language=fra mixed.mka
+```
+
+Result rows follow the LEFT side's track order, so the output track order is `f`'s - track order is player-visible surface, and nothing here resorts it. And when one file carries two English tracks (a 5.1 and a stereo, say), that's not an error, it's two pairs - real join semantics - and the fix is a wider key: `ON a.language = b.language AND a.channel_layout = b.channel_layout`.
+
+## 26. Mix everything the files have, missing tracks count as silence
+
+An outer join keeps the rows only one side has, and `COALESCE` fills the gap - for audio, with generated silence:
+
+```pgsql
+SELECT amix(a.track, COALESCE(b.track, ffmpeg.anullsrc(duration => 2)))
+FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
+     unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.language = b.language
+```
+
+```
+$ sqlmpeg compile -f query.sql -o full.mka
+ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex '[0:a:0][1:a:0]amix=inputs=2[out0];anullsrc=duration=2[n3];[0:a:1][n3]amix=inputs=2[out1]' -map '[out0]' -metadata:s:0 language=eng -map '[out1]' -metadata:s:1 language=fra full.mka
+```
+
+The second file has no French, so the French mix gets silence in that slot - and keeps its `fra` tag, because the tag came from the side that existed.
+
+## 27. Concatenate files with different track counts
+
+The founding case. `concat` demands identical segment shapes, so the file that lacks a French track needs a silent stand-in - which is the same outer join, once per branch, each branch selecting its own side. (Aliases respell in the second branch because alias names are script-wide.)
+
+```pgsql
+SELECT f.video[1], a.track
+FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
+     unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.language = b.language
+UNION ALL
+SELECT g2.video[1], COALESCE(b2.track, ffmpeg.anullsrc(duration => 2))
+FROM input('tests/fixtures/av2.mp4') f2, input('tests/fixtures/av-eng.mp4') g2,
+     unnest(f2.audio) a2 FULL OUTER JOIN unnest(g2.audio) b2 ON a2.language = b2.language
+```
+
+```
+$ sqlmpeg compile -f query.sql -o joined.mp4
+ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex 'anullsrc=duration=2[n5];[0:v:0][0:a:0][0:a:1][1:v:0][1:a:0][n5]concat=n=2:v=1:a=2[out0][out1][out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra joined.mp4
+```
+
+Both branches share one join shape, so both agree on track order, and eng concatenates with eng. Each file appears in two branches but gets ONE `-i`: untrimmed aliases over the same path share an input.
+
+## 28. Side by side, matched by resolution
+
+Video arrays unnest too - `width`, `height`, `fps`, `codec`, `bitrate` are the columns - so pairing renditions for a comparison strip is a join on the numbers that matter:
+
+```pgsql
+SELECT hstack(a.track, b.track)
+FROM input('tests/fixtures/testsrc.mp4') f, input('tests/fixtures/smptebars.mp4') g,
+     unnest(f.video) a JOIN unnest(g.video) b
+       ON a.width = b.width AND a.height = b.height
+```
+
+```
+$ sqlmpeg compile -f query.sql -o sxs.mp4
+ffmpeg -i tests/fixtures/testsrc.mp4 -i tests/fixtures/smptebars.mp4 -filter_complex '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' sxs.mp4
+```
+
+A video gap in an outer join fills with `COALESCE(b.track, ffmpeg.color())` - black by default, size, rate and duration inherited from the paired row. Captions have no fill (nobody can generate your subtitles), so caption alignment sticks to inner and left joins.

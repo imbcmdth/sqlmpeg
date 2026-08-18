@@ -116,11 +116,31 @@ explicit `duration =>` on the source call wins):
 - 063: docs (mine: filters.md or a new docs/tracks.md, cookbook recipes,
   README bullet), prompt.py section (agent-eligible).
 
+## Every stream type unnests; only the fill differs
+
+`unnest` accepts audio, video, subtitle and data arrays alike — the row
+model, WHERE, joins and ORDER BY are type-agnostic. What differs per
+type is the COALESCE fill for an outer join's gaps:
+
+- **audio**: `ffmpeg.anullsrc(...)` — sample_rate and duration inherit
+  from the paired row's columns; explicit options win.
+- **video**: `ffmpeg.color(...)` (black default) — size, rate and
+  duration inherit from the paired row's width/height/fps/duration the
+  same way.
+- **subtitle/data**: NO fill exists (cues cannot be generated). A
+  COALESCE fallback on a caption column is a typed rejection; a NULL
+  caption column selected bare is the ordinary NULL-track rejection. The
+  caption idiom is INNER or LEFT join — and caption rows still buy
+  selection by metadata (`WHERE s.language = 'eng'`), which replaces
+  subscript guessing. Caption track columns stay passthrough-only,
+  exactly like subtitle streams everywhere else in the dialect.
+
+Subtitle row columns: `track`, `index`, `language`, `title`, `codec`.
+
 ## Non-goals
 
-Frame-level joins (never — nothing here decodes); video black-fill in
-COALESCE (reject a video COALESCE fill in v1, audio silence only);
-GROUP BY/aggregates over rows (count of tracks etc. — maybe later, the
-fence stays put); joining unnest tables against real SQL VALUES lists;
+Frame-level joins (never — nothing here decodes); GROUP BY/aggregates
+over rows (count of tracks etc. — maybe later, the fence stays put);
+joining unnest tables against real SQL VALUES lists;
 disposition/default-track flags as columns (probe has them; add when a
 recipe needs them).
