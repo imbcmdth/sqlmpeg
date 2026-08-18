@@ -59,7 +59,7 @@ statement is not. `--` and `/* */` comments are allowed.
   `SELECT t.video[1], s.audio[1] FROM ffmpeg.testsrc2(duration => 1) t,
   ffmpeg.anullsrc(duration => 1) s` as the second branch.
 - `input('path', <name> => <value>, ...)` also takes trailing named options,
-  same `=>` syntax as a call's named arguments (RFC-003) -- CASE-SENSITIVE,
+  same `=>` syntax as a call's named arguments -- CASE-SENSITIVE,
   unlike a sink option name. They set ffmpeg's own per-input flags, rendered
   immediately before that input's own `-i`:
   - `loop` (bool) -- Loop a single-frame input (e.g. a still image) indefinitely.
@@ -260,8 +260,7 @@ statement is not. `--` and `/* */` comments are allowed.
   EOF, same as giving ffmpeg no end time at all.
 - On a CTE name, the window is still a filtergraph trim (`trim`+`setpts` /
   `atrim`+`asetpts`, with only the present bound(s) as filter args), because a
-  CTE's output is a filtergraph pad, not an input -- video/audio only, same as
-  before RFC-004.
+  CTE's output is a filtergraph pad, not an input -- video/audio only.
 - Caption caveat: ffmpeg does not retime subtitle/data packets under an
   input seek, so a track that is both inside its own alias's WHERE window
   AND selected in the same query would play out of sync with the rebased
