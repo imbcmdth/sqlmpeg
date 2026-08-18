@@ -648,3 +648,19 @@ language,codec,channel_layout
 eng,aac,mono
 fra,aac,mono
 ```
+
+## 33. One query, many files
+
+A query file with variables is a program. `-v name=value` is psql's own flag and `:'name'` is psql's own interpolation - the value lands as a properly escaped string literal (bare `:name` substitutes raw, for numbers), and an undefined variable is a compile-time error, not a surprise:
+
+```sql
+COPY (SELECT f.video[1], f.audio[1] FROM input(:'source') f)
+TO :'dest' WITH (video_codec 'libx264', crf 20, audio_codec 'aac')
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=out.mkv
+ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -c:1 aac out.mkv
+```
+
+Swap the `-v` values and the same file transcodes anything. The [queries/](../queries/) directory collects ready-to-run programs built this way.
