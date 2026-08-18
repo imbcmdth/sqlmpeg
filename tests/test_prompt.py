@@ -24,6 +24,7 @@ from sqlmpeg import cli
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import INPUT_OPTIONS
+from sqlmpeg.parser import ROW_SCHEMAS
 from sqlmpeg.prompt import build_system_prompt
 from sqlmpeg.registry import Registry, load
 from sqlmpeg.sink import SINK_OPTIONS
@@ -33,12 +34,17 @@ DOC_PATH = ROOT / "docs" / "system-prompt.md"
 GEN_SCRIPT = ROOT / "scripts" / "gen_prompt.py"
 
 _SQL_FENCE_RE = re.compile(r"```sql\n(.*?)\n```", re.DOTALL)
+_SQL_PROBED_FENCE_RE = re.compile(r"```sql-probed\n(.*?)\n```", re.DOTALL)
 
 PROMPT = build_system_prompt()
 
 
 def _sql_examples(text: str) -> list[str]:
     return _SQL_FENCE_RE.findall(text)
+
+
+def _probed_sql_examples(text: str) -> list[str]:
+    return _SQL_PROBED_FENCE_RE.findall(text)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +156,61 @@ def test_generated_sources_are_documented() -> None:
     assert "duration => <seconds>" in PROMPT
     # A source is NOT a column function; the prompt has to say where it goes.
     assert "belongs in `FROM`" in PROMPT
+
+
+# ---------------------------------------------------------------------------
+# track rows (RFC-009, plan 063): unnest, row columns, WHERE/ORDER BY, joins,
+# COALESCE fills
+# ---------------------------------------------------------------------------
+
+
+def test_track_rows_section_present() -> None:
+    assert "### Track rows" in PROMPT
+    assert "unnest(" in PROMPT
+
+
+def test_track_row_columns_match_row_schemas() -> None:
+    """The column lists are rendered from the real schema, not guessed --
+    every column ROW_SCHEMAS actually exposes must be named in the prompt."""
+    for schema in ROW_SCHEMAS.values():
+        for column in schema:
+            assert f"`{column}`" in PROMPT, column
+
+
+def test_track_row_where_and_order_by_documented() -> None:
+    assert "BETWEEN" in PROMPT
+    assert "IS [NOT] NULL" in PROMPT
+    assert "ORDER BY" in PROMPT
+    assert "NULLS FIRST" in PROMPT
+
+
+def test_track_row_joins_documented() -> None:
+    joined = PROMPT
+    for construct in ("INNER JOIN", "LEFT [OUTER] JOIN", "FULL OUTER JOIN"):
+        assert construct in joined, construct
+    assert "RIGHT [OUTER] JOIN" in joined
+    assert "row order is the LEFT side's track order" in joined
+
+
+def test_track_row_fills_documented() -> None:
+    assert "ffmpeg.anullsrc(...)" in PROMPT
+    assert "ffmpeg.color(...)" in PROMPT
+    assert "sqlmpeg.empty_captions()" in PROMPT
+    assert "COALESCE(<alias>.track, <fill>)" in PROMPT
+    assert "Nothing generates a `data` track" in PROMPT
+
+
+def test_track_row_examples_are_present_but_gated() -> None:
+    """unnest needs a probeable input to size its rows (same rule as a bare
+    array), so the worked track-row examples cannot be proven to compile
+    without a real file -- they are ```sql-probed, same convention as the
+    bare-array broadcast examples, and therefore NOT run by
+    test_every_sql_example_compiles above."""
+    probed = "\n".join(_probed_sql_examples(PROMPT))
+    assert "unnest(" in probed
+    assert "FULL OUTER JOIN" in probed
+    assert "COALESCE(" in probed
+    assert "unnest(" not in "\n".join(_sql_examples(PROMPT))
 
 
 def test_prompt_is_deterministic() -> None:

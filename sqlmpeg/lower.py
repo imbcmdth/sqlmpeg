@@ -2839,15 +2839,24 @@ class _Lowerer:
         """
         if row is not None:
             return row.stream
+        fill = _FILL_SPELLINGS.get(binding.type)
+        hint = (
+            f"an outer join leaves gaps; fill them with "
+            f"COALESCE({binding.alias}.{ROW_STREAM_COLUMN}, {fill})"
+            if fill is not None
+            # data rows have no fill spelling at all: nothing can stand in
+            # for a missing data track, so the join itself must not leave
+            # the gap.
+            else "data tracks have no fill; use an INNER or LEFT join so "
+            "every selected row has one"
+        )
         raise _error(
             ErrorCode.STREAM_NOT_FOUND,
             f"'{binding.alias}.{ROW_STREAM_COLUMN}' is NULL in row {position + 1}: "
             f"{self._unmatched_text(binding, position)}",
             anchor,
             fallback=select,
-            hint=f"an outer join leaves gaps; fill them with "
-            f"COALESCE({binding.alias}.{ROW_STREAM_COLUMN}, "
-            f"{_FILL_SPELLINGS[binding.type]})",
+            hint=hint,
         )
 
     def _unmatched_text(self, binding: _RowBinding, position: int) -> str:

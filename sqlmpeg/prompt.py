@@ -30,9 +30,10 @@ Marker convention (relied on by ``tests/test_prompt.py``): every fenced
 standalone, with no input file required to exist. Rejected SQL is only ever
 shown inline, in single backticks, so that the extract-and-compile test can
 treat every fence as a promise. An example whose query needs a real, readable
-file to compile (a bare-array broadcast, which needs the file's actual stream
-count) is fenced ```sql-probed instead -- a distinct tag the extractor
-deliberately does not match, so it is exempt from that promise.
+file to compile (a bare-array broadcast, or an `unnest(...)` track-row table
+-- either needs the file's actual stream data, not just its shape) is fenced
+```sql-probed instead -- a distinct tag the extractor deliberately does not
+match, so it is exempt from that promise.
 
 The prompt is ASCII-only: it is printed by ``sqlmpeg prompt`` and piped around
 on consoles whose encoding is not UTF-8.
@@ -175,7 +176,68 @@ _DIALECT_TAIL = """\
   it, e.g. `'mov_text'` to carry a `.vtt` track into an `.mp4` container.
 - `<alias>.t` is time in seconds. It is legal ONLY inside the `WHERE` form
   below; it is not a stream and cannot appear in the SELECT list.
-- There are no other columns.
+- There are no other columns on an `input()` or generated-source alias --
+  `unnest(...)` row tables have a column model of their own (see Track rows
+  below).
+
+### Track rows
+- `unnest(<alias>.audio)` (or `.video`, `.subtitle`, `.data`) in `FROM` turns
+  one input's track array into a compile-time TABLE, one row per track --
+  not a stream, and not sizeable without a readable file, same rule as a
+  bare array. It needs its own alias, exactly like `input()`:
+  `FROM input('film.mkv') f, unnest(f.audio) t`. The array argument must be
+  a bare `<alias>.video`/`.audio`/`.subtitle`/`.data` of an alias already
+  visible earlier in the same `FROM` list; a subscripted or starred
+  argument, more than one array, `unnest(unnest(...))`, or no alias at all
+  is rejected. A row alias shares the one flat namespace every other name in
+  the query does -- it may not collide with an input alias, a CTE, a view,
+  or `ffmpeg`/`sqlmpeg`.
+- Every row carries `track` (the stream itself -- the only row column that
+  can appear in the SELECT list), `index` (1-based, the same numbering as
+  `<alias>.audio[k]`), `language`, `title`, `codec`. Audio rows add
+  `channels`, `channel_layout`, `sample_rate`, `bitrate`, `duration`. Video
+  rows add `width`, `height`, `fps` (verbatim, e.g. `'30000/1001'`),
+  `bitrate`, `duration`, `color_transfer`. Subtitle and data rows carry only
+  the common set -- captions stay passthrough-only here too. A field the
+  probe never reported (or an input this compile never probed) is NULL:
+  ordinary three-valued SQL logic, so it equals nothing and never satisfies
+  a `WHERE`/`ON` predicate.
+- `WHERE` over row columns compares a column against a literal; `ON`
+  compares a column against another row's column or a literal: `=`, `!=`,
+  `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`. Every
+  one of these is decided while compiling, over probed metadata only --
+  never a runtime ffmpeg predicate. `ORDER BY` over row columns re-sorts the
+  rows (multi-key, Postgres `NULLS FIRST`/`LAST`) -- the one carve-out to
+  the No streaming equivalent rule below; frames themselves still never
+  sort. With no `ORDER BY`, rows keep the file's own track order.
+- `unnest(...) a JOIN unnest(...) b ON <predicate>` matches ROWS between two
+  unnest tables: `INNER JOIN`, `LEFT [OUTER] JOIN`, `FULL OUTER JOIN` (a
+  bare `FULL JOIN` means the same thing), each requiring its own `ON`.
+  `RIGHT [OUTER] JOIN`, `CROSS JOIN`, `NATURAL JOIN`, and `USING` are
+  rejected -- swap the tables and write `LEFT` instead of a right join, and
+  a comma between two unnest tables IS the (bounded) cross join:
+  `FROM ..., unnest(f.audio) a, unnest(g.audio) b`. `JOIN ... ON` is legal
+  ONLY between unnest tables -- `input()` aliases stay a comma cross-join,
+  same as always. Result row order is the LEFT side's track order, then
+  (`FULL OUTER` only) unmatched right rows in their own order. A row that
+  matches two rows on the other side pairs with both -- real join
+  semantics, not an error; widen the `ON` key if that is not what you want,
+  e.g. `ON a.language = b.language AND a.channel_layout = b.channel_layout`.
+- Selecting a NULL `track` (an outer join's gap) bare is a typed rejection
+  naming the row that failed to match. `COALESCE(<alias>.track, <fill>)` is
+  the only accepted spelling, and `<fill>` is a generated stand-in sized for
+  that row's stream type: `ffmpeg.anullsrc(...)` for audio (`duration`
+  inherits the paired row's probed duration when omitted; give it
+  explicitly, e.g. `anullsrc(duration => 2)`, when that duration was never
+  probed -- an unbounded fill with nothing to inherit is rejected),
+  `ffmpeg.color(...)` for video (`size`, `rate`, and `duration` inherit from
+  the paired row's `width`/`height`/`fps`/`duration` the same way),
+  `sqlmpeg.empty_captions()` for subtitle rows (an EMPTY track: it exists,
+  carries the paired row's tags, and holds zero cues -- nobody generates
+  subtitles for you). An explicit option on the fill always wins over the
+  inherited one. Nothing generates a `data` track, so a `data` row has no
+  fill -- avoid its gaps with an `INNER`/`LEFT` join that never selects the
+  missing side.
 
 ### Broadcasting
 - Passing a bare array where a function expects one stream applies the call
@@ -466,16 +528,19 @@ _REJECTED = """\
 These are typed errors, never a best-effort graph. Do not reach for them.
 
 - No streaming equivalent: `GROUP BY`, `HAVING`, aggregates (`count`, `sum`,
-  `max`, ...), `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `QUALIFY`, `WINDOW`,
-  window functions (`OVER`), subquery predicates (`IN (SELECT ...)`, `EXISTS`),
-  `UNION` without `ALL`.
+  `max`, ...), `ORDER BY` over anything but track-row columns (see Track
+  rows), `LIMIT`, `OFFSET`, `DISTINCT`, `QUALIFY`, `WINDOW`, window functions
+  (`OVER`), subquery predicates (`IN (SELECT ...)`, `EXISTS`), `UNION`
+  without `ALL`.
 - Outside the dialect: subqueries anywhere (use a CTE), explicit `JOIN ...
-  ON` / `USING`, casts (`::` or `CAST`), arithmetic or any non-literal in an
-  argument, unqualified columns, schema-qualified tables, an alias that
-  shadows another alias/CTE/view name already in scope, `WITH RECURSIVE`,
-  nested `WITH`, CTE column lists, table functions other than `input()`, a
-  statement that is neither a `SELECT` nor (in a script) `CREATE VIEW` /
-  `COPY`, a zero/negative/computed array subscript.
+  ON` / `USING` anywhere but between two `unnest(...)` tables (see Track
+  rows), `RIGHT [OUTER] JOIN` / `CROSS JOIN` / `NATURAL JOIN` even there,
+  casts (`::` or `CAST`), arithmetic or any non-literal in an argument,
+  unqualified columns, schema-qualified tables, an alias that shadows
+  another alias/CTE/view name already in scope, `WITH RECURSIVE`, nested
+  `WITH`, CTE column lists, table functions other than `input()` and
+  `unnest()`, a statement that is neither a `SELECT` nor (in a script)
+  `CREATE VIEW` / `COPY`, a zero/negative/computed array subscript.
 - Any name that is neither one of the three `sqlmpeg.*` macros nor a filter
   the installed ffmpeg provides (see Calling convention), including
   transitions between concatenated branches, motion tracking,
@@ -689,6 +754,21 @@ _PROBED_EXAMPLES: tuple[tuple[str, str], ...] = (
         "audio, subtitle and data stream it has.",
         "SELECT * FROM input('film.mkv') a",
     ),
+    (
+        "Pull the English audio track out of film.mkv, whatever subscript "
+        "it happens to sit at.",
+        "SELECT t.track\nFROM input('film.mkv') f, unnest(f.audio) t\n"
+        "WHERE t.language = 'eng'",
+    ),
+    (
+        "Mix film.mkv's audio with commentary.mkv's, matched by language; "
+        "where commentary.mkv has no matching language, fill with 2 "
+        "seconds of silence instead.",
+        "SELECT amix(a.track, COALESCE(b.track, ffmpeg.anullsrc(duration => 2)))\n"
+        "FROM input('film.mkv') f, input('commentary.mkv') g,\n"
+        "     unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b\n"
+        "       ON a.language = b.language",
+    ),
 )
 
 _EXAMPLES_HEADER = """\
@@ -696,9 +776,10 @@ _EXAMPLES_HEADER = """\
 
 _PROBED_EXAMPLES_NOTE = (
     "The next examples use a bare array (`v.audio`, `a.audio`) -- broadcast "
-    "over, or splatted into the SELECT list. Those only compile against a "
-    "real, readable file, since sizing the array needs its actual stream "
-    "count (see Broadcasting above)."
+    "over, or splatted into the SELECT list -- or an `unnest(...)` track-row "
+    "table. Either way they only compile against a real, readable file, "
+    "since sizing an array or building a row table's metadata needs the "
+    "file's actual stream data (see Broadcasting and Track rows above)."
 )
 
 

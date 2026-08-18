@@ -5876,6 +5876,27 @@ def test_a_left_join_keeps_unmatched_left_rows() -> None:
     assert _refs(g) == ["src:f:a:0", "src:f:a:1"]
 
 
+def test_a_data_rows_null_track_hint_names_the_join_not_a_fill() -> None:
+    """`_FILL_SPELLINGS` has no 'data' entry: the NULL-track rejection must
+    still be the typed one (a KeyError here would surface as INTERNAL,
+    guardrail #7) and its hint must steer to a tighter join, since nothing
+    can stand in for a missing data track."""
+    probes = _pair_probes(
+        left=[
+            _track("data", 0, language="eng"),
+            _track("data", 1, language="fra"),
+        ],
+        right=[_track("data", 0, language="eng")],
+    )
+    err = _reject_lower(
+        _join_query(projection="b.track", join="FULL OUTER JOIN", column="data"),
+        probes,
+    )
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "data tracks have no fill" in (err.hint or "")
+    assert "INNER or LEFT join" in (err.hint or "")
+
+
 def test_a_full_join_appends_unmatched_right_rows_in_their_own_order() -> None:
     probes = _pair_probes(
         right=[
