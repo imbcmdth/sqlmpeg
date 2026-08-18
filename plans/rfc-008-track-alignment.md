@@ -127,6 +127,21 @@ silence track would hang concat - not shipped broken).
 - 057: docs (mine - filters.md section, cookbook recipe, README bullet
   touch), prompt.py mention (agent-eligible), goldens if any.
 
+## Framing: these are compile-time joins
+
+`tracks_intersection` is an inner join on the match key;
+`tracks_union` is a full outer join with silence coalesced into the
+missing side; `take => k` is "select side k's column from the joined
+rows". The join key is probed metadata, known at compile time, so the
+join never reaches ffmpeg - it evaluates during lowering into static
+routing (the way a WHERE window vanishes into -ss/-to). A future dialect
+could express this natively (unnest -> FULL OUTER JOIN ON a.language ->
+COALESCE -> compile-time ORDER BY) - all of it is compile-time
+evaluable, and stock Postgres, but it is an RFC-sized grammar surface
+(table functions, join grammar, metadata as queryable columns, an ORDER
+BY carve-out). If that RFC ever happens, these macros remain its
+ergonomic shorthand, not a competing mechanism.
+
 ## Non-goals
 
 Video fill; CTE-column arguments; `order =>` beyond the canonical rule
