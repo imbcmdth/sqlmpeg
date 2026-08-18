@@ -20,9 +20,14 @@ sliver, and the modes that expose that sliver are footguns.
    since provenance rides on probing, that silently strips
    `-metadata:s:N language=...` from the output: same SQL, two different
    commands. A determinism switch that changes the result is not a
-   determinism switch. `compile_sql(probe=False)` SURVIVES as a
-   library/test seam (goldens and unit tests need deterministic
-   compiles); it leaves the CLI and the docs.
+   determinism switch. The `probe=` parameter dies ENTIRELY (amended
+   2026-08-18: not even a library/test seam - "we own the fixtures, go
+   ahead and probe them"). `compile_sql` always probes; missing files
+   degrade opportunistically as ever, which is measurably identical to
+   what probe=False produced on the goldens' illustrative paths (verify
+   in-wave, byte-diff before/after). Row-model unit tests already inject
+   synthetic probe dicts at the `lower()` seam - that is test
+   parameterization, not a mode, and it stays.
 
 ## Provisioning (folds in wave 055)
 
@@ -56,8 +61,17 @@ ffmpeg they didn't ask for.
   keeps stubbing probe underneath - test machinery, not user surface).
 - prompt.py: the no-registry fallback branch deleted; one prompt,
   always rendered from a registry.
+- probe.py: a local-path existence check before spawning ffprobe -
+  without the probe= parameter, goldens/fuzzing would otherwise pay a
+  failing subprocess per illustrative path; missing file -> None with no
+  spawn is both faster and the same policy.
 - tests: conftest snapshot pinning unchanged; test_cli --no-probe tests
-  become flag-rejection tests; probe=False library uses untouched.
+  become flag-rejection tests; every compile_sql(probe=False) call site
+  drops the argument (goldens byte-diffed before/after to prove the
+  no-op); fixture-probing tests assert STABLE fields only (tags, counts,
+  layouts, dimensions, approximate durations) - never exact encoder
+  output like bitrate, which drifts across the ffmpeg that generated the
+  fixture.
 
 ## Waves
 
