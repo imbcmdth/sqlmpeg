@@ -576,4 +576,4 @@ $ sqlmpeg compile -f query.sql -o sxs.mp4
 ffmpeg -i tests/fixtures/testsrc.mp4 -i tests/fixtures/smptebars.mp4 -filter_complex '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' sxs.mp4
 ```
 
-A video gap in an outer join fills with `COALESCE(b.track, ffmpeg.color())` - black by default, size, rate and duration inherited from the paired row. Captions have no fill (nobody can generate your subtitles), so caption alignment sticks to inner and left joins.
+A video gap in an outer join fills with `COALESCE(b.track, ffmpeg.color())` - black by default, size, rate and duration inherited from the paired row. A caption gap fills with `COALESCE(b.track, sqlmpeg.empty_captions())`: the track exists and takes its language tag, it just contains zero cues - nobody generates your subtitles for you.

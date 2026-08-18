@@ -127,15 +127,21 @@ type is the COALESCE fill for an outer join's gaps:
 - **video**: `ffmpeg.color(...)` (black default) — size, rate and
   duration inherit from the paired row's width/height/fps/duration the
   same way.
-- **subtitle/data**: NO fill exists (cues cannot be generated). A
-  COALESCE fallback on a caption column is a typed rejection; a NULL
-  caption column selected bare is the ordinary NULL-track rejection. The
-  caption idiom is INNER or LEFT join — and caption rows still buy
-  selection by metadata (`WHERE s.language = 'eng'`), which replaces
-  subscript guessing. Caption track columns stay passthrough-only,
-  exactly like subtitle streams everywhere else in the dialect.
+- **subtitle**: `sqlmpeg.empty_captions()` — an EMPTY track: it exists,
+  takes tags, contains zero cues (we are not generating anyone's
+  subtitles; the track is just present so shapes match). Measured
+  2026-08-17: `-f webvtt -i "data:text/vtt;base64,V0VCVlRUCgo="` (the
+  base64 is just "WEBVTT\n\n") muxes a real empty subtitle stream via
+  ffmpeg's data: protocol — no file shipped, the compiled command stays
+  self-contained. The macro lowers to that extra INPUT (a new
+  input-minting macro kind, not a filter node). A NULL caption column
+  selected bare stays the ordinary NULL-track rejection.
 
 Subtitle row columns: `track`, `index`, `language`, `title`, `codec`.
+Caption track columns stay passthrough-only, exactly like subtitle
+streams everywhere else in the dialect — and caption rows still buy
+selection by metadata (`WHERE s.language = 'eng'`), which replaces
+subscript guessing.
 
 ## Non-goals
 
