@@ -30,6 +30,9 @@ from sqlmpeg import binaries
 from sqlmpeg.ir import StreamType
 
 _TIMEOUT_SECONDS = 5.0
+# Remote specs fetch a manifest and often an init segment per stream before
+# ffprobe can report anything; 5s flakes on real networks, so they get more.
+_REMOTE_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass(frozen=True)
@@ -80,15 +83,24 @@ def clear_cache() -> None:
 
 
 def probe(path: str) -> ProbeResult | None:
-    """Probe a local media file with ffprobe.
+    """Probe a media input with ffprobe.
 
-    Returns None -- never raises -- when: `path` looks like a URL
-    (contains "://"), the file does not exist, ffprobe is not on PATH or via
-    its provisioner, ffprobe exits nonzero or times out (5s), or its output
-    is not the JSON shape we expect.
+    Returns None -- never raises -- when: the file does not exist, ffprobe
+    is not on PATH or via its provisioner, ffprobe exits nonzero or times
+    out, or its output is not the JSON shape we expect.
+
+    A spec containing "://" is handed to ffprobe VERBATIM: ffprobe is the
+    authority on its own protocols (http, https, file, rtmp, ...), so a
+    remote input probes over the network -- naming a URL is asking for
+    exactly that -- and an unsupported scheme fails into the same permissive
+    None every other unreadable input gets. Remote probes get a longer
+    timeout (manifest + init-segment fetches) and are memoized by the spec
+    string alone; there is no mtime to key on, so the cache is per-process
+    "what this URL said when we asked".
     """
     if "://" in path:
-        return None
+        cache_key: _CacheKey = (path, -1, -1)
+        return _cached_ffprobe(path, cache_key, _REMOTE_TIMEOUT_SECONDS)
 
     try:
         if not os.path.isfile(path):
@@ -98,7 +110,13 @@ def probe(path: str) -> ProbeResult | None:
     except OSError:
         return None
 
-    cache_key: _CacheKey = (real, st.st_mtime_ns, st.st_size)
+    return _cached_ffprobe(real, (real, st.st_mtime_ns, st.st_size), _TIMEOUT_SECONDS)
+
+
+def _cached_ffprobe(
+    spec: str, cache_key: _CacheKey, timeout: float
+) -> ProbeResult | None:
+    """One memoized ffprobe invocation over `spec` (a path or a URL)."""
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
@@ -115,14 +133,14 @@ def probe(path: str) -> ProbeResult | None:
         "json",
         "-show_streams",
         "-show_format",
-        real,
+        spec,
     ]
     try:
         result = subprocess.run(
             argv,
             capture_output=True,
             text=True,
-            timeout=_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError):
         return None

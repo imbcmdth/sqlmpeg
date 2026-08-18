@@ -220,7 +220,7 @@ FROM input('tests/fixtures/av.mp4') a
 
 ## INPUT_NOT_FOUND
 
-**Meaning:** A bare array (`<alias>.video` / `<alias>.audio`, splatted into the SELECT list or broadcast through a function) needs the file's actual stream count to expand, and the input could not be probed: missing, unreadable, or a URL. "Cannot enumerate the streams of a file I cannot read" gets its own honest error rather than hiding inside a generic probing-failure code.
+**Meaning:** A bare array (`<alias>.video` / `<alias>.audio`, splatted into the SELECT list or broadcast through a function) needs the file's actual stream count to expand, and the input could not be probed: missing, unreadable, or a remote spec ffprobe couldn't fetch. (URLs DO probe - ffprobe is the authority on its own protocols, so an `https://` manifest's tracks are as unnestable as a local file's; only an unreachable or unsupported one lands here.) "Cannot enumerate the streams of a file I cannot read" gets its own honest error rather than hiding inside a generic probing-failure code.
 
 **Fires when:** a bare array appears over an input with no probe result.
 

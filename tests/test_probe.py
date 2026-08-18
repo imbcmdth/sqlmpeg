@@ -84,10 +84,34 @@ def _fake_run(
 # --- URL / missing file / no ffprobe ---------------------------------------
 
 
-def test_url_scheme_returns_none() -> None:
-    assert probe("https://example.com/video.mp4") is None
+def test_url_spec_reaches_ffprobe_verbatim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A '://' spec is handed to ffprobe as-is: ffprobe is the authority on
+    its own protocols, and a remote input probes over the network (that is
+    what naming a URL asks for). No local existence check applies."""
+    _fake_ffprobe_present(monkeypatch)
+    calls = _fake_run(monkeypatch)
+    result = probe("https://example.com/master.mpd")
+    assert result is not None and len(result.streams) > 0
+    assert calls[0][-1] == "https://example.com/master.mpd"
+
+
+def test_url_result_is_memoized_by_spec(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No mtime exists for a URL, so the cache key is the spec string alone:
+    one network probe per process, however many aliases name it."""
+    _fake_ffprobe_present(monkeypatch)
+    calls = _fake_run(monkeypatch)
+    first = probe("https://example.com/master.mpd")
+    second = probe("https://example.com/master.mpd")
+    assert first is second
+    assert len(calls) == 1
+
+
+def test_url_failure_degrades_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unsupported scheme or unreachable host fails into the same
+    permissive None every other unreadable input gets."""
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch, returncode=1)
     assert probe("rtsp://example.com/stream") is None
-    assert probe("file:///etc/passwd") is None
 
 
 def test_missing_file_returns_none(tmp_path: Path) -> None:
@@ -642,3 +666,32 @@ def test_probe_result_dataclass_shape() -> None:
     assert r.by_type("audio") == []
     with pytest.raises(Exception):
         r.streams = []  # type: ignore[misc]
+
+
+# --- remote specs against a real ffprobe (localhost, no external network) ---
+
+
+@pytest.mark.exec
+def test_probe_http_url_end_to_end(_fixtures: Path) -> None:
+    """The remote branch with a REAL ffprobe: serve the fixtures over
+    localhost HTTP and probe av2.mp4 through http://. Exercises exactly the
+    code path a DASH manifest or any other remote input takes, with no
+    external network involved."""
+    import http.server
+    import threading
+    from functools import partial
+
+    handler = partial(http.server.SimpleHTTPRequestHandler, directory=str(_fixtures))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        result = probe(f"http://127.0.0.1:{port}/av2.mp4")
+        assert result is not None
+        audio = result.by_type("audio")
+        assert [s.metadata.get("language") for s in audio] == ["eng", "fra"]
+        assert result.by_type("video")[0].width == 320
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
