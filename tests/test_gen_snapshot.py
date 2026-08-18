@@ -69,9 +69,12 @@ def _forced_registry(tmp_path_factory: pytest.TempPathFactory) -> Registry:
 
 
 @pytest.mark.exec
-def test_snapshot_is_up_to_date(_forced_registry: Registry) -> None:
+def test_snapshot_is_up_to_date(_forced_registry: Registry, pinned_ffmpeg: None) -> None:
     """Regenerating with the committed file's own `generated` stamp reproduces
-    it byte-for-byte -- the file is generated, not hand-written."""
+    it byte-for-byte -- the file is generated, not hand-written.
+
+    Only meaningful on the snapshot's own ffmpeg build; any other version
+    skips with a drift warning (`pinned_ffmpeg`) instead of failing."""
     gen_snapshot = _load_gen_snapshot()
     with _SNAPSHOT_PATH.open(encoding="utf-8", newline="") as fh:
         committed = fh.read()
@@ -137,7 +140,7 @@ def test_build_registry_raises_without_ffmpeg(monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.exec
-def test_round_trip_matches_live_registry_spot_check() -> None:
+def test_round_trip_matches_live_registry_spot_check(pinned_ffmpeg: None) -> None:
     live = registry_mod.load()
     assert live.available() is True  # force _ensure_loaded() before anything else
     ref = load_reference(_SNAPSHOT_PATH)

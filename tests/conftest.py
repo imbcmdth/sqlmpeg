@@ -23,11 +23,13 @@ real ffmpeg, so they must compile against the real ffmpeg's own registry.
 from __future__ import annotations
 
 import functools
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from sqlmpeg import registry as registry_module
 from sqlmpeg.registry import Registry, load_reference
 
 SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "reference_registry.json"
@@ -36,6 +38,38 @@ SNAPSHOT_PATH = Path(__file__).resolve().parent / "data" / "reference_registry.j
 @functools.cache
 def _reference_registry() -> Registry:
     return load_reference(SNAPSHOT_PATH)
+
+
+@pytest.fixture
+def pinned_ffmpeg() -> None:
+    """Skip -- loudly, never fail -- unless the installed ffmpeg IS the
+    snapshot's pinned build.
+
+    A handful of exec tests compare the committed snapshot against the live
+    binary (freshness, option order, diagnostic text). Those comparisons are
+    only meaningful on the exact ffmpeg the snapshot was generated from;
+    on any other version the differences are ordinary release drift, which
+    is the situation sqlmpeg exists to handle, not a defect. Behavioral
+    guarantees stay tested on EVERY version (the md5 positional-fidelity
+    exec test carries them); what skips here is only the byte-level
+    version-pinned redundancy. The skip also warns, so a CI run against a
+    different ffmpeg reports the drift in the warnings summary without
+    breaking the build.
+    """
+    live = registry_module.load()
+    live.available()
+    pinned = _reference_registry().snapshot_of
+    installed = live._version_line
+    if installed != pinned:
+        message = (
+            f"installed ffmpeg is not the snapshot's pinned build; "
+            f"version-pinned snapshot checks skipped (informational, not a "
+            f"failure). installed: {installed!r}, snapshot: {pinned!r}. "
+            f"To refresh the pin, run scripts/gen_snapshot.py on the new "
+            f"version and review the diff."
+        )
+        warnings.warn(message, stacklevel=1)
+        pytest.skip(message)
 
 
 @pytest.fixture(autouse=True)

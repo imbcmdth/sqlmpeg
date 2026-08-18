@@ -4997,7 +4997,7 @@ def test_positional_options_bind_the_way_ffmpeg_binds_them(
 @pytest.mark.exec
 @pytest.mark.parametrize("case", _FIDELITY_CASES, ids=lambda c: str(c[0]))
 def test_ffmpeg_names_the_option_the_registry_put_in_each_slot(
-    case: tuple[str, str, str, list[str]], _av_fixture: str
+    case: tuple[str, str, str, list[str]], _av_fixture: str, pinned_ffmpeg: None
 ) -> None:
     """(b) structural: junk in slot i, and ffmpeg's diagnostic for the
     positional spelling matches its diagnostic for the named one.
@@ -5005,6 +5005,10 @@ def test_ffmpeg_names_the_option_the_registry_put_in_each_slot(
     Comparing the two DIAGNOSTICS rather than grepping for a name keeps this
     honest for string/expression options, which ffmpeg accepts at set time and
     only rejects later at config time (no "Error applying option" line at all).
+
+    Pinned-version only: other releases echo alias spellings ('w' for
+    'width') in these messages, which is text drift, not a binding bug --
+    the md5 fidelity test above proves the binding on every version.
     """
     name, kind, _pad, values = case
     options = registry_module.load().options(name)
@@ -5062,8 +5066,12 @@ def test_an_n_input_call_runs(_av_fixture: str, tmp_path: Path) -> None:
 
 
 @pytest.mark.exec
-def test_the_snapshot_agrees_with_the_installed_ffmpeg_on_option_order() -> None:
-    """The committed fixture is only a stand-in if its ORDER matches too."""
+def test_the_snapshot_agrees_with_the_installed_ffmpeg_on_option_order(
+    pinned_ffmpeg: None,
+) -> None:
+    """The committed fixture is only a stand-in if its ORDER matches too.
+    Pinned-version only: another release ordering its options differently is
+    drift the registry adapts to, not a bug (`pinned_ffmpeg` skips + warns)."""
     live = registry_module.load()
     ref = load_reference(SNAPSHOT_PATH)
     for name in live.names():
