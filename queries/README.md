@@ -43,6 +43,8 @@ sqlmpeg -f queries/transcode.sql -v source=film.mkv -v dest=film.mp4
 | [thumbnail.sql](thumbnail.sql) | grab a single poster frame at a timestamp | `source`, `at`, `dest` |
 | [extract-frames.sql](extract-frames.sql) | export a frame-rate-limited image sequence | `source`, `rate`, `dest` |
 | [retitle.sql](retitle.sql) | rewrite the container's title and artist tags, no re-encode | `source`, `title`, `artist`, `dest` |
+| [extract-languages.sql](extract-languages.sql) | one audio file per language, all that language's tracks inside | `source`, `ext` |
+| [split-chapters.sql](split-chapters.sql) | one file per chapter, stream-copied | `source`, `prefix` |
 
 An undefined variable is a compile-time error naming it, so a typo'd `-v`
 fails before anything runs. The [cookbook](../docs/examples.md) explains

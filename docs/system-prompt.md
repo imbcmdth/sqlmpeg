@@ -165,9 +165,21 @@ statement is not. `--` and `/* */` comments are allowed.
   alias being the key: `SELECT t.track, 'Audio (' || t.language || ')' AS
   title`. In a query with NO track rows the same aliased column tags the
   CONTAINER instead (`SELECT f.video[1], 'Remastered' AS title`), and `NULL
-  AS artist` clears that key in the output. Same grammar in a filter option
+  AS artist` clears that key in the output. To set both scopes in one query,
+  tag the tracks inside a CTE and the container in the outer SELECT (the
+  outer value wins on a shared key). Same grammar in a filter option
   over a row table, evaluated per row: `SELECT scale(t.track, t.width / 2,
   -2)`.
+- The implicit aggregation has an explicit spelling: `array_agg(<per-row
+  stream expression>)` as a whole SELECT column gathers the rows' streams in
+  row order, and `GROUP BY` names the keys (Postgres's rule enforced: outside
+  an aggregate, a row-referencing expression must match a key). `GROUP BY` an
+  input-level key is the one-file shape; `GROUP BY` a row column partitions
+  rows into one output file per group -- it requires a fan-out `TO
+  (expression over the group keys)`, and group keys double as container tag
+  columns: `SELECT array_agg(a.track), a.language AS title ... GROUP BY
+  a.language) TO (a.language || '.mka')`. `ORDER BY` inside `array_agg` is
+  rejected; `ORDER BY` before the aggregate defines the order.
 - `unnest(...) a JOIN unnest(...) b ON <predicate>` matches ROWS between two
   unnest tables: `INNER JOIN`, `LEFT [OUTER] JOIN`, `FULL OUTER JOIN` (a
   bare `FULL JOIN` means the same thing), each requiring its own `ON`.
@@ -547,11 +559,11 @@ An option name outside this list is `UNKNOWN_SINK_OPTION`; a value whose shape d
 
 These are typed errors, never a best-effort graph. Do not reach for them.
 
-- No streaming equivalent: `GROUP BY`, `HAVING`, aggregates (`count`, `sum`,
-  `max`, ...), `ORDER BY` over anything but track-row columns (see Track
-  rows), `LIMIT`, `OFFSET`, `DISTINCT`, `QUALIFY`, `WINDOW`, window functions
-  (`OVER`), subquery predicates (`IN (SELECT ...)`, `EXISTS`), `UNION`
-  without `ALL`.
+- No streaming equivalent: `HAVING`, aggregates other than `array_agg`
+  (`count`, `sum`, `max`, ...), `GROUP BY` or `ORDER BY` over anything but
+  track-row queries (see Track rows), `LIMIT`, `OFFSET`, `DISTINCT`,
+  `QUALIFY`, `WINDOW`, window functions (`OVER`), subquery predicates
+  (`IN (SELECT ...)`, `EXISTS`), `UNION` without `ALL`.
 - Outside the dialect: subqueries anywhere (use a CTE), explicit `JOIN ...
   ON` / `USING` anywhere but between two `unnest(...)` tables (see Track
   rows), `RIGHT [OUTER] JOIN` / `CROSS JOIN` / `NATURAL JOIN` even there,

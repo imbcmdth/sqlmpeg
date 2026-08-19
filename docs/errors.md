@@ -102,7 +102,7 @@ The macro flavor:
 
 **Meaning:** The construct is valid SQL with perfectly good relational semantics that simply cannot exist in a single-pass streaming filtergraph. ffmpeg processes frames as they arrive; it cannot look ahead, sort, or deduplicate across an input.
 
-**Fires when:** the query uses `GROUP BY`, `HAVING`, `ORDER BY`, `SORT BY`, `CLUSTER BY`, `DISTRIBUTE BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `QUALIFY`, `WINDOW`, `CONNECT BY`, an aggregate function, a window function, a subquery predicate (`IN (SELECT ...)`, `EXISTS`, etc.), or `UNION` without `ALL` (plain `UNION` requires deduplication, and there is no meaningful way to deduplicate a stream of frames).
+**Fires when:** the query uses `HAVING`, `SORT BY`, `CLUSTER BY`, `DISTRIBUTE BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `QUALIFY`, `WINDOW`, `CONNECT BY`, a window function, a subquery predicate (`IN (SELECT ...)`, `EXISTS`, etc.), or `UNION` without `ALL` (plain `UNION` requires deduplication, and there is no meaningful way to deduplicate a stream of frames). `GROUP BY`, `ORDER BY`, and `array_agg` are legal in a media query over track rows - they operate on the compile-time row table, not the streams; outside one they fire this error, and other aggregate functions (`count`, `sum`, ...) always do.
 
 **Example query:**
 

@@ -72,6 +72,24 @@ FROM input('film.mkv') f, unnest(f.audio) t
 
 Compiles to `-metadata:s:N` flags only - no filter nodes. The same columns in a table/CSV query print as plain data, which previews what a retag will write. `disposition` is a reserved key: its value is ffmpeg's disposition spec (`'default'`, `'forced'`, `'default+forced'`, `'0'` clears) and it emits `-disposition:N` instead - [recipe 41](examples.md#41-flag-the-default-track). Container-level tags are not per-row: in a query with no track rows the same aliased columns tag the CONTAINER (`'Remastered' AS title`, `NULL AS artist` clears), and the input's own tags are readable as columns on its alias - `f.title`, `f.artist`, `f.comment` and the other common keys, NULL when the file lacks them. `metadata_from <alias>` copies an input's global tags, `strip_metadata true` drops them; a tag column overrides either for its key. Recipes [37-38](examples.md#37-retitle-tracks-from-their-own-metadata) are the worked versions.
 
+To do both in one query, layer them with a CTE: tag columns in the CTE body are per-stream (its rows are tracks), tag columns in the outer SELECT are container-level (the CTE's output is streams). If the outer query re-tags a key a CTE already set, the outer value wins. [Recipe 53](examples.md#53-tag-the-tracks-and-the-container-in-one-query).
+
+## Grouping: the aggregation made explicit
+
+A multi-row media query writing one file implicitly aggregates: the destination is the group key, row streams are gathered in row order. Both halves can be written out - `GROUP BY` and `array_agg` are legal over track rows, and the explicit form compiles to the same bytes as the sugar:
+
+```sql
+COPY (
+  SELECT f.video, array_agg(a.track)
+  FROM input('film.mkv') f, unnest(f.audio) a
+  GROUP BY f.video
+) TO 'out.mp4'
+```
+
+`array_agg` takes any per-row stream expression (`array_agg(volume(a.track, 0.5))`) and must be a whole SELECT column; row order is the aggregation order (`ORDER BY` before the aggregate reorders it; `ORDER BY` inside `array_agg` is rejected). Postgres's grouping rule is enforced: outside an aggregate, a row-referencing expression must match a `GROUP BY` key.
+
+`GROUP BY` a row column partitions the rows, and each group is one output file - this requires a fan-out `TO (expression over the group keys)` and is how rows *share* a destination (the ungrouped fan-out still rejects two rows naming one file). Group keys are group-constants, so they double as container tag columns. [Recipe 55](examples.md#55-one-file-per-language-all-its-tracks-inside) writes one file per language with all of that language's tracks inside, titled by its key.
+
 ## Chapters
 
 `chapters(f)` in FROM is a row table - `index`, `title`, `start_t`, `end_t` per chapter, from the container. It composes with WHERE/ORDER BY and table/CSV output; chapters are not streams, so selecting them into a media query is rejected.
