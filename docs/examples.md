@@ -913,3 +913,34 @@ $ sqlmpeg compile -f query.sql -o merged.mka -v first=one.mp4 -v second=two.mp4
 ffmpeg -i one.mp4 -i two.mp4 -filter_complex '[0:a:0][1:a:0]amerge=inputs=2[out0]' -map \
   '[out0]' merged.mka
 ```
+
+## 45. Scale each track relative to itself
+
+A filter argument over a row table's columns is computed per row, at compile time - each rendition scaled against its own probed width:
+
+```pgsql
+SELECT scale(t.track, t.width / 2, -2)
+FROM input('tests/fixtures/av2.mp4') f, unnest(f.video) t
+```
+
+```
+$ sqlmpeg compile -f query.sql -o half.mp4
+ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:v:0]scale=width=160:height=-2[out0]' \
+  -map '[out0]' half.mp4
+```
+
+## 46. Keep everything but the end
+
+`f.duration` is the probed container duration, and trim bounds take arithmetic - so "all but the last half second" needs no known length:
+
+```pgsql
+SELECT f.video[1], f.audio[1]
+FROM input('tests/fixtures/av2.mp4') f
+WHERE f.t <= f.duration - 0.5
+```
+
+```
+$ sqlmpeg compile -f query.sql -o trimmed.mp4
+ffmpeg -to 1.5 -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy \
+  trimmed.mp4
+```
