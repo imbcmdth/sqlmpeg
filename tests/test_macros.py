@@ -103,8 +103,7 @@ def test_blur_regions_expands_to_crop_gblur_overlay() -> None:
     )
     assert _filters(g) == ["crop", "gblur", "overlay"]
     crop, gblur, overlay = (g.nodes[f"n{i}"] for i in (1, 2, 3))
-    # crop's arg KEYS are the registry's long names (out_w/out_h), plan 051's
-    # verified contract note for 053a's golden regen.
+    # crop's arg KEYS are the registry's long names (out_w/out_h).
     assert crop.args == {"out_w": 100, "out_h": 50, "x": 10, "y": 20}
     assert crop.inputs == ["src:a:v:0"]
     assert crop.outputs == ["video"]

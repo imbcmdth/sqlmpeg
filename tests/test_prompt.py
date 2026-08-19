@@ -156,9 +156,8 @@ def test_every_input_option_is_documented() -> None:
 
 
 def test_generated_sources_are_documented() -> None:
-    """RFC-005 SS1: the FROM-position half of the `ffmpeg.`
-    namespace, its column surface, and the silent-audio pattern it exists
-    for."""
+    """The FROM-position half of the `ffmpeg.` namespace: its column surface,
+    and the silent-audio pattern it exists for."""
     assert "FROM ffmpeg.<source>(<name> => <value>, ...) alias" in PROMPT
     assert "ffmpeg.anullsrc(duration => 1) s" in PROMPT
     assert "duration => <seconds>" in PROMPT
@@ -296,7 +295,7 @@ def test_cli_prompt_takes_no_query_argument() -> None:
 
 
 def test_cli_prompt_dynamic_flag_is_gone() -> None:
-    """RFC-007/053b: the base/--dynamic split collapsed into one prompt; the
+    """The base/--dynamic split collapsed into one prompt; the
     flag is deleted outright (pre-1.0), not kept-but-ignored."""
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["prompt", "--dynamic"])
@@ -305,13 +304,13 @@ def test_cli_prompt_dynamic_flag_is_gone() -> None:
 
 # ---------------------------------------------------------------------------
 # the Functions section: rendered from a real Registry, or a fallback note
-# for a broken one (guardrail #7 -- RFC-010: this is no longer a normal mode)
+# for a broken one (guardrail #7 -- not a normal mode)
 # ---------------------------------------------------------------------------
 
 
 def test_functions_section_is_rendered_from_the_reference_registry() -> None:
     """PROMPT (like docs/system-prompt.md) always has a real filter list now
-    -- RFC-010 retired the "no registry" default as a documented mode."""
+    -- the "no registry" default is not a documented mode."""
     assert "## Functions" in PROMPT
     assert "gblur(video) -> video" in PROMPT
     assert "-> video`" in PROMPT

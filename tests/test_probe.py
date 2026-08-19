@@ -204,10 +204,10 @@ def test_maps_fields_including_subtitle_streams(
 
     result = probe(str(f))
     assert result is not None
-    # RFC-004: subtitle streams are mapped, not ignored, so all three streams
+    # subtitle streams are mapped, not ignored, so all three streams
     # in FAKE_JSON (video, subtitle, audio) show up.
     assert len(result.streams) == 3
-    # RFC-009 §Plumbing item 1: ProbeResult grows a container-level duration
+    # ProbeResult carries a container-level duration
     # from -show_format.
     assert result.duration == 2.0
 
@@ -511,7 +511,7 @@ def test_argv_is_a_list_with_expected_flags(
     assert "-v" in argv and "error" in argv
     assert "-print_format" in argv and "json" in argv
     assert "-show_streams" in argv
-    assert "-show_format" in argv  # RFC-009: needed for ProbeResult.duration
+    assert "-show_format" in argv  # needed for ProbeResult.duration
 
 
 # --- real ffprobe against generated fixtures --------------------------------

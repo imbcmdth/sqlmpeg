@@ -82,8 +82,7 @@ def _snapshot_function_surface(
         compiler, "registry_module", SimpleNamespace(load=_reference_registry)
     )
     # cli.py holds its own reference for the `prompt` subcommand's registry
-    # (RFC-010 made the prompt registry-rendered, always) -- same shim, same
-    # reason: the default tier is deterministic on a bare machine.
+    # -- same shim, same reason: the default tier is deterministic on a bare machine.
     monkeypatch.setattr(
         cli, "registry_module", SimpleNamespace(load=_reference_registry)
     )

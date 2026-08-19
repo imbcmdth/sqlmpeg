@@ -625,7 +625,7 @@ def test_get_source_excludes_sinks(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_get_still_none_for_source_names_unchanged_column_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Deliverable #2: get() (column-function lookup) is UNCHANGED for
+    # get() (column-function lookup) is UNCHANGED for
     # sources -- a source is not callable as a column function.
     reg = _loaded_registry(monkeypatch)
     for name in SOURCE_NAMES:
@@ -761,7 +761,7 @@ def test_aecho_string_type_for_delays_and_decays(monkeypatch: pytest.MonkeyPatch
 
 # --- -help option parsing: sources through Registry.options() -----------
 # Sources use the SAME lazy Registry.options() path as regular filters
-# (deliverable #1: "Registry.options(name) must work for sources too").
+# Registry.options(name) must work for sources too.
 
 
 def test_testsrc_options_via_registry_alias_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -838,8 +838,8 @@ def test_source_options_lazy_and_memoized_like_regular_filters(
 # split/anullsink are excluded (dynamic-pad regular filter / sink), so
 # their -help output is only reachable directly, not through
 # Registry.options(), which only serves known/included names. testsrc is
-# ALSO exercised directly here (this test predates plan 040's sources
-# support and still pins the private parser's behavior in isolation) --
+# ALSO exercised directly here, pinning the private parser's behavior in
+# isolation --
 # it is additionally covered through the public Registry.options() path
 # above (test_testsrc_options_via_registry_alias_dedup).
 

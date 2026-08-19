@@ -42,8 +42,6 @@ def _write_sql(tmp_path: Path, text: str, name: str = "query.sql") -> str:
 def _sinked_graph(path: str, options: dict[str, object] | None = None) -> Graph:
     """A hand-built, already-sinked Graph.
 
-    ``compile_sql`` cannot yet produce a ``Graph`` with a sink -- COPY ... TO
-    parsing/lowering is plan 026, being written concurrently with this file.
     Sink-path-resolution tests below monkeypatch ``cli.compile_sql`` to
     return this instead of compiling real SQL.
     """
@@ -53,7 +51,7 @@ def _sinked_graph(path: str, options: dict[str, object] | None = None) -> Graph:
 def _multi_sink_graph(*sinks: tuple[str, dict[str, object]]) -> Graph:
     """One passthrough output per COPY, all reading the same input stream.
 
-    RFC-006's cross-group passthrough shape, hand-built: two groups may map
+    The cross-group passthrough shape, hand-built: two groups may map
     the same source stream without a split (see `sqlmpeg.split._exempt_refs`).
     """
     return Graph(
@@ -162,7 +160,7 @@ def test_compile_dash_o_overrides_sink_path(
 def test_compile_prints_every_sink_path_of_a_script(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """RFC-006: one ffmpeg command, one output file per COPY."""
+    """One ffmpeg command, one output file per COPY."""
     monkeypatch.setattr(
         cli,
         "compile_sql",
@@ -283,7 +281,7 @@ def test_explain_shows_the_sinks_list(capsys: pytest.CaptureFixture[str]) -> Non
 
 
 # ---------------------------------------------------------------------------
-# --portable and --no-probe are GONE (RFC-007 plan 051; RFC-010 plan 065)
+# --portable and --no-probe are GONE
 # ---------------------------------------------------------------------------
 
 # There is no portable subset any more: every function is a filter of the
@@ -592,7 +590,7 @@ def test_run_dash_o_overrides_sink_path(
 def test_run_bare_select_with_no_dash_o_prints_a_table(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """RFC-011, plan 067: a sinkless SELECT with no `-o` is a TABLE query now
+    """A sinkless SELECT with no `-o` is a TABLE query now
     -- it used to be the "no output path" usage error this test's name still
     remembers. `-o` (test_run_dash_o_overrides_sink_path et al.) still runs
     it as media, unchanged."""
@@ -739,7 +737,7 @@ def test_no_subcommand_exits_2(capsys: pytest.CaptureFixture[str]) -> None:
 def test_unknown_subcommand_falls_through_to_run_and_fails_as_sql(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """RFC-011, plan 067: `run` is the default subcommand, unconditionally --
+    """`run` is the default subcommand, unconditionally --
     no plausibility gating. A mistyped subcommand is not special-cased; it is
     just run's SQL text, and dies as an ordinary compile error (exit 1), a
     better diagnostic than a bare usage line."""

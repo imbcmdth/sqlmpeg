@@ -107,7 +107,7 @@ def test_graph_sinks_default_empty() -> None:
 
 
 def test_graph_outputs_is_the_union_across_sinks() -> None:
-    """RFC-006: the derived output list is what consume-once counts over."""
+    """The derived output list is what consume-once counts over."""
     g = _build_graph()
     g.sinks.append(
         SinkUnit(
@@ -225,7 +225,7 @@ def test_sink_error_codes_exist() -> None:
 
 
 # ---------------------------------------------------------------------------
-# SinkUnit (plan 025 sink options; plan 046 multi-sink shape)
+# SinkUnit: sink options and the multi-sink shape
 # ---------------------------------------------------------------------------
 
 
@@ -323,7 +323,7 @@ def test_output_from_dict_rejects_invalid_stream_type() -> None:
 
 def test_node_outputs_reject_subtitle_data_type_strings_are_still_parseable() -> None:
     # Node.outputs is typed StreamType too -- subtitle/data parse, even though
-    # by RFC-004's passthrough-only rule no node ever legitimately declares
+    # by the passthrough-only rule no node ever legitimately declares
     # them (that constraint is enforced by later passes, not by ir.py).
     n = Node(
         id="n0",
@@ -338,7 +338,7 @@ def test_node_outputs_reject_subtitle_data_type_strings_are_still_parseable() ->
 
 
 # ---------------------------------------------------------------------------
-# Graph.input_trims (RFC-004 input-seek amendment)
+# Graph.input_trims: the input seek
 # ---------------------------------------------------------------------------
 
 

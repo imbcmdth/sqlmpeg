@@ -224,7 +224,7 @@ def test_validate_csv_option_wrong_type() -> None:
 
 
 def test_validate_csv_option_rejects_a_media_option() -> None:
-    """A media-only option (deliverable 4): unknown against CSV_OPTIONS, a
+    """A media-only option: unknown against CSV_OPTIONS, a
     SEPARATE table from SINK_OPTIONS -- not silently accepted."""
     with pytest.raises(SqlmpegError) as excinfo:
         validate_csv_option("video_codec", "libx264")

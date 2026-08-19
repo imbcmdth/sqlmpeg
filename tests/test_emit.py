@@ -113,7 +113,7 @@ def test_readme_example_shape() -> None:
     """WITH pip AS (scale(crop(b.frame,...), 0.5)) SELECT overlay(a.frame, pip.frame, 20, 20).
 
     `a` and `b` are both untrimmed, option-free aliases of the SAME path, so
-    plan 060's input dedup folds them onto one `-i`: both source refs render
+    input dedup folds them onto one `-i`: both source refs render
     as `[0:v:0]` (see emit.py's "Input dedup" docstring section).
     """
     g = _graph(
@@ -433,7 +433,7 @@ def test_labels_are_sanitized() -> None:
 
 
 # ---------------------------------------------------------------------------
-# zero-input (generated source) nodes -- RFC-005 SS1, plan 042
+# zero-input (generated source) nodes
 # ---------------------------------------------------------------------------
 #
 # `FROM ffmpeg.testsrc(duration => 2) t` lowers to a node with `inputs=[]`.
@@ -521,7 +521,7 @@ def test_a_split_of_a_zero_input_node_chains_off_it() -> None:
 
 
 def test_zero_input_nodes_feed_concat_alongside_real_inputs() -> None:
-    """The silent-audio-for-concat shape (RFC-005 SS1's headline)."""
+    """The silent-audio-for-concat shape, generated sources' headline."""
     g = _graph(
         [
             _node("n1", "testsrc2", {"duration": 1}, []),
@@ -952,7 +952,7 @@ def test_build_ffmpeg_args_metadata_values_are_passed_raw() -> None:
 
 # ---------------------------------------------------------------------------
 # sink -- Graphs are hand-built with sink=_sink(...) here,
-# which plan 046 turned into one `SinkUnit` / one `Emitted.groups` entry.
+# i.e. one `SinkUnit` / one `Emitted.groups` entry.
 # ---------------------------------------------------------------------------
 
 
@@ -998,7 +998,7 @@ def test_build_ffmpeg_args_out_path_overrides_sink_path() -> None:
 
 
 def test_build_ffmpeg_args_no_sink_graph_unchanged_byte_for_byte() -> None:
-    """Regression pin: a sinkless graph's args are byte-for-byte what plan 027 found.
+    """Regression pin: a sinkless graph's args, byte for byte.
 
     `a`/`b` dedup onto one `-i`: see test_readme_example_shape.
     """
@@ -1168,7 +1168,7 @@ def test_sink_video_codec_suppresses_only_video_passthrough_copy() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-004: subtitle / data streams -- bare -map only, repeatable
+# subtitle / data streams -- bare -map only, repeatable
 # ---------------------------------------------------------------------------
 
 
@@ -1256,8 +1256,7 @@ def test_sink_subtitle_codec_renders_per_subtitle_output() -> None:
         "-map",
         "0:s:0",
         # copy suppressed on the SUBTITLE output only: the option table's
-        # scope drives it, so subtitle_codec generalizes for free (plan 033's
-        # contract note; this is the test it had to skip).
+        # scope drives it, so subtitle_codec generalizes for free.
         "-c:2",
         "mov_text",
         "out.mp4",
@@ -1300,7 +1299,7 @@ def test_sink_video_codec_does_not_suppress_a_subtitle_copy() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-006 output groups: one ffmpeg command, one file per sink
+# output groups: one ffmpeg command, one file per sink
 # ---------------------------------------------------------------------------
 
 
@@ -1439,7 +1438,7 @@ def test_copy_suppression_is_per_group() -> None:
 
 
 def test_two_groups_may_bare_map_the_same_source_stream() -> None:
-    """RFC-006's cross-group exemption: a repeated -map is not a fan-out bug."""
+    """The cross-group exemption: a repeated -map is not a fan-out bug."""
     g = _graph(
         [],
         [],
@@ -1495,7 +1494,7 @@ def test_a_group_without_a_path_and_without_out_path_raises() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-004 input seek: -ss/-to in front of the owning -i
+# input seek: -ss/-to in front of the owning -i
 # ---------------------------------------------------------------------------
 
 
@@ -1566,7 +1565,7 @@ def test_a_seeked_input_still_stream_copies() -> None:
 
 def test_a_hand_built_emitted_needs_no_input_trims() -> None:
     """The empty default means "no input is seeked", so an Emitted built
-    without windows renders exactly as it did before plan 035."""
+    without windows renders with no seek flags at all."""
     e = Emitted(
         inputs=["a.mp4"],
         filter_complex="",
@@ -1659,7 +1658,7 @@ def test_two_aliases_disagreeing_on_one_inputs_window_is_internal_error() -> Non
 
 
 # ---------------------------------------------------------------------------
-# RFC-005 SS4 input options: rendered before -ss/-to, before -i
+# input options: rendered before -ss/-to, before -i
 # ---------------------------------------------------------------------------
 
 
@@ -1712,7 +1711,7 @@ def test_build_ffmpeg_args_renders_options_before_the_owning_input() -> None:
 
 
 def test_input_options_render_before_seek_flags() -> None:
-    """Verified order (module docstring / plan 041): options, then -ss/-to, then -i."""
+    """Verified order (see emit.py's docstring): options, -ss/-to, then -i."""
     g = _graph(
         [],
         [_out("src:a:v:0")],

@@ -33,10 +33,10 @@ _TESTSRC = _FIXTURES_DIR / "testsrc.mp4"
 _FRAME_PNG = _FIXTURES_DIR / "frame.png"
 _AV2 = _FIXTURES_DIR / "av2.mp4"
 _AV3 = _FIXTURES_DIR / "av3.mp4"
-# Plan 047: the one fixture with a genuinely 2-CHANNEL audio track (440 Hz
+# The one fixture with a genuinely 2-CHANNEL audio track (440 Hz
 # left, 880 Hz right), which is what channelsplit needs to split.
 _STEREO = _FIXTURES_DIR / "stereo.mp4"
-# RFC-004 caption fixtures: avs.mkv is video + audio + an srt track tagged
+# Caption fixtures: avs.mkv is video + audio + an srt track tagged
 # language=eng; subs.en.vtt is a standalone 3-cue WebVTT file (no tags).
 _AVS = _FIXTURES_DIR / "avs.mkv"
 _SUBS_VTT = _FIXTURES_DIR / "subs.en.vtt"
@@ -203,7 +203,7 @@ def test_trim_reports_expected_duration(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-004 input-seek amendment: WHERE on an input alias is -ss/-to
+# Input seek: WHERE on an input alias is -ss/-to
 #
 # Accuracy contract, exec-tested on both sides:
 #   * DECODED streams (anything filtered/re-encoded) are frame-accurate --
@@ -256,8 +256,8 @@ def test_a_trimmed_passthrough_is_stream_copied_within_keyframe_tolerance(
 ) -> None:
     """The new capability: `SELECT a.video[1] ... WHERE` stream-copies.
 
-    Before plan 035 the window spliced a trim filter, which forced a re-encode.
-    Now the src ref survives lowering untouched, so the output is `-map` +
+    A window used to splice a trim filter, forcing a re-encode; the src ref
+    now survives lowering untouched, so the output is `-map` +
     `-c:0 copy` with the window as input options -- and the duration obeys the
     copy half of the accuracy contract (see the measured keyframe layout above:
     at least the requested window, at most the whole input).
@@ -285,7 +285,7 @@ def test_a_trimmed_passthrough_is_stream_copied_within_keyframe_tolerance(
 
 
 # ---------------------------------------------------------------------------
-# plan 039: open-ended windows -- WHERE <alias>.t >= x / <= y, no BETWEEN
+# open-ended windows -- WHERE <alias>.t >= x / <= y, no BETWEEN
 # ---------------------------------------------------------------------------
 
 
@@ -391,7 +391,7 @@ def test_hflip_matches_pil_flipped_source_by_phash(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# multi-stream (v2 / RFC-001): remap-only passthrough and audio broadcasting
+# multi-stream: remap-only passthrough and audio broadcasting
 # ---------------------------------------------------------------------------
 
 
@@ -426,9 +426,8 @@ def test_remap_only_stream_copies_the_selected_audio_track(tmp_path: Path) -> No
 
 
 def test_reverb_broadcast_produces_a_tagged_stream_per_language_track(tmp_path: Path) -> None:
-    """`aecho(a.audio, 0.8, 0.9, 60, 0.3)` (reverb's replacement, RFC-007's
-    respelling) on a 2-audio-track file expands to two aecho subgraphs, one
-    per track, and each output keeps its source language tag."""
+    """`aecho(a.audio, 0.8, 0.9, 60, 0.3)` on a 2-audio-track file expands to
+    two aecho subgraphs, one per track, and each output keeps its source language tag."""
     _require_fixture(_AV2)
     out_path = tmp_path / "reverb.mp4"
     query = f"SELECT aecho(a.audio, 0.8, 0.9, 60, 0.3) FROM input('{_sql_path(_AV2)}') a"
@@ -473,7 +472,7 @@ def test_union_splat_concatenates_both_language_tracks(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# PiP composite + broadcast-zip mix: the plan 024 flagship, end to end
+# PiP composite + broadcast-zip mix: the flagship, end to end
 # ---------------------------------------------------------------------------
 
 
@@ -556,7 +555,7 @@ def test_copy_sink_codec_options_land_in_the_real_encode(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# RFC-004: SELECT *, subtitle streams, external caption joins
+# SELECT *, subtitle streams, external caption joins
 # ---------------------------------------------------------------------------
 
 
@@ -614,7 +613,7 @@ def test_qualified_star_mixes_with_an_explicit_column(tmp_path: Path) -> None:
 
 
 def test_vtt_join_muxes_an_external_caption_track_into_an_mkv(tmp_path: Path) -> None:
-    """RFC-004's headline: an external WebVTT file joined as a subtitle track.
+    """An external WebVTT file joined as a subtitle track.
 
     Two inputs, three columns, no new join semantics -- the SELECT list IS the
     -map list, and `subtitle_codec 'srt'` transcodes webvtt into the mkv.
@@ -681,7 +680,7 @@ def test_subtitle_extraction_writes_a_parseable_srt_file(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# plan 038: the ad insert -- a video delay composed with overlay
+# the ad insert -- a video delay composed with overlay
 # ---------------------------------------------------------------------------
 #
 # `delay(f, s)` on VIDEO is format=yuva420p + tpad=start_duration=s:stop=1,
@@ -716,7 +715,7 @@ def _pip_difference(left: Path, right: Path) -> float:
 
 
 def test_ad_insert_composites_a_delayed_clip_over_the_film(tmp_path: Path) -> None:
-    """The plan 038 driving case, compiled and RUN.
+    """The ad-insert driving case, compiled and RUN.
 
     A 0.33-scale copy of the ad, delayed one second, composited into the
     film's corner, with its audio delayed by the same second and mixed under
@@ -808,7 +807,7 @@ def test_a_delayed_video_is_transparent_before_and_after_its_clip(
 
 def test_the_same_subtitle_track_may_be_mapped_twice(tmp_path: Path) -> None:
     """Duplicate consumption of one subtitle src ref: two Outputs, two identical
-    bare -maps, no split filter anywhere (RFC-004's split/emit exemption)."""
+    bare -maps, no split filter anywhere (the split/emit exemption)."""
     _require_fixture(_AVS)
     out_path = tmp_path / "twice.mkv"
     query = (
@@ -828,14 +827,14 @@ def test_the_same_subtitle_track_may_be_mapped_twice(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# plan 039: the ad-splice pattern, without the `BETWEEN x AND 3600` placeholder
+# the ad-splice pattern, without the `BETWEEN x AND 3600` placeholder
 # ---------------------------------------------------------------------------
 
 
 def test_ad_splice_tail_trim_needs_no_between_placeholder(tmp_path: Path) -> None:
     """Splice an ad into the middle of a clip by cutting the base into a head
-    and a tail, with the tail reaching to the end of the file. Before plan 039
-    that meant a `BETWEEN x AND 3600`-style placeholder to fake "to the end";
+    and a tail, with the tail reaching to the end of the file. That used to mean
+    a `BETWEEN x AND 3600`-style placeholder to fake "to the end";
     `g.t >= 1` says it directly, with no upper bound at all.
 
     Three UNION ALL branches over the 2s av2/av3 fixtures: a 1s head of av2, all
@@ -886,7 +885,7 @@ def test_ad_splice_tail_trim_needs_no_between_placeholder(tmp_path: Path) -> Non
 
 
 # ---------------------------------------------------------------------------
-# plan 041: input('path', name => value, ...) -- RFC-005 SS4
+# input('path', name => value, ...)
 # ---------------------------------------------------------------------------
 
 
@@ -934,14 +933,14 @@ def test_looped_png_title_card_composites_onto_testsrc(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# plan 042: FROM ffmpeg.<source>(...) -- RFC-005 SS1
+# FROM ffmpeg.<source>(...)
 # ---------------------------------------------------------------------------
 
 
 def test_silent_audio_lets_a_generated_segment_concat_with_a_real_clip(
     tmp_path: Path,
 ) -> None:
-    """THE headline of RFC-005 SS1.
+    """THE headline of generated sources.
 
     ffmpeg's `concat` needs every segment to have the same pad shape, so a
     generated video segment cannot join a clip that has audio -- unless
@@ -1042,11 +1041,11 @@ def test_a_sine_tone_is_a_whole_query_with_no_input_file(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# RFC-005 SS2: the timeline `enable` argument, RUN
+# the timeline `enable` argument, RUN
 # ---------------------------------------------------------------------------
 #
 # The claim `enable` makes is about individual FRAMES, so it is checked the way
-# plan 038's transparency test checks its canvas: render the query, pull one
+# the delay macro's transparency test checks its canvas: render the query, pull one
 # frame from inside the window and one from either side, and diff each against
 # the untouched fixture. The fixture is 2s at 15fps, so 0.2 / 1.0 / 1.8 sit
 # comfortably clear of the 0.5 and 1.5 edges.
@@ -1095,7 +1094,7 @@ def _assert_enable_window(
 
 
 def test_enable_blurs_only_inside_its_timeline_window(tmp_path: Path) -> None:
-    """The RFC-005 SS2 headline, measured frame by frame.
+    """The timeline-`enable` headline, measured frame by frame.
 
     One filter, one named argument, no trim and no branch: the clip is sharp,
     then blurred for a second, then sharp again.
@@ -1159,12 +1158,12 @@ def test_enable_is_rejected_where_this_ffmpeg_reports_no_timeline_flag() -> None
 
 
 # ---------------------------------------------------------------------------
-# RFC-005 SS3: `expr` slots, RUN, and checked against ffmpeg's types
+# `expr` slots, RUN, and checked against ffmpeg's types
 # ---------------------------------------------------------------------------
 
 
 def test_a_centered_overlay_runs_without_knowing_either_size(tmp_path: Path) -> None:
-    """The motivating case of RFC-005 SS3. `(W-w)/2` is ffmpeg's arithmetic over
+    """The motivating case for `expr` slots. `(W-w)/2` is ffmpeg's arithmetic over
     the real pad sizes, so nothing here had to probe anything: a 320x240 clip
     lands dead centre of a 640x480 matte, which the edge samples prove (the clip
     must start at x=160 and end at x=480)."""
@@ -1221,15 +1220,14 @@ def test_expression_crop_and_scale_run(tmp_path: Path) -> None:
     assert (stream["width"], stream["height"]) == (_SRC_WIDTH, _SRC_HEIGHT)
 
 
-# test_every_expr_slot_maps_to_a_string_typed_ffmpeg_option (RFC-005 SS3's
-# stdlib FUNCTIONS-table faithfulness test) is removed rather than respelled:
-# there is no stdlib FUNCTIONS table post-RFC-007 for it to check, and no
-# `expr` ParamKind for it to verify -- see the matching removal in
-# tests/test_lower.py.
+# test_every_expr_slot_maps_to_a_string_typed_ffmpeg_option (the stdlib
+# FUNCTIONS-table faithfulness test) is removed rather than respelled: there is
+# no stdlib FUNCTIONS table for it to check, and no `expr` ParamKind for it to
+# verify -- see the matching removal in tests/test_lower.py.
 
 
 # ---------------------------------------------------------------------------
-# RFC-006: a script with several COPYs is ONE ffmpeg command
+# a script with several COPYs is ONE ffmpeg command
 # ---------------------------------------------------------------------------
 
 
@@ -1321,7 +1319,7 @@ def test_two_sinks_may_stream_copy_the_same_audio_track(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-006: array-RETURNING filters, against real ffmpeg
+# array-RETURNING filters, against real ffmpeg
 # ---------------------------------------------------------------------------
 #
 # `ffmpeg.channelsplit(...)` and friends are `->N` filters the registry fences

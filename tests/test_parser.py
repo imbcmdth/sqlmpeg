@@ -471,7 +471,7 @@ def test_count_star_is_still_an_aggregate_rejection() -> None:
 
 
 def test_count_star_over_track_rows_is_still_an_aggregate_rejection() -> None:
-    """RFC-011, plan 067: table mode makes metadata columns legal SELECT
+    """Table mode makes metadata columns legal SELECT
     outputs, but it does not make sqlmpeg a database -- ``COUNT(*)`` over a
     row table (a bare SELECT, unconditionally table-capable) is still fenced
     off exactly like any other aggregate."""
@@ -1127,7 +1127,7 @@ def test_overlay_cannot_take_named_arguments() -> None:
 
 
 def _sink(sql: str) -> RawSink:
-    """The single sink of a one-COPY statement (RFC-006 made `sinks` a list)."""
+    """The single sink of a one-COPY statement (`sinks` is a list)."""
     sinks = _resolve(sql).sinks
     assert len(sinks) == 1
     return sinks[0]
@@ -1189,7 +1189,7 @@ def test_copy_wraps_a_union_all() -> None:
 
 
 def test_a_sink_carries_its_own_validated_query() -> None:
-    """RFC-006: one COPY is one output group, so a sink owns a whole query."""
+    """One COPY is one output group, so a sink owns a whole query."""
     res = _resolve(
         "COPY (SELECT a.frame FROM input('x') a UNION ALL "
         "SELECT b.frame FROM input('y') b) TO 'out.mkv'"
@@ -1467,7 +1467,7 @@ def test_several_copies_resolve_cleanly() -> None:
     assert [sink.path for sink in res.sinks] == ["720.mp4", "360.mp4"]
     assert [len(sink.branches) for sink in res.sinks] == [1, 1]
     assert [option.name for option in res.sinks[1].options] == ["crf"]
-    # `select`/`branches` stay the FIRST sink's until plan 046 retires them.
+    # `select`/`branches` stay the FIRST sink's.
     assert res.select is res.sinks[0].query
 
 
@@ -1596,7 +1596,7 @@ def test_a_bad_view_body_is_rejected_like_any_other_query() -> None:
 
 
 def test_a_view_may_be_aliased_in_from() -> None:
-    """RFC-006 relaxed it: `FROM master m` binds a BRANCH-LOCAL name."""
+    """`FROM master m` binds a BRANCH-LOCAL name."""
     res = _resolve(
         f"CREATE VIEW v AS {_VIEW_BODY};\nCOPY (SELECT m.f FROM v m) TO 'out.mp4';"
     )
@@ -1869,7 +1869,7 @@ def test_join_forms_outside_the_admitted_set(join: str, on: str, message: str) -
 
 
 def test_join_is_still_rejected_between_stream_level_sources() -> None:
-    # RFC-009 § Fences: input-level FROM stays a comma cross-join.
+    # input-level FROM stays a comma cross-join.
     err = _reject(
         "SELECT f.video[1] FROM input('a.mkv') f JOIN input('b.mkv') g ON f.t = g.t"
     )
@@ -2090,8 +2090,7 @@ def test_the_other_streaming_fences_are_untouched_by_the_carve_out() -> None:
 
 
 # ---------------------------------------------------------------------------
-# subscript metadata accessors: <alias>.<type>[k].<column> (RFC-009 addendum,
-# plan 064)
+# subscript metadata accessors: <alias>.<type>[k].<column>
 # ---------------------------------------------------------------------------
 
 
@@ -2130,7 +2129,7 @@ def test_dot_track_is_still_a_stream_not_a_where_value() -> None:
 def test_a_non_track_accessor_is_rejected_as_a_select_output_in_a_media_query(
     column: str,
 ) -> None:
-    # RFC-011, plan 067: this fence is MEDIA-only now -- a bare SELECT (no
+    # this fence is MEDIA-only -- a bare SELECT (no
     # COPY) is always at least table-capable, and metadata columns are legal
     # there (see test_subscript_metadata_output_is_legal_in_table_mode
     # below). Wrapping in a real media COPY keeps this test on the fence it

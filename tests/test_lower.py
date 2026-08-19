@@ -62,8 +62,8 @@ SNAPSHOT_PATH = REPO_ROOT / "tests" / "data" / "reference_registry.json"
 # an example up or down the page does not silently re-point a test. Both
 # examples name files nobody has; each is compiled against the real
 # two-language fixtures instead, which is exactly how its shown command was
-# produced. (The union example moved to docs/examples.md in plan 049; its
-# pin now lives in tests/test_examples.py's generic harness.)
+# produced. (The union example lives in docs/examples.md; its pin is in
+# tests/test_examples.py's generic harness.)
 _FLAGSHIP_README_PATHS = {"film.mkv": "av2.mp4", "commentary.mkv": "av3.mp4"}
 
 
@@ -94,7 +94,7 @@ def _readme_block(needle: str, *, exclude: str | None = None) -> str:
 def _snapshot_registry() -> Registry:
     """The captured ffmpeg 7.1 filter set: offline, machine-independent, complete.
 
-    RFC-007 made the registry the WHOLE function surface, so even a lowering
+    The registry is the WHOLE function surface, so even a lowering
     test that says nothing about ffmpeg needs one to resolve `gblur` or
     `volume`. `tests/data/reference_registry.json` IS that registry -- no
     subprocess, no PATH lookup, identical answers on every machine. Tests that
@@ -287,7 +287,7 @@ def test_readme_flagship_selects_its_three_streams(_fixtures: None) -> None:
 
 @pytest.mark.exec
 def test_readme_flagship_amix_pairs_keep_the_agreed_language(_fixtures: None) -> None:
-    """Deliverable 1: a multi-stream call threads provenance when every zipped
+    """A multi-stream call threads provenance when every zipped
     input agrees. Both fixtures tag audio[1]=eng, audio[2]=fra, so each mixed
     pair keeps its language; the composited video has no tag on either side
     (probed, untagged video streams) for `overlay` to agree on."""
@@ -707,7 +707,7 @@ def test_an_array_argument_still_type_checks_by_element() -> None:
 def test_broadcast_composes_with_the_input_seek() -> None:
     """One window on the -i covers every element of the broadcast array.
 
-    RFC-004's input seek: no atrim/asetpts pair per element any more -- the
+    The input seek: no atrim/asetpts pair per element -- the
     calls consume the raw stream refs and the whole input is seeked once.
     """
     g = _lower(
@@ -759,7 +759,7 @@ def test_provenance_survives_the_where_trim() -> None:
 
 
 def test_amix_keeps_provenance_both_inputs_agree_on() -> None:
-    """Plan 024: a multi-stream call is a join like concat -- it threads the
+    """A multi-stream call is a join like concat -- it threads the
     tag when every stream feeding it agrees, so mixing two English tracks
     yields an English track."""
     g = _lower(
@@ -930,7 +930,7 @@ def test_concat_after_amix_carries_no_metadata() -> None:
 
 
 def test_concat_after_agreeing_amix_keeps_the_shared_language() -> None:
-    """Plan 024: `a`'s two mixed tracks agree (eng and eng), so the amix
+    """`a`'s two mixed tracks agree (eng and eng), so the amix
     segment threads that language into the concat pad, and the other segment
     agrees too -- the tag survives two joins deep."""
     g = _lower(
@@ -1284,7 +1284,7 @@ def test_where_trims_a_cte_column_by_its_type() -> None:
 
 
 def test_cte_open_lower_trim_node_carries_only_start() -> None:
-    """Plan 039: a CTE trim with only one bound omits the other's arg entirely."""
+    """A CTE trim with only one bound omits the other's arg entirely."""
     g = _lower(
         "WITH c AS (SELECT hflip(a.frame) AS pic FROM input('x.mp4') a) "
         "SELECT c.pic FROM c WHERE c.t >= 3"
@@ -1492,7 +1492,7 @@ def test_a_call_with_no_options_at_all_is_legal() -> None:
 
 
 def test_argument_kind_mismatch_is_the_options_own_rejection() -> None:
-    """RFC-007 consolidation: a badly-typed POSITIONAL is an option problem,
+    """A badly-typed POSITIONAL is an option problem,
     reported against the option it landed on -- not a signature mismatch."""
     err = _reject("SELECT gblur(a.frame, 'lots') FROM input('x.mp4') a")
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
@@ -1579,7 +1579,7 @@ def test_a_partial_overlay_option_list_is_still_legal() -> None:
 
 
 def test_overlay_keeps_the_agreed_video_tag() -> None:
-    """Plan 024: overlay is a multi-stream join exactly like amix -- when both
+    """overlay is a multi-stream join exactly like amix -- when both
     probed video streams it composites agree on a tag, the composite keeps
     it. (Use the same file under two aliases, same as the README headline.)"""
     g = _lower(
@@ -1675,7 +1675,7 @@ def test_undefined_language_tag_is_not_copied() -> None:
 
 
 def test_filtered_output_threads_its_sources_provenance() -> None:
-    """Plan 020: a 1:1 filter chain keeps the tags raw ffmpeg would have lost."""
+    """A 1:1 filter chain keeps the tags raw ffmpeg would have lost."""
     g = _lower(
         "SELECT volume(a.audio[1], 0.5) FROM input('x.mp4') a",
         {"a": _probe_result(audio_tags={"language": "fra"})},
@@ -1689,7 +1689,7 @@ def test_unprobed_passthrough_has_no_metadata() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-004: subtitle / data columns -- same surface, passthrough-only
+# subtitle / data columns -- same surface, passthrough-only
 # ---------------------------------------------------------------------------
 
 
@@ -1841,7 +1841,7 @@ def test_where_over_a_consumed_subtitle_stream_is_rejected() -> None:
 
 
 def test_where_over_a_consumed_subtitle_stream_is_rejected_for_an_open_window() -> None:
-    """Plan 039: the desync rejection keys on `graph.input_trims` membership,
+    """The desync rejection keys on `graph.input_trims` membership,
     so an open-ended window (`t >= x`, no upper bound at all) triggers it just
     as a closed BETWEEN does -- there is no window shape that is safe."""
     err = _reject_lower(
@@ -1888,7 +1888,7 @@ def test_where_plus_unselected_captions_still_seeks() -> None:
 
 
 def test_where_over_a_cte_carrying_a_subtitle_column_is_rejected() -> None:
-    """Permanent per RFC-004: a CTE trim is a filtergraph trim."""
+    """Permanent: a CTE trim is a filtergraph trim."""
     err = _reject_lower(
         "WITH c AS (SELECT a.video[1] AS v, a.subtitle[1] AS caps "
         "FROM input('x.mkv') a) "
@@ -1936,7 +1936,7 @@ def test_union_all_branch_with_a_subtitle_column_is_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-004: SELECT * and <alias>.*
+# SELECT * and <alias>.*
 # ---------------------------------------------------------------------------
 
 
@@ -2425,7 +2425,7 @@ def test_itsoffset_compiles_to_a_negative_argv_flag() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-003: dynamic filters + named arguments, against an OFFLINE registry
+# dynamic filters + named arguments, against an OFFLINE registry
 # ---------------------------------------------------------------------------
 #
 # These build a real `Registry` over faked subprocess output, exactly as
@@ -2740,7 +2740,7 @@ def test_dynamic_options_keep_their_written_order(_registry: Registry) -> None:
 def test_a_positional_after_the_pads_binds_to_the_first_option(
     _registry: Registry,
 ) -> None:
-    """RFC-007's heart: `gblur(f, 5)` IS `gblur=5`, because `sigma` is the
+    """`gblur(f, 5)` IS `gblur=5`, because `sigma` is the
     option ffmpeg declares first."""
     g = _dyn("SELECT gblur(a.frame, 5) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].args == {"sigma": 5}
@@ -3240,8 +3240,8 @@ def test_a_dynamic_node_is_split_like_any_other(_registry: Registry) -> None:
 
 # -- no registry at all: no ffmpeg ------------------------------------------
 #
-# RFC-007 deleted --portable along with the tier system: there is no portable
-# subset left to compile against, because every function IS a filter of the
+# There is no --portable and no tier system: there is no portable subset
+# left to compile against, because every function IS a filter of the
 # installed ffmpeg. A None/empty registry is now exactly one situation -- no
 # ffmpeg -- and every call name in it is UNKNOWN_FUNCTION.
 
@@ -3461,7 +3461,7 @@ def test_union_of_disagreeing_tracks_drops_the_language(
 
 
 # ---------------------------------------------------------------------------
-# plan 029: crossfade of two WHERE-trimmed segments (compile-only)
+# crossfade of two WHERE-trimmed segments (compile-only)
 # ---------------------------------------------------------------------------
 
 
@@ -3471,9 +3471,8 @@ def test_crossfade_of_two_trimmed_segments_compiles(
 ) -> None:
     """Each side is trimmed to a 2s window via WHERE, then crossfaded over 1s
     starting 1s into the first segment -- exercises xfade as a real multi-input
-    tier-1 call against two independently seeked inputs. Since plan 035 the
-    windows are input options (one per -i), so xfade consumes the raw refs and
-    the graph is the single node."""
+    call against two independently seeked inputs. The windows are input options
+    (one per -i), so xfade consumes the raw refs and the graph is one node."""
     g = compile_sql(
         f"SELECT xfade(a.frame, b.frame, duration => 1, offset => 1) "
         f"FROM input('{_av2_fixture}') a, input('{_av3_fixture}') b "
@@ -3490,7 +3489,7 @@ def test_crossfade_of_two_trimmed_segments_compiles(
 
 
 # ---------------------------------------------------------------------------
-# plan 038 / 053b: sqlmpeg.delay -- the macro's VIDEO-only expansion
+# sqlmpeg.delay -- the macro's VIDEO-only expansion
 # ---------------------------------------------------------------------------
 #
 # The single-expansion shape (format+tpad), the arity/type-mismatch errors,
@@ -3508,7 +3507,7 @@ _AD_INSERT = (
 
 
 def test_the_ad_insert_composition_lowers_end_to_end() -> None:
-    """The plan 038 driving case: a clip delayed onto a film, video via
+    """The ad-insert driving case: a clip delayed onto a film, video via
     `sqlmpeg.delay`, audio via bare `adelay` in milliseconds (golden
     096-ad-insert pins the whole IR; this pins the shape)."""
     g = _lower(_AD_INSERT)
@@ -3541,7 +3540,7 @@ def test_delay_over_a_passthrough_stream_is_still_udf_arg_type() -> None:
 
 
 # ---------------------------------------------------------------------------
-# plan 038: the `ffmpeg.<filter>(...)` namespace
+# the `ffmpeg.<filter>(...)` namespace
 # ---------------------------------------------------------------------------
 #
 # One spelling of a filter name that no SQL grammar has an opinion about, and
@@ -3559,7 +3558,7 @@ def test_a_namespaced_call_lowers_to_an_ordinary_node(_registry: Registry) -> No
 
 
 def test_the_namespace_and_the_bare_name_are_the_same_call(_registry: Registry) -> None:
-    """RFC-007: there is no tier to resolve past. `scale` and `ffmpeg.scale`
+    """There is no tier to resolve past. `scale` and `ffmpeg.scale`
     are one filter, one option set, one argument order -- the namespace only
     changes what Postgres's parser does with the NAME."""
     named = _dyn(
@@ -3643,7 +3642,7 @@ def test_a_namespaced_did_you_mean_stays_in_the_namespace(
 
 
 def test_the_scope_fence_applies_to_the_namespace_too(_registry: Registry) -> None:
-    """Plan 047 re-admits three `->N` names through this namespace, and only
+    """Three `->N` names are re-admitted through this namespace, and only
     those three: `amerge` is dynamic-pad in exactly the same way and stays
     fenced, as do multi-output, source and `split`-shaped names."""
     for sql in (
@@ -3722,7 +3721,7 @@ def test_an_unrelated_qualified_call_is_still_rejected() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-006: array-RETURNING filters
+# array-RETURNING filters
 # ---------------------------------------------------------------------------
 #
 # `channelsplit`, `acrossover` and `extractplanes` are `->N` filters, fenced
@@ -4002,7 +4001,7 @@ def test_an_array_call_checks_its_input_pad_type(_registry: Registry) -> None:
 def test_an_array_call_takes_positional_options_like_any_other(
     _registry: Registry,
 ) -> None:
-    """RFC-007 is uniform: the pad comes first, then channelsplit's own options
+    """Calls are uniform: the pad comes first, then channelsplit's own options
     in ffmpeg's order (channel_layout, channels)."""
     g = _dyn(
         "SELECT ffmpeg.channelsplit(a.audio[1], '5.1') FROM input('x.mp4') a", _registry
@@ -4083,7 +4082,7 @@ def test_an_array_call_emits_one_label_per_pad(_registry: Registry) -> None:
 
 
 # ---------------------------------------------------------------------------
-# plan 051: everything still works OFFLINE, through the captured snapshot
+# everything still works OFFLINE, through the captured snapshot
 # ---------------------------------------------------------------------------
 #
 # There is no curated subset to fall back on, so "does this compile without
@@ -4185,7 +4184,7 @@ def test_positional_options_bind_offline_exactly_as_they_do_live(
 
 
 # ---------------------------------------------------------------------------
-# plan 051: fixed-count N-INPUT filters (amix / hstack / vstack)
+# fixed-count N-INPUT filters (amix / hstack / vstack)
 # ---------------------------------------------------------------------------
 #
 # The mirror of the array-RETURNING trio: `N->1` filters whose INPUT pad count
@@ -4356,7 +4355,7 @@ def test_an_n_input_node_is_split_like_any_other(_registry: Registry) -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-005 SS1: FROM ffmpeg.<source>(...) alias
+# FROM ffmpeg.<source>(...) alias
 # ---------------------------------------------------------------------------
 #
 # Offline, against the same fixture registry: the fixture's `-filters` block
@@ -4656,7 +4655,7 @@ def test_an_unknown_alias_hint_lists_source_aliases(_registry: Registry) -> None
 
 
 # ---------------------------------------------------------------------------
-# RFC-005 SS2: the timeline `enable` named argument
+# the timeline `enable` named argument
 # ---------------------------------------------------------------------------
 #
 # Offline again, and the fixture `-filters` block is what makes it possible:
@@ -4771,7 +4770,7 @@ def test_enable_needs_a_string_expression(_registry: Registry) -> None:
 
 
 def test_enable_expression_content_is_not_validated(_registry: Registry) -> None:
-    """RFC-005's non-goal, stated as a test: the variable vocabulary is
+    """A non-goal, stated as a test: the variable vocabulary is
     per-filter and not introspectable, so nonsense compiles and it is ffmpeg
     that rejects it at run time."""
     g = _dyn(
@@ -4814,9 +4813,9 @@ def test_enable_broadcasts_onto_every_element(_registry: Registry) -> None:
     ]
 
 
-# RFC-005 SS3's "expr parameter kind" (a stdlib FUNCTIONS-table
-# concept: which stdlib slots took a quoted expression vs. a bare number) is
-# dead post-RFC-007 -- there is no stdlib table anymore, only the registry's
+# The "expr parameter kind" (a stdlib FUNCTIONS-table concept: which stdlib
+# slots took a quoted expression vs. a bare number) is dead -- there is no
+# stdlib table anymore, only the registry's
 # own option types (num/str/bool/enum), covered by the dynamic-call tests
 # above and by the registry faithfulness tests in tests/exec/test_exec.py.
 # The section that pinned it (test_an_expr_slot_*, test_expr_slots_cover_*,
@@ -4826,7 +4825,7 @@ def test_enable_broadcasts_onto_every_element(_registry: Registry) -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-003: the same shapes against the REAL installed ffmpeg
+# the same shapes against the REAL installed ffmpeg
 # ---------------------------------------------------------------------------
 #
 # The offline tests above pin the semantics against captured fixtures; these
@@ -4960,7 +4959,7 @@ def test_did_you_mean_reaches_into_the_real_filter_set(_av_fixture: str) -> None
 
 
 # ---------------------------------------------------------------------------
-# plan 051: POSITIONAL-BINDING FIDELITY, measured against the REAL ffmpeg
+# POSITIONAL-BINDING FIDELITY, measured against the REAL ffmpeg
 # ---------------------------------------------------------------------------
 #
 # The claim positional options rest on: the registry's deduped, insertion-
@@ -5116,7 +5115,7 @@ def test_the_snapshot_agrees_with_the_installed_ffmpeg_on_option_order(
 
 
 # ---------------------------------------------------------------------------
-# plan 038: the collision census, measured against the REAL filter set
+# the collision census, measured against the REAL filter set
 # ---------------------------------------------------------------------------
 #
 # Which filter names Postgres parses specially is a property of sqlglot's
@@ -5303,7 +5302,7 @@ _CTE_EQUIVALENT = (
 
 
 def test_a_view_lowers_into_the_same_ir_a_cte_would() -> None:
-    """The whole design claim of RFC-006's first half, as one assertion."""
+    """The whole design claim of views-are-CTEs, as one assertion."""
     assert compile_sql(_VIEW_SCRIPT).to_dict() == compile_sql(_CTE_EQUIVALENT).to_dict()
 
 
@@ -5357,7 +5356,7 @@ def test_a_view_column_error_still_names_the_view() -> None:
     assert err.line == 2
 
 
-# --- multiple sinks (RFC-006 wave 2) -----------------------------
+# --- multiple sinks ---
 
 _TWO_SINKS = (
     "CREATE VIEW m AS SELECT a.frame AS v FROM input('film.mkv') a;\n"
@@ -6018,8 +6017,8 @@ def test_result_row_order_is_the_left_sides_track_order() -> None:
 
 
 def test_join_multiplicity_is_real_join_semantics() -> None:
-    """RFC-009: a row matching two rows on the other side pairs with BOTH --
-    that REPLACES RFC-008's duplicate-tag rejection. Two pairs, two outputs."""
+    """A row matching two rows on the other side pairs with BOTH -- real join
+    multiplicity, not a duplicate-tag rejection. Two pairs, two outputs."""
     probes = _pair_probes(
         right=[
             _track("audio", 0, language="eng", channel_layout="stereo", duration=2.0),

@@ -292,12 +292,12 @@ def test_idempotent_on_multi_output_graph() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-004: subtitle/data refs are exempt -- they are never filtergraph pads
+# subtitle/data refs are exempt -- they are never filtergraph pads
 # ---------------------------------------------------------------------------
 
 
 def _duplicate_subtitle_graph() -> Graph:
-    """One subtitle src ref named by TWO Outputs (legal per RFC-004)."""
+    """One subtitle src ref named by TWO Outputs (legal ffmpeg)."""
     g = Graph(input_paths=["a.mkv"], sources={"a": 0})
     g.sinks = [
         SinkUnit(
@@ -361,7 +361,7 @@ def test_idempotent_on_duplicate_subtitle_refs() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-006: several sinks, and the cross-GROUP passthrough exemption
+# several sinks, and the cross-GROUP passthrough exemption
 # ---------------------------------------------------------------------------
 
 
@@ -453,7 +453,7 @@ def test_sink_paths_and_options_survive_the_split_pass() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-004 input seek: input_trims are not part of the pad shape
+# input seek: input_trims are not part of the pad shape
 # ---------------------------------------------------------------------------
 
 
@@ -485,7 +485,7 @@ def test_input_trims_survive_a_graph_that_does_split() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-005 SS4 input options: not part of the pad shape either
+# input options: not part of the pad shape either
 # ---------------------------------------------------------------------------
 
 
@@ -517,7 +517,7 @@ def test_input_options_survive_a_graph_that_does_split() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RFC-005 SS1 generated sources: a zero-input node fans out like any other
+# generated sources: a zero-input node fans out like any other
 # ---------------------------------------------------------------------------
 
 
