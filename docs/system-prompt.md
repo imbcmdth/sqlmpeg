@@ -336,7 +336,7 @@ statement is not. `--` and `/* */` comments are allowed.
 Every function name resolves in exactly one of three namespaces. There is no
 curated function table to memorize -- what a name means, how many positional
 arguments it takes, and what options it has all come from the installed
-ffmpeg itself (except the three `sqlmpeg.*` macros, which are sqlmpeg's own).
+ffmpeg itself (except the four `sqlmpeg.*` macros, which are sqlmpeg's own).
 
 1. **A bare filter name** -- `<filter>(<streams...>, <positional
    options...>, <named options...>)` -- resolves directly against the
@@ -361,9 +361,9 @@ ffmpeg itself (except the three `sqlmpeg.*` macros, which are sqlmpeg's own).
    start => 1)` is the filter; bare `trim(a.frame)` is Postgres's string
    `TRIM` and silently loses the argument. `ffmpeg` is a reserved name:
    never use it as an alias or a CTE name.
-3. **`sqlmpeg.<name>(...)`** -- three fixed macros, each a small filter
-   subgraph no single ffmpeg filter provides. Their signature is sqlmpeg's
-   own, POSITIONAL ONLY -- no `=>`, ever; a named argument to a macro
+3. **`sqlmpeg.<name>(...)`** -- four fixed macros, each doing what no single
+   ffmpeg filter does. Their signature is sqlmpeg's own. The first three are
+   POSITIONAL ONLY -- no `=>`, ever; a named argument to one of them
    (`enable` included) is `UNSUPPORTED_SQL`:
    - `sqlmpeg.blur_regions(f, x, y, w, h, sigma)` -- crop the `w`x`h` region
      at `(x, y)` out of video `f`, blur it by `sigma`, and lay it back over
@@ -378,6 +378,22 @@ ffmpeg itself (except the three `sqlmpeg.*` macros, which are sqlmpeg's own).
      reserved, `sqlmpeg.delay` on an audio stream is `UDF_ARG_TYPE`, and its
      hint names the replacement -- delay AUDIO with the bare filter
      directly, in MILLISECONDS: `adelay(a.audio[1], 2000)`.
+
+   The fourth is the exception to positional-only, because its options are
+   the whole point:
+   - `sqlmpeg.loudnorm2(stream, I => ..., TP => ..., LRA => ...)` --
+     normalize audio `stream` to a loudness target the broadcast-compliant
+     way: MEASURE the whole stream, then correct it in one linear gain
+     change. The three options are named only, all optional (ffmpeg's own
+     loudnorm defaults apply to any you leave out), and each takes a bare
+     number: `sqlmpeg.loudnorm2(f.audio[1], I => -16, TP => -1.5, LRA => 11)`.
+     AUDIO ONLY. It changes the SHAPE of the compile -- one query becomes
+     two chained ffmpeg commands with a measuring pass in front -- which is
+     why the v1 fences are: one `loudnorm2` per query, never together with a
+     `two_pass` sink, never inside a fan-out `TO (<expression>)`, and never
+     in a table/CSV query. Each is `UNSUPPORTED_SQL`. Use the bare
+     `loudnorm(...)` filter instead when one pass is genuinely enough (a
+     live stream, or a file you have already measured).
 
    `sqlmpeg` is a reserved name too: never use it as an alias or a CTE name.
 
@@ -422,7 +438,7 @@ A handful of names are exceptions to "one stream in, one filter, one call":
 
 Function names are case-insensitive; option names are not. Filter calls are
 machine-dependent -- a query naming a filter (or an option) only compiles
-where the installed ffmpeg has it; the three `sqlmpeg.*` macros and the
+where the installed ffmpeg has it; the four `sqlmpeg.*` macros and the
 dialect otherwise compile anywhere. sqlmpeg requires ffmpeg (PATH, or its
 bundled provisioner); if that provisioner ever fails and no ffmpeg is
 available, every filter call is `UNKNOWN_FUNCTION` and every named argument
@@ -538,7 +554,7 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   `WITH`, CTE column lists, table functions other than `input()` and
   `unnest()`, a statement that is neither a `SELECT` nor (in a script)
   `CREATE VIEW` / `COPY`, a zero/negative/computed array subscript.
-- Any name that is neither one of the three `sqlmpeg.*` macros nor a filter
+- Any name that is neither one of the four `sqlmpeg.*` macros nor a filter
   the installed ffmpeg provides (see Calling convention), including
   transitions between concatenated branches, motion tracking,
   subtitle/data-stream filtering, and anything requiring more than one pass
@@ -549,9 +565,9 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   `WHERE` window (a CTE trim is a filtergraph trim, which cannot carry
   captions at all).
 
-## Functions (464 installed filters, plus the 3 sqlmpeg.* macros)
+## Functions (464 installed filters, plus the 4 sqlmpeg.* macros)
 
-Every filter this machine's installed ffmpeg reports -- name, pad signature, one-line description, sorted alphabetically -- callable bare or as `ffmpeg.<name>` (see Calling convention). This list is machine-dependent: it is only what THIS ffmpeg reported when this prompt was generated. Options are never dumped here -- pass them by name (`<name> => <value>`) as usual and let `sqlmpeg validate --json` report the real option set on a mistake (`UNKNOWN_FILTER_OPTION` / `FILTER_OPTION_TYPE`); the repair loop below covers the rest. The three `sqlmpeg.*` macros (`blur_regions`, `speed`, `delay`) are not in this list -- their signatures are fixed and given in full under Calling convention.
+Every filter this machine's installed ffmpeg reports -- name, pad signature, one-line description, sorted alphabetically -- callable bare or as `ffmpeg.<name>` (see Calling convention). This list is machine-dependent: it is only what THIS ffmpeg reported when this prompt was generated. Options are never dumped here -- pass them by name (`<name> => <value>`) as usual and let `sqlmpeg validate --json` report the real option set on a mistake (`UNKNOWN_FILTER_OPTION` / `FILTER_OPTION_TYPE`); the repair loop below covers the rest. The four `sqlmpeg.*` macros (`blur_regions`, `speed`, `delay`, `loudnorm2`) are not in this list -- their signatures are fixed and given in full under Calling convention.
 
 - `a3dscope(audio) -> video` -- Convert input audio to 3d scope video output.
 - `aap(audio, audio) -> audio` -- Apply Affine Projection algorithm to first audio stream.
@@ -1214,7 +1230,7 @@ not repeat a fix that already failed -- if a construct is rejected twice, it is
 not in the dialect.
 
 - `PARSE_ERROR` -- Not valid Postgres SQL. Check for unbalanced parentheses, a missing comma between FROM items, double quotes used for a string, or text after the statement. One more cause: a `=>` argument inside a call whose name Postgres parses specially (`overlay`, `trim`, `format`, ...) -- write that call as `ffmpeg.<name>(...)` instead. Re-emit one well-formed SELECT.
-- `UNKNOWN_FUNCTION` -- That name is neither one of the 3 `sqlmpeg.*` macros nor a filter the installed ffmpeg has. Take the did-you-mean from `hint` if there is one -- it comes back in the spelling that works, so `ffmpeg.<name>()` in the hint means write it with the namespace. Otherwise rebuild the effect from the Functions list, or declare it inexpressible. Do not invent ffmpeg filter names, and do not retry a bare name as `ffmpeg.<name>` unless the filter really exists: the namespace changes how the name resolves, not which filters exist.
+- `UNKNOWN_FUNCTION` -- That name is neither one of the 4 `sqlmpeg.*` macros nor a filter the installed ffmpeg has. Take the did-you-mean from `hint` if there is one -- it comes back in the spelling that works, so `ffmpeg.<name>()` in the hint means write it with the namespace. Otherwise rebuild the effect from the Functions list, or declare it inexpressible. Do not invent ffmpeg filter names, and do not retry a bare name as `ffmpeg.<name>` unless the filter really exists: the namespace changes how the name resolves, not which filters exist.
 - `UNKNOWN_ALIAS` -- The qualifier before the dot is not in this SELECT's FROM. Add `input('path') <alias>` or the CTE name to that FROM clause; `hint` lists what is in scope. Names do not cross UNION ALL branches, and a CTE is in scope only in the branches whose FROM names it.
 - `UDF_ARG_TYPE` -- Wrong arity or wrong argument kind. Count the arguments against one signature in `message` and fix the mismatched slot: `video` needs `<alias>.video[k]`, `<alias>.frame`, or a nested video-returning call; `audio` needs `<alias>.audio[k]` or a nested audio-returning call; `num` needs a bare number; `str` needs a single-quoted literal. `video`/`audio` in the got-list where the other was expected usually means you mixed up video and audio; a stream kind where `num` was expected usually means you passed a stream or `<alias>.t` instead of a number. A got-list that is EMPTY (`trim(), got trim()`) for a call you did pass arguments to means Postgres claimed the name: rewrite it as `ffmpeg.<name>(...)`.
 - `SINGLE_OUTPUT_ONLY` -- Reserved; sqlmpeg never raises this code -- a multi-column SELECT is ordinary usage, one column per output stream. If you see it anyway, treat it as INTERNAL: re-emit the simplest form of the query.

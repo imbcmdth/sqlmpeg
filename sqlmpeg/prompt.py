@@ -51,6 +51,7 @@ from __future__ import annotations
 
 from sqlmpeg.errors import ErrorCode
 from sqlmpeg.inputs import INPUT_OPTIONS
+from sqlmpeg.macros import MACROS
 from sqlmpeg.registry import Registry
 from sqlmpeg.sink import SINK_OPTIONS
 
@@ -401,7 +402,7 @@ _DIALECT_TAIL = """\
 Every function name resolves in exactly one of three namespaces. There is no
 curated function table to memorize -- what a name means, how many positional
 arguments it takes, and what options it has all come from the installed
-ffmpeg itself (except the three `sqlmpeg.*` macros, which are sqlmpeg's own).
+ffmpeg itself (except the four `sqlmpeg.*` macros, which are sqlmpeg's own).
 
 1. **A bare filter name** -- `<filter>(<streams...>, <positional
    options...>, <named options...>)` -- resolves directly against the
@@ -426,9 +427,9 @@ ffmpeg itself (except the three `sqlmpeg.*` macros, which are sqlmpeg's own).
    start => 1)` is the filter; bare `trim(a.frame)` is Postgres's string
    `TRIM` and silently loses the argument. `ffmpeg` is a reserved name:
    never use it as an alias or a CTE name.
-3. **`sqlmpeg.<name>(...)`** -- three fixed macros, each a small filter
-   subgraph no single ffmpeg filter provides. Their signature is sqlmpeg's
-   own, POSITIONAL ONLY -- no `=>`, ever; a named argument to a macro
+3. **`sqlmpeg.<name>(...)`** -- four fixed macros, each doing what no single
+   ffmpeg filter does. Their signature is sqlmpeg's own. The first three are
+   POSITIONAL ONLY -- no `=>`, ever; a named argument to one of them
    (`enable` included) is `UNSUPPORTED_SQL`:
    - `sqlmpeg.blur_regions(f, x, y, w, h, sigma)` -- crop the `w`x`h` region
      at `(x, y)` out of video `f`, blur it by `sigma`, and lay it back over
@@ -443,6 +444,22 @@ ffmpeg itself (except the three `sqlmpeg.*` macros, which are sqlmpeg's own).
      reserved, `sqlmpeg.delay` on an audio stream is `UDF_ARG_TYPE`, and its
      hint names the replacement -- delay AUDIO with the bare filter
      directly, in MILLISECONDS: `adelay(a.audio[1], 2000)`.
+
+   The fourth is the exception to positional-only, because its options are
+   the whole point:
+   - `sqlmpeg.loudnorm2(stream, I => ..., TP => ..., LRA => ...)` --
+     normalize audio `stream` to a loudness target the broadcast-compliant
+     way: MEASURE the whole stream, then correct it in one linear gain
+     change. The three options are named only, all optional (ffmpeg's own
+     loudnorm defaults apply to any you leave out), and each takes a bare
+     number: `sqlmpeg.loudnorm2(f.audio[1], I => -16, TP => -1.5, LRA => 11)`.
+     AUDIO ONLY. It changes the SHAPE of the compile -- one query becomes
+     two chained ffmpeg commands with a measuring pass in front -- which is
+     why the v1 fences are: one `loudnorm2` per query, never together with a
+     `two_pass` sink, never inside a fan-out `TO (<expression>)`, and never
+     in a table/CSV query. Each is `UNSUPPORTED_SQL`. Use the bare
+     `loudnorm(...)` filter instead when one pass is genuinely enough (a
+     live stream, or a file you have already measured).
 
    `sqlmpeg` is a reserved name too: never use it as an alias or a CTE name.
 
@@ -487,7 +504,7 @@ A handful of names are exceptions to "one stream in, one filter, one call":
 
 Function names are case-insensitive; option names are not. Filter calls are
 machine-dependent -- a query naming a filter (or an option) only compiles
-where the installed ffmpeg has it; the three `sqlmpeg.*` macros and the
+where the installed ffmpeg has it; the four `sqlmpeg.*` macros and the
 dialect otherwise compile anywhere. sqlmpeg requires ffmpeg (PATH, or its
 bundled provisioner); if that provisioner ever fails and no ffmpeg is
 available, every filter call is `UNKNOWN_FUNCTION` and every named argument
@@ -596,7 +613,7 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   `WITH`, CTE column lists, table functions other than `input()` and
   `unnest()`, a statement that is neither a `SELECT` nor (in a script)
   `CREATE VIEW` / `COPY`, a zero/negative/computed array subscript.
-- Any name that is neither one of the three `sqlmpeg.*` macros nor a filter
+- Any name that is neither one of the four `sqlmpeg.*` macros nor a filter
   the installed ffmpeg provides (see Calling convention), including
   transitions between concatenated branches, motion tracking,
   subtitle/data-stream filtering, and anything requiring more than one pass
@@ -625,8 +642,8 @@ _NO_REGISTRY_NOTE = (
     "render here. Calling convention above still describes the mechanism -- "
     "bare and `ffmpeg.<name>` calls both resolve against the installed "
     "ffmpeg's filter set, whatever it turns out to be, once the provisioner "
-    "is fixed. `sqlmpeg.blur_regions` / `sqlmpeg.speed` / `sqlmpeg.delay` "
-    "need no registry at all and always compile."
+    "is fixed. `sqlmpeg.blur_regions` / `sqlmpeg.speed` / `sqlmpeg.delay` / "
+    "`sqlmpeg.loudnorm2` need no registry at all and always compile."
 )
 
 
@@ -642,7 +659,8 @@ def _function_reference(registry: Registry) -> str:
         return f"## Functions\n\n{_NO_REGISTRY_NOTE}"
     names = sorted(registry.names())
     lines = [
-        f"## Functions ({len(names)} installed filters, plus the 3 sqlmpeg.* macros)",
+        f"## Functions ({len(names)} installed filters, plus the "
+        f"{len(MACROS)} sqlmpeg.* macros)",
         "",
         "Every filter this machine's installed ffmpeg reports -- name, pad "
         "signature, one-line description, sorted alphabetically -- callable "
@@ -652,9 +670,10 @@ def _function_reference(registry: Registry) -> str:
         "name (`<name> => <value>`) as usual and let `sqlmpeg validate "
         "--json` report the real option set on a mistake "
         "(`UNKNOWN_FILTER_OPTION` / `FILTER_OPTION_TYPE`); the repair loop "
-        "below covers the rest. The three `sqlmpeg.*` macros "
-        "(`blur_regions`, `speed`, `delay`) are not in this list -- their "
-        "signatures are fixed and given in full under Calling convention.",
+        "below covers the rest. The four `sqlmpeg.*` macros "
+        "(`blur_regions`, `speed`, `delay`, `loudnorm2`) are not in this "
+        "list -- their signatures are fixed and given in full under Calling "
+        "convention.",
         "",
     ]
     lines.extend(_filter_line(name, registry) for name in names)
@@ -883,7 +902,7 @@ _REPAIR: dict[ErrorCode, str] = {
         "well-formed SELECT."
     ),
     ErrorCode.UNKNOWN_FUNCTION: (
-        "That name is neither one of the 3 `sqlmpeg.*` macros nor a filter "
+        "That name is neither one of the 4 `sqlmpeg.*` macros nor a filter "
         "the installed ffmpeg has. Take the did-you-mean from `hint` if "
         "there is one -- it comes back in the spelling that works, so "
         "`ffmpeg.<name>()` in the hint means write it with the namespace. "

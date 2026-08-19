@@ -4,7 +4,8 @@ Macros expand to a small ffmpeg filter subgraph no single filter provides.
 Unlike a registry filter call, a macro's signature is OURS: fixed positional
 parameters, checked without consulting the installed ffmpeg's option tables --
 macros work OFFLINE, with no registry. Named arguments are rejected outright
-(``lower._lower_macro_call``): there is no option surface to name.
+(``lower._lower_macro_call``) unless the macro declares ``options``: a macro's
+option surface is its own, closed list, not something read off a filter.
 
 :data:`MACROS` is keyed by lowercased macro name and sqlmpeg/lower.py is its
 only reader, resolving ``sqlmpeg.<name>(...)`` here and nowhere else (not the
@@ -19,11 +20,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from sqlmpeg import loudnorm
 from sqlmpeg.ir import StreamType
 
 __all__ = [
     "INPUT_MACROS",
     "MACROS",
+    "Expander",
     "InputMacro",
     "Macro",
     "MacroParam",
@@ -35,6 +38,10 @@ __all__ = [
 # new node's ref (pad 0). Exactly `_NodeFactory.node`'s shape, so `self.ctx.node`
 # passes through with no adapter.
 NodeBuilder = Callable[[str, dict[str, object], list[str], list[StreamType]], str]
+
+# One expansion: positional values, the node minter, the named options that
+# were actually written ({} for a positional-only macro).
+Expander = Callable[[list[object], NodeBuilder, dict[str, object]], str]
 
 
 @dataclass(frozen=True)
@@ -58,24 +65,31 @@ class Macro:
     and supplies a hint more specific than the generic stream-signature
     message. Only ``delay`` uses it: audio into a video-only macro is common
     enough to earn a hint naming the bare filter that does the job.
+
+    `options` are named-only numeric options, all optional, in render order.
+    An empty tuple (every macro but ``loudnorm2``) means the signature is
+    positional only and any ``=>`` argument is rejected.
     """
 
     name: str
     params: tuple[MacroParam, ...]
     output: StreamType
-    expand: Callable[[list[object], NodeBuilder], str]
+    expand: Expander
     kind_hints: dict[str, str] = field(default_factory=dict)
+    options: tuple[str, ...] = ()
 
     @property
     def signature(self) -> str:
-        return f"sqlmpeg.{self.name}(" + ", ".join(p.name for p in self.params) + ")"
+        parts = [p.name for p in self.params]
+        parts += [f"{name} => ..." for name in self.options]
+        return f"sqlmpeg.{self.name}(" + ", ".join(parts) + ")"
 
     @property
     def stream_positions(self) -> list[int]:
         return [index for index, param in enumerate(self.params) if param.kind == "stream"]
 
 
-def _blur_regions(values: list[object], node: NodeBuilder) -> str:
+def _blur_regions(values: list[object], node: NodeBuilder, _options: dict[str, object]) -> str:
     """crop -> gblur -> overlay, region named once; `f` feeds crop AND overlay."""
     f, x, y, w, h, sigma = values
     cropped = node("crop", {"out_w": w, "out_h": h, "x": x, "y": y}, [str(f)], ["video"])
@@ -83,12 +97,12 @@ def _blur_regions(values: list[object], node: NodeBuilder) -> str:
     return node("overlay", {"x": x, "y": y}, [str(f), blurred], ["video"])
 
 
-def _speed(values: list[object], node: NodeBuilder) -> str:
+def _speed(values: list[object], node: NodeBuilder, _options: dict[str, object]) -> str:
     f, factor = values
     return node("setpts", {"expr": f"PTS/{factor}"}, [str(f)], ["video"])
 
 
-def _delay(values: list[object], node: NodeBuilder) -> str:
+def _delay(values: list[object], node: NodeBuilder, _options: dict[str, object]) -> str:
     """The transparent-canvas macro: format to yuva420p, then pad the start."""
     f, seconds = values
     formatted = node("format", {"pix_fmts": "yuva420p"}, [str(f)], ["video"])
@@ -98,6 +112,17 @@ def _delay(values: list[object], node: NodeBuilder) -> str:
         [formatted],
         ["video"],
     )
+
+
+def _loudnorm2(values: list[object], node: NodeBuilder, options: dict[str, object]) -> str:
+    """One node carrying only what was written; emit renders it once per phase.
+
+    Not a subgraph at all -- the expansion this macro exists for is in TIME
+    (measure, then correct), not in the filtergraph, and the whole command's
+    shape follows from this node being present.
+    """
+    (f,) = values
+    return node(loudnorm.FILTER, dict(options), [str(f)], ["audio"])
 
 
 _ADELAY_HINT = (
@@ -132,6 +157,13 @@ MACROS: dict[str, Macro] = {
         output="video",
         expand=_delay,
         kind_hints={"audio": _ADELAY_HINT},
+    ),
+    "loudnorm2": Macro(
+        name="loudnorm2",
+        params=(MacroParam("stream", "stream", "audio"),),
+        output="audio",
+        expand=_loudnorm2,
+        options=loudnorm.OPTIONS,
     ),
 }
 

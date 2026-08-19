@@ -109,6 +109,14 @@ def test_macros_are_documented_as_positional_only() -> None:
     assert "UNSUPPORTED_SQL" in PROMPT
 
 
+def test_loudnorm2_signature_and_fences_are_documented() -> None:
+    """The one macro with named options, and the one whose presence changes
+    the shape of the compile -- so the prompt has to carry its fences too."""
+    assert "sqlmpeg.loudnorm2(stream, I => ..., TP => ..., LRA => ...)" in PROMPT
+    assert "one `loudnorm2` per query" in PROMPT
+    assert "two chained ffmpeg commands" in PROMPT
+
+
 def test_delay_audio_hint_is_documented() -> None:
     assert "adelay(a.audio[1], 2000)" in PROMPT
     assert "VIDEO ONLY" in PROMPT

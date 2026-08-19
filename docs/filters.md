@@ -45,7 +45,7 @@ Eleven bare names need it (measured against ffmpeg 7.1 / sqlglot 30.17): `copy`,
 
 ## The `sqlmpeg.` namespace
 
-Three macros that expand to subgraphs no single filter provides. Positional arguments only, in the documented order; named arguments are rejected. `sqlmpeg` is reserved like `ffmpeg`.
+Four macros that do what no single filter does. `sqlmpeg` is reserved like `ffmpeg`. The first three expand to a subgraph and take positional arguments only, in the documented order; named arguments are rejected.
 
 - **`sqlmpeg.delay(f, seconds)`** - delay a video stream on a transparent canvas (`format=pix_fmts=yuva420p` + `tpad=start_duration=<s>:stop=1:color=black@0`). Use for timed overlays: the delayed stream is invisible until its start time.
 
@@ -64,6 +64,19 @@ Three macros that expand to subgraphs no single filter provides. Positional argu
 - **`sqlmpeg.speed(f, factor)`** - `setpts=PTS/<factor>`; 2 is double speed, 0.5 half.
 
 - **`sqlmpeg.blur_regions(f, x, y, w, h, sigma)`** - crop the rectangle, `gblur` it, overlay it back in place.
+
+The fourth expands in TIME rather than in the graph, and is the one macro with named options:
+
+- **`sqlmpeg.loudnorm2(stream, I => ..., TP => ..., LRA => ...)`** - normalize audio to a loudness target the broadcast-compliant way: measure the whole stream, then correct it with one linear gain change. The three options are named only and all optional (ffmpeg's own `loudnorm` defaults cover any you omit); only what you write is rendered. Audio only.
+
+  It compiles to TWO chained commands, not one. Pass 1 runs the same stream through `loudnorm=<your options>:print_format=json` into `-f null -`; `sqlmpeg loudnorm2env` turns the JSON block on its stderr into `export SQLMPEG_LN_*=` lines; pass 2 splices those variables into its filtergraph alongside `linear=true`. Recipe 49 in [examples.md](examples.md) shows the whole line.
+
+  Two costs come with that shape:
+
+  - the printed command is the one compiled output that is not pure ffmpeg - it needs `sqlmpeg loudnorm2env` on `PATH` when you run it. If you would rather not depend on that, run pass 1 by hand and paste the five numbers into a bare `loudnorm(...)` call yourself.
+  - the printed command is POSIX-shell only (`eval`, `$( )`, `${ }`). On cmd.exe or PowerShell, use `sqlmpeg run`, which does the measure/substitute/encode handoff in process and needs no shell anywhere.
+
+  v1 fences, each `UNSUPPORTED_SQL`: one `loudnorm2` per query; never together with a `two_pass` sink; never inside a fan-out `TO (<expression>)`; never in a table/CSV query. Use the bare `loudnorm(...)` filter when one pass is genuinely enough.
 
 ## Generated sources in `FROM`
 

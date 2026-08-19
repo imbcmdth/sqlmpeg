@@ -273,11 +273,11 @@ from dataclasses import dataclass, field, replace
 
 from sqlglot import exp
 
-from sqlmpeg import binaries
+from sqlmpeg import binaries, loudnorm
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import validate_option as validate_input_option
 from sqlmpeg.ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType, is_src, src_parts
-from sqlmpeg.macros import INPUT_MACROS, MACROS, InputMacro, macro_names
+from sqlmpeg.macros import INPUT_MACROS, MACROS, InputMacro, Macro, macro_names
 from sqlmpeg.parser import (
     _ARITHMETIC,
     _ARITHMETIC_NAMES,
@@ -1728,6 +1728,9 @@ class _Lowerer:
         # what tells `lower_commands` this was not a fan-out query at all.
         self.fanout_index = fanout_index
         self.fanout_expr: exp.Expr | None = None
+        # Sticky across sinks, unlike `fanout_expr`: the loudnorm2 fences ask
+        # whether ANY COPY of the script fanned out.
+        self.fanout_seen = False
         self.fanout_row: dict[str, _TrackRow | None] = {}
         self.fanout_env: _Env | None = None
         self.fanout_count: int | None = None
@@ -1764,8 +1767,52 @@ class _Lowerer:
         else:
             columns = self._lower_query(self.res.branches, self.res.select, tags=True)
             self.graph.sinks = [SinkUnit(outputs=_outputs(columns, self.tags))]
+        self._check_loudnorm2()
         self.graph.input_options = self._lower_input_options()
         return self.graph
+
+    def _check_loudnorm2(self) -> None:
+        """The v1 fences on ``sqlmpeg.loudnorm2``.
+
+        It is not one filter among others: its presence turns the whole
+        compile into a two-command sequence with a shell handoff in the
+        middle. Everything that would need a SECOND sequencing rule on top of
+        that -- a second loudnorm2, a ``two_pass`` sink, a fan-out TO -- is
+        closed rather than guessed at. Counted over NODES, so a call
+        broadcast across an audio array is caught as the several it is.
+        """
+        anchors = [(raw.path_expr, raw.path_node) for raw in self.res.sinks]
+        anchor, fallback = anchors[0] if anchors else (self.res.select, self.res.select)
+        count = sum(1 for n in self.graph.nodes.values() if n.filter == loudnorm.FILTER)
+        if count == 0:
+            return
+        if count > 1:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"one sqlmpeg.loudnorm2() per query, got {count}",
+                anchor,
+                fallback=fallback,
+                hint="each one needs its own measuring pass; write one query per "
+                "stream you are normalizing",
+            )
+        for unit, raw in zip(self.graph.sinks, self.res.sinks):
+            if unit.options.get("two_pass") is True:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "'two_pass' and sqlmpeg.loudnorm2() cannot both be set",
+                    raw.path_node,
+                    hint="both compile to a command sequence of their own; "
+                    "normalize the audio in a separate COPY",
+                )
+        if self.fanout_seen:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "sqlmpeg.loudnorm2() and a fan-out TO cannot both be set",
+                anchor,
+                fallback=fallback,
+                hint="a TO expression writes one file per row, each needing its "
+                "own measuring pass; write a quoted TO path",
+            )
 
     # -- the COPY sink ----------------------------------
 
@@ -1800,6 +1847,7 @@ class _Lowerer:
             and references_row_alias(raw.path_expr, set(self.res.track_rows))
             else None
         )
+        self.fanout_seen = self.fanout_seen or self.fanout_expr is not None
         columns = self._lower_query(list(raw.branches), raw.query, tags=True)
         options: dict[str, object] = {}
         option_nodes: dict[str, exp.Expr] = {}
@@ -4732,10 +4780,11 @@ class _Lowerer:
         A macro owns its OWN positional signature: there is no option table to
         bind against, so named arguments are rejected outright (UNSUPPORTED_SQL,
         the same shape-violation code resolve's own named-only/positional-only
-        argument rules use) and arity/kind mismatches are UDF_ARG_TYPE naming
-        the macro's signature -- mirroring the registry call's stream-signature
-        message, but there is exactly one stream position (always index 0) to
-        check, so no `_bind_options` machinery is involved.
+        argument rules use) unless the macro declares its own closed option
+        list, and arity/kind mismatches are UDF_ARG_TYPE naming the macro's
+        signature -- mirroring the registry call's stream-signature message,
+        but there is exactly one stream position (always index 0) to check, so
+        no `_bind_options` machinery is involved.
 
         Broadcasting reuses :meth:`_expand_call` unchanged: it is type-driven
         off `positions`/`streams`, so a macro's single stream argument
@@ -4767,7 +4816,7 @@ class _Lowerer:
                 fallback=select,
                 hint=self._macro_function_hint(name),
             )
-        if call.named:
+        if call.named and not macro.options:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"{call.display}() is a sqlmpeg macro: its arguments are "
@@ -4775,6 +4824,15 @@ class _Lowerer:
                 call.named[0].value,
                 fallback=node,
                 hint=f"its signature is {macro.signature}",
+            )
+        if macro.name == loudnorm.FILTER and self.table_mode:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{call.display}() is a filter, and a table query filters nothing",
+                node,
+                fallback=select,
+                hint="print the tracks with a table query, normalize them with "
+                "a COPY that writes a file",
             )
         if len(call.args) != len(macro.params):
             raise _error(
@@ -4819,10 +4877,11 @@ class _Lowerer:
                     fallback=node,
                     hint=f"its signature is {macro.signature}",
                 ) from None
+        options = self._macro_options(macro, call, node)
         streams = {stream_pos: self._lower_expr(call.args[stream_pos], env, select)}
 
         def build(values: list[object], _element: int) -> FrameRef:
-            return macro.expand(values, self.ctx.node)
+            return macro.expand(values, self.ctx.node, options)
 
         return self._expand_call(
             call.display,
@@ -4836,6 +4895,41 @@ class _Lowerer:
             returns=macro.output,
             build=build,
         )
+
+    def _macro_options(
+        self, macro: Macro, call: _Call, node: exp.Expr
+    ) -> dict[str, object]:
+        """A macro's named-only options: every one optional, none repeated.
+
+        Returned in the MACRO's declared order, not the order they were
+        written, so the rendered filter is the same whichever way round the
+        query spells them. An omitted option is left out entirely -- the
+        expansion renders only what was written, and ffmpeg's own default
+        covers the rest. Repeats need no check here: resolve rejects a
+        duplicate `name =>` on any call before lowering starts.
+        """
+        written: dict[str, object] = {}
+        for argument in call.named:
+            if argument.name not in macro.options:
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{call.display}() has no '{argument.name}' option",
+                    argument.value,
+                    fallback=node,
+                    hint=f"its signature is {macro.signature}",
+                )
+            try:
+                written[argument.name] = _number(argument.value)
+            except SqlmpegError as exc:
+                raise _error(
+                    exc.code,
+                    f"{call.display}()'s '{argument.name}' option must be a "
+                    "numeric literal",
+                    argument.value,
+                    fallback=node,
+                    hint=f"its signature is {macro.signature}",
+                ) from None
+        return {name: written[name] for name in macro.options if name in written}
 
     def _macro_function_hint(self, name: str) -> str:
         """Did-you-mean over :data:`MACROS`, the small-by-design macro set."""

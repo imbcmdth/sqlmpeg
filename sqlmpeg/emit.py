@@ -58,6 +58,16 @@ except a ``two_pass`` sink, which returns two. :func:`build_ffmpeg_args`
 renders the single command and stays the seam every other caller uses; it
 refuses a ``two_pass`` :class:`Emitted` rather than silently dropping a pass.
 
+A ``sqlmpeg.loudnorm2`` node returns two as well, for a different reason:
+its two commands share every input and every label but NOT the filtergraph.
+:func:`emit` therefore renders the chains twice, once per phase, and keeps
+the measuring one in :attr:`Emitted.measure_filter_complex` (empty when the
+graph has no such node). Pass 1 is that filtergraph, the FILTERED maps only,
+and ``-f null -``: it measures, encodes nothing, and carries none of the
+sink's options -- a codec on the measuring pass would be work thrown away.
+Pass 2 is the ordinary command, with ``${SQLMPEG_LN_*}`` references sitting
+in its filtergraph where the measurements go (see ``sqlmpeg.loudnorm``).
+
 ``two_pass`` renders as ``-pass <n> -passlogfile <dest>``, where ``<dest>`` is
 the resolved destination path of the WRITING pass (so ffmpeg's own stats file
 lands beside the output as ``<dest>-0.log``, and is left there — ffmpeg owns
@@ -188,6 +198,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, replace
 
+from . import loudnorm
 from .errors import ErrorCode, SqlmpegError
 from .inputs import InputOptionSpec, option_spec
 from .ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType, is_src, src_parts
@@ -277,6 +288,10 @@ class Emitted:
     # Entry `i` is the validated, insertion-ordered options of the `-i` at
     # index `i`, {} if it set none. Same convention as `input_trims`.
     input_options: list[dict[str, object]] = field(default_factory=list)
+    # The same graph rendered in loudnorm2's MEASURING phase, or "" when the
+    # graph has no loudnorm2 node. Non-empty means this compile is a sequence
+    # (`build_ffmpeg_commands`), same as a two_pass group does.
+    measure_filter_complex: str = ""
 
     @property
     def maps(self) -> list[OutputMap]:
@@ -369,7 +384,8 @@ def emit(g: Graph) -> Emitted:
     labels = _assign_labels(nodes, pads, g.outputs)
 
     chains = _build_chains(nodes, pads)
-    filter_complex = ";".join(_render_chain(chain, g, pads, labels) for chain in chains)
+    filter_complex = _render_chains(chains, g, pads, labels, measure=False)
+    two_phase = any(node.filter == loudnorm.FILTER for node in nodes)
 
     groups = [_output_group(g, unit, labels) for unit in g.sinks]
 
@@ -379,6 +395,9 @@ def emit(g: Graph) -> Emitted:
         groups=groups,
         input_trims=_input_windows(g),
         input_options=_input_option_list(g),
+        measure_filter_complex=(
+            _render_chains(chains, g, pads, labels, measure=True) if two_phase else ""
+        ),
     )
 
 
@@ -472,7 +491,18 @@ def build_ffmpeg_commands(e: Emitted, out_path: str | None = None) -> list[list[
     raises ``ValueError``, as does one with no destination to derive the
     ``-passlogfile`` path from. Path precedence is
     :func:`build_ffmpeg_args`'s: `out_path`, else the group's own.
+
+    A ``loudnorm2`` `e` is the other sequence: the measuring pass, then the
+    write. Lower rejects it together with ``two_pass``, so an `e` carrying
+    both is hand-built and raises ``ValueError``.
     """
+    if e.measure_filter_complex:
+        if _two_pass_groups(e):
+            raise ValueError("loudnorm2 and two_pass are two different command sequences")
+        return [
+            _render_command(_measure_emitted(e), _ANALYSIS_PATH, None),
+            _render_command(e, out_path, None),
+        ]
     two_pass = _two_pass_groups(e)
     if not two_pass:
         return [_render_command(e, out_path, None)]
@@ -487,6 +517,23 @@ def build_ffmpeg_commands(e: Emitted, out_path: str | None = None) -> list[list[
         _render_command(_analysis_emitted(e), _ANALYSIS_PATH, _Pass(1, dest)),
         _render_command(e, out_path, _Pass(2, dest)),
     ]
+
+
+def _measure_emitted(e: Emitted) -> Emitted:
+    """`e` reduced to loudnorm2's measuring pass.
+
+    One group holding every FILTERED map -- the measured stream itself plus
+    any other pad, since a filtergraph output with no consumer is a hard
+    ffmpeg error -- muxed to ``-f null -``. Passthrough maps are dropped
+    (copying a stream teaches the measurement nothing) and so is every sink
+    option: this pass writes no file.
+    """
+    group = OutputGroup(
+        maps=[mapping for mapping in e.maps if not mapping.copy],
+        path=None,
+        options={_FORMAT: _ANALYSIS_FORMAT},
+    )
+    return replace(e, filter_complex=e.measure_filter_complex, groups=[group])
 
 
 def _analysis_emitted(e: Emitted) -> Emitted:
@@ -505,8 +552,9 @@ def _analysis_emitted(e: Emitted) -> Emitted:
 def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     """Full ffmpeg argv for `e`: one invocation, one output file per group.
 
-    The single-command seam. A ``two_pass`` `e` compiles to a SEQUENCE and is
-    refused here with ``ValueError``; :func:`build_ffmpeg_commands` renders it.
+    The single-command seam. A ``two_pass`` or ``loudnorm2`` `e` compiles to a
+    SEQUENCE and is refused here with ``ValueError``;
+    :func:`build_ffmpeg_commands` renders it.
 
     Path precedence per group: `out_path`, else that group's own path, else
     ``ValueError``. `out_path` OVERRIDES, so it is legal only for a
@@ -553,9 +601,14 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     ``subtitle_codec`` (webvtt -> mov_text on a passthrough subtitle
     output). Per group, so one file may re-encode what another copies.
     """
+    reason = None
     if _two_pass_groups(e):
+        reason = _TWO_PASS
+    elif e.measure_filter_complex:
+        reason = loudnorm.FILTER
+    if reason is not None:
         raise ValueError(
-            "this query compiles to a sequence of commands (two_pass); "
+            f"this query compiles to a sequence of commands ({reason}); "
             "call build_ffmpeg_commands"
         )
     return _render_command(e, out_path, None)
@@ -1031,15 +1084,32 @@ def _extends(prev: Node, node: Node, pads: dict[str, int]) -> bool:
     return _slot(ref) == f"{prev.id}:0"
 
 
+def _render_chains(
+    chains: list[list[Node]],
+    g: Graph,
+    pads: dict[str, int],
+    labels: dict[str, str],
+    *,
+    measure: bool,
+) -> str:
+    """The whole ``-filter_complex`` string for one loudnorm2 phase.
+
+    `measure` only ever changes a loudnorm2 node's own arguments: the chains,
+    the labels and every other filter render identically in both phases.
+    """
+    return ";".join(_render_chain(chain, g, pads, labels, measure) for chain in chains)
+
+
 def _render_chain(
     chain: list[Node],
     g: Graph,
     pads: dict[str, int],
     labels: dict[str, str],
+    measure: bool,
 ) -> str:
     head, tail = chain[0], chain[-1]
     prefix = "".join(f"[{_input_label(g, ref, labels)}]" for ref in head.inputs)
-    body = ",".join(_render_filter(node) for node in chain)
+    body = ",".join(_render_filter(node, measure) for node in chain)
     suffix = "".join(f"[{labels[f'{tail.id}:{pad}']}]" for pad in range(pads[tail.id]))
     return f"{prefix}{body}{suffix}"
 
@@ -1054,18 +1124,24 @@ def _input_label(g: Graph, ref: FrameRef, labels: dict[str, str]) -> str:
     return label
 
 
-def _render_filter(node: Node) -> str:
-    if not node.args:
-        return node.filter
-    value_only_filter = node.filter in _SPLIT_FILTERS
+def _render_filter(node: Node, measure: bool) -> str:
+    name, args = node.filter, node.args
+    if name == loudnorm.FILTER:
+        # The one node whose rendered arguments depend on which command of the
+        # sequence is being written.
+        name = loudnorm.FFMPEG_FILTER
+        args = loudnorm.phase_args(args, measure=measure)
+    if not args:
+        return name
+    value_only_filter = name in _SPLIT_FILTERS
     parts: list[str] = []
-    for key, value in node.args.items():
+    for key, value in args.items():
         rendered = _escape_value(_render_scalar(node, key, value))
         if value_only_filter or key in _VALUE_ONLY_KEYS:
             parts.append(rendered)
         else:
             parts.append(f"{key}={rendered}")
-    return f"{node.filter}={':'.join(parts)}"
+    return f"{name}={':'.join(parts)}"
 
 
 def _render_number(value: int | float) -> str:

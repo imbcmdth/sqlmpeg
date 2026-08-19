@@ -4,9 +4,16 @@ Thin wrapper around the library pipeline (``compile_sql`` -> ``emit`` ->
 ``build_ffmpeg_commands``). See the "CLI" section of sqlmpeg-project.md.
 
 A compile is a SEQUENCE of ffmpeg commands — one for every query but a
-``two_pass`` sink, which is two. ``compile`` prints them joined by `` && ``
-on one line; ``run`` executes them in order, stopping at the first nonzero
-exit and returning it, with ``--timeout`` applied per command.
+``two_pass`` sink or a ``sqlmpeg.loudnorm2`` graph, either of which is two.
+``compile`` prints them joined by `` && `` on one line; ``run`` executes them
+in order, stopping at the first nonzero exit and returning it, with
+``--timeout`` applied per command.
+
+``loudnorm2`` is the one compile whose printed line is not pure ffmpeg: its
+measuring pass is wrapped in ``eval "$(... | sqlmpeg loudnorm2env)"``, which
+makes the printed form POSIX-shell only. ``run`` needs no shell — it captures
+the measuring pass's stderr, parses it in process (``sqlmpeg.loudnorm``) and
+substitutes the numbers straight into the second command's argv.
 
 Subcommands:
 
@@ -30,6 +37,11 @@ Subcommands:
 * ``prompt`` -- print the LLM system prompt to stdout. Takes no arguments and
   touches no files, but calls ``registry.load()`` to render the filter
   reference from this machine's ``ffmpeg -filters``/``-help`` output.
+* ``loudnorm2env`` -- read ffmpeg's stderr on stdin, print the
+  ``export SQLMPEG_LN_*=`` lines its loudnorm JSON block holds. Takes no
+  arguments and touches no files; exit 1 with one stderr line if there is no
+  such block. It exists for the printed ``loudnorm2`` command line, which
+  pipes pass 1 into it.
 
 ``compile``/``explain``/``validate``/``run`` take the query as SQL TEXT on
 the command line. ``-f/--file PATH`` reads it from a file instead (``-f -``
@@ -57,7 +69,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import binaries
+from . import binaries, loudnorm
 from . import registry as registry_module
 from .compiler import classify, compile_commands, compile_table_sql
 from .emit import Emitted, build_ffmpeg_commands, emit
@@ -77,12 +89,14 @@ _DEFAULT_TIMEOUT = 600
 _CHAIN = " && "
 
 # `run` is the DEFAULT subcommand, unconditionally: any argv whose
-# first token is not one of these five names IS run's argv, flags included
+# first token is not one of these six names IS run's argv, flags included
 # (`sqlmpeg -f q.sql`). No plausibility gating -- a mistyped subcommand falls
 # through to run's SQL parser and dies as a line-anchored PARSE_ERROR, a
 # better diagnostic than a usage line. Consequence: `sqlmpeg -h` shows run's
 # help, not the top-level one.
-_SUBCOMMANDS = frozenset({"compile", "explain", "validate", "run", "prompt"})
+_SUBCOMMANDS = frozenset(
+    {"compile", "explain", "validate", "run", "prompt", loudnorm.ENV_SUBCOMMAND}
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -161,6 +175,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("prompt", help="print the LLM system prompt for this dialect")
+    subparsers.add_parser(
+        loudnorm.ENV_SUBCOMMAND,
+        help="read ffmpeg's stderr on stdin, print loudnorm's measurements as exports",
+    )
 
     return parser
 
@@ -384,11 +402,28 @@ def _cmd_compile(args: argparse.Namespace) -> int:
     out_path = args.output
     if out_path is None and _needs_out_path(graphs):
         out_path = _DEFAULT_OUT
-    commands = [
-        command for e in emitted for command in build_ffmpeg_commands(e, out_path)
-    ]
-    print(_CHAIN.join(shlex.join(command) for command in commands))
+    print(_CHAIN.join(_shell_commands(emitted, out_path)))
     return 0
+
+
+def _shell_commands(emitted: list[Emitted], out_path: str | None) -> list[str]:
+    """Every command of the compile as a shell-ready line, in order.
+
+    ``shlex.join`` for all but a ``loudnorm2`` compile: there the measuring
+    pass is wrapped in the ``eval "$(...)"`` that exports what it measured,
+    and the write pass keeps its ``${SQLMPEG_LN_*}`` references expandable
+    (:func:`sqlmpeg.loudnorm.shell_join`).
+    """
+    lines: list[str] = []
+    for e in emitted:
+        commands = build_ffmpeg_commands(e, out_path)
+        if not e.measure_filter_complex:
+            lines += [shlex.join(command) for command in commands]
+            continue
+        measure, *rest = commands
+        lines.append(loudnorm.measure_command(shlex.join(measure)))
+        lines += [loudnorm.shell_join(command) for command in rest]
+    return lines
 
 
 def _cmd_explain(args: argparse.Namespace) -> int:
@@ -488,40 +523,78 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"error: ffmpeg not found: {binaries.INSTALL_HINT}", file=sys.stderr)
         return 1
 
-    # A two-pass sink compiles to two commands, a fan-out COPY to one per row,
-    # every other query to one. They run in order and the first nonzero exit is
-    # the run's exit code, so a failed pass 1 never writes the destination. The
-    # timeout is per command.
-    commands = [
-        command for e in emitted for command in build_ffmpeg_commands(e, out_path)
-    ]
-    for ffmpeg_args in commands:
-        if args.overwrite:
-            ffmpeg_args.insert(1, "-y")
-        else:
-            ffmpeg_args.insert(1, "-n")
-        ffmpeg_args.insert(1, "-hide_banner")
+    # A two-pass sink compiles to two commands, a loudnorm2 graph to two, a
+    # fan-out COPY to one per row, every other query to one. They run in order
+    # and the first nonzero exit is the run's exit code, so a failed pass 1
+    # never writes the destination. The timeout is per command.
+    #
+    # No shell, on any platform: loudnorm2's handoff is a captured stderr, the
+    # shared parser, and a substitution into the next command's argv -- the
+    # `eval "$(...)"` the printed line shows is only for a pasted command.
+    measured: dict[str, str] = {}
+    for e in emitted:
+        commands = build_ffmpeg_commands(e, out_path)
+        measures = bool(e.measure_filter_complex)
+        for index, command in enumerate(commands):
+            capture = measures and index == 0
+            ffmpeg_args = [loudnorm.substitute(word, measured) for word in command]
+            ffmpeg_args.insert(1, "-y" if args.overwrite else "-n")
+            ffmpeg_args.insert(1, "-hide_banner")
 
-        print("$", shlex.join(ffmpeg_args))
+            print("$", shlex.join(ffmpeg_args))
 
-        try:
-            result = subprocess.run(
-                ffmpeg_args,
-                timeout=args.timeout,
-            )
-        except subprocess.TimeoutExpired:
-            print(f"error: ffmpeg timed out after {args.timeout}s", file=sys.stderr)
-            return 1
+            try:
+                code, captured = _run_ffmpeg(ffmpeg_args, args.timeout, capture=capture)
+            except subprocess.TimeoutExpired:
+                print(f"error: ffmpeg timed out after {args.timeout}s", file=sys.stderr)
+                return 1
 
-        if result.returncode != 0:
-            print(f"error: ffmpeg exited with code {result.returncode}", file=sys.stderr)
-            return result.returncode
+            if code != 0:
+                print(captured, file=sys.stderr, end="")
+                print(f"error: ffmpeg exited with code {code}", file=sys.stderr)
+                return code
+
+            if capture:
+                try:
+                    measured = loudnorm.parse(captured)
+                except ValueError as err:
+                    print(f"error: {err}", file=sys.stderr)
+                    return 1
 
     return 0
 
 
+def _run_ffmpeg(argv: list[str], timeout: float, *, capture: bool) -> tuple[int, str]:
+    """Run one ffmpeg command; ``(exit code, its stderr)``.
+
+    stderr is captured only for loudnorm2's measuring pass, whose JSON block
+    is the whole point of running it; every other command writes straight
+    through to the terminal, progress lines included.
+    """
+    if not capture:
+        return subprocess.run(argv, timeout=timeout).returncode, ""
+    done = subprocess.run(argv, timeout=timeout, stderr=subprocess.PIPE, text=True)
+    return done.returncode, done.stderr
+
+
 def _cmd_prompt(args: argparse.Namespace) -> int:
     print(build_system_prompt(registry_module.load()))
+    return 0
+
+
+def _cmd_loudnorm2env(args: argparse.Namespace) -> int:
+    """stdin (ffmpeg's stderr) -> the ``export SQLMPEG_LN_*=`` block.
+
+    The other half of the printed ``loudnorm2`` command line. Nothing else
+    calls it: ``run`` parses the same text through the same function without
+    a shell in between.
+    """
+    try:
+        values = loudnorm.parse(sys.stdin.read())
+    except ValueError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 1
+    print(loudnorm.export_lines(values))
     return 0
 
 
@@ -531,6 +604,7 @@ _HANDLERS = {
     "validate": _cmd_validate,
     "run": _cmd_run,
     "prompt": _cmd_prompt,
+    loudnorm.ENV_SUBCOMMAND: _cmd_loudnorm2env,
 }
 
 

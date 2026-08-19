@@ -14,15 +14,17 @@ missing.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import imagehash
 import pytest
 from PIL import Image
 
-from sqlmpeg import cli
+from sqlmpeg import cli, loudnorm
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.emit import build_ffmpeg_args, build_ffmpeg_commands, emit
 from sqlmpeg.errors import SqlmpegError
@@ -1778,6 +1780,152 @@ def test_two_pass_runs_end_to_end_through_the_cli(tmp_path: Path) -> None:
     assert out_path.exists()
     assert Path(f"{_sql_path(out_path)}-0.log").exists()
     assert [s["codec_type"] for s in _ffprobe_streams(out_path)] == ["video", "audio"]
+
+
+# ---------------------------------------------------------------------------
+# two-pass loudnorm: measure, substitute, encode -- then measure the result
+# ---------------------------------------------------------------------------
+
+_LOUDNORM_TARGET_I = -16.0
+# EBU R128 tolerance for this check: the whole point of measuring first is
+# that the delivered file lands on target, not near it.
+_LOUDNORM_TOLERANCE_LU = 1.0
+
+
+def _measure_loudness(path: Path) -> dict[str, str]:
+    """`path`'s integrated loudness, measured by a fresh loudnorm pass."""
+    args = [
+        "ffmpeg",
+        "-hide_banner",
+        "-i",
+        str(path),
+        "-filter_complex",
+        "[0:a:0]loudnorm=print_format=json[out0]",
+        "-map",
+        "[out0]",
+        "-f",
+        "null",
+        "-",
+    ]
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+    return loudnorm.parse(result.stderr)
+
+
+def _loudnorm2_query(source: Path, out_path: Path) -> str:
+    return (
+        "COPY (\n"
+        "  SELECT sqlmpeg.loudnorm2(f.audio[1], I => -16, TP => -1.5, LRA => 11)\n"
+        f"  FROM input('{_sql_path(source)}') f\n"
+        f") TO '{_sql_path(out_path)}' WITH (audio_codec 'aac')"
+    )
+
+
+def test_loudnorm2_run_lands_on_target(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`run` does the whole handoff in process: measure, parse, substitute,
+    encode. The delivered file's own measured loudness is the assertion."""
+    _require_fixture(_AV)
+    out_path = tmp_path / "loudnorm2.m4a"
+
+    assert cli.main(["run", _loudnorm2_query(_AV, out_path), "-y"]) == 0
+    printed = capsys.readouterr().out
+
+    # The second command really carries numbers, not variable references.
+    assert "${SQLMPEG_LN_" not in printed
+    assert "measured_I=" in printed
+
+    measured = _measure_loudness(out_path)
+    delivered = float(measured["SQLMPEG_LN_I"])
+    assert abs(delivered - _LOUDNORM_TARGET_I) <= _LOUDNORM_TOLERANCE_LU, measured
+    assert float(measured["SQLMPEG_LN_TP"]) <= -1.5
+
+
+def test_loudnorm2_measuring_pass_writes_nothing(tmp_path: Path) -> None:
+    """Pass 1 measures and muxes to `-f null -`; the destination only appears
+    once the correction pass has run."""
+    _require_fixture(_AV)
+    out_path = tmp_path / "not-yet.m4a"
+    commands = build_ffmpeg_commands(emit(compile_sql(_loudnorm2_query(_AV, out_path))))
+
+    _run_command_sequence([commands[0]])
+
+    assert not out_path.exists()
+
+
+def test_loudnorm2_measurements_reach_the_correction_pass(tmp_path: Path) -> None:
+    """The library seam, without the CLI: run pass 1, parse its stderr with
+    the shared parser, substitute into pass 2's argv, run that."""
+    _require_fixture(_AV)
+    out_path = tmp_path / "spliced.m4a"
+    measure, correct = build_ffmpeg_commands(
+        emit(compile_sql(_loudnorm2_query(_AV, out_path)))
+    )
+
+    result = subprocess.run(
+        measure, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+    values = loudnorm.parse(result.stderr)
+
+    substituted = [loudnorm.substitute(word, values) for word in correct]
+    assert substituted != correct
+    _run_command_sequence([substituted])
+
+    assert out_path.exists()
+    delivered = float(_measure_loudness(out_path)["SQLMPEG_LN_I"])
+    assert abs(delivered - _LOUDNORM_TARGET_I) <= _LOUDNORM_TOLERANCE_LU
+
+
+def test_the_printed_loudnorm2_command_runs_in_bash(tmp_path: Path) -> None:
+    """The printed line is a POSIX-shell chain, and this is the only test that
+    proves it: `eval "$(... | sqlmpeg loudnorm2env)"` exporting into the
+    second command's environment, spliced back through adjacent quotes.
+
+    Skipped where there is no bash (the printed form is POSIX-only by design;
+    cmd.exe/PowerShell users have `run`) and where the `sqlmpeg` console
+    script is not installed, since the chain calls it by name. When it is
+    installed but the environment was never activated, its directory is put
+    on PATH for the shell -- which is what activating would have done.
+    """
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash not found on PATH (the printed chain is POSIX-shell only)")
+    console_script = shutil.which("sqlmpeg") or shutil.which(
+        "sqlmpeg", path=str(Path(sys.executable).parent)
+    )
+    if console_script is None:
+        pytest.skip("the sqlmpeg console script is not installed")
+    env = dict(
+        os.environ,
+        PATH=str(Path(console_script).parent) + os.pathsep + os.environ["PATH"],
+    )
+    _require_fixture(_AV)
+    out_path = tmp_path / "bash.m4a"
+
+    printed = subprocess.run(
+        [sys.executable, "-m", "sqlmpeg", "compile", _loudnorm2_query(_AV, out_path)],
+        capture_output=True,
+        text=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    assert printed.returncode == 0, printed.stderr
+    line = printed.stdout.strip()
+
+    result = subprocess.run(
+        [bash, "-c", f"set -e\n{line}"],
+        capture_output=True,
+        text=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert out_path.exists()
+    delivered = float(_measure_loudness(out_path)["SQLMPEG_LN_I"])
+    assert abs(delivered - _LOUDNORM_TARGET_I) <= _LOUDNORM_TOLERANCE_LU
 
 
 # ---------------------------------------------------------------------------

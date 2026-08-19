@@ -13,6 +13,7 @@ stdin) where file-reading behavior is the point.
 
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 from pathlib import Path
@@ -824,6 +825,152 @@ def test_run_of_an_ordinary_query_still_executes_one_command(
             "out.mp4",
         ]
     ]
+
+
+# ---------------------------------------------------------------------------
+# command sequences: loudnorm2 is two commands with a shell handoff between
+# ---------------------------------------------------------------------------
+
+LOUDNORM2_QUERY = (
+    "COPY (SELECT sqlmpeg.loudnorm2(a.audio[1], I => -16) FROM input('x.mp4') a) "
+    "TO 'out.m4a' WITH (audio_codec 'aac')"
+)
+
+# What ffmpeg's stderr looks like where it matters (tests/test_loudnorm.py
+# carries the full capture); `run`'s stub below hands this back verbatim.
+LOUDNORM_JSON = """\
+[Parsed_loudnorm_0 @ 0000000000000000]
+{
+    "input_i" : "-21.76",
+    "input_tp" : "-17.69",
+    "input_lra" : "0.00",
+    "input_thresh" : "-31.76",
+    "target_offset" : "0.05"
+}
+"""
+
+
+def test_compile_prints_a_loudnorm2_chain_on_one_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = cli.main(["compile", LOUDNORM2_QUERY])
+    captured = capsys.readouterr()
+    assert code == 0
+    line = captured.out.rstrip("\n")
+    assert "\n" not in line
+    first, second = line.split(" && ")
+    assert first.startswith('eval "$(ffmpeg ')
+    assert first.endswith('-f null - 2>&1 | sqlmpeg loudnorm2env)"')
+    assert second.startswith("ffmpeg ")
+    assert second.endswith("-c:0 aac out.m4a")
+
+
+def test_the_printed_correction_pass_leaves_the_variables_expandable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Adjacent-quote concatenation: the filtergraph stays ONE argument, but
+    the `${...}` parts sit in double quotes so the shell expands them."""
+    cli.main(["compile", LOUDNORM2_QUERY])
+    line = capsys.readouterr().out
+    assert ":measured_I='\"${SQLMPEG_LN_I}\"':measured_TP='" in line
+    assert "'${SQLMPEG_LN_I}'" not in line
+
+
+def test_compile_of_a_loudnorm2_query_needs_no_ffmpeg(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The macro resolves offline; only the PRINTED line depends on
+    `sqlmpeg loudnorm2env` being there at run time."""
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: None)
+    assert cli.main(["compile", LOUDNORM2_QUERY]) == 0
+    assert "loudnorm2env" in capsys.readouterr().out
+
+
+def _record_loudnorm_runs(
+    monkeypatch: pytest.MonkeyPatch, stderr: str
+) -> list[list[str]]:
+    """Stub `subprocess.run` so the measuring pass hands back `stderr`."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(list(argv))
+        captured = stderr if kwargs.get("stderr") is subprocess.PIPE else ""
+        return subprocess.CompletedProcess(args=argv, returncode=0, stderr=captured)
+
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    return calls
+
+
+def test_run_substitutes_the_measurements_into_the_second_command(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _record_loudnorm_runs(monkeypatch, LOUDNORM_JSON)
+
+    code = cli.main(["run", LOUDNORM2_QUERY, "-y"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert len(calls) == 2
+    measure = calls[0][calls[0].index("-filter_complex") + 1]
+    assert measure.endswith("print_format=json[out0]")
+    correct = calls[1][calls[1].index("-filter_complex") + 1]
+    assert "measured_I=-21.76:measured_TP=-17.69" in correct
+    assert "offset=0.05:linear=true" in correct
+    # No shell anywhere: nothing is ever asked to expand a `${...}`.
+    assert "${" not in correct
+    assert "eval" not in captured.out
+
+
+def test_run_reports_stderr_with_no_loudnorm_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _record_loudnorm_runs(monkeypatch, "Conversion failed!\n")
+
+    code = cli.main(["run", LOUDNORM2_QUERY, "-y"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert len(calls) == 1  # the correction pass never starts
+    assert "no loudnorm JSON block" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# loudnorm2env: stdin -> export lines
+# ---------------------------------------------------------------------------
+
+
+def test_loudnorm2env_prints_the_exports(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("sys.stdin", io.StringIO(LOUDNORM_JSON))
+    code = cli.main(["loudnorm2env"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out.splitlines() == [
+        "export SQLMPEG_LN_I=-21.76",
+        "export SQLMPEG_LN_TP=-17.69",
+        "export SQLMPEG_LN_LRA=0.00",
+        "export SQLMPEG_LN_THRESH=-31.76",
+        "export SQLMPEG_LN_OFFSET=0.05",
+    ]
+
+
+def test_loudnorm2env_rejects_input_with_no_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("sys.stdin", io.StringIO("ffmpeg version 9.0.1\n"))
+    code = cli.main(["loudnorm2env"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.out == ""
+    assert captured.err.splitlines() == ["error: no loudnorm JSON block in the input"]
+
+
+def test_loudnorm2env_takes_no_query_argument() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["loudnorm2env", "query.sql"])
+    assert exc_info.value.code == 2
 
 
 # ---------------------------------------------------------------------------

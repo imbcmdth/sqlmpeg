@@ -43,7 +43,7 @@ FROM input('x.mp4') a
 {"line": 1, "col": 8, "code": "UNKNOWN_FUNCTION", "message": "unknown function gblu()", "hint": "did you mean gblur()?"}
 ```
 
-The hint is a did-you-mean match against every filter name the installed ffmpeg reports. A `sqlmpeg.<name>` call matches against the three macros the same way (`sqlmpeg.dela()` suggests `sqlmpeg.delay()`). Should the registry come up empty - which since ffmpeg became a managed requirement means the provisioner failed - the hint states that real problem instead of guessing: check `static-ffmpeg` installed correctly, or put a system ffmpeg on `PATH`.
+The hint is a did-you-mean match against every filter name the installed ffmpeg reports. A `sqlmpeg.<name>` call matches against the macro names the same way (`sqlmpeg.dela()` suggests `sqlmpeg.delay()`). Should the registry come up empty - which since ffmpeg became a managed requirement means the provisioner failed - the hint states that real problem instead of guessing: check `static-ffmpeg` installed correctly, or put a system ffmpeg on `PATH`.
 
 ## UNKNOWN_ALIAS
 

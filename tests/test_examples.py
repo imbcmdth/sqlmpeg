@@ -393,6 +393,23 @@ def test_wrap_command_leaves_non_ffmpeg_lines_untouched() -> None:
     assert wrap_command(" a | b") == " a | b"
 
 
+def test_wrap_command_passes_an_eval_line_through_unwrapped() -> None:
+    """The loudnorm2 chain (recipe 49) is pinned as ONE long line on purpose:
+    its quoting is adjacent-quote concatenation around `${...}` references,
+    which the token packer would split in the wrong places. Keying on
+    `ffmpeg ` is what leaves it alone -- do not "fix" that to match `eval `
+    too."""
+    line = (
+        'eval "$(ffmpeg -i film.mkv -filter_complex '
+        "'[0:a:0]loudnorm=I=-16:print_format=json[out0]' -map '[out0]' -f null - "
+        '2>&1 | sqlmpeg loudnorm2env)" && ffmpeg -i film.mkv -filter_complex '
+        "'[0:a:0]loudnorm=I=-16:measured_I='\"${SQLMPEG_LN_I}\"':linear=true[out0]' "
+        "-map '[out0]' -c:0 aac out.m4a"
+    )
+    assert len(line) > _WRAP_WIDTH
+    assert wrap_command(line) == line
+
+
 def test_wrap_command_packs_tokens_at_the_width_boundary() -> None:
     line = "ffmpeg -i in.mp4 -map 0:v:0 -map 0:a:0 -c:0 copy -c:1 copy out.mp4"
     wrapped = wrap_command(line, width=30)
