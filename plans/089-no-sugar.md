@@ -1,12 +1,13 @@
 # 089 — No implicit aggregation
 
-Maintainer decision (2026-08-19): the implicit row-squish is removed.
-It was already inconsistent in principle — a "single" destination like
-a DASH/HLS manifest can legitimately carry multiple renditions, so
-"one path = squish the rows" could not be a universal rule, and a
-shorthand that depends on the container is a second grammar. Removing
-it also keeps the multi-row-to-manifest design space open. Releases
-with 088 as 0.22.0.
+Maintainer decision (2026-08-19): the implicit row-squish is removed,
+and the row rule is absolute — a single destination needs exactly one
+row, NO exceptions, manifests included. If DASH/HLS output ever
+lands, its renditions are array columns on that one row (`array_agg`
+of the video ladder, `array_agg` of the audio set), which mirrors the
+input model: a container is one row with array columns, coming or
+going. No container-dependent carve-outs, so the check is one check.
+Releases with 088 as 0.22.0.
 
 ## The rules (these become THE documented semantics)
 
