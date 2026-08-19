@@ -1112,3 +1112,38 @@ ffmpeg -i tests/fixtures/av-2eng.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language
   -i tests/fixtures/av-2eng.mp4 -map 0:a:2 -c:0 copy -metadata:s:0 language=fra \
   -metadata title=fra fra.mka
 ```
+
+## 56. Preview a grouped shape as a table
+
+Grouping works in table queries too - drop the COPY and the same relation prints instead of writing, one row per group, arrays in braces. The single-group form shows what a one-file COPY would carry:
+
+```pgsql
+SELECT f.video, array_agg(a.track)
+FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) a
+GROUP BY f.video
+```
+
+```
+$ sqlmpeg -f query.sql
+ video           | array_agg
+-----------------+-------------------------------
+ {<video 0:v:0>} | {<audio 0:a:0>,<audio 0:a:1>}
+(1 row)
+```
+
+And grouping by a row column previews a fan-out's partitions before any file is written - here, recipe 55's per-language split:
+
+```pgsql
+SELECT a.language, array_agg(a.track)
+FROM input('tests/fixtures/av-2eng.mp4') f, unnest(f.audio) a
+GROUP BY a.language
+```
+
+```
+$ sqlmpeg -f query.sql
+ language | array_agg
+----------+-------------------------------
+ eng      | {<audio 0:a:0>,<audio 0:a:1>}
+ fra      | {<audio 0:a:2>}
+(2 rows)
+```
