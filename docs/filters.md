@@ -76,7 +76,7 @@ The fourth expands in TIME rather than in the graph, and is the one macro with n
   - the printed command is the one compiled output that is not pure ffmpeg - it needs `sqlmpeg loudnorm2env` on `PATH` when you run it. If you would rather not depend on that, run pass 1 by hand and paste the five numbers into a bare `loudnorm(...)` call yourself.
   - the printed command is POSIX-shell only (`eval`, `$( )`, `${ }`). On cmd.exe or PowerShell, use `sqlmpeg run`, which does the measure/substitute/encode handoff in process and needs no shell anywhere.
 
-  v1 fences, each `UNSUPPORTED_SQL`: one `loudnorm2` per query; never together with a `two_pass` sink; never inside a fan-out `TO (<expression>)`; never in a table/CSV query. Use the bare `loudnorm(...)` filter when one pass is genuinely enough.
+  Current limits, each rejected as `UNSUPPORTED_SQL`: one `loudnorm2` per query; never together with a `two_pass` sink; never inside a fan-out `TO (<expression>)`; never in a table/CSV query. Use the bare `loudnorm(...)` filter when one pass is genuinely enough.
 
 ## Generated sources in `FROM`
 
@@ -113,7 +113,7 @@ Three N-input filters take however many streams you pass: `amix`, `hstack`, `vst
 
 To choose which tracks to pass in the first place (by language, codec, resolution), use track rows: [rows.md](rows.md).
 
-## Scope fence
+## Not supported
 
 Not callable:
 
