@@ -746,3 +746,36 @@ COPY (
 $ sqlmpeg compile -f query.sql -v source=film.mkv -v at=90 -v dest=poster.png
 ffmpeg -ss 90 -i film.mkv -map 0:v:0 -c:0 png -frames:0 1 poster.png
 ```
+
+## 35. Hit a delivery spec
+
+Device and platform specs name a profile, a level, and a rate-control ceiling; they map straight onto sink options. `-t`-style output limiting rides along as `duration`:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1] FROM input(:'source') f
+) TO :'dest' WITH (
+  video_codec 'libx264', profile 'baseline', level '3.1',
+  maxrate '2675k', bufsize '5350k', audio_codec 'aac', duration 30
+)
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=in.mkv -v dest=out.mp4
+ffmpeg -i in.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -profile:0 baseline -level:0 3.1 \
+  -maxrate:0 2675k -bufsize:0 5350k -c:1 aac -t 30 out.mp4
+```
+
+## 36. Keep the last minute
+
+`seek_end` seeks from the END of the file - no need to know its length. Stream copy applies, keyframe snapping included, same as any input seek:
+
+```pgsql
+SELECT a.video[1], a.audio[1]
+FROM input(:'source', seek_end => 60) a
+```
+
+```
+$ sqlmpeg compile -f query.sql -o tail.mp4 -v source=clip.mp4
+ffmpeg -sseof -60 -i clip.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy tail.mp4
+```
