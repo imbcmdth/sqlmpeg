@@ -8,6 +8,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -37,7 +38,10 @@ jobs:
       - name: Test (pytest, exec tests excluded by default)
         run: python -m pytest tests/
 
+      # A stuck apt mirror once held this step for the job's full ceiling;
+      # fail fast instead so a re-run is cheap.
       - name: Install ffmpeg
+        timeout-minutes: 8
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
