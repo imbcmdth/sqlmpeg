@@ -1126,3 +1126,11 @@ def test_v_accepted_on_run(capsys: pytest.CaptureFixture[str]) -> None:
     captured = capsys.readouterr()
     assert code == 0
     assert "(1 row)" in captured.out
+
+
+def test_a_protocol_url_destination_skips_the_directory_check() -> None:
+    """udp://host:port is not a path; ffmpeg owns protocol URLs, so the
+    missing-output-directory pre-flight must not parse them as files."""
+    assert cli._check_output_dir("udp://127.0.0.1:12399?pkt_size=1316") is None
+    assert cli._check_output_dir("rtmp://live.example.com/app/key") is None
+    assert cli._check_output_dir("no-such-dir/out.mp4") is not None

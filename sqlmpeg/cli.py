@@ -278,7 +278,13 @@ def _print_error(err: SqlmpegError, *, source: str | None = None) -> None:
 
 
 def _check_output_dir(out_path: str) -> str | None:
-    """Return an error message if `out_path`'s parent directory does not exist."""
+    """Return an error message if `out_path`'s parent directory does not exist.
+
+    A destination containing "://" is a protocol URL (udp, rtmp, srt, ...):
+    ffmpeg owns it, there is no directory to check.
+    """
+    if "://" in out_path:
+        return None
     parent = Path(out_path).parent
     if str(parent) and not parent.exists():
         return f"error: output directory does not exist: {parent}"

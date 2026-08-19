@@ -995,3 +995,20 @@ COPY (
 $ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=out.m4a
 eval "$(ffmpeg -i film.mkv -filter_complex '[0:a:0]loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json[out0]' -map '[out0]' -f null - 2>&1 | sqlmpeg loudnorm2env)" && ffmpeg -i film.mkv -filter_complex '[0:a:0]loudnorm=I=-16:TP=-1.5:LRA=11:measured_I='"${SQLMPEG_LN_I}"':measured_TP='"${SQLMPEG_LN_TP}"':measured_LRA='"${SQLMPEG_LN_LRA}"':measured_thresh='"${SQLMPEG_LN_THRESH}"':offset='"${SQLMPEG_LN_OFFSET}"':linear=true[out0]' -map '[out0]' -c:0 aac out.m4a
 ```
+
+## 50. Stream instead of writing a file
+
+A sink path can be a protocol URL - rtmp, srt, udp - and ffmpeg owns it from there. Name the muxer with `format` (a URL has no extension to infer from):
+
+```pgsql
+COPY (SELECT f.video[1], f.audio[1] FROM input(:'source') f)
+TO :'dest' WITH (format 'flv', video_codec 'libx264', audio_codec 'aac')
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=rtmp://live.example.com/app/streamkey
+ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -f flv -c:0 libx264 -c:1 aac \
+  rtmp://live.example.com/app/streamkey
+```
+
+For SRT use `format 'mpegts'` with an `srt://` destination; UDP the same. Verified end to end: a query streamed over `udp://` to a listening receiver arrives intact, video and audio.
