@@ -1,4 +1,5 @@
-# RFC-014 — Set-driven output fan-out  (draft; NOT started)
+# RFC-014 — Set-driven output fan-out  (accepted 2026-08-19; runs after
+RFC-015, whose ::text cast the path expressions use)
 
 Maintainer insight: compile already emits command sequences (0.17.0),
 so "one output per chapter" is just one command per row, `&&`-chained.
@@ -16,7 +17,7 @@ file; chapters in a media query stay rejected).
       SELECT f.video[1], f.audio[1]
       FROM input(:'src') f, chapters(f) c
       WHERE f.t BETWEEN c.start_t AND c.end_t
-    ) TO ('ch' || c.index || '-' || c.title || '.mkv') WITH (...)
+    ) TO ('ch' || c.index::text || '-' || c.title || '.mkv') WITH (...)
 
     -- one file per language
     COPY (SELECT t.track FROM input(:'src') f, unnest(f.audio) t)

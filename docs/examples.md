@@ -944,3 +944,38 @@ $ sqlmpeg compile -f query.sql -o trimmed.mp4
 ffmpeg -to 1.5 -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy \
   -metadata:s:1 language=eng trimmed.mp4
 ```
+
+## 47. Split a file by its chapters
+
+A `TO` expression over a row table's columns means one ffmpeg command per row - the chapters drive the seeks and the filenames, chained with `&&`:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1]
+  FROM input('tests/fixtures/av-chapters.mkv') f, chapters(f) c
+  WHERE f.t BETWEEN c.start_t AND c.end_t
+) TO ('ch' || c.index::text || '.mkv')
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -ss 0.0 -to 1.0 -i tests/fixtures/av-chapters.mkv -map 0:v:0 -c:0 copy -map 0:a:0 \
+  -c:1 copy ch1.mkv && ffmpeg -ss 1.0 -to 2.0 -i tests/fixtures/av-chapters.mkv -map \
+  0:v:0 -c:0 copy -map 0:a:0 -c:1 copy ch2.mkv
+```
+
+## 48. Extract every language to its own file
+
+The same rule over track rows: each row's stream goes to a filename built from its own metadata:
+
+```pgsql
+COPY (SELECT t.track FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t)
+TO (t.language || '.m4a')
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng eng.m4a \
+  && ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:1 -c:0 copy -metadata:s:0 language=fra \
+  fra.m4a
+```
