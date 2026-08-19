@@ -2369,6 +2369,78 @@ def test_codec_params_with_an_unsupported_video_codec_is_rejected() -> None:
     assert "libvpx-vp9" in err.message
 
 
+def test_two_pass_lowers_with_a_codec_and_a_bitrate() -> None:
+    assert _sink_of("video_codec 'libx264', video_bitrate '2500k', two_pass true") == {
+        "video_codec": "libx264",
+        "video_bitrate": "2500k",
+        "two_pass": True,
+    }
+
+
+def test_two_pass_false_needs_nothing() -> None:
+    """The rules guard the two-command shape, which `false` never asks for."""
+    assert _sink_of("two_pass false") == {"two_pass": False}
+
+
+def test_two_pass_without_video_bitrate_is_rejected() -> None:
+    err = _reject(
+        f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH (video_codec 'libx264', two_pass true)"
+    )
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert "video_bitrate" in err.message
+    assert err.hint is not None
+
+
+@pytest.mark.parametrize("codec", ["", "video_codec 'libvpx-vp9', "])
+def test_two_pass_without_a_pass_capable_codec_is_rejected(codec: str) -> None:
+    err = _reject(
+        f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH "
+        f"({codec}video_bitrate '2500k', two_pass true)"
+    )
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert "video_codec" in err.message
+    assert err.hint is not None
+    assert "libx264" in err.hint
+
+
+def test_two_pass_with_crf_is_rejected() -> None:
+    err = _reject(
+        f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH "
+        "(video_codec 'libx264', video_bitrate '2500k', crf 20, two_pass true)"
+    )
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert "crf" in err.message
+    assert "two_pass" in err.message
+
+
+def test_two_pass_on_an_audio_only_copy_is_rejected() -> None:
+    err = _reject(
+        "COPY (SELECT a.audio[1] FROM input('x.mp4') a) TO 'out.m4a' WITH "
+        "(video_codec 'libx264', video_bitrate '2500k', two_pass true)"
+    )
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert "video" in err.message
+
+
+def test_two_pass_in_a_multi_copy_script_is_rejected() -> None:
+    err = _reject(
+        f"COPY ({SINK_QUERY}) TO 'one.mkv' WITH "
+        "(video_codec 'libx264', video_bitrate '2500k', two_pass true); "
+        "COPY (SELECT b.frame FROM input('x.mp4') b) TO 'two.mkv'"
+    )
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert "two_pass" in err.message
+    assert err.hint is not None
+
+
+def test_two_pass_is_fine_as_the_only_copy_of_a_script() -> None:
+    g = _lower(
+        f"COPY ({SINK_QUERY}) TO 'one.mkv' WITH "
+        "(video_codec 'libx264', video_bitrate '2500k', two_pass true)"
+    )
+    assert g.sinks[0].options["two_pass"] is True
+
+
 def test_faststart_and_movflags_together_are_rejected() -> None:
     err = _reject(
         f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH "

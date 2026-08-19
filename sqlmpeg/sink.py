@@ -49,6 +49,14 @@ CODEC_PARAMS_FLAGS: dict[str, str] = {
 }
 
 
+# Encoders whose `-pass 1` / `-pass 2` rate control `two_pass` drives.
+TWO_PASS_CODECS: frozenset[str] = frozenset({"libx264", "libx265"})
+
+# `two_pass`'s second rendered flag. Its value is the destination path, which
+# only emit knows, so it cannot be a `value_template` on the spec.
+PASSLOGFILE_FLAG = "-passlogfile"
+
+
 SINK_OPTIONS: dict[str, SinkOptionSpec] = {
     "video_codec": SinkOptionSpec(
         name="video_codec",
@@ -230,6 +238,23 @@ SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         ),
         flag="-{codec}-params",  # placeholder filled from video_codec; see CODEC_PARAMS_FLAGS
         per_stream=True,
+    ),
+    # The one option whose value changes the SHAPE of the compile: a two_pass
+    # sink emits two chained ffmpeg commands, not one. emit renders it as
+    # `-pass <n> -passlogfile <dest>`, both derived per pass, so neither the
+    # value nor the second flag can come from this row alone.
+    "two_pass": SinkOptionSpec(
+        name="two_pass",
+        scope="container",
+        type="bool",
+        doc=(
+            "Two-pass encode: compiles to two chained ffmpeg commands, a "
+            "video-only analysis pass then the real write. Needs video_bitrate "
+            "and a video_codec of libx264/libx265; conflicts with crf. One "
+            "COPY per script."
+        ),
+        flag="-pass",
+        per_stream=False,
     ),
     "movflags": SinkOptionSpec(
         name="movflags",

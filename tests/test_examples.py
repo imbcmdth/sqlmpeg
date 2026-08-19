@@ -166,6 +166,10 @@ _SPLIT_DELIMS = (";", ",")
 # line which turns out to need a break, decided one token later, never grows
 # past `width` once that " \" lands on it
 _BREAK_RESERVE = 2
+# The separator `compile` prints between two chained commands. It packs like
+# any other token but must NOT be quoted: `'&&'` would be an argument to the
+# first ffmpeg rather than the shell operator that runs the second.
+_CHAIN_TOKEN = "&&"
 
 
 def wrap_command(line: str, width: int = _WRAP_WIDTH) -> str:
@@ -186,7 +190,7 @@ def wrap_command(line: str, width: int = _WRAP_WIDTH) -> str:
     """
     if not line.startswith("ffmpeg "):
         return line
-    tokens = [shlex.quote(token) for token in shlex.split(line)]
+    tokens = [_quote(token) for token in shlex.split(line)]
     lines: list[str] = []
     current = tokens[0]
     for token in tokens[1:]:
@@ -215,6 +219,11 @@ def wrap_command(line: str, width: int = _WRAP_WIDTH) -> str:
         current = f"{_INDENT}{token}"
     lines.append(current)
     return "\n".join(lines)
+
+
+def _quote(token: str) -> str:
+    """`shlex.quote`, except the chain separator stays bare (see `_CHAIN_TOKEN`)."""
+    return token if token == _CHAIN_TOKEN else shlex.quote(token)
 
 
 def _is_simple_quoted(token: str) -> bool:

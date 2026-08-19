@@ -468,6 +468,7 @@ stream copy.
 - `level` (str, video) -- Encoder level, e.g. '3.1', '4.0'.
 - `tune` (str, video) -- Encoder tuning, e.g. 'film', 'animation', 'zerolatency'.
 - `codec_params` (str, video) -- Encoder-private key=value:key=value passthrough. Only libx264/libx265/libsvtav1; needs a matching video_codec.
+- `two_pass` (bool, container) -- Two-pass encode: compiles to two chained ffmpeg commands, a video-only analysis pass then the real write. Needs video_bitrate and a video_codec of libx264/libx265; conflicts with crf. One COPY per script.
 - `movflags` (str, container) -- Raw -movflags value, e.g. '+faststart+frag_keyframe'. Conflicts with faststart.
 - `chapters` (str, container) -- Write chapters from a VALUES CTE (bare name, not quoted): WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro'), ...) ... WITH (chapters marks). Conflicts with chapters_from.
 - `chapters_from` (str, container) -- Copy chapters through from an input() alias (bare name, not quoted), e.g. chapters_from f. Conflicts with chapters.

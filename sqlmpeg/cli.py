@@ -1,7 +1,12 @@
 """Command-line interface for sqlmpeg.
 
 Thin wrapper around the library pipeline (``compile_sql`` -> ``emit`` ->
-``build_ffmpeg_args``). See the "CLI" section of sqlmpeg-project.md.
+``build_ffmpeg_commands``). See the "CLI" section of sqlmpeg-project.md.
+
+A compile is a SEQUENCE of ffmpeg commands — one for every query but a
+``two_pass`` sink, which is two. ``compile`` prints them joined by `` && ``
+on one line; ``run`` executes them in order, stopping at the first nonzero
+exit and returning it, with ``--timeout`` applied per command.
 
 Subcommands:
 
@@ -55,7 +60,7 @@ from pathlib import Path
 from . import binaries
 from . import registry as registry_module
 from .compiler import classify, compile_sql, compile_table_sql
-from .emit import Emitted, build_ffmpeg_args, emit
+from .emit import Emitted, build_ffmpeg_commands, emit
 from .errors import SqlmpegError
 from .ir import Graph
 from .prompt import build_system_prompt
@@ -66,6 +71,10 @@ __all__ = ["main"]
 
 _DEFAULT_OUT = "out.mp4"
 _DEFAULT_TIMEOUT = 600
+
+# `compile` prints a command SEQUENCE as one line: shell chaining, so the
+# printed line runs the passes in order when pasted.
+_CHAIN = " && "
 
 # `run` is the DEFAULT subcommand, unconditionally: any argv whose
 # first token is not one of these five names IS run's argv, flags included
@@ -368,8 +377,8 @@ def _cmd_compile(args: argparse.Namespace) -> int:
     out_path = args.output
     if out_path is None and _needs_out_path(graph):
         out_path = _DEFAULT_OUT
-    ffmpeg_args = build_ffmpeg_args(emitted, out_path)
-    print(shlex.join(ffmpeg_args))
+    commands = build_ffmpeg_commands(emitted, out_path)
+    print(_CHAIN.join(shlex.join(command) for command in commands))
     return 0
 
 
@@ -466,27 +475,30 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"error: ffmpeg not found: {binaries.INSTALL_HINT}", file=sys.stderr)
         return 1
 
-    ffmpeg_args = build_ffmpeg_args(emitted, out_path)
-    if args.overwrite:
-        ffmpeg_args.insert(1, "-y")
-    else:
-        ffmpeg_args.insert(1, "-n")
-    ffmpeg_args.insert(1, "-hide_banner")
+    # A two-pass sink compiles to two commands; every other query to one. They
+    # run in order and the first nonzero exit is the run's exit code, so a
+    # failed pass 1 never writes the destination. The timeout is per command.
+    for ffmpeg_args in build_ffmpeg_commands(emitted, out_path):
+        if args.overwrite:
+            ffmpeg_args.insert(1, "-y")
+        else:
+            ffmpeg_args.insert(1, "-n")
+        ffmpeg_args.insert(1, "-hide_banner")
 
-    print("$", shlex.join(ffmpeg_args))
+        print("$", shlex.join(ffmpeg_args))
 
-    try:
-        result = subprocess.run(
-            ffmpeg_args,
-            timeout=args.timeout,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"error: ffmpeg timed out after {args.timeout}s", file=sys.stderr)
-        return 1
+        try:
+            result = subprocess.run(
+                ffmpeg_args,
+                timeout=args.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"error: ffmpeg timed out after {args.timeout}s", file=sys.stderr)
+            return 1
 
-    if result.returncode != 0:
-        print(f"error: ffmpeg exited with code {result.returncode}", file=sys.stderr)
-        return result.returncode
+        if result.returncode != 0:
+            print(f"error: ffmpeg exited with code {result.returncode}", file=sys.stderr)
+            return result.returncode
 
     return 0
 

@@ -70,7 +70,7 @@ SELECT t.track,
 FROM input('film.mkv') f, unnest(f.audio) t
 ```
 
-Compiles to `-metadata:s:N` flags only - no filter nodes. The same columns in a table/CSV query print as plain data, which previews what a retag will write. Container-level tags are not per-row; recipes [37-38](examples.md#37-retitle-tracks-from-their-own-metadata) are the worked versions.
+Compiles to `-metadata:s:N` flags only - no filter nodes. The same columns in a table/CSV query print as plain data, which previews what a retag will write. `disposition` is a reserved key: its value is ffmpeg's disposition spec (`'default'`, `'forced'`, `'default+forced'`, `'0'` clears) and it emits `-disposition:N` instead - [recipe 41](examples.md#41-flag-the-default-track). Container-level tags are not per-row: `WITH (title '...', comment '...')` on the sink, `metadata_from <alias>` copies an input's global tags, `strip_metadata true` drops them. Recipes [37-38](examples.md#37-retitle-tracks-from-their-own-metadata) are the worked versions.
 
 ## Chapters
 

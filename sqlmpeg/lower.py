@@ -301,7 +301,7 @@ from sqlmpeg.parser import (
 from sqlmpeg.parser import _ident_name as _fold
 from sqlmpeg.probe import ProbeResult, StreamMeta
 from sqlmpeg.registry import DynamicFilter, FilterOption, Registry, SourceFilter
-from sqlmpeg.sink import CODEC_PARAMS_FLAGS, validate_csv_option
+from sqlmpeg.sink import CODEC_PARAMS_FLAGS, TWO_PASS_CODECS, validate_csv_option
 from sqlmpeg.sink import validate_option as validate_sink_option
 from sqlmpeg.table import CellValue, StreamCell, TableResult, TableSink
 
@@ -1190,6 +1190,78 @@ def _check_sink_option_conflicts(
                 hint="set video_codec to one of: "
                 + ", ".join(sorted(CODEC_PARAMS_FLAGS)),
             )
+    if options.get("two_pass") is True:
+        _check_two_pass(options, option_nodes, path_node)
+
+
+def _check_two_pass(
+    options: dict[str, object],
+    option_nodes: dict[str, exp.Expr],
+    path_node: exp.Expr,
+) -> None:
+    """The rate-control rules a ``two_pass true`` sink must satisfy.
+
+    Two-pass exists to hit a target bitrate with a codec that has a ``-pass``
+    mode, so it needs both and cannot coexist with ``crf``, which is the other
+    rate control entirely.
+    """
+    anchor = option_nodes.get("two_pass")
+    if "crf" in options:
+        raise _error(
+            ErrorCode.SINK_OPTION_TYPE,
+            "'crf' and 'two_pass' are two different rate controls",
+            option_nodes.get("crf", anchor),
+            fallback=path_node,
+            hint="two-pass targets a bitrate (video_bitrate); crf targets a "
+            "quality level -- pick one",
+        )
+    codec = options.get("video_codec")
+    if not isinstance(codec, str) or codec not in TWO_PASS_CODECS:
+        raise _error(
+            ErrorCode.SINK_OPTION_TYPE,
+            f"'two_pass' needs a video_codec with a -pass mode, got {codec!r}",
+            option_nodes.get("video_codec", anchor),
+            fallback=path_node,
+            hint="set video_codec to one of: " + ", ".join(sorted(TWO_PASS_CODECS)),
+        )
+    if "video_bitrate" not in options:
+        raise _error(
+            ErrorCode.SINK_OPTION_TYPE,
+            "'two_pass' needs a video_bitrate to target",
+            anchor,
+            fallback=path_node,
+            hint="two-pass exists to hit a bitrate, e.g. video_bitrate '2500k'",
+        )
+
+
+def _check_two_pass_outputs(
+    options: dict[str, object], outputs: list[Output], path_node: exp.Expr
+) -> None:
+    """A ``two_pass`` sink must have a video output for pass 1 to analyse."""
+    if options.get("two_pass") is not True:
+        return
+    if not any(output.type == "video" for output in outputs):
+        raise _error(
+            ErrorCode.SINK_OPTION_TYPE,
+            "'two_pass' analyses a video stream, but this COPY selects none",
+            path_node,
+            hint="select a video column, or drop two_pass",
+        )
+
+
+def _check_two_pass_is_single_sink(sinks: list[SinkUnit], raws: list[RawSink]) -> None:
+    """``two_pass`` is one COPY per script: nothing sequences per-COPY passes."""
+    if len(sinks) <= 1:
+        return
+    for unit, raw in zip(sinks, raws):
+        if unit.options.get("two_pass") is True:
+            raise _error(
+                ErrorCode.SINK_OPTION_TYPE,
+                f"'two_pass' is not supported in a {len(sinks)}-COPY script",
+                raw.path_node,
+                hint="a script's COPYs share one ffmpeg command; two_pass "
+                "splits it in two -- write the two-pass COPY on its own",
+            )
 
 
 # typed values, bindings, per-branch environment
@@ -1651,6 +1723,7 @@ class _Lowerer:
             )
         if self.res.sinks:
             self.graph.sinks = [self._lower_sink(raw) for raw in self.res.sinks]
+            _check_two_pass_is_single_sink(self.graph.sinks, self.res.sinks)
         else:
             columns = self._lower_query(self.res.branches, self.res.select, tags=True)
             self.graph.sinks = [SinkUnit(outputs=_outputs(columns, self.tags))]
@@ -1722,9 +1795,9 @@ class _Lowerer:
             )
             option_nodes["metadata_from"] = metadata_from_opt.value
         _check_sink_option_conflicts(options, option_nodes, raw.path_node)
-        return SinkUnit(
-            outputs=_outputs(columns, self.tags), path=raw.path, options=options
-        )
+        outputs = _outputs(columns, self.tags)
+        _check_two_pass_outputs(options, outputs, raw.path_node)
+        return SinkUnit(outputs=outputs, path=raw.path, options=options)
 
     # -- chapters sink options ----------------------------------------
 

@@ -22,7 +22,9 @@ from sqlmpeg.emit import (
     OutputGroup,
     OutputMap,
     _escape_value,
+    _render_command,
     build_ffmpeg_args,
+    build_ffmpeg_commands,
     emit,
 )
 from sqlmpeg.errors import ErrorCode, SqlmpegError
@@ -2126,6 +2128,197 @@ def test_dedup_renumbers_source_specs_onto_the_shared_slot() -> None:
     e = emit(g)
     assert e.filter_complex == "[0:v:0]hflip[out0]"
     assert e.maps[1].target == "0:v:0"  # y's passthrough map, same merged index
+
+
+# ---------------------------------------------------------------------------
+# command sequences: build_ffmpeg_commands and the two_pass sink option
+# ---------------------------------------------------------------------------
+
+
+def _two_pass_sink(**extra: object) -> SinkUnit:
+    options: dict[str, object] = {
+        "video_codec": "libx264",
+        "video_bitrate": "2500k",
+        "two_pass": True,
+    }
+    options.update(extra)
+    return _sink(path="out.mp4", options=options)
+
+
+def test_an_ordinary_query_is_a_sequence_of_one() -> None:
+    """Every non-two_pass compile: one command, byte-identical to
+    `build_ffmpeg_args`."""
+    g = _graph([_node("n1", "hflip", {}, ["src:a:v:0"])], [_out("n1")])
+    e = emit(g)
+    commands = build_ffmpeg_commands(e, "out.mp4")
+    assert commands == [build_ffmpeg_args(e, "out.mp4")]
+
+
+def test_a_multi_sink_query_is_still_a_sequence_of_one() -> None:
+    """Several output FILES stay ONE ffmpeg command; only two_pass splits."""
+    g = _graph(
+        [],
+        [],
+        sinks=[
+            SinkUnit(outputs=[_out("src:a:v:0")], path="one.mp4"),
+            SinkUnit(outputs=[_out("src:a:a:0", "audio")], path="two.m4a"),
+        ],
+    )
+    e = emit(g)
+    assert len(build_ffmpeg_commands(e)) == 1
+
+
+def test_two_pass_emits_two_commands() -> None:
+    g = _graph(
+        [],
+        [_out("src:a:v:0"), _out("src:a:a:0", "audio")],
+        sink=_two_pass_sink(audio_codec="aac"),
+    )
+    first, second = build_ffmpeg_commands(emit(g))
+    assert first == [
+        "ffmpeg",
+        "-i", "a.mp4",
+        "-map", "0:v:0",
+        "-c:0", "libx264",
+        "-b:0", "2500k",
+        "-pass", "1",
+        "-passlogfile", "out.mp4",
+        "-f", "null",
+        "-",
+    ]
+    assert second == [
+        "ffmpeg",
+        "-i", "a.mp4",
+        "-map", "0:v:0",
+        "-map", "0:a:0",
+        "-c:0", "libx264",
+        "-b:0", "2500k",
+        "-pass", "2",
+        "-passlogfile", "out.mp4",
+        "-c:1", "aac",
+        "out.mp4",
+    ]
+
+
+def test_pass_one_drops_passthrough_non_video_maps() -> None:
+    """Subtitles and copied audio are bare -maps: nothing needs them in pass 1."""
+    g = _graph(
+        [],
+        [
+            _out("src:a:v:0"),
+            _out("src:a:a:0", "audio"),
+            _out("src:a:s:0", "subtitle"),
+        ],
+        sink=_two_pass_sink(),
+    )
+    first = build_ffmpeg_commands(emit(g))[0]
+    assert [first[i + 1] for i, tok in enumerate(first) if tok == "-map"] == ["0:v:0"]
+
+
+def test_pass_one_keeps_a_filtered_audio_map() -> None:
+    """A filtergraph output pad with no consumer is a hard ffmpeg error, so a
+    FILTERED audio output stays mapped in pass 1 and encodes into the null
+    muxer; only passthrough maps are dropped."""
+    g = _graph(
+        [
+            _node("n1", "hflip", {}, ["src:a:v:0"]),
+            _node("n2", "volume", {"volume": 0.5}, ["src:a:a:0"], outputs=["audio"]),
+        ],
+        [_out("n1"), _out("n2", "audio")],
+        sink=_two_pass_sink(audio_codec="aac"),
+    )
+    first = build_ffmpeg_commands(emit(g))[0]
+    assert [first[i + 1] for i, tok in enumerate(first) if tok == "-map"] == [
+        "[out0]",
+        "[out1]",
+    ]
+    assert first[first.index("-c:1") : first.index("-c:1") + 2] == ["-c:1", "aac"]
+
+
+def test_pass_one_renumbers_stream_indices_over_its_own_maps() -> None:
+    """Audio first in the SELECT: pass 2 calls the video stream 1, pass 1
+    calls it 0, because indices are per FILE and pass 1 writes fewer."""
+    g = _graph(
+        [],
+        [_out("src:a:a:0", "audio"), _out("src:a:v:0")],
+        sink=_two_pass_sink(),
+    )
+    first, second = build_ffmpeg_commands(emit(g))
+    assert "-c:0" in first and "libx264" == first[first.index("-c:0") + 1]
+    assert "-c:1" in second and "libx264" == second[second.index("-c:1") + 1]
+
+
+def test_passlogfile_follows_the_out_path_override() -> None:
+    """`-o` renames the destination, so the stats file moves with it."""
+    g = _graph([], [_out("src:a:v:0")], sink=_two_pass_sink())
+    for command in build_ffmpeg_commands(emit(g), "elsewhere/final.mkv"):
+        assert command[command.index("-passlogfile") + 1] == "elsewhere/final.mkv"
+    assert build_ffmpeg_commands(emit(g))[0][-5:] == [
+        "-passlogfile",
+        "out.mp4",
+        "-f",
+        "null",
+        "-",
+    ]
+
+
+def test_pass_one_overrides_an_explicit_format_option() -> None:
+    """`format 'mp4'` is the pass-2 container; pass 1 muxes to null regardless."""
+    g = _graph([], [_out("src:a:v:0")], sink=_two_pass_sink(format="mp4"))
+    first, second = build_ffmpeg_commands(emit(g))
+    assert first[-3:] == ["-f", "null", "-"]
+    assert first.count("-f") == 1
+    assert second[second.index("-f") + 1] == "mp4"
+
+
+def test_two_pass_false_emits_one_command_and_no_pass_flags() -> None:
+    g = _graph([], [_out("src:a:v:0")], sink=_sink("out.mp4", {"two_pass": False}))
+    commands = build_ffmpeg_commands(emit(g))
+    assert len(commands) == 1
+    assert "-pass" not in commands[0]
+
+
+def test_build_ffmpeg_args_refuses_a_two_pass_emitted() -> None:
+    """The single-command seam never silently drops a pass."""
+    g = _graph([], [_out("src:a:v:0")], sink=_two_pass_sink())
+    with pytest.raises(ValueError, match="build_ffmpeg_commands"):
+        build_ffmpeg_args(emit(g))
+
+
+def test_two_pass_across_several_groups_raises() -> None:
+    """lower rejects this shape; a hand-built Emitted gets the ValueError."""
+    g = _graph(
+        [],
+        [],
+        sinks=[
+            SinkUnit(
+                outputs=[_out("src:a:v:0")],
+                path="one.mp4",
+                options={"video_codec": "libx264", "two_pass": True},
+            ),
+            SinkUnit(outputs=[_out("src:a:a:0", "audio")], path="two.m4a"),
+        ],
+    )
+    with pytest.raises(ValueError, match="two_pass writes one file"):
+        build_ffmpeg_commands(emit(g))
+
+
+def test_two_pass_with_no_destination_anywhere_raises() -> None:
+    g = _graph(
+        [],
+        [],
+        sinks=[SinkUnit(outputs=[_out("src:a:v:0")], options={"two_pass": True})],
+    )
+    with pytest.raises(ValueError, match="no output path"):
+        build_ffmpeg_commands(emit(g))
+
+
+def test_two_pass_reaching_the_renderer_with_no_pass_number_is_internal() -> None:
+    """Defensive: both public entry points supply one or refuse."""
+    e = emit(_graph([], [_out("src:a:v:0")], sink=_two_pass_sink()))
+    with pytest.raises(SqlmpegError) as excinfo:
+        _render_command(e, "out.mp4", None)
+    assert excinfo.value.code == ErrorCode.INTERNAL
 
 
 # ---------------------------------------------------------------------------

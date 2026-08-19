@@ -14,6 +14,7 @@ stdin) where file-reading behavior is the point.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -722,6 +723,107 @@ def test_run_file_happy_path_reaches_ffmpeg_check(
     assert code == 1
     assert "ffmpeg" in captured.err
     assert "not found" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# command sequences: a two_pass query is two chained ffmpeg commands
+# ---------------------------------------------------------------------------
+
+TWO_PASS_QUERY = (
+    "COPY (SELECT a.video[1], a.audio[1] FROM input('x.mp4') a) TO 'out.mp4' "
+    "WITH (video_codec 'libx264', video_bitrate '2500k', two_pass true)"
+)
+
+
+def test_compile_prints_a_two_pass_chain_on_one_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = cli.main(["compile", TWO_PASS_QUERY])
+    captured = capsys.readouterr()
+    assert code == 0
+    line = captured.out.rstrip("\n")
+    assert "\n" not in line
+    first, second = line.split(" && ")
+    assert first.startswith("ffmpeg ")
+    assert first.endswith("-pass 1 -passlogfile out.mp4 -f null -")
+    assert second.startswith("ffmpeg ")
+    assert second.endswith("-pass 2 -passlogfile out.mp4 out.mp4")
+
+
+def test_compile_prints_an_ordinary_query_unchained(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = cli.main(["compile", VALID_QUERY, "-o", "out.mp4"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert " && " not in captured.out
+
+
+def _record_runs(monkeypatch: pytest.MonkeyPatch, codes: list[int]) -> list[list[str]]:
+    """Stub `subprocess.run` to return `codes` in order; collect each argv."""
+    calls: list[list[str]] = []
+    remaining = list(codes)
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(args=argv, returncode=remaining.pop(0))
+
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    return calls
+
+
+def test_run_executes_both_passes_in_order(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _record_runs(monkeypatch, [0, 0])
+
+    code = cli.main(["run", TWO_PASS_QUERY, "-y"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert len(calls) == 2
+    assert calls[0][:3] == ["ffmpeg", "-hide_banner", "-y"]
+    assert calls[0][-3:] == ["-f", "null", "-"]
+    assert calls[1][-1] == "out.mp4"
+    assert captured.out.count("$ ffmpeg") == 2
+
+
+def test_run_stops_at_the_first_failing_pass(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _record_runs(monkeypatch, [3, 0])
+
+    code = cli.main(["run", TWO_PASS_QUERY, "-y"])
+    captured = capsys.readouterr()
+
+    assert code == 3
+    assert len(calls) == 1  # pass 2 never starts, so nothing writes the dest
+    assert "exited with code 3" in captured.err
+
+
+def test_run_of_an_ordinary_query_still_executes_one_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _record_runs(monkeypatch, [0])
+
+    code = cli.main(["run", VALID_QUERY, "-o", "out.mp4"])
+
+    assert code == 0
+    assert calls == [
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-n",
+            "-i",
+            "x.mp4",
+            "-filter_complex",
+            "[0:v:0]scale=width=640:height=480[out0]",
+            "-map",
+            "[out0]",
+            "out.mp4",
+        ]
+    ]
 
 
 # ---------------------------------------------------------------------------

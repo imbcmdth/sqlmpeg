@@ -50,6 +50,25 @@ A graph whose outputs are all passthrough has NO nodes and therefore an empty
 ``filter_complex``; ``build_ffmpeg_args`` omits ``-filter_complex`` entirely
 in that case.
 
+Command sequences
+-----------------
+A compile is a SEQUENCE of ffmpeg commands: :func:`build_ffmpeg_commands` is
+the entry point and returns a list of argv lists, one entry for every query
+except a ``two_pass`` sink, which returns two. :func:`build_ffmpeg_args`
+renders the single command and stays the seam every other caller uses; it
+refuses a ``two_pass`` :class:`Emitted` rather than silently dropping a pass.
+
+``two_pass`` renders as ``-pass <n> -passlogfile <dest>``, where ``<dest>`` is
+the resolved destination path of the WRITING pass (so ffmpeg's own stats file
+lands beside the output as ``<dest>-0.log``, and is left there — ffmpeg owns
+its temp files). Pass 1 is the same inputs, the same ``-filter_complex`` and
+the same options, writing ``-f null -`` with a reduced ``-map`` list: video
+outputs, plus any FILTERED output of another type. Dropping a passthrough
+audio/subtitle map costs nothing, but a filtergraph pad with no consumer is a
+hard ffmpeg error ("has output N unconnected"), so a filtered pad is kept and
+encoded into the null muxer. Per-file stream indices are recomputed from that
+reduced list, so ``-c:<i>`` still names the right stream in both passes.
+
 Input seeking
 -------------
 ``Graph.input_trims`` maps an alias to a ``(start, end)`` window, either bound
@@ -172,7 +191,7 @@ from dataclasses import dataclass, field, replace
 from .errors import ErrorCode, SqlmpegError
 from .inputs import InputOptionSpec, option_spec
 from .ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType, is_src, src_parts
-from .sink import CODEC_PARAMS_FLAGS, SINK_OPTIONS, SinkOptionSpec
+from .sink import CODEC_PARAMS_FLAGS, PASSLOGFILE_FLAG, SINK_OPTIONS, SinkOptionSpec
 
 OUTPUT_LABEL_PREFIX = "out"
 """Filtered outputs are labelled ``out0``, ``out1``, ... (without brackets)."""
@@ -210,6 +229,12 @@ _LEVEL1_ESCAPES = {
 _LEVEL2_SPECIAL = re.compile(r"[\\'\[\],;#\s]")
 
 _LABEL_UNSAFE = re.compile(r"[^A-Za-z0-9_]")
+
+_TWO_PASS = "two_pass"
+_FORMAT = "format"
+# Pass 1 analyses and throws the muxed result away.
+_ANALYSIS_PATH = "-"
+_ANALYSIS_FORMAT = "null"
 
 
 @dataclass
@@ -423,8 +448,65 @@ def _input_option_list(g: Graph) -> list[dict[str, object]]:
     return options
 
 
+@dataclass(frozen=True)
+class _Pass:
+    """Which half of a two-pass encode is being rendered, and its stats file."""
+
+    number: int
+    logfile: str
+
+
+def _two_pass_groups(e: Emitted) -> list[OutputGroup]:
+    return [group for group in e.groups if group.options.get(_TWO_PASS) is True]
+
+
+def build_ffmpeg_commands(e: Emitted, out_path: str | None = None) -> list[list[str]]:
+    """Every ffmpeg command `e` runs, in order — the compile's real shape.
+
+    One entry for an ordinary query (:func:`build_ffmpeg_args` verbatim), two
+    for a ``two_pass`` sink: the video-only analysis pass, then the write. A
+    caller runs them in order and stops at the first nonzero exit.
+
+    ``two_pass`` is single-sink only (lower rejects it in a multi-COPY
+    script), so a multi-group `e` carrying it is a hand-built object and
+    raises ``ValueError``, as does one with no destination to derive the
+    ``-passlogfile`` path from. Path precedence is
+    :func:`build_ffmpeg_args`'s: `out_path`, else the group's own.
+    """
+    two_pass = _two_pass_groups(e)
+    if not two_pass:
+        return [_render_command(e, out_path, None)]
+    if len(e.groups) > 1:
+        raise ValueError(
+            f"two_pass writes one file, but this command writes {len(e.groups)}"
+        )
+    dest = out_path if out_path is not None else e.groups[0].path
+    if dest is None:
+        raise ValueError("no output path given and the query has no sink")
+    return [
+        _render_command(_analysis_emitted(e), _ANALYSIS_PATH, _Pass(1, dest)),
+        _render_command(e, out_path, _Pass(2, dest)),
+    ]
+
+
+def _analysis_emitted(e: Emitted) -> Emitted:
+    """`e` reduced to what pass 1 encodes: see "Command sequences" above."""
+    group = e.groups[0]
+    options = {name: value for name, value in group.options.items() if name != _FORMAT}
+    options[_FORMAT] = _ANALYSIS_FORMAT
+    analysis = OutputGroup(
+        maps=[m for m in group.maps if m.type == "video" or not m.copy],
+        path=group.path,
+        options=options,
+    )
+    return replace(e, groups=[analysis])
+
+
 def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     """Full ffmpeg argv for `e`: one invocation, one output file per group.
+
+    The single-command seam. A ``two_pass`` `e` compiles to a SEQUENCE and is
+    refused here with ``ValueError``; :func:`build_ffmpeg_commands` renders it.
 
     Path precedence per group: `out_path`, else that group's own path, else
     ``ValueError``. `out_path` OVERRIDES, so it is legal only for a
@@ -452,11 +534,13 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
 
     Sink options render after each group's -map/-metadata block, in
     insertion order, purely from ``sqlmpeg.sink.SINK_OPTIONS`` table data --
-    no option-specific logic here, with two derived exceptions: a ``bare``
+    no option-specific logic here, with three derived exceptions: a ``bare``
     spec (``shortest`` -> ``-shortest``) renders the flag alone with no
-    value, only when True; and ``codec_params``'s flag has a ``{codec}``
+    value, only when True; ``codec_params``'s flag has a ``{codec}``
     placeholder filled from THIS GROUP's own ``video_codec`` value via
-    ``sqlmpeg.sink.CODEC_PARAMS_FLAGS`` (``libx264`` -> ``-x264-params``).
+    ``sqlmpeg.sink.CODEC_PARAMS_FLAGS`` (``libx264`` -> ``-x264-params``);
+    and ``two_pass`` renders a pair of flags whose values come from the pass
+    being rendered (see "Command sequences").
     ``per_stream=True`` specs render ``f"{flag}:{i}"`` for every output index
     `i` of THAT GROUP whose type matches the spec's scope; ``per_stream=False``
     renders ``flag`` once. A False bool is never rendered (``faststart false``
@@ -469,6 +553,16 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     ``subtitle_codec`` (webvtt -> mov_text on a passthrough subtitle
     output). Per group, so one file may re-encode what another copies.
     """
+    if _two_pass_groups(e):
+        raise ValueError(
+            "this query compiles to a sequence of commands (two_pass); "
+            "call build_ffmpeg_commands"
+        )
+    return _render_command(e, out_path, None)
+
+
+def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> list[str]:
+    """One ffmpeg invocation's argv. `pass_` is set only for a two-pass half."""
     if not e.groups:
         raise ValueError("no output path given and the query has no sink")
     if out_path is not None and len(e.groups) > 1:
@@ -507,7 +601,7 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
                 args += [f"-metadata:s:{index}", f"{key}={mapping.metadata[key]}"]
             if _DISPOSITION_KEY in mapping.metadata:
                 args += [f"-disposition:{index}", mapping.metadata[_DISPOSITION_KEY]]
-        args += _render_sink_options(group)
+        args += _render_sink_options(group, pass_)
         args.append(path)
     return args
 
@@ -582,10 +676,27 @@ def _codec_params_flag(options: dict[str, object]) -> str:
     return SINK_OPTIONS["codec_params"].flag.format(codec=codec_key)
 
 
-def _render_sink_options(group: OutputGroup) -> list[str]:
+def _render_two_pass(value: object, pass_: _Pass | None) -> list[str]:
+    """``two_pass true`` -> ``-pass <n> -passlogfile <dest>``; False -> nothing.
+
+    The pass number and the stats-file path are properties of the COMMAND, not
+    of the option's value, which is why this is the second derived exception
+    to "flag is static table data" (``codec_params`` is the first).
+    """
+    if value is not True:
+        return []
+    if pass_ is None:  # defensive: build_ffmpeg_args refuses a two_pass Emitted
+        raise _internal("two_pass reached emit with no pass number")
+    return [SINK_OPTIONS[_TWO_PASS].flag, str(pass_.number), PASSLOGFILE_FLAG, pass_.logfile]
+
+
+def _render_sink_options(group: OutputGroup, pass_: _Pass | None = None) -> list[str]:
     args: list[str] = []
     for name, value in group.options.items():
         spec = SINK_OPTIONS[name]
+        if name == _TWO_PASS:
+            args += _render_two_pass(value, pass_)
+            continue
         if spec.bare:
             if value is True:
                 args.append(spec.flag)

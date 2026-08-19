@@ -22,8 +22,9 @@ import imagehash
 import pytest
 from PIL import Image
 
+from sqlmpeg import cli
 from sqlmpeg.compiler import compile_sql
-from sqlmpeg.emit import build_ffmpeg_args, emit
+from sqlmpeg.emit import build_ffmpeg_args, build_ffmpeg_commands, emit
 from sqlmpeg.errors import SqlmpegError
 
 pytestmark = pytest.mark.exec
@@ -1665,3 +1666,115 @@ def test_metadata_from_copies_an_inputs_global_tags_through(tmp_path: Path) -> N
     # case-insensitively, since it's the VALUE round-tripping that's under test.
     tags = {k.lower(): v for k, v in _ffprobe_format_tags(out_path).items()}
     assert tags.get("genre") == "Test Genre"
+
+
+# ---------------------------------------------------------------------------
+# two_pass: a compile that is a SEQUENCE of ffmpeg commands
+# ---------------------------------------------------------------------------
+
+
+def _run_command_sequence(commands: list[list[str]]) -> None:
+    for command in commands:
+        command.insert(1, "-y")
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+        )
+        assert result.returncode == 0, f"{command}\n{result.stderr}"
+
+
+def test_two_pass_encode_runs_both_passes_and_writes_a_playable_file(
+    tmp_path: Path,
+) -> None:
+    """The whole chain against real ffmpeg: pass 1 writes only ffmpeg's stats
+    file, pass 2 reads it and writes the destination.
+
+    The stats file is ffmpeg's own temp file and is deliberately NOT cleaned
+    up: it stays beside the destination as `<dest>-0.log` (plus x264's
+    `-0.log.mbtree`), which this asserts rather than works around.
+    """
+    _require_fixture(_AV)
+    out_path = tmp_path / "two-pass.mp4"
+    query = (
+        "COPY (\n"
+        f"  SELECT f.video[1], f.audio[1] FROM input('{_sql_path(_AV)}') f\n"
+        f") TO '{_sql_path(out_path)}' WITH (\n"
+        "  video_codec 'libx264', video_bitrate '500k', two_pass true, "
+        "audio_codec 'aac'\n"
+        ")"
+    )
+
+    commands = build_ffmpeg_commands(emit(compile_sql(query)))
+    assert len(commands) == 2
+    assert commands[0][-3:] == ["-f", "null", "-"]
+    assert commands[0][commands[0].index("-pass") + 1] == "1"
+    assert commands[1][commands[1].index("-pass") + 1] == "2"
+    logfile = commands[0][commands[0].index("-passlogfile") + 1]
+    assert logfile == _sql_path(out_path)
+
+    # Pass 1 alone: the stats file appears beside the destination, and the
+    # destination itself is not written.
+    _run_command_sequence([commands[0]])
+    stats = Path(f"{logfile}-0.log")
+    assert stats.exists()
+    assert not out_path.exists()
+
+    _run_command_sequence([commands[1]])
+
+    assert out_path.exists()
+    assert stats.exists()  # ffmpeg owns its temp files; sqlmpeg leaves them
+    streams = _ffprobe_streams(out_path)
+    assert [s["codec_type"] for s in streams] == ["video", "audio"]
+    assert streams[0]["codec_name"] == "h264"
+    assert streams[1]["codec_name"] == "aac"
+    assert _ffprobe_duration(out_path) == pytest.approx(
+        _ffprobe_duration(_AV), abs=0.3
+    )
+
+
+def test_two_pass_keeps_a_filtered_audio_pad_connected_in_pass_one(
+    tmp_path: Path,
+) -> None:
+    """A FILTERED audio output stays mapped in pass 1: ffmpeg refuses a
+    filtergraph output pad with no consumer, so dropping it would break the
+    analysis pass outright."""
+    _require_fixture(_AV)
+    out_path = tmp_path / "two-pass-filtered.mp4"
+    query = (
+        "COPY (\n"
+        f"  SELECT hflip(f.frame), volume(f.audio[1], 0.5)\n"
+        f"  FROM input('{_sql_path(_AV)}') f\n"
+        f") TO '{_sql_path(out_path)}' WITH (\n"
+        "  video_codec 'libx264', video_bitrate '500k', two_pass true, "
+        "audio_codec 'aac'\n"
+        ")"
+    )
+
+    commands = build_ffmpeg_commands(emit(compile_sql(query)))
+    assert [c for i, c in enumerate(commands[0]) if commands[0][i - 1] == "-map"] == [
+        "[out0]",
+        "[out1]",
+    ]
+
+    _run_command_sequence(commands)
+
+    assert out_path.exists()
+    assert [s["codec_type"] for s in _ffprobe_streams(out_path)] == ["video", "audio"]
+
+
+def test_two_pass_runs_end_to_end_through_the_cli(tmp_path: Path) -> None:
+    """`sqlmpeg run` drives the sequence itself: one process, both passes."""
+    _require_fixture(_AV)
+    out_path = tmp_path / "cli-two-pass.mp4"
+    query = (
+        "COPY (\n"
+        f"  SELECT f.video[1], f.audio[1] FROM input('{_sql_path(_AV)}') f\n"
+        f") TO '{_sql_path(out_path)}' WITH (\n"
+        "  video_codec 'libx264', video_bitrate '500k', two_pass true\n"
+        ")"
+    )
+
+    assert cli.main(["run", query, "-y"]) == 0
+
+    assert out_path.exists()
+    assert Path(f"{_sql_path(out_path)}-0.log").exists()
+    assert [s["codec_type"] for s in _ffprobe_streams(out_path)] == ["video", "audio"]
