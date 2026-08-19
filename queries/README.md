@@ -31,6 +31,17 @@ sqlmpeg -f queries/transcode.sql -v source=film.mkv -v dest=film.mp4
 | [split-channels.sql](split-channels.sql) | split a stereo track into two mono outputs | `source`, `dest` |
 | [gif.sql](gif.sql) | palette-optimized GIF via a two-pass CTE | `source`, `dest` |
 | [mux-subtitles.sql](mux-subtitles.sql) | mux an external subtitle file in as its own track | `main`, `subs`, `dest` |
+| [resize.sql](resize.sql) | resize to a target width, aspect ratio preserved | `source`, `width`, `dest` |
+| [compress.sql](compress.sql) | shrink a file's size with a variable quality target | `source`, `crf`, `dest` |
+| [strip-audio.sql](strip-audio.sql) | drop the audio, keep the picture, no re-encode | `source`, `dest` |
+| [volume.sql](volume.sql) | turn the volume up or down on every audio track | `source`, `gain`, `dest` |
+| [rotate.sql](rotate.sql) | rotate a quarter turn (phone-video fix) | `source`, `dir`, `dest` |
+| [crop.sql](crop.sql) | crop to a fixed rectangle | `source`, `w`, `h`, `x`, `y`, `dest` |
+| [fade.sql](fade.sql) | fade in from black at the start | `source`, `duration`, `dest` |
+| [burn-subtitles.sql](burn-subtitles.sql) | burn subtitles into the picture | `source`, `subs`, `dest` |
+| [extract-subtitles.sql](extract-subtitles.sql) | extract the first subtitle track as its own file | `source`, `dest` |
+| [thumbnail.sql](thumbnail.sql) | grab a single poster frame at a timestamp | `source`, `at`, `dest` |
+| [extract-frames.sql](extract-frames.sql) | export a frame-rate-limited image sequence | `source`, `rate`, `dest` |
 
 An undefined variable is a compile-time error naming it, so a typo'd `-v`
 fails before anything runs. The [cookbook](../docs/examples.md) explains

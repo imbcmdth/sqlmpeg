@@ -60,6 +60,16 @@ _DUMMY_VALUES = {
     "mid": "720p.mp4",
     "low": "480p.mp4",
     "insert": "promo.mp4",
+    "crf": "23",
+    "gain": "0.5",
+    "w": "640",
+    "h": "480",
+    "x": "100",
+    "y": "50",
+    "at": "10",
+    "duration": "1",
+    "dir": "clock",
+    "rate": "1",
 }
 
 

@@ -1058,6 +1058,27 @@ def test_sink_video_codec_and_crf_render_per_video_output() -> None:
     ]
 
 
+def test_sink_video_codec_and_frames_render_per_video_output() -> None:
+    """Recipe 34's shape: -c:0 png -frames:0 1, in WITH-clause order."""
+    sink = _sink(path="poster.png", options={"video_codec": "png", "frames": 1})
+    g = _graph(
+        [_node("n1", "hflip", {}, ["src:a:v:0"])],
+        [_out("n1")],
+        sink=sink,
+    )
+    e = emit(g)
+    args = build_ffmpeg_args(e)
+    assert args[args.index("-map") :] == [
+        "-map",
+        "[out0]",
+        "-c:0",
+        "png",
+        "-frames:0",
+        "1",
+        "poster.png",
+    ]
+
+
 def test_sink_audio_bitrate_renders_per_audio_output() -> None:
     sink = _sink(path="out.mp4", options={"audio_bitrate": "192k"})
     g = _graph(

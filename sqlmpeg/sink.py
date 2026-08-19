@@ -106,6 +106,14 @@ SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         flag="-c",
         per_stream=True,
     ),
+    "frames": SinkOptionSpec(
+        name="frames",
+        scope="video",
+        type="int",
+        doc="Stop the video output after N frames.",
+        flag="-frames",
+        per_stream=True,
+    ),
     "format": SinkOptionSpec(
         name="format",
         scope="container",

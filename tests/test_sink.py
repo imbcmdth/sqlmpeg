@@ -31,11 +31,12 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "format": ("container", "str"),
     "faststart": ("container", "bool"),
     "subtitle_codec": ("subtitle", "str"),
+    "frames": ("video", "int"),
 }
 
 
-def test_table_has_exactly_eleven_entries() -> None:
-    assert len(SINK_OPTIONS) == 11
+def test_table_has_exactly_twelve_entries() -> None:
+    assert len(SINK_OPTIONS) == 12
     assert set(SINK_OPTIONS) == set(_EXPECTED)
 
 
@@ -80,6 +81,7 @@ def test_per_stream_options_use_colon_index_flags() -> None:
         "audio_bitrate",
         "sample_rate",
         "subtitle_codec",
+        "frames",
     }
 
 
@@ -102,6 +104,17 @@ def test_validate_option_happy_str() -> None:
 
 def test_validate_option_happy_int() -> None:
     assert validate_option("crf", 20) == 20
+
+
+def test_validate_option_happy_frames() -> None:
+    assert validate_option("frames", 1) == 1
+
+
+def test_frames_scope_and_flag() -> None:
+    spec = SINK_OPTIONS["frames"]
+    assert spec.scope == "video"
+    assert spec.flag == "-frames"
+    assert spec.per_stream is True
 
 
 def test_validate_option_happy_subtitle_codec() -> None:
