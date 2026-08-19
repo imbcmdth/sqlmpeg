@@ -174,6 +174,7 @@ from sqlmpeg.errors import ErrorCode, SqlmpegError
 
 __all__ = [
     "FILTER_NAMESPACE",
+    "INPUT_DURATION_COLUMN",
     "MACRO_NAMESPACE",
     "ROW_SCHEMAS",
     "ROW_STREAM_COLUMN",
@@ -188,6 +189,7 @@ __all__ = [
     "Resolved",
     "from_entries",
     "from_items",
+    "is_value_expr",
     "kwarg_name",
     "parse",
     "resolve",
@@ -239,15 +241,22 @@ _BRACKET_ALLOWED = frozenset({"this", "expressions"})
 # its own explicit rejection below.
 _COPY_ALLOWED = frozenset({"this", "kind", "credentials", "files", "params"})
 
+# The scalar pseudo-column every INPUT alias carries: the probed container
+# duration in seconds. A value, never a stream, so it is only legal inside a
+# compile-time expression; lower reads it off the probe.
+INPUT_DURATION_COLUMN = "duration"
+
 # The only column names an INPUT alias exposes. A CTE alias exposes whatever its
 # body named with AS, so the whitelist does not apply there (lower checks those).
 # `subtitle`/`data` have the same array/subscript/splat surface as video/audio
 # but are passthrough-only downstream (lower enforces that half).
-_INPUT_COLUMNS = frozenset({"frame", "video", "audio", "subtitle", "data", "t"})
+_INPUT_COLUMNS = frozenset(
+    {"frame", "video", "audio", "subtitle", "data", "t", INPUT_DURATION_COLUMN}
+)
 
 # The array columns `unnest(<alias>.<name>)` accepts. Exactly the
-# array-typed half of `_INPUT_COLUMNS`: `frame` is one stream and `t` is a
-# timeline, and neither is a set of tracks.
+# array-typed half of `_INPUT_COLUMNS`: `frame` is one stream, `t` is a
+# timeline and `duration` is a scalar, and none of them is a set of tracks.
 _UNNEST_COLUMNS = frozenset({"video", "audio", "subtitle", "data"})
 
 # The compile-time type of a track-row column. `stream` is the track itself
@@ -364,8 +373,8 @@ _JOIN_ON_HINT = (
     "AND/OR/NOT"
 )
 _VALUE_HINT = (
-    "a compile-time value is a literal, NULL, a track-row column, or CASE / "
-    "'||' over those"
+    "a compile-time value is a literal, NULL, a track-row column, "
+    "<input>.duration, or CASE / '||' / arithmetic / ::text over those"
 )
 _ROW_ORDER_HINT = (
     "ORDER BY sorts track rows by their metadata columns, "
@@ -439,6 +448,47 @@ def _ident_name(node: exp.Expr | None) -> str:
     if isinstance(node, exp.Identifier):
         return node.name if node.args.get("quoted") else node.name.lower()
     return str(node.name).lower()
+
+
+# compile-time value shapes
+
+# The operator nodes sqlglot builds for `+ - * /`, already nested in written
+# precedence (`a + b * c` puts the Mul under the Add). Unary `-x` is exp.Neg,
+# which the value grammar handles alongside them.
+_ARITHMETIC = exp.Add | exp.Sub | exp.Mul | exp.Div
+
+# How each operator is named back to the writer in a rejection.
+_ARITHMETIC_NAMES: dict[type[exp.Expr], str] = {
+    exp.Add: "'+'",
+    exp.Sub: "'-'",
+    exp.Mul: "'*'",
+    exp.Div: "'/'",
+}
+
+
+def is_value_expr(node: exp.Expr | None) -> bool:
+    """True for a shape that is a compile-time VALUE and can never be a stream.
+
+    The dispatch test every context shares: a projection deciding whether it
+    is a tag column, a comparison deciding whether both sides go through the
+    value grammar, a call argument deciding whether it is computed per row.
+    Bare literals and columns are left out on purpose -- they are already
+    handled where they appear, and a bare column may well be a stream.
+    """
+    return isinstance(node, exp.Case | exp.DPipe | exp.Cast | _ARITHMETIC)
+
+
+def _is_input_duration(node: exp.Expr | None, scope: dict[str, str]) -> bool:
+    """True for ``<input alias>.duration``, the one scalar an input exposes."""
+    if not isinstance(node, exp.Column):
+        return False
+    table_node = node.args.get("table")
+    if table_node is None:
+        return False
+    return (
+        scope.get(_ident_name(table_node)) == "input"
+        and _ident_name(node.this) == INPUT_DURATION_COLUMN
+    )
 
 
 # subscripts
@@ -2027,7 +2077,7 @@ class _Resolver:
         """
         inner = projection.this if isinstance(projection, exp.Alias) else projection
         value = _unwrap_paren(inner) if isinstance(inner, exp.Expr) else None
-        if isinstance(value, exp.Case | exp.DPipe):
+        if is_value_expr(value):
             self._check_value_expr(value, scope, select)
 
     def _check_expression(self, node: exp.Expr, select: exp.Select) -> None:
@@ -2343,9 +2393,7 @@ class _Resolver:
             left = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
             right = node.args.get("expression")
             right = _unwrap_paren(right) if isinstance(right, exp.Expr) else None
-            if isinstance(left, exp.Case | exp.DPipe) or isinstance(
-                right, exp.Case | exp.DPipe
-            ):
+            if is_value_expr(left) or is_value_expr(right):
                 self._check_value_pair(left, right, scope, join, _JOIN_ON_HINT)
                 return
             column, other = (left, right) if isinstance(left, exp.Column) else (right, left)
@@ -3345,11 +3393,11 @@ class _Resolver:
             and not self._check_subscript_conjunct(conjunct, scope, where)
         ]
 
-        # alias -> {"low": <literal>, "high": <literal>}, accumulated across
+        # alias -> {"low": <bound>, "high": <bound>}, accumulated across
         # every conjunct so a repeated bound of one kind is rejected however it
         # is spelled (twice in one BETWEEN, two inequalities, or a mix), and so
         # a closed pair can be checked for an empty window once both are known.
-        bounds: dict[str, dict[str, exp.Literal]] = {}
+        bounds: dict[str, dict[str, exp.Expr]] = {}
         for conjunct in conjuncts:
             parsed = _time_bounds(conjunct)
             if parsed is None:
@@ -3400,14 +3448,7 @@ class _Resolver:
             for kind, bound in (("low", low), ("high", high)):
                 if bound is None:
                     continue
-                if not (isinstance(bound, exp.Literal) and not bound.is_string):
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        "time bounds must be numeric literals (seconds)",
-                        bound,
-                        fallback=where,
-                        hint=_WHERE_HINT,
-                    )
+                self._check_time_bound(bound, scope, where)
                 if kind in alias_bounds:
                     bound_name = "lower" if kind == "low" else "upper"
                     raise _error(
@@ -3423,7 +3464,11 @@ class _Resolver:
         for alias, alias_bounds in bounds.items():
             low_literal = alias_bounds.get("low")
             high_literal = alias_bounds.get("high")
-            if low_literal is None or high_literal is None:
+            # Only a pair of literals is orderable HERE; a computed bound is
+            # a number lower knows and checks the same window against.
+            if not isinstance(low_literal, exp.Literal) or not isinstance(
+                high_literal, exp.Literal
+            ):
                 continue
             start = _literal_seconds(low_literal)
             end = _literal_seconds(high_literal)
@@ -3437,6 +3482,29 @@ class _Resolver:
                 fallback=where,
                 hint="the start bound must be strictly before the end bound",
             )
+
+    def _check_time_bound(
+        self, bound: exp.Expr, scope: dict[str, str], where: exp.Where
+    ) -> None:
+        """One trim bound: a number of seconds, literal or computed.
+
+        A bound is still a SEEK on the input, so it has to be a number by the
+        time lower reads it -- but which number may be arithmetic over probed
+        scalars (``f.duration - 0.5``), so the value grammar types it here.
+        """
+        if isinstance(bound, exp.Literal) and not bound.is_string:
+            return
+        if (is_value_expr(bound) or _is_input_duration(bound, scope)) and (
+            self._check_value_expr(bound, scope, where) == "number"
+        ):
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "time bounds must be numeric literals (seconds)",
+            bound,
+            fallback=where,
+            hint=_WHERE_HINT,
+        )
 
     # -- WHERE over track-row columns ---------------------------
 
@@ -3552,6 +3620,12 @@ class _Resolver:
                     hint=_ROW_WHERE_HINT,
                 )
             column = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
+            if is_value_expr(column):
+                # A computed subject types against each bound the way any
+                # comparison's two sides do; there is no COLUMN to name.
+                for bound in (node.args.get("low"), node.args.get("high")):
+                    self._check_value_pair(column, bound, scope, where, _ROW_WHERE_HINT)
+                return
             if not isinstance(column, exp.Column):
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -3562,15 +3636,16 @@ class _Resolver:
                 )
             column_type = self._row_operand(column, scope, where)
             for bound in (node.args.get("low"), node.args.get("high")):
+                if is_value_expr(_unwrap_paren(bound) if isinstance(bound, exp.Expr) else None):
+                    self._check_value_pair(column, bound, scope, where, _ROW_WHERE_HINT)
+                    continue
                 self._check_row_literal(bound, column, column_type, where)
             return
         if isinstance(node, exp.EQ | exp.NEQ | exp.GT | exp.GTE | exp.LT | exp.LTE):
             left = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
             right = node.args.get("expression")
             right = _unwrap_paren(right) if isinstance(right, exp.Expr) else None
-            if isinstance(left, exp.Case | exp.DPipe) or isinstance(
-                right, exp.Case | exp.DPipe
-            ):
+            if is_value_expr(left) or is_value_expr(right):
                 self._check_value_pair(left, right, scope, where, _ROW_WHERE_HINT)
                 return
             column, literal = (left, right) if isinstance(left, exp.Column) else (right, left)
@@ -3604,7 +3679,11 @@ class _Resolver:
     def _row_operand(
         self, column: exp.Column, scope: dict[str, str], where: exp.Expr
     ) -> str:
-        """Check one row-column operand and return its type; reject ``track``."""
+        """Check one value-expression column operand and return its type.
+
+        A track-row column, or an input alias's ``duration``; ``track`` is a
+        stream and is rejected as one.
+        """
         table_node = column.args.get("table")
         if table_node is None:
             raise _error(
@@ -3616,12 +3695,26 @@ class _Resolver:
             )
         alias = _ident_name(table_node)
         if scope.get(alias) != "row":
+            # `<input>.duration` is the one non-row column the value grammar
+            # reads: a probed container scalar, so it types as a number here
+            # and lower rejects it on an input it could not probe.
+            if _is_input_duration(column, scope):
+                return "number"
+            if alias not in scope:
+                raise _error(
+                    ErrorCode.UNKNOWN_ALIAS,
+                    f"unknown alias '{alias}'",
+                    table_node,
+                    fallback=where,
+                    hint=self._known_hint(scope),
+                )
             raise _error(
-                ErrorCode.UNKNOWN_ALIAS,
-                f"unknown alias '{alias}'",
-                table_node,
+                ErrorCode.UNSUPPORTED_SQL,
+                f"unknown column '{alias}.{column.name}'",
+                column,
                 fallback=where,
-                hint=self._known_hint(scope),
+                hint=f"'{alias}' is not a track-row table; the only value an "
+                f"input alias carries is '{alias}.{INPUT_DURATION_COLUMN}'",
             )
         column_type = self._check_row_column(column, alias, where)
         if column_type == "stream":
@@ -3635,7 +3728,8 @@ class _Resolver:
             )
         return column_type
 
-    # -- compile-time value expressions: literals, row columns, CASE, || ----
+    # -- compile-time value expressions: literals, row columns, CASE, ||,
+    #    arithmetic, ::text ---------------------------------------------------
 
     def _check_value_expr(
         self, node: exp.Expr | None, scope: dict[str, str], fallback: exp.Expr
@@ -3660,22 +3754,17 @@ class _Resolver:
         if isinstance(value, exp.Column):
             return self._row_operand(value, scope, fallback)
         if isinstance(value, exp.Neg):
-            inner = _unwrap_paren(value.this) if isinstance(value.this, exp.Expr) else None
-            if not isinstance(inner, exp.Literal) or inner.is_string:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    "negation needs a numeric literal",
-                    value,
-                    fallback=fallback,
-                    hint=_VALUE_HINT,
-                )
-            return "number"
+            return self._check_numeric(value.this, "negation", value, scope, fallback)
         if isinstance(value, exp.Literal):
             return "text" if value.is_string else "number"
         if isinstance(value, exp.Case):
             return self._check_case(value, scope, fallback)
         if isinstance(value, exp.DPipe):
             return self._check_concat(value, scope, fallback)
+        if isinstance(value, _ARITHMETIC):
+            return self._check_arithmetic(value, scope, fallback)
+        if isinstance(value, exp.Cast):
+            return self._check_cast(value, scope, fallback)
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             f"unsupported value expression: {value.__class__.__name__.upper()}",
@@ -3746,10 +3835,72 @@ class _Resolver:
                 "'||' joins text, but one side is a number",
                 side if isinstance(side, exp.Expr) else None,
                 fallback=fallback,
-                hint="quote the number, or join text columns: "
-                "'Audio (' || t.language || ')'",
+                hint="cast the number with ::text, quote it, or join text "
+                "columns: 'Audio (' || t.language || ')'",
             )
         return "text"
+
+    def _check_arithmetic(
+        self, node: exp.Expr, scope: dict[str, str], fallback: exp.Expr
+    ) -> str | None:
+        """``+ - * /`` over two numbers; the result is a number.
+
+        Precedence and grouping are sqlglot's -- `a + b * c` already arrives
+        with the Mul nested under the Add -- so there is nothing to decide
+        here but the operand types. NULL keeps the type open, exactly as it
+        does in a CASE.
+        """
+        operator = _ARITHMETIC_NAMES[type(node)]
+        left = self._check_numeric(node.this, operator, node, scope, fallback)
+        right = self._check_numeric(
+            node.args.get("expression"), operator, node, scope, fallback
+        )
+        return None if left is None or right is None else "number"
+
+    def _check_numeric(
+        self,
+        operand: exp.Expr | None,
+        operator: str,
+        node: exp.Expr,
+        scope: dict[str, str],
+        fallback: exp.Expr,
+    ) -> str | None:
+        """One arithmetic operand: a number, or NULL (which keeps it open)."""
+        operand_type = self._check_value_expr(operand, scope, fallback)
+        if operand_type is None or operand_type == "number":
+            return operand_type
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"{operator} needs numbers, but one side is {operand_type}",
+            operand if isinstance(operand, exp.Expr) else node,
+            fallback=fallback,
+            hint=_VALUE_HINT,
+        )
+
+    def _check_cast(
+        self, node: exp.Cast, scope: dict[str, str], fallback: exp.Expr
+    ) -> str | None:
+        """``x::text`` / ``CAST(x AS text)``: the bridge from a number into ``||``.
+
+        Text is the only target v1 casts to. The other direction is already
+        covered without a cast -- a bare ``:name`` variable parses as a number
+        wherever a number is wanted -- so ``::int``/``::float`` would only add
+        a second way to spell what already works.
+        """
+        to = node.args.get("to")
+        target = to.this if isinstance(to, exp.DataType) else None
+        if target != exp.DataType.Type.TEXT:
+            spelled = str(getattr(target, "value", target or "")).lower()
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"cast to {spelled or 'that type'} is not supported",
+                node,
+                fallback=fallback,
+                hint="::text is the only cast sqlmpeg has; it spells a number "
+                "for '||', e.g. 'w=' || t.width::text",
+            )
+        value_type = self._check_value_expr(node.this, scope, fallback)
+        return None if value_type is None else "text"
 
     def _check_value_pair(
         self,

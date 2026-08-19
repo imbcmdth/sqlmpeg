@@ -269,7 +269,7 @@ from __future__ import annotations
 import base64
 import difflib
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from sqlglot import exp
 
@@ -279,7 +279,10 @@ from sqlmpeg.inputs import validate_option as validate_input_option
 from sqlmpeg.ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType, is_src, src_parts
 from sqlmpeg.macros import INPUT_MACROS, MACROS, InputMacro, macro_names
 from sqlmpeg.parser import (
+    _ARITHMETIC,
+    _ARITHMETIC_NAMES,
     FILTER_NAMESPACE,
+    INPUT_DURATION_COLUMN,
     MACRO_NAMESPACE,
     ROW_SCHEMAS,
     ROW_STREAM_COLUMN,
@@ -292,6 +295,7 @@ from sqlmpeg.parser import (
     _pos,
     _time_bounds,
     from_entries,
+    is_value_expr,
     kwarg_name,
     star_qualifier,
     subscript_index,
@@ -2832,7 +2836,7 @@ class _Lowerer:
             is_null = value is None
             return not is_null if node.args.get("negate") else is_null
         if isinstance(node, exp.Between):
-            value = self._row_value_of(node.this, env, rows, select)
+            value = self._eval_value(node.this, env, rows, select)
             low = self._eval_value(node.args.get("low"), env, rows, select)
             high = self._eval_value(node.args.get("high"), env, rows, select)
             return _kleene_and(
@@ -2865,6 +2869,9 @@ class _Lowerer:
         A gap (the alias maps to None, because an outer join found no
         counterpart) reads NULL in every column — the one thing an absent row
         can honestly say about itself.
+
+        ``<input alias>.duration`` is the one column that comes from no row at
+        all: it is the probed container length, read straight off the input.
         """
         column = _unwrap(node) if isinstance(node, exp.Expr) else None
         if not isinstance(column, exp.Column):
@@ -2877,6 +2884,8 @@ class _Lowerer:
             )
         table_node = column.args.get("table")
         binding = env.bindings.get(_fold(table_node)) if table_node is not None else None
+        if isinstance(binding, _InputBinding) and _fold(column.this) == INPUT_DURATION_COLUMN:
+            return self._input_duration(binding.alias, column, select)
         if not isinstance(binding, _RowBinding):  # defensive: resolve checked it
             raise _error(
                 ErrorCode.UNKNOWN_ALIAS,
@@ -2907,10 +2916,11 @@ class _Lowerer:
     ) -> RowValue:
         """One compile-time value over a result row.
 
-        The whole value grammar: a literal, NULL, a row's metadata column,
-        ``CASE`` and ``||``. Shared by the predicate evaluator (a comparison's
-        operands, a BETWEEN bound) and by tag columns, so WHERE, ON and a tag
-        value all speak the same language.
+        The whole value grammar: a literal, NULL, a row's metadata column, an
+        input's probed ``duration``, ``CASE``, ``||``, arithmetic and
+        ``::text``. Shared by the predicate evaluator (a comparison's operands,
+        a BETWEEN bound), by tag columns, by trim bounds and by computed call
+        arguments, so every one of them speaks the same language.
         """
         value = _unwrap(node) if isinstance(node, exp.Expr) else None
         if isinstance(value, exp.Null):
@@ -2921,7 +2931,88 @@ class _Lowerer:
             return self._eval_case(value, env, rows, select)
         if isinstance(value, exp.DPipe):
             return self._eval_concat(value, env, rows, select)
+        if isinstance(value, _ARITHMETIC):
+            return self._eval_arithmetic(value, env, rows, select)
+        if isinstance(value, exp.Cast):
+            return self._eval_cast(value, env, rows, select)
+        if isinstance(value, exp.Neg) and not isinstance(_unwrap(value.this), exp.Literal):
+            operand = self._eval_number(value.this, "'-'", value, env, rows, select)
+            return None if operand is None else -operand
         return self._literal_of(value, select)
+
+    def _eval_arithmetic(
+        self,
+        node: exp.Expr,
+        env: _Env,
+        rows: dict[str, _TrackRow | None],
+        select: exp.Select,
+    ) -> RowValue:
+        """``+ - * /`` with Postgres' own typing, at compile time.
+
+        int op int stays an int and ``/`` TRUNCATES toward zero, any float
+        operand makes the result a float, and NULL on either side propagates.
+        Dividing by a zero is a typed rejection: the value is knowable here, so
+        shipping an ffmpeg command built on it is not an option.
+        """
+        operator = _ARITHMETIC_NAMES[type(node)]
+        left = self._eval_number(node.this, operator, node, env, rows, select)
+        right = self._eval_number(node.args.get("expression"), operator, node, env, rows, select)
+        if left is None or right is None:
+            return None
+        if isinstance(node, exp.Add):
+            return left + right
+        if isinstance(node, exp.Sub):
+            return left - right
+        if isinstance(node, exp.Mul):
+            return left * right
+        if right == 0:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "division by zero",
+                node,
+                fallback=select,
+                hint="the divisor is known at compile time, and it is zero",
+            )
+        if isinstance(left, int) and isinstance(right, int):
+            quotient = abs(left) // abs(right)
+            return -quotient if (left < 0) != (right < 0) else quotient
+        return left / right
+
+    def _eval_number(
+        self,
+        node: exp.Expr | None,
+        operator: str,
+        anchor: exp.Expr,
+        env: _Env,
+        rows: dict[str, _TrackRow | None],
+        select: exp.Select,
+    ) -> int | float | None:
+        """One arithmetic operand's value; text is a typed rejection."""
+        value = self._eval_value(node, env, rows, select)
+        if value is None or isinstance(value, int | float):
+            return value
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"{operator} needs numbers, but one side is text",
+            node if isinstance(node, exp.Expr) else anchor,
+            fallback=select,
+        )
+
+    def _eval_cast(
+        self,
+        node: exp.Cast,
+        env: _Env,
+        rows: dict[str, _TrackRow | None],
+        select: exp.Select,
+    ) -> RowValue:
+        """``x::text``: the number spelled out, NULL left NULL.
+
+        One spelling rule, shared with the filtergraph and the seek times --
+        an int prints without a point, a float in python's shortest form that
+        reads back as the same float.
+        """
+        value = self._eval_value(node.this, env, rows, select)
+        return None if value is None else _tag_text(value)
 
     def _eval_case(
         self,
@@ -3079,6 +3170,29 @@ class _Lowerer:
             ErrorCode.UNSUPPORTED_SQL, "unsupported WHERE predicate", node,
             fallback=select,
         )
+
+    def _input_duration(
+        self, alias: str, anchor: exp.Expr, select: exp.Select
+    ) -> int | float:
+        """``<input>.duration``: the probed container length, in seconds.
+
+        Probed-only, and a rejection when it is not there — an unreadable file
+        has no length, and neither does a container that declares none, so
+        there is nothing to guess an expression's value from.
+        """
+        result = self.probes.get(alias)
+        duration = None if result is None else result.duration
+        if duration is None:
+            raise _error(
+                ErrorCode.INPUT_NOT_FOUND,
+                f"'{alias}.{INPUT_DURATION_COLUMN}' is unknown: "
+                f"'{self._path_of(alias)}' reports no container duration",
+                anchor,
+                fallback=select,
+                hint="the duration is probed from the file; only a readable "
+                "input that declares one has it",
+            )
+        return duration
 
     def _accessor_value(self, node: exp.Expr | None, select: exp.Select) -> RowValue:
         """The probed value one ``<alias>.<type>[k].<column>`` accessor names.
@@ -3310,9 +3424,9 @@ class _Lowerer:
                 )
             start, end = windows.get(alias, (None, None))
             if low is not None:
-                start = _number(low, ErrorCode.UNSUPPORTED_SQL)
+                start = self._time_bound(low, env, select)
             if high is not None:
-                end = _number(high, ErrorCode.UNSUPPORTED_SQL)
+                end = self._time_bound(high, env, select)
             windows[alias] = (start, end)
 
         for alias, window in windows.items():
@@ -3341,6 +3455,28 @@ class _Lowerer:
                 self.graph.input_trims[alias] = window
             else:
                 env.trims[alias] = window
+
+    def _time_bound(
+        self, bound: exp.Expr, env: _Env, select: exp.Select
+    ) -> int | float:
+        """One trim bound in seconds: a literal, or the value grammar's answer.
+
+        A computed bound is still a SEEK, so it must come out a number. The
+        one way it could come out NULL — an input whose duration was never
+        probed — is already a rejection naming that field
+        (:meth:`_input_duration`), so the raise below is the defensive floor.
+        """
+        value = self._eval_value(bound, env, {}, select)
+        if isinstance(value, int | float):
+            return value
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"time bound '{bound.sql(dialect='postgres')}' is "
+            + ("NULL" if value is None else "text"),
+            bound,
+            fallback=select,
+            hint="a trim bound is a number of seconds",
+        )
 
     def _access(
         self,
@@ -3456,7 +3592,7 @@ class _Lowerer:
             # Not a call: COALESCE resolves against the ROW model, not the
             # registry -- it is how a nullable track column is spelled.
             return self._lower_coalesce(node, env, select)
-        if isinstance(node, exp.Case | exp.DPipe):
+        if is_value_expr(node):
             # A value expression, never a stream. Reaching here means it is not
             # a tag column either: unaliased, or in a query with no track rows.
             raise _error(
@@ -4098,6 +4234,17 @@ class _Lowerer:
                 fallback=select,
                 hint=_TIME_HINT,
             )
+        if name == INPUT_DURATION_COLUMN:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{INPUT_DURATION_COLUMN}' is a number of seconds, "
+                "not a stream",
+                anchor,
+                fallback=select,
+                hint=f"'{alias}.{INPUT_DURATION_COLUMN}' belongs in an "
+                f"expression, e.g. WHERE {alias}.t <= {alias}."
+                f"{INPUT_DURATION_COLUMN} - 60",
+            )
         if name == _FRAME_COLUMN:
             if index is not None:
                 raise _error(
@@ -4464,7 +4611,7 @@ class _Lowerer:
                 ) from None
         streams = {stream_pos: self._lower_expr(call.args[stream_pos], env, select)}
 
-        def build(values: list[object]) -> FrameRef:
+        def build(values: list[object], _element: int) -> FrameRef:
             return macro.expand(values, self.ctx.node)
 
         return self._expand_call(
@@ -4518,7 +4665,7 @@ class _Lowerer:
         kinds = self._stream_kinds(call, env, select, len(expected))
         if kinds != expected:
             raise self._bad_streams(call, node, select, expected, kinds)
-        args = self._bind_options(
+        args_at = self._option_binder(
             name,
             call,
             node,
@@ -4534,9 +4681,9 @@ class _Lowerer:
         }
         output = dynamic.output
 
-        def build(values: list[object]) -> FrameRef:
+        def build(values: list[object], element: int) -> FrameRef:
             return self.ctx.node(
-                name, dict(args), [_as_ref(value) for value in values], [output]
+                name, dict(args_at(element)), [_as_ref(value) for value in values], [output]
             )
 
         return self._expand_call(
@@ -4647,7 +4794,7 @@ class _Lowerer:
             for position, arg in enumerate(call.args[:count])
         }
 
-        def build(values: list[object]) -> FrameRef:
+        def build(values: list[object], _element: int) -> FrameRef:
             return self.ctx.node(
                 spec.name, dict(args), [_as_ref(value) for value in values], [spec.output]
             )
@@ -4920,6 +5067,79 @@ class _Lowerer:
             "signature; everything after them is an option value",
         )
 
+    def _option_binder(
+        self,
+        filter_name: str,
+        call: _Call,
+        node: exp.Expr,
+        select: exp.Select,
+        env: _Env,
+        *,
+        options: dict[str, FilterOption],
+        extras: list[exp.Expr],
+        timeline: bool,
+    ) -> Callable[[int], dict[str, object]]:
+        """This call's option dict, as a function of the broadcast element.
+
+        An option written as a compile-time expression
+        (``scale(t.track, t.width / 2, -2)``) is evaluated against the row that
+        element came from and REPLACED BY THE LITERAL it computes to, so a
+        per-row option and a written one bind through the same
+        :meth:`_bind_options` and are validated by the same option table.
+
+        A call with no computed option binds exactly once and hands the same
+        dict to every element -- which is every call that existed before
+        arithmetic did.
+        """
+        if not any(is_value_expr(arg) for arg in self._option_args(call, extras)):
+            args = self._bind_options(
+                filter_name, call, node, select, env,
+                options=options, extras=extras, timeline=timeline,
+            )
+            return lambda _element: args
+        tuples = env.relation.tuples if env.relation is not None else []
+        cache: dict[int, dict[str, object]] = {}
+
+        def bound(element: int) -> dict[str, object]:
+            if element not in cache:
+                row = tuples[element] if element < len(tuples) else {}
+                cache[element] = self._bind_options(
+                    filter_name,
+                    replace(
+                        call,
+                        named=[
+                            _NamedArg(arg.name, self._computed_arg(arg.value, env, row, select))
+                            for arg in call.named
+                        ],
+                    ),
+                    node,
+                    select,
+                    env,
+                    options=options,
+                    extras=[self._computed_arg(arg, env, row, select) for arg in extras],
+                    timeline=timeline,
+                )
+            return cache[element]
+
+        return bound
+
+    @staticmethod
+    def _option_args(call: _Call, extras: list[exp.Expr]) -> list[exp.Expr]:
+        """Every value node this call binds to an option, positional and named."""
+        return [*extras, *(arg.value for arg in call.named)]
+
+    def _computed_arg(
+        self,
+        node: exp.Expr,
+        env: _Env,
+        row: dict[str, _TrackRow | None],
+        select: exp.Select,
+    ) -> exp.Expr:
+        """One option argument as `row` makes it; anything else, untouched."""
+        if not is_value_expr(node):
+            return node
+        return _literal_node(self._eval_value(node, env, row, select), node)
+
     def _bind_options(
         self,
         filter_name: str,
@@ -4992,14 +5212,16 @@ class _Lowerer:
         arity: int,
         positions: list[int],
         returns: StreamType,
-        build: Callable[[list[object]], FrameRef],
+        build: Callable[[list[object], int], FrameRef],
     ) -> _Value:
         """Broadcast `build` over the array arguments, if there are any.
 
         Type-driven and tier-agnostic: `positions` is where the stream
         arguments are (always the LEADING positions, from the pad signature or
         from an N-input call's own count) and `build` is what turns one
-        element's argument values into a subgraph.
+        element's argument values into a subgraph. `build` also gets the
+        ELEMENT INDEX, which is what lets a filter option computed per row
+        pick out the row that element came from.
         """
         length = self._zip_length(name, node, arg_nodes, streams, select)
         expanded: list[_Stream] = []
@@ -5021,7 +5243,7 @@ class _Lowerer:
                 source = _agreed_source([streams[p].at(element) for p in positions])
             else:
                 source = None
-            expanded.append(_Stream(ref=build(values), type=returns, source=source))
+            expanded.append(_Stream(ref=build(values, element), type=returns, source=source))
         if length is None:
             return _scalar(expanded[0])
         return _array(returns, expanded)
@@ -5388,7 +5610,7 @@ class _Lowerer:
                     name = _fold(expr.this)
                     if name != ROW_STREAM_COLUMN:
                         return self._row_metadata_cells(binding, name, expr, select)
-        if isinstance(expr, exp.Case | exp.DPipe):
+        if is_value_expr(expr) or _is_input_duration_column(expr, env):
             return self._value_cells(expr, env, select, cardinality)
         shape = subscript_metadata_shape(expr)
         if shape is not None and shape[1] != ROW_STREAM_COLUMN:
@@ -5545,15 +5767,27 @@ def _is_tag_column(projection: exp.Expr, env: _Env) -> bool:
 
     A tag column is aliased — the alias IS the tag key — and its value is a
     compile-time expression over the row: a literal, NULL, a row's metadata
-    column, CASE or ``||``. Everything else is a stream expression and lowers
-    as one.
+    column, an input's ``duration``, CASE, ``||``, arithmetic or ``::text``.
+    Everything else is a stream expression and lowers as one.
     """
     if _projection_name(projection) is None:
         return False
     value = _unwrap(projection)
-    if isinstance(value, exp.Case | exp.DPipe | exp.Null | exp.Literal | exp.Neg):
+    if isinstance(value, exp.Null | exp.Literal | exp.Neg) or is_value_expr(value):
+        return True
+    if _is_input_duration_column(value, env):
         return True
     return _row_metadata_column(value, env) is not None
+
+
+def _is_input_duration_column(node: exp.Expr, env: _Env) -> bool:
+    """True for ``<input alias>.duration`` — a value column, never a stream."""
+    if not isinstance(node, exp.Column) or _fold(node.this) != INPUT_DURATION_COLUMN:
+        return False
+    table_node = node.args.get("table")
+    if table_node is None:
+        return False
+    return isinstance(env.bindings.get(_fold(table_node)), _InputBinding)
 
 
 def _row_metadata_column(node: exp.Expr, env: _Env) -> str | None:
@@ -5680,6 +5914,26 @@ def _literal_value(node: exp.Expr) -> object | None:
         return None
     number = value if isinstance(value, int) else float(value)
     return -number if negated else number
+
+
+def _literal_node(value: RowValue, source: exp.Expr) -> exp.Expr:
+    """A computed value back as the literal node the option binder reads.
+
+    The synthesized node inherits `source`'s position, so an option that
+    rejects what a row computed still points at the expression that wrote it.
+    """
+    node: exp.Expr
+    if value is None:
+        node = exp.Null()
+    elif isinstance(value, str):
+        node = exp.Literal.string(value)
+    elif value < 0:
+        node = exp.Neg(this=exp.Literal.number(str(-value)))
+    else:
+        node = exp.Literal.number(str(value))
+    line, col = _pos(source)
+    node.meta.update({"line": line, "col": col})
+    return node
 
 
 def _option_got(node: exp.Expr, value: object) -> str:

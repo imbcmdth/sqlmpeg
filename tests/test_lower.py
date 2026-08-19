@@ -1535,9 +1535,14 @@ def test_an_unknown_nested_call_in_an_option_slot_still_names_it() -> None:
 
 
 def test_non_literal_scalar_argument_is_rejected() -> None:
-    err = _reject("SELECT gblur(a.frame, 1 + 2) FROM input('x.mp4') a")
+    err = _reject("SELECT gblur(a.frame, NULL) FROM input('x.mp4') a")
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "'sigma' of filter 'gblur' expects a number" in err.message
+
+
+def test_arithmetic_scalar_argument_is_folded() -> None:
+    g = _lower("SELECT gblur(a.frame, 1 + 2) FROM input('x.mp4') a")
+    assert g.nodes["n1"].args["sigma"] == 3
 
 
 def test_malformed_numeric_literal_is_a_typed_rejection() -> None:
@@ -7172,7 +7177,7 @@ def test_concatenating_a_number_is_rejected_rather_than_coerced() -> None:
     err = _reject(_tag_query("'ch' || t.channels AS title"))
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'||' joins text" in err.message
-    assert "quote the number" in (err.hint or "")
+    assert "cast the number with ::text" in (err.hint or "")
 
 
 def test_case_results_must_share_one_type() -> None:
@@ -7242,3 +7247,151 @@ def test_a_table_query_prints_what_a_tag_would_say() -> None:
         [2, "fre", "A (fra)"],
         [3, None, None],
     ]
+
+
+# ---------------------------------------------------------------------------
+# compile-time arithmetic, ::text and <input>.duration
+# ---------------------------------------------------------------------------
+
+
+def _values(columns: str, probes: dict[str, ProbeResult | None] | None = None) -> list[list[object]]:
+    """A table query's rows, so a computed value can be read back directly."""
+    sql = f"SELECT {columns} FROM input('f.mkv') f, unnest(f.audio) t"
+    sinks = lower_table(resolve(parse(sql)), probes or _row_probes())
+    return [list(row) for row in sinks[0].result.rows]
+
+
+def _duration_probes(duration: float | None) -> dict[str, ProbeResult | None]:
+    return {"f": ProbeResult(streams=list(_ROW_TRACKS), duration=duration)}
+
+
+def _trim(where: str, probes: dict[str, ProbeResult | None]) -> object:
+    g = _lower(f"SELECT f.video[1] FROM input('f.mkv') f WHERE {where}", probes)
+    return g.input_trims["f"]
+
+
+def test_int_division_truncates_the_way_postgres_does() -> None:
+    assert _values("t.channels / 4 AS q") == [[0], [1], [0]]
+
+
+def test_int_division_truncates_toward_zero_not_down() -> None:
+    assert _values("(0 - t.channels) / 4 AS q") == [[0], [-1], [0]]
+
+
+def test_a_float_operand_makes_the_whole_result_a_float() -> None:
+    assert _values("t.channels / 4.0 AS q") == [[0.5], [1.5], [0.5]]
+
+
+def test_int_arithmetic_stays_an_int() -> None:
+    assert _values("t.channels * 2 + 1 AS q") == [[5], [13], [5]]
+
+
+def test_precedence_is_the_parsers() -> None:
+    assert _values("1 + 2 * 3 AS a, (1 + 2) * 3 AS b")[0] == [7, 9]
+
+
+def test_arithmetic_composes_with_a_comparison() -> None:
+    g = _lower(_row_query(where="t.channels / 2 = 3"), _row_probes())
+    assert _refs(g) == ["src:f:a:1"]
+
+
+def test_arithmetic_composes_with_between() -> None:
+    g = _lower(_row_query(where="t.channels + 1 BETWEEN 2 AND 3 + 1"), _row_probes())
+    assert _refs(g) == ["src:f:a:0", "src:f:a:2"]
+
+
+def test_arithmetic_on_null_propagates_null() -> None:
+    assert _values("t.bitrate + 1 AS q") == [[None], [None], [None]]
+
+
+def test_division_by_a_known_zero_is_a_typed_rejection() -> None:
+    err = _reject_lower(_tag_query("t.channels / 0 AS title"), _row_probes())
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "division by zero" in err.message
+
+
+def test_a_float_result_prints_its_shortest_roundtrip_form() -> None:
+    g = _lower(_tag_query("t.channels * 1.5 AS title"), _row_probes())
+    assert [o.metadata["title"] for o in g.outputs] == ["3.0", "9.0", "3.0"]
+
+
+def test_cast_to_text_bridges_a_number_into_concatenation() -> None:
+    g = _lower(_tag_query("'ch' || t.channels::text AS title"), _row_probes())
+    assert [o.metadata["title"] for o in g.outputs] == ["ch2", "ch6", "ch2"]
+
+
+def test_the_cast_function_spelling_is_the_same_cast() -> None:
+    assert _values("CAST(t.channels AS text) AS q") == [["2"], ["6"], ["2"]]
+
+
+def test_casting_null_stays_null() -> None:
+    assert _values("t.bitrate::text AS q") == [[None], [None], [None]]
+
+
+def test_duration_seeks_the_input_from_an_expression() -> None:
+    assert _trim("f.t <= f.duration - 0.5", _duration_probes(12.0)) == (None, 11.5)
+
+
+def test_a_bare_duration_is_a_trim_bound_of_its_own() -> None:
+    assert _trim("f.t <= f.duration", _duration_probes(12.0)) == (None, 12.0)
+
+
+def test_an_unprobed_duration_is_a_rejection_naming_the_field() -> None:
+    with pytest.raises(SqlmpegError) as excinfo:
+        _lower(
+            "SELECT f.video[1] FROM input('f.mkv') f WHERE f.t <= f.duration - 0.5",
+            _duration_probes(None),
+        )
+    err = excinfo.value
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+    assert "'f.duration' is unknown" in err.message
+
+
+def test_duration_is_a_value_not_a_stream() -> None:
+    err = _reject("SELECT f.duration FROM input('f.mkv') f")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.duration' is a number of seconds, not a stream" in err.message
+
+
+def test_a_computed_filter_argument_is_evaluated_per_row() -> None:
+    probes: dict[str, ProbeResult | None] = {
+        "f": ProbeResult(
+            streams=[
+                _track("video", 0, width=320, height=240),
+                _track("video", 1, width=640, height=480),
+            ]
+        )
+    }
+    g = _lower(
+        "SELECT scale(t.track, t.width / 2, -2) "
+        "FROM input('f.mkv') f, unnest(f.video) t",
+        probes,
+    )
+    assert [n.args["width"] for n in g.nodes.values() if n.filter == "scale"] == [160, 320]
+
+
+def test_a_computed_named_argument_is_evaluated_per_row() -> None:
+    probes: dict[str, ProbeResult | None] = {
+        "f": ProbeResult(
+            streams=[
+                _track("video", 0, width=320, height=240),
+                _track("video", 1, width=640, height=480),
+            ]
+        )
+    }
+    g = _lower(
+        "SELECT scale(t.track, width => t.width / 4, height => -2) "
+        "FROM input('f.mkv') f, unnest(f.video) t",
+        probes,
+    )
+    assert [n.args["width"] for n in g.nodes.values() if n.filter == "scale"] == [80, 160]
+
+
+def test_a_computed_argument_still_meets_the_option_table() -> None:
+    err = _reject_lower(
+        "SELECT gblur(t.track, t.language || 'x') "
+        "FROM input('f.mkv') f, unnest(f.video) t",
+        {"f": ProbeResult(streams=[_track("video", 0, width=320)])},
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "'sigma' of filter 'gblur' expects a number" in err.message

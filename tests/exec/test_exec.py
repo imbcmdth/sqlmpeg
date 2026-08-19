@@ -1778,3 +1778,40 @@ def test_two_pass_runs_end_to_end_through_the_cli(tmp_path: Path) -> None:
     assert out_path.exists()
     assert Path(f"{_sql_path(out_path)}-0.log").exists()
     assert [s["codec_type"] for s in _ffprobe_streams(out_path)] == ["video", "audio"]
+
+
+# ---------------------------------------------------------------------------
+# compile-time arithmetic: per-row filter arguments and duration trim bounds
+# ---------------------------------------------------------------------------
+
+
+def test_a_per_row_scale_argument_runs_against_the_real_probe(tmp_path: Path) -> None:
+    """Recipe 45: each rendition is scaled against its OWN probed width, so
+    the emitted number comes from the file rather than from the query."""
+    _require_fixture(_AV2)
+    out_path = tmp_path / "half.mp4"
+    query = (
+        "SELECT scale(t.track, t.width / 2, -2) "
+        f"FROM input('{_sql_path(_AV2)}') f, unnest(f.video) t"
+    )
+
+    source = _ffprobe_video_stream(_AV2)
+    _compile_and_run(query, out_path)
+
+    assert _ffprobe_video_stream(out_path)["width"] == int(source["width"]) // 2  # type: ignore[call-overload]
+
+
+def test_a_duration_trim_bound_shortens_the_output(tmp_path: Path) -> None:
+    """Recipe 46: `f.duration - 0.5` needs no known length, and the file that
+    comes out really is shorter than the one that went in."""
+    _require_fixture(_AV2)
+    out_path = tmp_path / "trimmed.mp4"
+    query = (
+        f"SELECT f.video[1], f.audio[1] FROM input('{_sql_path(_AV2)}') f "
+        "WHERE f.t <= f.duration - 0.5"
+    )
+
+    source_duration = _ffprobe_duration(_AV2)
+    _compile_and_run(query, out_path)
+
+    assert _ffprobe_duration(out_path) < source_duration

@@ -1844,7 +1844,9 @@ def test_a_join_with_no_on_is_the_comma_cross_join() -> None:
 
 def test_an_on_predicate_may_not_name_a_non_row_alias() -> None:
     err = _reject(_joined(on="ON a.language = f.t"))
-    assert err.code is ErrorCode.UNKNOWN_ALIAS
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 'f.t'" in err.message
+    assert "not a track-row table" in (err.hint or "")
 
 
 def test_unsupported_on_shapes_are_rejected() -> None:
@@ -2443,3 +2445,83 @@ def test_values_cte_rejects_duplicate_column_names() -> None:
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "duplicate column name" in err.message
+
+
+# ---------------------------------------------------------------------------
+# arithmetic, casts and <input>.duration in the compile-time value grammar
+# ---------------------------------------------------------------------------
+
+_ROWS = "FROM input('x.mp4') f, unnest(f.audio) t"
+
+
+def test_arithmetic_over_row_columns_types_as_a_number() -> None:
+    _resolve(f"SELECT t.track, t.channels * 2 AS chans {_ROWS}")
+
+
+def test_arithmetic_needs_numbers_on_both_sides() -> None:
+    err = _reject(f"SELECT t.track, t.language + 1 AS x {_ROWS}")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'+' needs numbers, but one side is text" in err.message
+
+
+def test_arithmetic_result_does_not_join_text() -> None:
+    err = _reject(f"SELECT t.track, 'n=' || t.channels + 1 AS x {_ROWS}")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'||' joins text" in err.message
+
+
+def test_cast_to_text_bridges_a_number_into_concatenation() -> None:
+    _resolve(f"SELECT t.track, 'n=' || t.channels::text AS title {_ROWS}")
+
+
+def test_cast_function_spelling_is_the_same_cast() -> None:
+    _resolve(f"SELECT t.track, 'n=' || CAST(t.channels AS text) AS title {_ROWS}")
+
+
+def test_only_text_is_a_supported_cast_target() -> None:
+    err = _reject(f"SELECT t.track, t.language::int + 1 AS x {_ROWS}")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cast to int is not supported" in err.message
+    assert "::text is the only cast" in (err.hint or "")
+
+
+def test_a_comparison_still_needs_one_type_across_a_cast() -> None:
+    err = _reject(f"SELECT t.track {_ROWS} WHERE t.channels::text = 2")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a comparison needs one type" in err.message
+
+
+def test_arithmetic_is_allowed_in_a_row_between_bound() -> None:
+    _resolve(f"SELECT t.track {_ROWS} WHERE t.channels BETWEEN 1 AND 4 * 2")
+
+
+def test_a_trim_bound_may_be_an_expression_over_duration() -> None:
+    _resolve("SELECT f.video[1] FROM input('x.mp4') f WHERE f.t <= f.duration - 0.5")
+
+
+def test_a_bare_duration_is_a_legal_trim_bound() -> None:
+    _resolve("SELECT f.video[1] FROM input('x.mp4') f WHERE f.t <= f.duration")
+
+
+def test_a_text_trim_bound_is_still_rejected() -> None:
+    err = _reject("SELECT f.video[1] FROM input('x.mp4') f WHERE f.t <= 'ten'")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "time bounds must be numeric literals" in err.message
+
+
+def test_a_trim_bound_cannot_read_a_track_row_column() -> None:
+    err = _reject(f"SELECT t.track {_ROWS} WHERE f.t <= t.channels")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot mix track-row columns" in err.message
+
+
+def test_a_row_column_the_schema_never_had_is_still_unknown() -> None:
+    err = _reject(f"SELECT t.track, t.nope * 2 AS x {_ROWS}")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 't.nope'" in err.message
+
+
+def test_only_duration_is_readable_off_an_input_alias() -> None:
+    err = _reject("SELECT f.video[1] FROM input('x.mp4') f WHERE f.t <= f.width - 1")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 'f.width'" in err.message

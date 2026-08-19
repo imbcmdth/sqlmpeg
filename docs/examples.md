@@ -925,8 +925,8 @@ FROM input('tests/fixtures/av2.mp4') f, unnest(f.video) t
 
 ```
 $ sqlmpeg compile -f query.sql -o half.mp4
-ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:v:0]scale=width=160:height=-2[out0]' \
-  -map '[out0]' half.mp4
+ffmpeg -i tests/fixtures/av2.mp4 -filter_complex \
+  '[0:v:0]scale=width=160:height=-2[out0]' -map '[out0]' half.mp4
 ```
 
 ## 46. Keep everything but the end
@@ -942,5 +942,5 @@ WHERE f.t <= f.duration - 0.5
 ```
 $ sqlmpeg compile -f query.sql -o trimmed.mp4
 ffmpeg -to 1.5 -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy \
-  trimmed.mp4
+  -metadata:s:1 language=eng trimmed.mp4
 ```

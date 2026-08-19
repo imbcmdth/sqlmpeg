@@ -176,6 +176,11 @@ _DIALECT_TAIL = """\
   it, e.g. `'mov_text'` to carry a `.vtt` track into an `.mp4` container.
 - `<alias>.t` is time in seconds. It is legal ONLY inside the `WHERE` form
   below; it is not a stream and cannot appear in the SELECT list.
+- `<alias>.duration` is the probed container length in seconds, on an
+  `input()` alias only. It is a VALUE, not a stream: it belongs in a
+  compile-time expression (`WHERE f.t <= f.duration - 60`), never in the
+  SELECT list on its own. An input this compile could not probe, or a
+  container that declares no duration, makes it a typed rejection.
 - There are no other columns on an `input()` or generated-source alias --
   `unnest(...)` row tables have a column model of their own (see Track rows
   below).
@@ -210,6 +215,15 @@ _DIALECT_TAIL = """\
   rows (multi-key, Postgres `NULLS FIRST`/`LAST`) -- the one carve-out to
   the No streaming equivalent rule below; frames themselves still never
   sort. With no `ORDER BY`, rows keep the file's own track order.
+- Wherever one of those predicates takes a value, the value may be a
+  compile-time EXPRESSION over row columns, `<input>.duration` and literals:
+  `+ - * /` (Postgres typing -- int/int truncates, any float operand gives a
+  float; dividing by a known zero is rejected), `CASE`, `||` (text only), and
+  `::text` / `CAST(x AS text)` to spell a number for `||`. NULL propagates.
+  An aliased expression column is a metadata TAG on that row's tracks, the
+  alias being the key: `SELECT t.track, 'Audio (' || t.language || ')' AS
+  title`. Same grammar in a filter option over a row table, evaluated per
+  row: `SELECT scale(t.track, t.width / 2, -2)`.
 - `unnest(...) a JOIN unnest(...) b ON <predicate>` matches ROWS between two
   unnest tables: `INNER JOIN`, `LEFT [OUTER] JOIN`, `FULL OUTER JOIN` (a
   bare `FULL JOIN` means the same thing), each requiring its own `ON`.
@@ -327,9 +341,11 @@ _DIALECT_TAIL = """\
 ### Time selection
 - The supported predicates are `WHERE <alias>.t BETWEEN <start> AND <end>`,
   `<alias>.t >= <start>` (open-ended, no upper bound), and `<alias>.t <= <end>`
-  (open-ended, no lower bound), all in seconds. Bounds are plain numeric
-  literals. Either operand order works -- `<alias>.t >= 120` and
-  `120 <= <alias>.t` are the exact same predicate, not an approximation.
+  (open-ended, no lower bound), all in seconds. A bound is a number: a plain
+  numeric literal, or compile-time arithmetic over `<alias>.duration` and
+  literals (`WHERE f.t <= f.duration - 60`). Either operand order works --
+  `<alias>.t >= 120` and `120 <= <alias>.t` are the exact same predicate, not
+  an approximation.
 - At most one lower bound and one upper bound per alias per `SELECT`, from any
   combination of the forms above -- `t >= 1 AND t <= 2` means exactly what
   `t BETWEEN 1 AND 2` means. Join different aliases with `AND`:
@@ -337,8 +353,9 @@ _DIALECT_TAIL = """\
   for one alias (two lower bounds, a BETWEEN plus an overlapping `>=`, ...) is
   rejected, same as writing `BETWEEN` twice.
 - No `OR`, no `NOT BETWEEN`, no strict `<`/`>` (seeks are time-based, and a
-  strict bound has no frame-level meaning -- use `>=`/`<=`), no `=`, no
-  expressions as bounds. A window with both bounds present where the start is
+  strict bound has no frame-level meaning -- use `>=`/`<=`), no `=`, and no
+  track-row column in a bound (a seek is a property of the input, not of a
+  row). A window with both bounds present where the start is
   not strictly before the end is a compile-time `UNSUPPORTED_SQL`, not an
   ffmpeg runtime error.
 - On an `input()` alias, the window becomes an INPUT seek (`-ss <start>`
