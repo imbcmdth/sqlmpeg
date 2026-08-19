@@ -10,9 +10,10 @@ one verb, uniform across all the query shapes here.
 
 HERMETIC: the registry comes from ``tests/conftest.py``'s snapshot shim
 (autouse outside the ``exec`` tier); ``probe_path`` is stubbed here with a
-rich synthetic ``ProbeResult`` (one video row, one audio row) carrying the
-language/codec/channel_layout/resolution metadata the track-row queries
-filter on, so those queries compile without touching a real file.
+rich synthetic ``ProbeResult`` (one video row, one audio row, one subtitle
+row) carrying the language/codec/channel_layout/resolution metadata the
+track-row queries filter on, so those queries compile without touching a
+real file.
 """
 
 from __future__ import annotations
@@ -47,6 +48,18 @@ _DUMMY_VALUES = {
     "codec": "aac",
     "width": "1920",
     "height": "1080",
+    "start": "5",
+    "end": "60",
+    "factor": "2",
+    "first": "one.mp4",
+    "music": "music.m4a",
+    "voice": "voiceover.wav",
+    "subs": "subs.en.vtt",
+    "cut": "120",
+    "high": "1080p.mp4",
+    "mid": "720p.mp4",
+    "low": "480p.mp4",
+    "insert": "promo.mp4",
 }
 
 
@@ -80,7 +93,17 @@ def _synthetic_probe(monkeypatch: pytest.MonkeyPatch) -> None:
         channels=2,
         channel_layout="stereo",
     )
-    result = ProbeResult(streams=[video, audio])
+    subtitle = StreamMeta(
+        type="subtitle",
+        index=0,
+        metadata={"language": "eng"},
+        width=None,
+        height=None,
+        fps=None,
+        sample_rate=None,
+        codec="srt",
+    )
+    result = ProbeResult(streams=[video, audio, subtitle])
     monkeypatch.setattr(compiler, "probe_path", lambda path: result)
 
 
