@@ -385,11 +385,12 @@ ffmpeg flags with timeline support take it; asking on one that does not is
 `sqlmpeg.*` macro (see above).
 
 A handful of names are exceptions to "one stream in, one filter, one call":
-- `amix`, `hstack`, `vstack` take ANY NUMBER of same-type stream arguments
-  (two or more), all positional, no named options before them: `amix(a, b,
-  c)` mixes three audio streams. The count sqlmpeg passes to ffmpeg is
-  however many streams you wrote; give `inputs => <n>` explicitly only if
-  you need to override that.
+- `amix`, `hstack`, `vstack`, `amerge`, `join` take ANY NUMBER of same-type
+  stream arguments (two or more), all positional, no named options before
+  them: `amix(a, b, c)` mixes three audio streams. The count sqlmpeg passes
+  to ffmpeg is however many streams you wrote; give `inputs => <n>`
+  explicitly only if you need to override that. `interleave`/`ainterleave`
+  are the same shape, but their count option is `nb_inputs`, not `inputs`.
 - `ffmpeg.channelsplit(audio)`, `ffmpeg.acrossover(audio)`, and
   `ffmpeg.extractplanes(video)` are the one exception to "namespaced options
   are all named": each RETURNS AN ARRAY (one stream per channel, per
@@ -470,6 +471,10 @@ stream copy.
 - `movflags` (str, container) -- Raw -movflags value, e.g. '+faststart+frag_keyframe'. Conflicts with faststart.
 - `chapters` (str, container) -- Write chapters from a VALUES CTE (bare name, not quoted): WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro'), ...) ... WITH (chapters marks). Conflicts with chapters_from.
 - `chapters_from` (str, container) -- Copy chapters through from an input() alias (bare name, not quoted), e.g. chapters_from f. Conflicts with chapters.
+- `title` (str, container) -- Container-level title tag, e.g. 'Director Cut'.
+- `comment` (str, container) -- Container-level comment tag.
+- `metadata_from` (str, container) -- Copy an input()'s global tags through (bare name, not quoted), e.g. metadata_from f. Conflicts with strip_metadata.
+- `strip_metadata` (bool, container) -- Drop the tags the muxer would otherwise copy implicitly (sqlmpeg's own per-stream tags still apply). Conflicts with metadata_from.
 
 An option name outside this list is `UNKNOWN_SINK_OPTION`; a value whose shape does not match the option's type is `SINK_OPTION_TYPE` -- both are typed, anchored rejections with repair guidance below (see Repair loop).
 

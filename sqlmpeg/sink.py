@@ -265,6 +265,48 @@ SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         flag="-map_chapters",
         per_stream=False,
     ),
+    "title": SinkOptionSpec(
+        name="title",
+        scope="container",
+        type="str",
+        doc="Container-level title tag, e.g. 'Director Cut'.",
+        flag="-metadata",
+        per_stream=False,
+        value_template="title={v}",
+    ),
+    "comment": SinkOptionSpec(
+        name="comment",
+        scope="container",
+        type="str",
+        doc="Container-level comment tag.",
+        flag="-metadata",
+        per_stream=False,
+        value_template="comment={v}",
+    ),
+    # `metadata_from`'s value is a bare identifier (an input() alias), never a
+    # str/int/bool/num literal -- lower resolves it directly (bypassing
+    # `validate_option`) into `options["metadata_from"]`, the input index
+    # `-map_metadata` renders. Here only so it validates, docs, and hints like
+    # every other option.
+    "metadata_from": SinkOptionSpec(
+        name="metadata_from",
+        scope="container",
+        type="str",
+        doc="Copy an input()'s global tags through (bare name, not quoted), "
+        "e.g. metadata_from f. Conflicts with strip_metadata.",
+        flag="-map_metadata",
+        per_stream=False,
+    ),
+    "strip_metadata": SinkOptionSpec(
+        name="strip_metadata",
+        scope="container",
+        type="bool",
+        doc="Drop the tags the muxer would otherwise copy implicitly "
+        "(sqlmpeg's own per-stream tags still apply). Conflicts with metadata_from.",
+        flag="-map_metadata",
+        per_stream=False,
+        value_template="-1",
+    ),
 }
 
 

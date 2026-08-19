@@ -450,11 +450,12 @@ ffmpeg flags with timeline support take it; asking on one that does not is
 `sqlmpeg.*` macro (see above).
 
 A handful of names are exceptions to "one stream in, one filter, one call":
-- `amix`, `hstack`, `vstack` take ANY NUMBER of same-type stream arguments
-  (two or more), all positional, no named options before them: `amix(a, b,
-  c)` mixes three audio streams. The count sqlmpeg passes to ffmpeg is
-  however many streams you wrote; give `inputs => <n>` explicitly only if
-  you need to override that.
+- `amix`, `hstack`, `vstack`, `amerge`, `join` take ANY NUMBER of same-type
+  stream arguments (two or more), all positional, no named options before
+  them: `amix(a, b, c)` mixes three audio streams. The count sqlmpeg passes
+  to ffmpeg is however many streams you wrote; give `inputs => <n>`
+  explicitly only if you need to override that. `interleave`/`ainterleave`
+  are the same shape, but their count option is `nb_inputs`, not `inputs`.
 - `ffmpeg.channelsplit(audio)`, `ffmpeg.acrossover(audio)`, and
   `ffmpeg.extractplanes(video)` are the one exception to "namespaced options
   are all named": each RETURNS AN ARRAY (one stream per channel, per

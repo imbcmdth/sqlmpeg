@@ -180,6 +180,10 @@ OUTPUT_LABEL_PREFIX = "out"
 _SPLIT_FILTERS = frozenset({"split", "asplit"})
 _VALUE_ONLY_KEYS = frozenset({"expr"})
 
+# A tag column aliased `disposition` is reserved: it renders as
+# `-disposition:<i> <value>` instead of `-metadata:s:<i> disposition=<value>`.
+_DISPOSITION_KEY = "disposition"
+
 _TYPE_MARKERS: dict[StreamType, str] = {
     "video": "v",
     "audio": "a",
@@ -431,9 +435,12 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
 
     The SELECT list is authoritative: exactly one ``-map`` per
     :class:`OutputMap`, in order, with ``-c:<i> copy`` for passthrough streams
-    and ``-metadata:s:<i> k=v`` (keys sorted) for provenance metadata. Those
-    ``<i>`` are PER GROUP — ffmpeg restarts output stream numbering at each
-    file — so group 2's first map is ``-c:0``, not ``-c:<n>``.
+    and ``-metadata:s:<i> k=v`` (keys sorted) for provenance metadata, except
+    the reserved ``disposition`` key, which renders ``-disposition:<i> <v>``
+    instead (ffmpeg's own spec string, not a ``k=v`` pair) and always after
+    the other metadata. Those ``<i>`` are PER GROUP — ffmpeg restarts output
+    stream numbering at each file — so group 2's first map is ``-c:0``, not
+    ``-c:<n>``.
     ``-filter_complex`` is rendered once for the command, omitted when the
     graph is pure passthrough.
 
@@ -495,7 +502,11 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
             if mapping.copy and mapping.type not in copy_suppressed_scopes:
                 args += [f"-c:{index}", "copy"]
             for key in sorted(mapping.metadata):
+                if key == _DISPOSITION_KEY:
+                    continue
                 args += [f"-metadata:s:{index}", f"{key}={mapping.metadata[key]}"]
+            if _DISPOSITION_KEY in mapping.metadata:
+                args += [f"-disposition:{index}", mapping.metadata[_DISPOSITION_KEY]]
         args += _render_sink_options(group)
         args.append(path)
     return args

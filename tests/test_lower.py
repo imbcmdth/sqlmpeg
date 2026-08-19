@@ -2570,9 +2570,12 @@ Filters:
  .S. acrossover        A->N       Split audio into per-bands streams.
  ... aecho             A->A       Add echoing to the audio.
  ... amerge            N->A       Merge two or more audio streams into a single multi-channel stream.
+ ... join              N->A       Join multiple audio streams into multi-channel output.
  ..C amix              N->A       Audio mixing.
  .S. hstack            N->V       Stack video inputs horizontally.
  .S. vstack            N->V       Stack video inputs vertically.
+ ... interleave        N->V       Temporally interleave video inputs.
+ ... ainterleave       N->A       Temporally interleave audio inputs.
  ... channelsplit      A->N       Split audio into per-channel streams.
  ..C crop              V->V       Crop the input video.
  T.C feedback          VV->VV     Apply feedback video filter.
@@ -2628,6 +2631,38 @@ _HELP_FIXTURES: dict[str, str] = {
     "vstack": """(h|v)stack AVOptions:
    inputs            <int>        ..FV....... set number of inputs (from 2 to INT_MAX) (default 2)
    shortest          <boolean>    ..FV....... force termination when the shortest input terminates (default false)
+
+""",
+    "amerge": """amerge AVOptions:
+   inputs            <int>        ..F.A...... specify the number of inputs (from 1 to 64) (default 2)
+   layout_mode       <int>        ..F.A...... method used to determine the output channel layout (from 0 to 2) (default legacy)
+     legacy          0            ..F.A......
+     reset           1            ..F.A......
+     normal          2            ..F.A......
+
+""",
+    "join": """join AVOptions:
+   inputs            <int>        ..F.A...... Number of input streams. (from 1 to INT_MAX) (default 2)
+   channel_layout    <channel_layout> ..F.A...... Channel layout of the output stream. (default "stereo")
+   map               <string>     ..F.A...... A comma-separated list of channels maps.
+
+""",
+    "interleave": """interleave AVOptions:
+   nb_inputs         <int>        ..FV....... set number of inputs (from 1 to INT_MAX) (default 2)
+   n                 <int>        ..FV....... set number of inputs (from 1 to INT_MAX) (default 2)
+   duration          <int>        ..FV....... how to determine the end-of-stream (from 0 to 2) (default longest)
+     longest         0            ..FV....... Duration of longest input
+     shortest        1            ..FV....... Duration of shortest input
+     first           2            ..FV....... Duration of first input
+
+""",
+    "ainterleave": """ainterleave AVOptions:
+   nb_inputs         <int>        ..F.A...... set number of inputs (from 1 to INT_MAX) (default 2)
+   n                 <int>        ..F.A...... set number of inputs (from 1 to INT_MAX) (default 2)
+   duration          <int>        ..F.A...... how to determine the end-of-stream (from 0 to 2) (default longest)
+     longest         0            ..F.A...... Duration of longest input
+     shortest        1            ..F.A...... Duration of shortest input
+     first           2            ..F.A...... Duration of first input
 
 """,
     "gblur": """\
@@ -3766,11 +3801,11 @@ def test_a_namespaced_did_you_mean_stays_in_the_namespace(
 
 
 def test_the_scope_fence_applies_to_the_namespace_too(_registry: Registry) -> None:
-    """Three `->N` names are re-admitted through this namespace, and only
-    those three: `amerge` is dynamic-pad in exactly the same way and stays
-    fenced, as do multi-output, source and `split`-shaped names."""
+    """Three `->N` names are re-admitted through this namespace (array-
+    RETURNING), and a handful of `N->1` names through N_INPUT (amix, amerge,
+    ...); multi-output, source and `split`-shaped (`N` on the OUTPUT side,
+    admitted by neither table) names stay fenced."""
     for sql in (
-        "SELECT ffmpeg.amerge(a.audio[1]) FROM input('x.mp4') a",
         "SELECT ffmpeg.feedback(a.frame, a.frame) FROM input('x.mp4') a",
         "SELECT ffmpeg.testsrc(a.frame) FROM input('x.mp4') a",
         "SELECT ffmpeg.split(a.frame) FROM input('x.mp4') a",
@@ -4476,6 +4511,115 @@ def test_an_n_input_node_is_split_like_any_other(_registry: Registry) -> None:
         )
     )
     assert _filters(g) == ["gblur", "split", "hstack"]
+
+
+# ---------------------------------------------------------------------------
+# amerge / join / interleave / ainterleave join the N_INPUT table (plan 078)
+# ---------------------------------------------------------------------------
+#
+# Same rescue mechanism as amix/hstack/vstack, added second wave. amerge and
+# join count via `inputs`; interleave/ainterleave count via `nb_inputs` --
+# VERIFIED against a real ffmpeg 9.0.1 (`Registry.fenced_options`): `n` is
+# `nb_inputs`'s adjacent alias, so the registry's dedup rule keeps the longer
+# name, and `nb_inputs` is what a positional binds too.
+
+
+def test_amerge_is_callable_bare_and_counts_via_inputs(_registry: Registry) -> None:
+    g = _dyn("SELECT amerge(a.audio[1], a.audio[2]) FROM input('x.mp4') a", _registry)
+    node = g.nodes["n1"]
+    assert node.filter == "amerge"
+    assert node.inputs == ["src:a:a:0", "src:a:a:1"]
+    assert node.outputs == ["audio"]
+    assert node.args == {"inputs": 2}
+
+
+def test_join_is_a_reserved_keyword_so_it_needs_the_namespace(
+    _registry: Registry,
+) -> None:
+    """Unlike amerge, bare `join(...)` collides with the JOIN clause keyword
+    itself -- a PARSE_ERROR from sqlglot before lowering ever runs, not an
+    UNKNOWN_FUNCTION. `ffmpeg.join(...)` reaches it, same as any other
+    namespace-only collision."""
+    err = _reject_dyn(
+        "SELECT join(a.audio[1], a.audio[2]) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.PARSE_ERROR
+    g = _dyn(
+        "SELECT ffmpeg.join(a.audio[1], a.audio[2]) FROM input('x.mp4') a", _registry
+    )
+    node = g.nodes["n1"]
+    assert node.filter == "join"
+    assert node.args == {"inputs": 2}
+
+
+def test_interleave_and_ainterleave_count_via_nb_inputs(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT interleave(a.frame, b.frame) FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    node = g.nodes["n1"]
+    assert node.filter == "interleave"
+    assert node.outputs == ["video"]
+    assert node.args == {"nb_inputs": 2}
+
+    g = _dyn(
+        "SELECT ainterleave(a.audio[1], a.audio[2]) FROM input('x.mp4') a", _registry
+    )
+    node = g.nodes["n1"]
+    assert node.filter == "ainterleave"
+    assert node.outputs == ["audio"]
+    assert node.args == {"nb_inputs": 2}
+
+
+def test_interleaves_count_option_agrees_with_the_streams_supplied(
+    _registry: Registry,
+) -> None:
+    g = _dyn(
+        "SELECT interleave(a.frame, b.frame, c.frame, nb_inputs => 3) "
+        "FROM input('x.mp4') a, input('y.mp4') b, input('z.mp4') c",
+        _registry,
+    )
+    assert g.nodes["n1"].args == {"nb_inputs": 3}
+    err = _reject_dyn(
+        "SELECT interleave(a.frame, b.frame, c.frame) "
+        "FROM input('x.mp4') a, input('y.mp4') b, input('z.mp4') c",
+        _registry,
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "'nb_inputs' option says 2" in err.message
+
+
+def test_amerge_rejects_a_video_stream(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT amerge(a.audio[1], a.frame) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "its stream inputs are all audio" in err.message
+
+
+def test_interleave_rejects_an_audio_stream(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT interleave(a.frame, a.audio[1]) FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "its stream inputs are all video" in err.message
+
+
+def test_amerge_join_interleave_ainterleave_reachable_through_the_namespace(
+    _registry: Registry,
+) -> None:
+    for name in ("amerge", "join"):
+        g = _dyn(
+            f"SELECT ffmpeg.{name}(a.audio[1], a.audio[2]) FROM input('x.mp4') a",
+            _registry,
+        )
+        assert g.nodes["n1"].filter == name
+    g = _dyn(
+        "SELECT ffmpeg.interleave(a.frame, b.frame) "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        _registry,
+    )
+    assert g.nodes["n1"].filter == "interleave"
 
 
 # ---------------------------------------------------------------------------
@@ -6100,6 +6244,71 @@ def test_chapters_values_cte_rejects_an_unescapable_title() -> None:
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "cannot represent unescaped" in err.message
+
+
+# ---------------------------------------------------------------------------
+# title / comment / metadata_from / strip_metadata sink options
+# ---------------------------------------------------------------------------
+
+
+def test_title_and_comment_land_in_sink_options_verbatim() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (title 'Director Cut', comment 'ripped')"
+    )
+    assert g.sinks[0].options["title"] == "Director Cut"
+    assert g.sinks[0].options["comment"] == "ripped"
+
+
+def test_metadata_from_resolves_an_input_alias_to_its_index() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (metadata_from f)"
+    )
+    assert g.sinks[0].options["metadata_from"] == 0
+
+
+def test_metadata_from_names_the_second_inputs_index() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], g.audio[1] FROM input('film.mkv') f, "
+        "input('extra.mkv') g) TO 'out.mkv' WITH (metadata_from g)"
+    )
+    assert g.sinks[0].options["metadata_from"] == 1
+
+
+def test_metadata_from_must_name_a_real_input_alias() -> None:
+    err = _reject(
+        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (metadata_from nope)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "names an input() alias" in err.message
+
+
+def test_metadata_from_rejects_a_quoted_string() -> None:
+    err = _reject(
+        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (metadata_from 'f')"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "names an input() alias" in err.message
+
+
+def test_strip_metadata_lands_in_sink_options() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (strip_metadata true)"
+    )
+    assert g.sinks[0].options["strip_metadata"] is True
+
+
+def test_strip_metadata_and_metadata_from_together_are_rejected() -> None:
+    err = _reject(
+        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (strip_metadata true, metadata_from f)"
+    )
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert "both set" in err.message
 
 
 # ---------------------------------------------------------------------------

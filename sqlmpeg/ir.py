@@ -148,7 +148,9 @@ class Output:
     ref: FrameRef
     type: StreamType
     name: str | None  # SELECT ... AS name, else None
-    metadata: dict[str, str]  # provenance (e.g. {"language": "fra"}) -> -metadata:s:
+    # provenance/tags (e.g. {"language": "fra"}) -> -metadata:s:; the reserved
+    # "disposition" key renders as -disposition: instead (see emit.py).
+    metadata: dict[str, str]
 
     def to_dict(self) -> dict[str, object]:
         return {

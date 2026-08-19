@@ -170,14 +170,16 @@ compiles therefore depends on what that ffmpeg reports, and an empty registry
   elementwise like any other array. The table is
   consulted before the registry's verdict, since the registry has no entry to
   give; every other fenced name keeps its ``UNKNOWN_FUNCTION``.
-* Three ``N->1`` filters are re-admitted the mirror way (:data:`N_INPUT`):
-  ``amix``, ``hstack`` and ``vstack`` take a variable number of INPUT pads
-  fixed by their ``inputs`` option, so the pad fence excludes them too, yet
-  the count is statically knowable the moment that option is read.
-  Their leading stream arguments ARE the input pads and their `inputs` option
-  must agree with how many were supplied (``UDF_ARG_TYPE`` naming both
-  numbers when it does not). Unlike the array trio these are reachable BARE
-  as well as namespaced — no Postgres grammar claims their names.
+* Several ``N->1`` filters are re-admitted the mirror way (:data:`N_INPUT`):
+  ``amix``, ``hstack``, ``vstack``, ``amerge``, ``join``, ``interleave`` and
+  ``ainterleave`` take a variable number of INPUT pads fixed by one option
+  (``inputs`` for most, ``nb_inputs`` for interleave/ainterleave), so the pad
+  fence excludes them too, yet the count is statically knowable the moment
+  that option is read. Their leading stream arguments ARE the input pads and
+  the count option must agree with how many were supplied (``UDF_ARG_TYPE``
+  naming both numbers when it does not). Unlike the array trio these are
+  reachable BARE as well as namespaced — no Postgres grammar claims their
+  names.
 * ``sqlmpeg.<name>(...)`` is a THIRD namespace, resolved against
   :data:`sqlmpeg.macros.MACROS` and NEVER the registry -- macros work offline,
   with no ffmpeg on PATH at all. A macro owns its own fixed
@@ -622,18 +624,18 @@ _ARRAY_INPUT_HINT = (
 
 # fixed-count N-INPUT filters, the mirror image of ARRAY_RETURNING.
 #
-# Three ffmpeg filters take a number of INPUT pads fixed statically by one of
-# their options and produce exactly one output pad. Their `-filters` spec is
-# `N->A` / `N->V`, so the pad fence excludes all three -- yet the count is
+# Several ffmpeg filters take a number of INPUT pads fixed statically by one
+# of their options and produce exactly one output pad. Their `-filters` spec
+# is `N->A` / `N->V`, so the pad fence excludes them all -- yet the count is
 # knowable the moment the option is read, the same argument that re-admits the
 # array-returning trio.
 #
-# Re-admitted under BOTH spellings, bare and namespaced: unlike the array trio,
-# none of these three names collides with a Postgres special form.
+# Re-admitted under BOTH spellings, bare and namespaced: none of these names
+# collides with a Postgres special form.
 #
 # The mechanism generalizes to any `N->1` filter whose input count is one
-# option (`concat`'s `n`, `mix`, `interleave`, ...), but stays scoped to these
-# three until array-CONSUMING calls exist.
+# option (`concat`'s `n`, `mix`, ...), but stays scoped to the entries below
+# until array-CONSUMING calls exist.
 
 
 @dataclass(frozen=True)
@@ -669,6 +671,22 @@ N_INPUT: dict[str, _NInputFilter] = {
         option="inputs",
         fallback=2,
         emit_default=False,
+    ),
+    "amerge": _NInputFilter(
+        name="amerge", stream="audio", output="audio", option="inputs", fallback=2
+    ),
+    "join": _NInputFilter(
+        name="join", stream="audio", output="audio", option="inputs", fallback=2
+    ),
+    # interleave/ainterleave's count option is `nb_inputs`, not the shorter
+    # `n` alias: VERIFIED via `Registry.fenced_options` (ffmpeg 9.0.1) -- `n`
+    # is `nb_inputs`'s adjacent alias, and the dedup rule keeps the longer
+    # name (see registry.py's docstring).
+    "interleave": _NInputFilter(
+        name="interleave", stream="video", output="video", option="nb_inputs", fallback=2
+    ),
+    "ainterleave": _NInputFilter(
+        name="ainterleave", stream="audio", output="audio", option="nb_inputs", fallback=2
     ),
 }
 
@@ -1137,8 +1155,9 @@ def _check_sink_option_conflicts(
     """Reject two sink options that cannot both hold, once all are validated.
 
     ``faststart``/``movflags`` both set: -movflags either way, so one would
-    silently win over the other's spelling. ``codec_params`` with no
-    matching ``video_codec``: its rendered flag (see
+    silently win over the other's spelling. ``strip_metadata``/
+    ``metadata_from`` both set: -map_metadata either way, same problem.
+    ``codec_params`` with no matching ``video_codec``: its rendered flag (see
     ``sqlmpeg.sink.CODEC_PARAMS_FLAGS``) is derived FROM ``video_codec``, so
     it has nothing to derive from.
     """
@@ -1150,6 +1169,15 @@ def _check_sink_option_conflicts(
             fallback=path_node,
             hint="use 'faststart true' for the common case, or 'movflags' "
             "directly for anything else -- not both",
+        )
+    if "strip_metadata" in options and "metadata_from" in options:
+        raise _error(
+            ErrorCode.SINK_OPTION_TYPE,
+            "'strip_metadata' and 'metadata_from' both set -map_metadata",
+            option_nodes["metadata_from"],
+            fallback=path_node,
+            hint="'metadata_from' copies an input's global tags through; "
+            "'strip_metadata' drops them -- not both",
         )
     if "codec_params" in options:
         codec = options.get("video_codec")
@@ -1657,12 +1685,16 @@ class _Lowerer:
         option_nodes: dict[str, exp.Expr] = {}
         chapters_opt: RawSinkOption | None = None
         chapters_from_opt: RawSinkOption | None = None
+        metadata_from_opt: RawSinkOption | None = None
         for option in raw.options:
             if option.name == "chapters":
                 chapters_opt = option
                 continue
             if option.name == "chapters_from":
                 chapters_from_opt = option
+                continue
+            if option.name == "metadata_from":
+                metadata_from_opt = option
                 continue
             line, col = _pos(option.name_node, option.value, raw.path_node)
             options[option.name] = validate_sink_option(
@@ -1684,6 +1716,11 @@ class _Lowerer:
         elif chapters_from_opt is not None:
             options["chapters"] = self._lower_chapters_from(chapters_from_opt, raw.path_node)
             option_nodes["chapters"] = chapters_from_opt.value
+        if metadata_from_opt is not None:
+            options["metadata_from"] = self._lower_metadata_from(
+                metadata_from_opt, raw.path_node
+            )
+            option_nodes["metadata_from"] = metadata_from_opt.value
         _check_sink_option_conflicts(options, option_nodes, raw.path_node)
         return SinkUnit(
             outputs=_outputs(columns, self.tags), path=raw.path, options=options
@@ -1726,6 +1763,22 @@ class _Lowerer:
                 fallback=path_node,
                 hint="chapters_from copies an input's chapters through, e.g. "
                 "chapters_from f for FROM input(:'source') f",
+            )
+        return index
+
+    def _lower_metadata_from(self, option: RawSinkOption, path_node: exp.Expr) -> int:
+        """``metadata_from <alias>``: copy an existing input's own global tags."""
+        node = option.value
+        name = _bare_name(node)
+        index = self.graph.sources.get(name) if name is not None else None
+        if index is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'metadata_from' names an input() alias, got {_sink_describe(node)}",
+                node,
+                fallback=path_node,
+                hint="metadata_from copies an input's global tags through, e.g. "
+                "metadata_from f for FROM input(:'source') f",
             )
         return index
 

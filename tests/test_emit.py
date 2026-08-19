@@ -950,6 +950,60 @@ def test_build_ffmpeg_args_metadata_values_are_passed_raw() -> None:
     assert "title=12:30, take 'one'" in build_ffmpeg_args(e, "out.mp4")
 
 
+def test_disposition_renders_as_its_own_flag_not_metadata_s() -> None:
+    """`disposition` is a reserved tag key: it never joins the ordinary
+    `-metadata:s:<i> k=v` block, and its value is passed through verbatim
+    (ffmpeg's own disposition spec string), not a `key=value` pair."""
+    e = Emitted(
+        inputs=["a.mp4"],
+        filter_complex="",
+        groups=[
+            OutputGroup(
+                maps=[
+                    OutputMap(
+                        target="0:a:0",
+                        type="audio",
+                        copy=True,
+                        metadata={"language": "eng", "disposition": "default"},
+                    )
+                ]
+            )
+        ],
+    )
+    args = build_ffmpeg_args(e, "out.mp4")
+    assert args[args.index("-map") :] == [
+        "-map",
+        "0:a:0",
+        "-c:0",
+        "copy",
+        "-metadata:s:0",
+        "language=eng",
+        "-disposition:0",
+        "default",
+        "out.mp4",
+    ]
+    assert "-metadata:s:0" not in args[args.index("-disposition:0") :]
+
+
+def test_disposition_alone_omits_metadata_s_entirely() -> None:
+    e = Emitted(
+        inputs=["a.mp4"],
+        filter_complex="",
+        groups=[
+            OutputGroup(
+                maps=[
+                    OutputMap(
+                        target="0:a:0", type="audio", copy=True, metadata={"disposition": "0"}
+                    )
+                ]
+            )
+        ],
+    )
+    args = build_ffmpeg_args(e, "out.mp4")
+    assert "-metadata:s:0" not in args
+    assert args[args.index("-disposition:0") + 1] == "0"
+
+
 # ---------------------------------------------------------------------------
 # sink -- Graphs are hand-built with sink=_sink(...) here,
 # i.e. one `SinkUnit` / one `Emitted.groups` entry.
@@ -1161,6 +1215,44 @@ def test_sink_movflags_renders_its_raw_value() -> None:
         "+faststart+frag_keyframe",
         "out.mp4",
     ]
+
+
+def test_sink_title_and_comment_render_as_global_metadata_flags() -> None:
+    sink = _sink(path="out.mp4", options={"title": "Director's Cut", "comment": "ripped"})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-map") :] == [
+        "-map",
+        "0:v:0",
+        "-c:0",
+        "copy",
+        "-metadata",
+        "title=Director's Cut",
+        "-metadata",
+        "comment=ripped",
+        "out.mp4",
+    ]
+
+
+def test_sink_metadata_from_renders_map_metadata_with_the_input_index() -> None:
+    sink = _sink(path="out.mp4", options={"metadata_from": 0})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-map_metadata") :] == ["-map_metadata", "0", "out.mp4"]
+
+
+def test_sink_strip_metadata_renders_map_metadata_negative_one() -> None:
+    sink = _sink(path="out.mp4", options={"strip_metadata": True})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-map_metadata") :] == ["-map_metadata", "-1", "out.mp4"]
+
+
+def test_sink_strip_metadata_false_emits_nothing() -> None:
+    sink = _sink(path="out.mp4", options={"strip_metadata": False})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert "-map_metadata" not in args
 
 
 def test_sink_codec_params_derives_its_flag_from_video_codec() -> None:

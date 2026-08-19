@@ -46,11 +46,15 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "movflags": ("container", "str"),
     "chapters": ("container", "str"),
     "chapters_from": ("container", "str"),
+    "title": ("container", "str"),
+    "comment": ("container", "str"),
+    "metadata_from": ("container", "str"),
+    "strip_metadata": ("container", "bool"),
 }
 
 
-def test_table_has_exactly_twenty_five_entries() -> None:
-    assert len(SINK_OPTIONS) == 25
+def test_table_has_exactly_twenty_nine_entries() -> None:
+    assert len(SINK_OPTIONS) == 29
     assert set(SINK_OPTIONS) == set(_EXPECTED)
 
 
@@ -147,6 +151,22 @@ def test_codec_params_flags_cover_x264_x265_svtav1() -> None:
         "libx265": "x265",
         "libsvtav1": "svtav1",
     }
+
+
+def test_title_and_comment_render_as_global_metadata() -> None:
+    assert SINK_OPTIONS["title"].flag == "-metadata"
+    assert SINK_OPTIONS["title"].value_template == "title={v}"
+    assert SINK_OPTIONS["title"].per_stream is False
+    assert SINK_OPTIONS["comment"].flag == "-metadata"
+    assert SINK_OPTIONS["comment"].value_template == "comment={v}"
+    assert SINK_OPTIONS["comment"].per_stream is False
+
+
+def test_metadata_from_and_strip_metadata_share_the_map_metadata_flag() -> None:
+    assert SINK_OPTIONS["metadata_from"].flag == "-map_metadata"
+    assert SINK_OPTIONS["strip_metadata"].flag == "-map_metadata"
+    assert SINK_OPTIONS["strip_metadata"].value_template == "-1"
+    assert SINK_OPTIONS["strip_metadata"].type == "bool"
 
 
 def test_subtitle_codec_scope_and_flag() -> None:
@@ -249,6 +269,16 @@ def test_validate_option_happy_movflags() -> None:
 
 def test_validate_option_happy_max_size() -> None:
     assert validate_option("max_size", "10M") == "10M"
+
+
+def test_validate_option_happy_title_and_comment() -> None:
+    assert validate_option("title", "Director's Cut") == "Director's Cut"
+    assert validate_option("comment", "ripped") == "ripped"
+
+
+def test_validate_option_happy_strip_metadata() -> None:
+    assert validate_option("strip_metadata", True) is True
+    assert validate_option("strip_metadata", False) is False
 
 
 def test_validate_option_unknown_raises() -> None:

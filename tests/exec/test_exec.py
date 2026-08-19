@@ -162,6 +162,39 @@ def _ffprobe_chapters(path: Path) -> list[dict[str, object]]:
     return chapters
 
 
+def _ffprobe_audio_dispositions(path: Path) -> list[dict[str, object]]:
+    args = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream_disposition",
+        "-of",
+        "json",
+        str(path),
+    ]
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    streams: list[dict[str, object]] = data["streams"]
+    return streams
+
+
+def _ffprobe_format_tags(path: Path) -> dict[str, str]:
+    args = ["ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "json", str(path)]
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    tags: dict[str, str] = data["format"].get("tags", {})
+    return tags
+
+
 def _extract_frame(video: Path, t: float, out_png: Path) -> None:
     args = [
         "ffmpeg",
@@ -1550,3 +1583,85 @@ def test_chapters_from_copies_an_inputs_own_chapters_through(tmp_path: Path) -> 
 
     chapters = _ffprobe_chapters(out_path)
     assert [c["tags"]["title"] for c in chapters] == ["Intro", "Credits"]
+
+
+# ---------------------------------------------------------------------------
+# plan 078: disposition, metadata_from, amerge -- read back for real, not
+# just checked for the right command shape (that part is the cookbook's job).
+# ---------------------------------------------------------------------------
+
+
+def test_disposition_tag_column_flags_the_default_track(tmp_path: Path) -> None:
+    """Cookbook recipe 41's query, run for real: ffprobe's own disposition
+    block on the output proves `-disposition:<i>` actually reached the
+    muxer, not just that the printed command has the right shape."""
+    _require_fixture(_AV2)
+    out_path = tmp_path / "flagged.mka"
+    query = (
+        "SELECT t.track, "
+        "CASE WHEN t.language = 'eng' THEN 'default' ELSE '0' END AS disposition "
+        f"FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) t"
+    )
+
+    _compile_and_run(query, out_path)
+
+    dispositions = _ffprobe_audio_dispositions(out_path)
+    assert dispositions[0]["disposition"]["default"] == 1
+    assert dispositions[1]["disposition"]["default"] == 0
+
+
+def test_amerge_runs_and_produces_one_multichannel_stream(tmp_path: Path) -> None:
+    """`amerge` is fenced out of the registry's tables; N_INPUT is what makes
+    it callable at all (mirrors the amix exec test), and running it for real
+    proves the two mono tracks actually landed in one merged stream."""
+    _require_fixture(_AV2)
+    _require_fixture(_AV3)
+    out_path = tmp_path / "merged.mka"
+    query = (
+        f"SELECT amerge(a.audio[1], b.audio[1]) "
+        f"FROM input('{_sql_path(_AV2)}') a, input('{_sql_path(_AV3)}') b"
+    )
+
+    _compile_and_run(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert len(streams) == 1
+    assert streams[0]["codec_type"] == "audio"
+    assert streams[0]["channels"] == 2  # two mono `sine` tracks merged
+
+
+def test_metadata_from_copies_an_inputs_global_tags_through(tmp_path: Path) -> None:
+    """`metadata_from <alias>` round-trips a real input's container-level
+    tags onto the output via ffprobe's format tags, not just the compiled
+    command's shape (recipe 42, exec tier, only proves that offline)."""
+    _require_fixture(_AV)
+    tagged = tmp_path / "tagged.mkv"
+    tag_args = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(_AV),
+        "-c",
+        "copy",
+        "-metadata",
+        "genre=Test Genre",
+        str(tagged),
+    ]
+    result = subprocess.run(
+        tag_args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+
+    out_path = tmp_path / "copied.mkv"
+    query = (
+        "COPY (SELECT f.video[1], f.audio[1] "
+        f"FROM input('{_sql_path(tagged)}') f) "
+        f"TO '{_sql_path(out_path)}' WITH (metadata_from f);"
+    )
+
+    _run_sink_query(query, out_path)
+
+    # mkv's own convention uppercases tag keys (GENRE, not genre) -- lookup
+    # case-insensitively, since it's the VALUE round-tripping that's under test.
+    tags = {k.lower(): v for k, v in _ffprobe_format_tags(out_path).items()}
+    assert tags.get("genre") == "Test Genre"
