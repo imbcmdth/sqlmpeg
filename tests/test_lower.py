@@ -7768,3 +7768,238 @@ def test_a_computed_argument_still_meets_the_option_table() -> None:
     )
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "'sigma' of filter 'gblur' expects a number" in err.message
+
+
+# ---------------------------------------------------------------------------
+# array_agg + GROUP BY: the implicit aggregation, spelled out
+#
+# The contract is byte-identity, not resemblance: the explicit form reuses the
+# splat machinery, so the sugar and the spelling emit the same argv.
+# ---------------------------------------------------------------------------
+
+
+def _agg_argv(sql: str, probes: dict[str, ProbeResult | None]) -> list[str]:
+    return build_ffmpeg_args(emit(insert_splits(_lower(sql, probes))))
+
+
+def _agg_copy(select: str) -> str:
+    return f"COPY ({select}) TO 'out.mkv'"
+
+
+_AGG_SHAPES = [
+    # (sugar, explicit) -- one query written both ways
+    (
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t",
+        "SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t",
+    ),
+    (
+        "SELECT f.video, t.track FROM input('f.mkv') f, unnest(f.audio) t",
+        "SELECT f.video, array_agg(t.track) FROM input('f.mkv') f, "
+        "unnest(f.audio) t GROUP BY f.video",
+    ),
+    (
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.language = 'fra'",
+        "SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.language = 'fra'",
+    ),
+    (
+        "SELECT volume(t.track, 0.5) FROM input('f.mkv') f, unnest(f.audio) t",
+        "SELECT array_agg(volume(t.track, 0.5)) FROM input('f.mkv') f, "
+        "unnest(f.audio) t",
+    ),
+    (
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "ORDER BY t.channels DESC",
+        "SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t "
+        "ORDER BY t.channels DESC",
+    ),
+]
+
+
+@pytest.mark.parametrize("sugar,explicit", _AGG_SHAPES, ids=range(len(_AGG_SHAPES)))
+def test_the_explicit_aggregate_compiles_to_the_sugar_byte_for_byte(
+    sugar: str, explicit: str
+) -> None:
+    probes = _row_probes()
+    assert _agg_argv(_agg_copy(explicit), probes) == _agg_argv(_agg_copy(sugar), probes)
+
+
+def test_an_aggregate_without_a_group_by_is_one_group() -> None:
+    """Postgres's own rule: an aggregate and no GROUP BY is the whole set."""
+    g = _lower(
+        _agg_copy("SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t"),
+        _row_probes(),
+    )
+    assert len(g.outputs) == 3
+
+
+def test_a_grouped_scalar_tags_the_container_not_the_tracks() -> None:
+    probes = _row_probes()
+    sugar = _agg_copy(
+        "SELECT t.track, 'Set' AS album FROM input('f.mkv') f, unnest(f.audio) t"
+    )
+    explicit = _agg_copy(
+        "SELECT array_agg(t.track), 'Set' AS album FROM input('f.mkv') f, "
+        "unnest(f.audio) t GROUP BY f.video"
+    )
+    assert _lower(explicit, probes).sinks[0].tags == {"album": "Set"}
+    assert _lower(sugar, probes).sinks[0].tags == {}
+
+
+def test_the_group_key_itself_reads_as_a_container_tag() -> None:
+    probes = _row_probes(
+        _track("audio", 0, language="eng", codec="aac"),
+        _track("audio", 1, language="eng", codec="aac"),
+    )
+    g = _lower(
+        "COPY (SELECT array_agg(t.track), t.language AS title "
+        "FROM input('f.mkv') f, unnest(f.audio) t GROUP BY t.language) "
+        "TO (t.language || '.mka')",
+        probes,
+    )
+    assert g.sinks[0].tags == {"title": "eng"}
+    assert g.sinks[0].path == "eng.mka"
+
+
+def test_disposition_is_still_not_a_container_key_when_grouped() -> None:
+    err = _reject_lower(
+        _agg_copy(
+            "SELECT array_agg(t.track), 'default' AS disposition "
+            "FROM input('f.mkv') f, unnest(f.audio) t"
+        ),
+        _row_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'disposition' is a per-stream key" in err.message
+
+
+# -- grouping validity ------------------------------------------------------
+
+
+def test_an_ungrouped_row_scalar_is_rejected_beside_an_aggregate() -> None:
+    err = _reject(
+        _agg_copy(
+            "SELECT array_agg(t.track), t.language AS title "
+            "FROM input('f.mkv') f, unnest(f.audio) t"
+        )
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t.language' is neither aggregated nor a GROUP BY key" in err.message
+    assert "GROUP BY" in (err.hint or "")
+    assert "CTE" in (err.hint or "")
+
+
+def test_an_ungrouped_row_stream_is_rejected_beside_an_aggregate() -> None:
+    err = _reject(
+        _agg_copy(
+            "SELECT array_agg(t.track), u.track FROM input('f.mkv') f, "
+            "unnest(f.audio) t, unnest(f.video) u"
+        )
+    )
+    assert "'u.track' is neither aggregated nor a GROUP BY key" in err.message
+    assert "array_agg" in (err.hint or "")
+
+
+def test_a_row_star_is_rejected_in_a_grouped_branch() -> None:
+    err = _reject(
+        _agg_copy(
+            "SELECT array_agg(t.track), u.* FROM input('f.mkv') f, "
+            "unnest(f.audio) t, unnest(f.video) u"
+        )
+    )
+    assert "'u.*' is neither aggregated nor a GROUP BY key" in err.message
+
+
+def test_a_to_expression_may_only_read_the_group_keys() -> None:
+    err = _reject(
+        "COPY (SELECT array_agg(t.track) FROM input('f.mkv') f, "
+        "unnest(f.audio) t GROUP BY t.language) TO (t.codec || '.mka')"
+    )
+    assert "'t.codec' is neither aggregated nor a GROUP BY key" in err.message
+
+
+def test_grouping_by_a_row_column_needs_a_fan_out_destination() -> None:
+    err = _reject(
+        "COPY (SELECT array_agg(t.track) FROM input('f.mkv') f, "
+        "unnest(f.audio) t GROUP BY t.language) TO 'out.mka'"
+    )
+    assert "writes one file per group" in err.message
+    assert "TO (t.language" in (err.hint or "")
+
+
+def test_order_by_inside_array_agg_is_rejected() -> None:
+    err = _reject(
+        _agg_copy(
+            "SELECT array_agg(t.track ORDER BY t.index) FROM input('f.mkv') f, "
+            "unnest(f.audio) t"
+        )
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "ORDER BY inside array_agg() is not supported" in err.message
+
+
+def test_array_agg_outside_a_row_branch_is_rejected() -> None:
+    err = _reject(_agg_copy("SELECT array_agg(f.audio) FROM input('f.mkv') f"))
+    assert "array_agg" in err.message
+
+
+def test_array_agg_is_only_a_whole_select_column() -> None:
+    err = _reject(
+        _agg_copy(
+            "SELECT volume(array_agg(t.track), 0.5) FROM input('f.mkv') f, "
+            "unnest(f.audio) t"
+        )
+    )
+    assert "array_agg() is only supported as a whole SELECT column" in err.message
+
+
+@pytest.mark.parametrize("name", ["count", "sum"])
+def test_the_other_aggregates_keep_their_typed_rejection(name: str) -> None:
+    err = _reject(
+        _agg_copy(
+            f"SELECT array_agg(t.track), {name}(t.index) AS n "
+            "FROM input('f.mkv') f, unnest(f.audio) t"
+        )
+    )
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+    assert f"aggregate function {name}() has no streaming equivalent" in err.message
+    assert "array_agg" in (err.hint or "")
+
+
+_AGG_CONTEXTS = [
+    (
+        "a table query",
+        "SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t "
+        "GROUP BY f.video",
+    ),
+    (
+        "a UNION ALL branch",
+        "COPY (SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t "
+        "GROUP BY f.video UNION ALL SELECT g.audio[1] FROM input('g.mkv') g) "
+        "TO 'out.mka'",
+    ),
+    (
+        "a CTE body",
+        "COPY (WITH c AS (SELECT array_agg(t.track) AS track FROM input('f.mkv') f, "
+        "unnest(f.audio) t GROUP BY f.video) SELECT c.track FROM c) TO 'out.mka'",
+    ),
+    (
+        "a view body",
+        "CREATE VIEW v AS SELECT array_agg(t.track) AS track FROM input('f.mkv') f, "
+        "unnest(f.audio) t GROUP BY f.video; COPY (SELECT v.track FROM v) TO 'out.mka'",
+    ),
+]
+
+
+@pytest.mark.parametrize("where,sql", _AGG_CONTEXTS, ids=[c[0] for c in _AGG_CONTEXTS])
+def test_aggregation_is_a_media_copys_own_select(where: str, sql: str) -> None:
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert f"GROUP BY is not supported in {where}" in err.message
+
+
+def test_group_by_without_track_rows_keeps_the_streaming_fence() -> None:
+    err = _reject("COPY (SELECT f.audio[1] FROM input('f.mkv') f GROUP BY f.audio[1]) TO 'o.mka'")
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+    assert err.message == "GROUP BY has no streaming equivalent"

@@ -297,6 +297,8 @@ from sqlmpeg.parser import (
     _pos,
     _time_bounds,
     from_entries,
+    group_keys,
+    is_grouped,
     is_value_expr,
     kwarg_name,
     references_row_alias,
@@ -379,6 +381,10 @@ _ROW_METADATA_HINT = (
     "the only column that is a stream — and therefore the only one that can be "
     "an output — is <alias>.track. Give the column an alias to write it back as "
     "a TAG instead, e.g. SELECT t.track, t.language AS language"
+)
+_ARRAY_AGG_HINT = (
+    "array_agg takes one track-row stream expression, e.g. array_agg(t.track) "
+    "over FROM input('f.mkv') f, unnest(f.audio) t"
 )
 _CHAPTER_ROW_HINT = (
     "chapters(f) has no stream column at all — a chapter is not a track — "
@@ -1676,6 +1682,14 @@ class _Env:
     # into it, comma sources included (the comma between two unnests is the
     # bounded cross join), so all row aliases stay aligned by construction.
     relation: _RowRelation | None = None
+    # True for a branch that aggregates -- a GROUP BY, an `array_agg`, or both.
+    # Its scalar columns are group-constants (resolve's grouping check proves
+    # that), so they tag the CONTAINER rather than the tracks.
+    grouped: bool = False
+    # The GROUP BY keys that read a track-row column: the ones that actually
+    # partition the relation. An input-level or constant key has the same value
+    # for every tuple and leaves one group.
+    group_keys: tuple[exp.Expr, ...] = ()
 
 
 # ExpandCtx
@@ -1752,6 +1766,9 @@ class _Lowerer:
         self.fanout_row: dict[str, _TrackRow | None] = {}
         self.fanout_env: _Env | None = None
         self.fanout_count: int | None = None
+        # True when the pin partitioned by a GROUP BY key rather than by row,
+        # so a collision message names groups.
+        self.fanout_grouped = False
         # True for the whole duration of `run_table()`; `run()` never sets it.
         # Table mode changes exactly one thing about the stream machinery it
         # otherwise reuses verbatim: an outer join's NULL row is an empty cell
@@ -2248,6 +2265,12 @@ class _Lowerer:
 
     def _lower_branch(self, select: exp.Select, *, tags: _TagScope) -> list[_Column]:
         env = self._scope(select)
+        env.grouped = is_grouped(select)
+        env.group_keys = tuple(
+            key
+            for key in group_keys(select)
+            if references_row_alias(key, set(self.res.track_rows))
+        )
         # One WHERE clause, three languages. A conjunct over track-row columns
         # is decided HERE and never reaches ffmpeg; a subscript metadata
         # conjunct is a compile-time ASSERTION (nothing to filter -- the SELECT
@@ -2284,9 +2307,11 @@ class _Lowerer:
             # A tag column produces no stream, so it never becomes an output.
             # With track rows the tag is per-stream, without them it is a
             # container tag on the file being written -- which a CTE body
-            # ("rows" scope) has no way to name.
+            # ("rows" scope) has no way to name. A GROUPED branch has rows but
+            # no per-row scope: its scalars are group-constants, so they tag
+            # the group's container.
             if _is_tag_column(projection, env):
-                if env.relation is not None:
+                if env.relation is not None and not env.grouped:
                     self._collect_tag(projection, env, select)
                 elif tags == "sink":
                     self._collect_container_tag(projection, env, select)
@@ -2364,11 +2389,15 @@ class _Lowerer:
     def _collect_container_tag(
         self, projection: exp.Expr, env: _Env, select: exp.Select
     ) -> None:
-        """One tag column in a branch with no track rows: a CONTAINER tag.
+        """One tag column in a branch with no per-row scope: a CONTAINER tag.
 
-        The alias is the key, free-form, and the value is evaluated once over
-        no row. NULL CLEARS the key rather than leaving it alone: ffmpeg copies
-        an input's global tags by default, so the clear has to be written out.
+        The alias is the key, free-form, and the value is evaluated once. NULL
+        CLEARS the key rather than leaving it alone: ffmpeg copies an input's
+        global tags by default, so the clear has to be written out.
+
+        A GROUPED branch evaluates it over the group's first tuple: resolve's
+        grouping check proved the column is a GROUP BY key, so every tuple of
+        the group reads the same value and the first one stands for all.
         """
         key = _projection_name(projection)
         if key is None:  # defensive: `_is_tag_column` checked
@@ -2385,7 +2414,7 @@ class _Lowerer:
                 hint="a disposition rides on a track row, e.g. SELECT t.track, "
                 "'default' AS disposition FROM input('f.mkv') f, unnest(f.audio) t",
             )
-        value = self._eval_value(_unwrap(projection), env, {}, select)
+        value = self._eval_value(_unwrap(projection), env, _group_row(env), select)
         text = None if value is None else _tag_text(value)
         if key in self.container_tags and self.container_tags[key] != text:
             raise _error(
@@ -3118,17 +3147,24 @@ class _Lowerer:
             ]
 
     def _pin_fanout_row(self, env: _Env, select: exp.Select) -> None:
-        """Cut the branch's relation down to the ONE row this command writes.
+        """Cut the branch's relation down to the ONE group this command writes.
 
-        Everything downstream then works unchanged: a one-row relation makes
-        ``t.track`` a one-element array, tag columns read one row, and the trim
-        bounds and the path expression read `fanout_row`. `fanout_count` is
-        recorded so :func:`lower_commands` knows how many more runs to make.
+        Ungrouped, a group is a single row and this is the per-row pin it has
+        always been. Under a GROUP BY over row columns the relation partitions
+        into one group per distinct key, and the pinned group keeps ALL its
+        tuples: everything downstream then works unchanged, since ``t.track``
+        over the surviving tuples is exactly the array ``array_agg`` asked for,
+        and the trim bounds and the path expression read `fanout_row` -- the
+        group's first tuple, which stands for the whole group because the key
+        is what every tuple in it agrees on.
+
+        `fanout_count` is recorded so :func:`lower_commands` knows how many
+        more runs to make.
         """
         if self.fanout_expr is None or env.relation is None:
             return
-        tuples = env.relation.tuples
-        if not tuples:
+        groups = self._fanout_groups(env, select)
+        if not groups:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 "a TO expression writes one file per row, and no row survives "
@@ -3137,18 +3173,42 @@ class _Lowerer:
                 fallback=select,
                 hint="loosen the filter, or write a quoted TO path",
             )
-        if not 0 <= self.fanout_index < len(tuples):
+        if not 0 <= self.fanout_index < len(groups):
             raise _error(
                 ErrorCode.INTERNAL,
-                f"fan-out row {self.fanout_index} is outside the {len(tuples)} "
-                "surviving rows",
+                f"fan-out index {self.fanout_index} is outside the "
+                f"{len(groups)} files this query writes",
                 fallback=select,
                 hint="please report this query as a bug",
             )
-        self.fanout_count = len(tuples)
-        self.fanout_row = tuples[self.fanout_index]
+        group = groups[self.fanout_index]
+        self.fanout_count = len(groups)
+        self.fanout_grouped = bool(env.group_keys)
+        self.fanout_row = group[0]
         self.fanout_env = env
-        env.relation.tuples = [self.fanout_row]
+        env.relation.tuples = list(group)
+
+    def _fanout_groups(
+        self, env: _Env, select: exp.Select
+    ) -> list[list[dict[str, _TrackRow | None]]]:
+        """The relation's tuples partitioned into the files they write.
+
+        One group per distinct GROUP BY key, in FIRST-APPEARANCE order (the
+        dict's own insertion order), so the command sequence follows the row
+        order the query built. With no row-level key every tuple is its own
+        group, which is the ungrouped fan-out unchanged.
+        """
+        relation = env.relation
+        tuples = relation.tuples if relation is not None else []
+        if not env.group_keys:
+            return [[row] for row in tuples]
+        groups: dict[tuple[RowValue, ...], list[dict[str, _TrackRow | None]]] = {}
+        for row in tuples:
+            key = tuple(
+                self._eval_value(node, env, row, select) for node in env.group_keys
+            )
+            groups.setdefault(key, []).append(row)
+        return list(groups.values())
 
     def _row_binding_of(
         self, node: exp.Expr, env: _Env, select: exp.Select
@@ -3986,6 +4046,8 @@ class _Lowerer:
         if isinstance(node, exp.Bracket | exp.Column):
             alias, value = self._base_stream(node, env, select)
             return self._access(env, alias, value, node, select)
+        if isinstance(node, exp.ArrayAgg):
+            return self._lower_array_agg(node, env, select)
         if isinstance(node, exp.Cast):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -4021,6 +4083,37 @@ class _Lowerer:
             fallback=select,
             hint=_STREAM_HINT,
         )
+
+    def _lower_array_agg(
+        self, node: exp.ArrayAgg, env: _Env, select: exp.Select
+    ) -> _Value:
+        """``array_agg(<stream expression>)``: the explicit splat.
+
+        The argument lowers over the branch's surviving tuples exactly as it
+        would on its own -- ``t.track`` is already the N-element array of the
+        rows in row order (:meth:`_row_value`), and a filter call over it
+        already broadcasts elementwise -- so the aggregate is the identity on
+        the value, and the sugar and the spelled-out form emit the same bytes
+        by construction rather than by agreement.
+        """
+        inner = node.this
+        if not isinstance(inner, exp.Expr):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "array_agg() takes one stream expression",
+                node,
+                fallback=select,
+                hint=_ARRAY_AGG_HINT,
+            )
+        if env.relation is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "array_agg() aggregates track rows, and this query has none",
+                node,
+                fallback=select,
+                hint=_ARRAY_AGG_HINT,
+            )
+        return self._lower_expr(inner, env, select)
 
     # -- stream references -------------------------------------------------
 
@@ -6228,6 +6321,13 @@ def _tag_text(value: str | int | float) -> str:
     return value if isinstance(value, str) else str(value)
 
 
+def _group_row(env: _Env) -> dict[str, _TrackRow | None]:
+    """The tuple a grouped branch's group-constant values read, else no row."""
+    if not env.grouped or env.relation is None or not env.relation.tuples:
+        return {}
+    return env.relation.tuples[0]
+
+
 def _is_tag_column(projection: exp.Expr, env: _Env) -> bool:
     """True for a SELECT column that sets a metadata TAG rather than a stream.
 
@@ -6633,7 +6733,7 @@ def lower_commands(
                 _Lowerer(res, probes, registry, fanout_index=index).run()
                 for index in range(1, count)
             ]
-            _check_distinct_paths(graphs, res)
+            _check_distinct_paths(graphs, res, grouped=first.fanout_grouped)
         return graphs
     except SqlmpegError:
         raise
@@ -6647,8 +6747,23 @@ def lower_commands(
         ) from err
 
 
-def _check_distinct_paths(graphs: list[Graph], res: Resolved) -> None:
-    """No two fan-out commands may write the same file."""
+def _check_distinct_paths(
+    graphs: list[Graph], res: Resolved, *, grouped: bool = False
+) -> None:
+    """No two fan-out commands may write the same file.
+
+    Rows sharing a destination is the typo guard; GROUP BY is how a query ASKS
+    for them to share one, so the hint says so. Two distinct GROUPS colliding
+    is still a rejection -- the key told them apart, the name did not.
+    """
+    what = "groups" if grouped else "rows"
+    hint = (
+        "add a column that tells the groups apart to the TO expression"
+        if grouped
+        else "add a column that tells the rows apart, e.g. t.index::text, to "
+        "the TO expression, or GROUP BY the column they share to write one "
+        "file per group"
+    )
     seen: dict[str, int] = {}
     anchor = res.sinks[0].path_expr if res.sinks else None
     fallback = res.sinks[0].path_node if res.sinks else None
@@ -6659,11 +6774,10 @@ def _check_distinct_paths(graphs: list[Graph], res: Resolved) -> None:
         if path in seen:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"rows {seen[path] + 1} and {index + 1} both name '{path}'",
+                f"{what} {seen[path] + 1} and {index + 1} both name '{path}'",
                 anchor,
                 fallback=fallback,
-                hint="add a column that tells the rows apart, e.g. "
-                "t.index::text, to the TO expression",
+                hint=hint,
             )
         seen[path] = index
 

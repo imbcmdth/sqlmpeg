@@ -196,6 +196,8 @@ __all__ = [
     "Resolved",
     "from_entries",
     "from_items",
+    "group_keys",
+    "is_grouped",
     "is_value_expr",
     "kwarg_name",
     "parse",
@@ -413,6 +415,27 @@ _SUBSCRIPT_WHERE_HINT = (
     "a subscript metadata predicate compares <alias>.<type>[k].<column> against "
     "a literal: =, !=, <, <=, >, >=, BETWEEN, IS [NOT] NULL, joined with "
     "AND/OR/NOT"
+)
+_AGG_HINT = (
+    "array_agg(<track expression>) gathers a branch's track rows into one "
+    "file, e.g. SELECT array_agg(t.track) FROM input('f.mkv') f, "
+    "unnest(f.audio) t"
+)
+_ARRAY_AGG_PLACE_HINT = (
+    "array_agg(...) is a whole SELECT column: write array_agg(volume(t.track, "
+    "0.5)), not volume(array_agg(t.track), 0.5)"
+)
+_GROUP_STREAM_HINT = (
+    "a grouped query aggregates its streams: wrap it in array_agg(...), or "
+    "drop the GROUP BY and let the implicit aggregation do it"
+)
+_GROUP_VALUE_HINT = (
+    "add it to the GROUP BY to make it the group's key, or tag the tracks "
+    "inside a CTE and aggregate the CTE's streams outside it"
+)
+_GROUP_FANOUT_HINT = (
+    "one group is one file, so the destination has to name the group, "
+    "e.g. TO (t.language || '.mka')"
 )
 
 
@@ -1240,6 +1263,46 @@ def _has_unnest(select: exp.Select) -> bool:
     )
 
 
+def _projection_expr(projection: exp.Expr) -> exp.Expr:
+    """A SELECT column with its ``AS`` alias and parentheses peeled off."""
+    inner = projection.this if isinstance(projection, exp.Alias) else projection
+    return _unwrap_paren(inner) if isinstance(inner, exp.Expr) else projection
+
+
+def group_keys(select: exp.Select) -> list[exp.Expr]:
+    """The GROUP BY key expressions of a branch, empty when it has none."""
+    group = select.args.get("group")
+    if not isinstance(group, exp.Group):
+        return []
+    return [key for key in group.expressions if isinstance(key, exp.Expr)]
+
+
+def _array_aggs(select: exp.Select) -> list[exp.ArrayAgg]:
+    """Every ``array_agg(...)`` in the SELECT list, in written order."""
+    found: list[exp.ArrayAgg] = []
+    for projection in select.expressions:
+        if not isinstance(projection, exp.Expr):
+            continue
+        found += [sub for sub in projection.walk() if isinstance(sub, exp.ArrayAgg)]
+    return found
+
+
+def is_grouped(select: exp.Select) -> bool:
+    """True for a branch that aggregates: a GROUP BY, an array_agg, or both."""
+    return bool(group_keys(select)) or bool(_array_aggs(select))
+
+
+def _references_row(node: exp.Expr, scope: dict[str, str]) -> bool:
+    """True if `node` reads a column of a track-row alias bound in `scope`."""
+    for sub in node.walk():
+        if not isinstance(sub, exp.Column):
+            continue
+        table_node = sub.args.get("table")
+        if table_node is not None and scope.get(_ident_name(table_node)) == "row":
+            return True
+    return False
+
+
 def _is_chapters_call(item: exp.Expr) -> bool:
     """True for a bare ``chapters(...)`` FROM item, shape only (unvalidated)."""
     return (
@@ -1777,7 +1840,12 @@ class _Resolver:
             )
 
     def _resolve_query(
-        self, node: exp.Expr, *, table_mode: bool = False, path_expr: exp.Expr | None = None
+        self,
+        node: exp.Expr,
+        *,
+        table_mode: bool = False,
+        path_expr: exp.Expr | None = None,
+        context: str | None = None,
     ) -> tuple[QueryExpr, list[exp.Select]]:
         """Validate one whole query — a view body, a COPY's, or a bare SELECT.
 
@@ -1810,10 +1878,20 @@ class _Resolver:
                 fallback=query,
                 hint="give the concatenated query a quoted TO path",
             )
+        # Where aggregation is NOT available, and what to call the place.
+        no_aggregate = context
+        if no_aggregate is None and table_mode:
+            no_aggregate = "a table query"
+        if no_aggregate is None and len(branches) > 1:
+            no_aggregate = "a UNION ALL branch"
         visible = set(self.ctes)
         for branch in branches:
             self._validate_select(
-                branch, visible, table_mode=table_mode, path_expr=path_expr
+                branch,
+                visible,
+                table_mode=table_mode,
+                path_expr=path_expr,
+                no_aggregate=no_aggregate,
             )
         return query, branches
 
@@ -1926,7 +2004,7 @@ class _Resolver:
         # own WITH: the nested-WITH rejection is CTE-body-only
         # (`_resolve_ctes`) and branch-level (`_collect_branches`), and neither
         # fires on a statement's own top-level one.
-        query, _ = self._resolve_query(body)
+        query, _ = self._resolve_query(body, context="a view body")
         # Reserved a second time on purpose: the body's own WITH may have
         # claimed the name in between, and that collision has to be caught
         # before the binding below overwrites it.
@@ -2032,7 +2110,7 @@ class _Resolver:
             # A CTE only sees the CTEs defined before it (no forward refs).
             visible = set(self.ctes)
             for branch in union_branches(body):
-                self._validate_select(branch, visible)
+                self._validate_select(branch, visible, no_aggregate="a CTE body")
             self.ctes[name] = body
 
     def _add_values_cte(self, name: str, alias: exp.TableAlias, cte: exp.CTE) -> None:
@@ -2163,12 +2241,16 @@ class _Resolver:
         *,
         table_mode: bool = False,
         path_expr: exp.Expr | None = None,
+        no_aggregate: str | None = None,
     ) -> None:
-        # `ORDER BY` is admitted for TRACK-ROW queries and nowhere else. The
-        # carve-out is decided from the FROM clause alone, before any of it is
-        # validated, so a branch with no `unnest` keeps the
+        # `ORDER BY` and `GROUP BY` are admitted for TRACK-ROW queries and
+        # nowhere else. The carve-out is decided from the FROM clause alone,
+        # before any of it is validated, so a branch with no `unnest` keeps the
         # NO_STREAMING_EQUIVALENT fence byte for byte.
-        allowed = _SELECT_ALLOWED | {"order"} if _has_unnest(select) else _SELECT_ALLOWED
+        unnest = _has_unnest(select)
+        if unnest:
+            self._check_aggregate_context(select, no_aggregate)
+        allowed = _SELECT_ALLOWED | {"order", "group"} if unnest else _SELECT_ALLOWED
         _check_query_args(select, allowed, "SELECT")
 
         # The SELECT list IS the output stream list, so any number of
@@ -2178,12 +2260,17 @@ class _Resolver:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL, "SELECT has no output column", fallback=select
             )
+        aggregating = unnest and no_aggregate is None
         for projection in projections:
             # A star projection carries nothing but the star and its qualifier,
             # so there is no expression to check inside it -- and running the
             # generic walk would hit the star rejection it is exempt from.
             if star_qualifier(projection) is None:
-                self._check_expression(projection, select)
+                self._check_expression(
+                    projection,
+                    select,
+                    array_agg=_projection_expr(projection) if aggregating else None,
+                )
 
         where = select.args.get("where")
         if isinstance(where, exp.Where):
@@ -2200,6 +2287,120 @@ class _Resolver:
             self._check_order(order, scope, select)
         if path_expr is not None:
             self._check_path_expr(path_expr, scope, select)
+        if is_grouped(select):
+            self._check_grouping(select, scope, path_expr)
+
+    def _check_aggregate_context(self, select: exp.Select, where: str | None) -> None:
+        """Aggregation is a branch-local feature of one media COPY, v1.
+
+        Fires only for a branch that HAS track rows: without them the generic
+        ``GROUP BY has no streaming equivalent`` / ``aggregate function ...``
+        fences already say the right thing.
+        """
+        if where is None:
+            return
+        keys = group_keys(select)
+        if keys:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"GROUP BY is not supported in {where}",
+                keys[0],
+                fallback=select,
+                hint="aggregation belongs to a media COPY's own SELECT",
+            )
+        aggregates = _array_aggs(select)
+        if aggregates:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"array_agg() is not supported in {where}",
+                aggregates[0],
+                fallback=select,
+                hint="aggregation belongs to a media COPY's own SELECT",
+            )
+
+    # -- grouping validity ------------------------------------------------
+
+    def _check_grouping(
+        self, select: exp.Select, scope: dict[str, str], path_expr: exp.Expr | None
+    ) -> None:
+        """Postgres's rule: every column is aggregated, constant, or a key.
+
+        A grouped branch is one with a GROUP BY, an ``array_agg``, or both, and
+        what makes it decidable here is that only a TRACK-ROW column varies
+        within a group -- an input alias's streams and scalars are the same for
+        every row of the branch. So a row-referencing expression outside an
+        aggregate must match a GROUP BY key verbatim (sqlglot ``.sql()``
+        equality), and everything else passes.
+
+        Keys that read a row column partition the branch into one file per
+        group, which only a fan-out ``TO (<expression>)`` can write.
+        """
+        keys = group_keys(select)
+        key_texts = {key.sql() for key in keys}
+        for key in keys:
+            self._check_expression(key, select)
+            self._check_columns(key, scope, select)
+        for projection in select.expressions:
+            if not isinstance(projection, exp.Expr):
+                continue
+            qualifier = star_qualifier(projection)
+            if qualifier is None:
+                self._check_grouped_expr(
+                    _projection_expr(projection), scope, select, key_texts
+                )
+            elif scope.get(qualifier) == "row":
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{qualifier}.*' is neither aggregated nor a GROUP BY key",
+                    projection,
+                    fallback=select,
+                    hint=_GROUP_STREAM_HINT,
+                )
+        if path_expr is not None:
+            self._check_grouped_expr(path_expr, scope, select, key_texts)
+        row_keys = [key for key in keys if _references_row(key, scope)]
+        if not row_keys:
+            return
+        if path_expr is None or not _references_row(path_expr, scope):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "GROUP BY over a track-row column writes one file per group, "
+                "and this COPY names one destination",
+                row_keys[0],
+                fallback=select,
+                hint=_GROUP_FANOUT_HINT,
+            )
+
+    def _check_grouped_expr(
+        self,
+        node: exp.Expr,
+        scope: dict[str, str],
+        select: exp.Select,
+        key_texts: set[str],
+    ) -> None:
+        """One expression of a grouped branch, recursively."""
+        if node.sql() in key_texts or isinstance(node, exp.ArrayAgg):
+            return
+        if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star):
+            table_node = node.args.get("table")
+            alias = _ident_name(table_node) if table_node is not None else ""
+            if scope.get(alias) != "row":
+                return
+            name = _ident_name(node.this)
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{name}' is neither aggregated nor a GROUP BY key",
+                node,
+                fallback=select,
+                hint=_GROUP_STREAM_HINT
+                if name == ROW_STREAM_COLUMN
+                else _GROUP_VALUE_HINT,
+            )
+        for value in node.args.values():
+            items = value if isinstance(value, list) else [value]
+            for item in items:
+                if isinstance(item, exp.Expr):
+                    self._check_grouped_expr(item, scope, select, key_texts)
 
     def _check_path_expr(
         self, node: exp.Expr, scope: dict[str, str], select: exp.Select
@@ -2231,16 +2432,43 @@ class _Resolver:
         if is_value_expr(value):
             self._check_value_expr(value, scope, select)
 
-    def _check_expression(self, node: exp.Expr, select: exp.Select) -> None:
-        """Reject constructs no streaming filtergraph can express."""
+    def _check_expression(
+        self, node: exp.Expr, select: exp.Select, *, array_agg: exp.Expr | None = None
+    ) -> None:
+        """Reject constructs no streaming filtergraph can express.
+
+        ``array_agg`` names the one node exempt from the aggregate fence: the
+        whole SELECT column of a track-row branch, which lower collapses into
+        the same stream list the bare splat produces. Every other aggregate,
+        and every array_agg written anywhere else, still has no equivalent.
+        """
         for sub in node.walk():
-            if isinstance(sub, exp.AggFunc):
+            if isinstance(sub, exp.ArrayAgg):
+                if sub is not array_agg:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        "array_agg() is only supported as a whole SELECT column",
+                        sub,
+                        fallback=select,
+                        hint=_ARRAY_AGG_PLACE_HINT,
+                    )
+                if isinstance(sub.this, exp.Order):
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        "ORDER BY inside array_agg() is not supported",
+                        sub.this,
+                        fallback=select,
+                        hint="the aggregate keeps the branch's row order; sort "
+                        "the rows themselves with the query's own ORDER BY",
+                    )
+            elif isinstance(sub, exp.AggFunc):
                 raise _error(
                     ErrorCode.NO_STREAMING_EQUIVALENT,
                     f"aggregate function {sub.sql_name().lower()}() has no "
                     "streaming equivalent",
                     sub,
                     fallback=select,
+                    hint=_AGG_HINT,
                 )
             if isinstance(sub, exp.Window):
                 raise _error(

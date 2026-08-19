@@ -2081,14 +2081,8 @@ def test_order_by_a_non_row_column_is_rejected_even_in_a_row_query(key: str) -> 
 
 
 def test_the_other_streaming_fences_are_untouched_by_the_carve_out() -> None:
-    for clause, code in (
-        ("GROUP BY t.language", ErrorCode.NO_STREAMING_EQUIVALENT),
-        ("LIMIT 1", ErrorCode.NO_STREAMING_EQUIVALENT),
-    ):
-        err = _reject(
-            "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t " + clause
-        )
-        assert err.code is code
+    err = _reject("SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t LIMIT 1")
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
 
 
 # ---------------------------------------------------------------------------

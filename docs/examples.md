@@ -1107,8 +1107,8 @@ COPY (
 
 ```
 $ sqlmpeg compile -f query.sql
-ffmpeg -i tests/fixtures/av-2eng.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng -map \
-  0:a:1 -c:1 copy -metadata:s:1 language=eng -metadata title=eng eng.mka && ffmpeg -i \
-  tests/fixtures/av-2eng.mp4 -map 0:a:2 -c:0 copy -metadata:s:0 language=fra -metadata \
-  title=fra fra.mka
+ffmpeg -i tests/fixtures/av-2eng.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng \
+  -map 0:a:1 -c:1 copy -metadata:s:1 language=eng -metadata title=eng eng.mka && ffmpeg \
+  -i tests/fixtures/av-2eng.mp4 -map 0:a:2 -c:0 copy -metadata:s:0 language=fra \
+  -metadata title=fra fra.mka
 ```

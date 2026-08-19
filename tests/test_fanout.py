@@ -537,3 +537,147 @@ def test_extract_every_language_runs(
         assert isinstance(streams, list)
         assert len(streams) == 1
         assert streams[0]["tags"]["language"] == language
+
+
+# ---------------------------------------------------------------------------
+# the GROUPED fan-out: one command per GROUP, not per row
+# ---------------------------------------------------------------------------
+
+
+def _two_eng(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Three audio rows, two of them sharing a language: two groups."""
+    result = ProbeResult(
+        streams=[
+            _stream("audio", 0, "eng", codec="aac"),
+            _stream("audio", 1, "eng", codec="aac"),
+            _stream("audio", 2, "fra", codec="aac"),
+        ],
+        duration=10.0,
+    )
+    monkeypatch.setattr(compiler, "probe_path", lambda path: result)
+
+
+_GROUPED = (
+    f"COPY (SELECT array_agg(t.track), t.language AS title FROM input('{SRC}') f, "
+    "unnest(f.audio) t GROUP BY t.language) TO (t.language || '.mka')"
+)
+
+
+def test_a_group_writes_one_file_holding_all_its_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _two_eng(monkeypatch)
+    graphs = compile_commands(_GROUPED)
+    assert [g.sinks[0].path for g in graphs] == ["eng.mka", "fra.mka"]
+    assert [len(g.outputs) for g in graphs] == [2, 1]
+
+
+def test_the_group_key_tags_the_groups_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _two_eng(monkeypatch)
+    graphs = compile_commands(_GROUPED)
+    assert [g.sinks[0].tags for g in graphs] == [{"title": "eng"}, {"title": "fra"}]
+
+
+def test_groups_come_out_in_first_appearance_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = ProbeResult(
+        streams=[
+            _stream("audio", 0, "fra", codec="aac"),
+            _stream("audio", 1, "eng", codec="aac"),
+            _stream("audio", 2, "fra", codec="aac"),
+        ],
+        duration=10.0,
+    )
+    monkeypatch.setattr(compiler, "probe_path", lambda path: result)
+    assert [g.sinks[0].path for g in compile_commands(_GROUPED)] == ["fra.mka", "eng.mka"]
+
+
+def test_a_multi_key_group_by_partitions_on_the_tuple(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = ProbeResult(
+        streams=[
+            _stream("audio", 0, "eng", codec="aac"),
+            _stream("audio", 1, "eng", codec="ac3"),
+            _stream("audio", 2, "eng", codec="aac"),
+        ],
+        duration=10.0,
+    )
+    monkeypatch.setattr(compiler, "probe_path", lambda path: result)
+    sql = (
+        f"COPY (SELECT array_agg(t.track) FROM input('{SRC}') f, unnest(f.audio) t "
+        "GROUP BY t.language, t.codec) TO (t.language || '-' || t.codec || '.mka')"
+    )
+    graphs = compile_commands(sql)
+    assert [g.sinks[0].path for g in graphs] == ["eng-aac.mka", "eng-ac3.mka"]
+    assert [len(g.outputs) for g in graphs] == [2, 1]
+
+
+def test_two_groups_naming_one_file_are_rejected() -> None:
+    sql = (
+        f"COPY (SELECT array_agg(t.track) FROM input('{SRC}') f, unnest(f.audio) t "
+        "GROUP BY t.language) TO (t.codec || '.mka')"
+    )
+    err = _rejects(sql)
+    assert "'t.codec' is neither aggregated nor a GROUP BY key" in err.message
+
+
+def test_distinct_groups_colliding_on_one_path_are_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The key tells the groups apart; the name has to as well."""
+    result = ProbeResult(
+        streams=[
+            _stream("audio", 0, "eng", codec="aac"),
+            _stream("audio", 1, "fra", codec="aac"),
+        ],
+        duration=10.0,
+    )
+    monkeypatch.setattr(compiler, "probe_path", lambda path: result)
+    sql = (
+        f"COPY (SELECT array_agg(t.track) FROM input('{SRC}') f, unnest(f.audio) t "
+        "GROUP BY t.language, t.codec) TO (t.codec || '.mka')"
+    )
+    err = _rejects(sql)
+    assert "groups 1 and 2 both name 'aac.mka'" in err.message
+    assert "tells the groups apart" in (err.hint or "")
+
+
+def test_the_ungrouped_collision_now_points_at_group_by() -> None:
+    sql = (
+        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
+        "TO (t.codec || '.m4a')"
+    )
+    err = _rejects(sql)
+    assert "rows 1 and 2 both name 'aac.m4a'" in err.message
+    assert "GROUP BY the column they share" in (err.hint or "")
+
+
+@pytest.mark.exec
+def test_one_file_per_language_with_all_its_tracks_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fixtures: None
+) -> None:
+    """Recipe 55 executed: the eng file carries BOTH eng tracks, titled by key."""
+    monkeypatch.undo()
+    monkeypatch.chdir(tmp_path)
+    source = (FIXTURES_DIR / "av-2eng.mp4").as_posix()
+    sql = (
+        f"COPY (SELECT array_agg(t.track), t.language AS title FROM input('{source}') f, "
+        "unnest(f.audio) t GROUP BY t.language) TO (t.language || '.mka')"
+    )
+    assert cli.main(["run", sql, "-y"]) == 0
+    for name, count in (("eng.mka", 2), ("fra.mka", 1)):
+        written = tmp_path / name
+        assert written.exists()
+        streams = _probe_json(written)["streams"]
+        assert isinstance(streams, list)
+        assert len(streams) == count
+        assert all(stream["codec_type"] == "audio" for stream in streams)
+        container = _probe_json(written)["format"]
+        assert isinstance(container, dict)
+        tags = container["tags"]
+        assert isinstance(tags, dict)
+        assert tags["title"] == name.removesuffix(".mka")
