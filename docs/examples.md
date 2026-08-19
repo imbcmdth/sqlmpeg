@@ -979,3 +979,19 @@ ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng
   && ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:1 -c:0 copy -metadata:s:0 language=fra \
   fra.m4a
 ```
+
+## 49. Normalize loudness properly (two-pass)
+
+`sqlmpeg.loudnorm2` measures first and corrects second - the broadcast-compliant way. It compiles to a shell chain: pass 1 prints measurements, `sqlmpeg loudnorm2env` turns them into environment variables, and pass 2 splices them into its filter. (POSIX shells only; `run` does the substitution itself and works everywhere. This is the one command line the cookbook shows unwrapped - its quoting cannot be split.)
+
+```pgsql
+COPY (
+  SELECT sqlmpeg.loudnorm2(f.audio[1], I => -16, TP => -1.5, LRA => 11)
+  FROM input(:'source') f
+) TO :'dest' WITH (audio_codec 'aac')
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=out.m4a
+eval "$(ffmpeg -i film.mkv -filter_complex '[0:a:0]loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json[out0]' -map '[out0]' -f null - 2>&1 | sqlmpeg loudnorm2env)" && ffmpeg -i film.mkv -filter_complex '[0:a:0]loudnorm=I=-16:TP=-1.5:LRA=11:measured_I='"${SQLMPEG_LN_I}"':measured_TP='"${SQLMPEG_LN_TP}"':measured_LRA='"${SQLMPEG_LN_LRA}"':measured_thresh='"${SQLMPEG_LN_THRESH}"':offset='"${SQLMPEG_LN_OFFSET}"':linear=true[out0]' -map '[out0]' -c:0 aac out.m4a
+```

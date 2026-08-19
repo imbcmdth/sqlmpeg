@@ -1,4 +1,5 @@
-# RFC-013 — Two-pass loudnorm  (draft; NOT started)
+# RFC-013 — Two-pass loudnorm  (accepted 2026-08-19; runs after
+RFC-014 - third of the approved sequence)
 
 Maintainer-designed shape: keep it a compiled command, no orchestrator.
 A pipe cannot carry environment variables between pipeline siblings
