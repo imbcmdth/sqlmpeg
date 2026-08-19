@@ -1052,3 +1052,63 @@ ffmpeg -i tests/fixtures/tagged.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -m
 ```
 
 Reading needs the probe (the values live in the file), so this one is fixture-bound. The same columns work in table queries: `select f.title, f.artist, f.duration from input('movie.mp4') f` prints them.
+
+## 53. Tag the tracks and the container in one query
+
+Two levels, two scopes, visible in the query text: inside the `WITH`, rows are tracks, so the tag column titles each stream; outside it, the CTE's streams are just streams, so the tag column titles the container:
+
+```pgsql
+COPY (
+  WITH tagged AS (
+    SELECT a.track, 'Audio (' || a.language || ')' AS title
+    FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) a
+  )
+  SELECT g.video, tagged.track, 'Director Cut' AS title
+  FROM input('tests/fixtures/av2.mp4') g, tagged
+) TO 'out.mkv'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 \
+  language=eng -metadata:s:1 'title=Audio (eng)' -map 0:a:1 -c:2 copy -metadata:s:2 \
+  language=fra -metadata:s:2 'title=Audio (fra)' -metadata 'title=Director Cut' out.mkv
+```
+
+## 54. The implicit aggregate, written out
+
+A multi-row query writing one file is sugar: the destination is the GROUP BY key, row streams are gathered with `array_agg`. You can always say it explicitly - both forms compile to the same bytes:
+
+```pgsql
+COPY (
+  SELECT f.video, array_agg(a.track)
+  FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) a
+  GROUP BY f.video
+) TO 'out.mp4'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 \
+  language=eng -map 0:a:1 -c:2 copy -metadata:s:2 language=fra out.mp4
+```
+
+## 55. One file per language, all its tracks inside
+
+Explicit grouping unlocks what the plain fan-out rejects as a collision: rows that SHARE a destination. `GROUP BY` a row column, aggregate the tracks, and fan out over the key - the group key doubles as each file's title:
+
+```pgsql
+COPY (
+  SELECT array_agg(a.track), a.language AS title
+  FROM input('tests/fixtures/av-2eng.mp4') f, unnest(f.audio) a
+  GROUP BY a.language
+) TO (a.language || '.mka')
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av-2eng.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng -map \
+  0:a:1 -c:1 copy -metadata:s:1 language=eng -metadata title=eng eng.mka && ffmpeg -i \
+  tests/fixtures/av-2eng.mp4 -map 0:a:2 -c:0 copy -metadata:s:0 language=fra -metadata \
+  title=fra fra.mka
+```
