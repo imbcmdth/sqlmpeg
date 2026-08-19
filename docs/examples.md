@@ -18,7 +18,8 @@ COPY (
 
 ```
 $ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=film.mp4
-ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -preset:0 slow -c:1 aac -b:1 192k -movflags +faststart film.mp4
+ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -preset:0 slow -c:1 aac \
+  -b:1 192k -movflags +faststart film.mp4
 ```
 
 ## 2. Remux into another container without re-encoding
@@ -33,7 +34,8 @@ COPY (
 
 ```
 $ sqlmpeg compile -f query.sql
-ffmpeg -i tests/fixtures/avs.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 0:s:0 -metadata:s:2 language=eng -c:2 mov_text film.mp4
+ffmpeg -i tests/fixtures/avs.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 0:s:0 \
+  -metadata:s:2 language=eng -c:2 mov_text film.mp4
 ```
 
 ## 3. Extract the audio track to its own file
@@ -79,7 +81,8 @@ COPY (
 
 ```
 $ sqlmpeg compile -f query.sql -v source=clip.mp4 -v dest=cut.mp4
-ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 18 -c:1 aac cut.mp4
+ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 18 -c:1 aac \
+  cut.mp4
 ```
 
 ## 5. Resize to 1280 wide, or to half size
@@ -93,7 +96,8 @@ FROM input(:'source') f
 
 ```
 $ sqlmpeg compile -f query.sql -o small.mp4 -v source=film.mp4
-ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=1280:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy small.mp4
+ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=1280:height=-2[out0]' -map \
+  '[out0]' -map 0:a:0 -c:1 copy small.mp4
 ```
 
 Or express the width relative to the input - any string-typed option takes an ffmpeg expression - and let `-2` keep the aspect:
@@ -105,7 +109,8 @@ FROM input(:'source') f
 
 ```
 $ sqlmpeg compile -f query.sql -o half.mp4 -v source=film.mp4
-ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=iw/2:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy half.mp4
+ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=iw/2:height=-2[out0]' -map \
+  '[out0]' -map 0:a:0 -c:1 copy half.mp4
 ```
 
 ## 6. Rotate a phone video 90 degrees
@@ -119,7 +124,8 @@ FROM input(:'source') v
 
 ```
 $ sqlmpeg compile -f query.sql -o upright.mp4 -v source=phone.mp4
-ffmpeg -i phone.mp4 -filter_complex '[0:v:0]transpose=dir=clock[out0]' -map '[out0]' -map 0:a:0 -c:1 copy upright.mp4
+ffmpeg -i phone.mp4 -filter_complex '[0:v:0]transpose=dir=clock[out0]' -map '[out0]' \
+  -map 0:a:0 -c:1 copy upright.mp4
 ```
 
 ## 7. Sharpen a soft-looking video
@@ -133,7 +139,8 @@ FROM input(:'source') a
 
 ```
 $ sqlmpeg compile -f query.sql -v source=clip.mp4
-ffmpeg -i clip.mp4 -filter_complex '[0:v:0]unsharp=luma_msize_x=7:luma_amount=1.5[out0]' -map '[out0]' -map 0:a:0 -c:1 copy out.mp4
+ffmpeg -i clip.mp4 -filter_complex '[0:v:0]unsharp=luma_msize_x=7:luma_amount=1.5[out0]' \
+  -map '[out0]' -map 0:a:0 -c:1 copy out.mp4
 ```
 
 ## 8. Concatenate two clips
@@ -148,7 +155,9 @@ SELECT b.video[1], b.audio[1] FROM input(:'second') b
 
 ```
 $ sqlmpeg compile -f query.sql -o joined.mp4 -v first=part1.mp4 -v second=part2.mp4
-ffmpeg -i part1.mp4 -i part2.mp4 -filter_complex '[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[out0][out1]' -map '[out0]' -map '[out1]' joined.mp4
+ffmpeg -i part1.mp4 -i part2.mp4 -filter_complex \
+  '[0:v:0][0:a:0][1:v:0][1:a:0]concat=n=2:v=1:a=1[out0][out1]' -map '[out0]' -map \
+  '[out1]' joined.mp4
 ```
 
 And it scales to files you'd rather not count streams in: splat the whole audio array and the languages pair up positionally, English with English, French with French, tags surviving. (This one needs real files - a splat has to know how many tracks there are.)
@@ -161,7 +170,10 @@ SELECT b.frame, b.audio FROM input('tests/fixtures/av3.mp4') b
 
 ```
 $ sqlmpeg compile -f query.sql -o season.mkv
-ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex '[0:v:0][0:a:0][0:a:1][1:v:0][1:a:0][1:a:1]concat=n=2:v=1:a=2[out0][out1][out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra season.mkv
+ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex \
+  '[0:v:0][0:a:0][0:a:1][1:v:0][1:a:0][1:a:1]concat=n=2:v=1:a=2[out0][out1][out2]' -map \
+  '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 \
+  language=fra season.mkv
 ```
 
 ## 9. Watermark a video
@@ -175,7 +187,9 @@ FROM input(:'main') f, input(:'overlay', loop => true) logo
 
 ```
 $ sqlmpeg compile -f query.sql -o branded.mp4 -v main=film.mp4 -v overlay=watermark.png
-ffmpeg -i film.mp4 -loop 1 -i watermark.png -filter_complex '[0:v:0][1:v:0]overlay=x=(W-w)/2:y=(H-h)/2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy branded.mp4
+ffmpeg -i film.mp4 -loop 1 -i watermark.png -filter_complex \
+  '[0:v:0][1:v:0]overlay=x=(W-w)/2:y=(H-h)/2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy \
+  branded.mp4
 ```
 
 ## 10. Mux external subtitles in, or pull them back out
@@ -191,7 +205,8 @@ COPY (
 
 ```
 $ sqlmpeg compile -f query.sql -v main=film.mp4 -v subs=subs.en.vtt -v dest=captioned.mp4
-ffmpeg -i film.mp4 -i subs.en.vtt -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 1:s:0 -c:2 mov_text captioned.mp4
+ffmpeg -i film.mp4 -i subs.en.vtt -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 1:s:0 \
+  -c:2 mov_text captioned.mp4
 ```
 
 Extraction is the same idea with a shorter SELECT list - the container implies the format:
@@ -219,7 +234,8 @@ FROM input(:'source') f
 
 ```
 $ sqlmpeg compile -f query.sql -o burned.mp4 -v source=film.mp4
-ffmpeg -i film.mp4 -filter_complex '[0:v:0]subtitles=filename=subs.en.srt[out0]' -map '[out0]' -map 0:a:0 -c:1 copy burned.mp4
+ffmpeg -i film.mp4 -filter_complex '[0:v:0]subtitles=filename=subs.en.srt[out0]' -map \
+  '[out0]' -map 0:a:0 -c:1 copy burned.mp4
 ```
 
 ## 12. Speed a clip up 2x, picture and sound together
@@ -233,7 +249,9 @@ FROM input(:'source') f
 
 ```
 $ sqlmpeg compile -f query.sql -o fast.mp4 -v source=film.mp4 -v factor=2
-ffmpeg -i film.mp4 -filter_complex '[0:v:0]setpts=PTS/2[out0];[0:a:0]atempo=tempo=2[out1]' -map '[out0]' -map '[out1]' fast.mp4
+ffmpeg -i film.mp4 -filter_complex \
+  '[0:v:0]setpts=PTS/2[out0];[0:a:0]atempo=tempo=2[out1]' -map '[out0]' -map '[out1]' \
+  fast.mp4
 ```
 
 ## 13. Crossfade between two clips
@@ -248,7 +266,9 @@ FROM input(:'first') a, input(:'second') b
 
 ```
 $ sqlmpeg compile -f query.sql -o dissolve.mp4 -v first=one.mp4 -v second=two.mp4
-ffmpeg -i one.mp4 -i two.mp4 -filter_complex '[0:v:0][1:v:0]xfade=duration=1:offset=9[out0];[0:a:0][1:a:0]acrossfade=duration=1[out1]' -map '[out0]' -map '[out1]' dissolve.mp4
+ffmpeg -i one.mp4 -i two.mp4 -filter_complex \
+  '[0:v:0][1:v:0]xfade=duration=1:offset=9[out0];'\
+'[0:a:0][1:a:0]acrossfade=duration=1[out1]' -map '[out0]' -map '[out1]' dissolve.mp4
 ```
 
 ## 14. Turn a clip into a GIF
@@ -266,7 +286,9 @@ FROM small
 
 ```
 $ sqlmpeg compile -f query.sql -o clip.gif -v source=clip.mp4
-ffmpeg -i clip.mp4 -filter_complex '[0:v:0]scale=width=480:height=-2,fps=fps=12,split=2[n2_split0][n2_split1];[n2_split0]palettegen[n3];[n2_split1][n3]paletteuse[out0]' -map '[out0]' clip.gif
+ffmpeg -i clip.mp4 -filter_complex \
+  '[0:v:0]scale=width=480:height=-2,fps=fps=12,split=2[n2_split0][n2_split1];'\
+'[n2_split0]palettegen[n3];[n2_split1][n3]paletteuse[out0]' -map '[out0]' clip.gif
 ```
 
 ## 15. Replace a video's audio, or duck music under the dialogue
@@ -292,7 +314,9 @@ FROM input(:'main') v, input(:'music') m
 
 ```
 $ sqlmpeg compile -f query.sql -o scored.mp4 -v main=film.mp4 -v music=music.m4a
-ffmpeg -i film.mp4 -i music.m4a -filter_complex '[1:a:0]volume=volume=0.2[n1];[0:a:0][n1]amix=inputs=2[out1]' -map 0:v:0 -c:0 copy -map '[out1]' scored.mp4
+ffmpeg -i film.mp4 -i music.m4a -filter_complex \
+  '[1:a:0]volume=volume=0.2[n1];[0:a:0][n1]amix=inputs=2[out1]' -map 0:v:0 -c:0 copy \
+  -map '[out1]' scored.mp4
 ```
 
 Real ducking - music that dips when someone speaks - is a sidechain compressor keyed off the dialogue. Naming `v.audio[1]` twice is fine; the compiler inserts the split:
@@ -304,7 +328,11 @@ FROM input(:'main') v, input(:'music') m
 
 ```
 $ sqlmpeg compile -f query.sql -o ducked.mp4 -v main=film.mp4 -v music=music.m4a
-ffmpeg -i film.mp4 -i music.m4a -filter_complex '[0:a:0]asplit=2[src_v_a_0_split0][src_v_a_0_split1];[1:a:0][src_v_a_0_split0]sidechaincompress=threshold=0.03:ratio=8[n1];[src_v_a_0_split1][n1]amix=inputs=2[out1]' -map 0:v:0 -c:0 copy -map '[out1]' ducked.mp4
+ffmpeg -i film.mp4 -i music.m4a -filter_complex \
+  '[0:a:0]asplit=2[src_v_a_0_split0][src_v_a_0_split1];'\
+'[1:a:0][src_v_a_0_split0]sidechaincompress=threshold=0.03:ratio=8[n1];'\
+'[src_v_a_0_split1][n1]amix=inputs=2[out1]' -map 0:v:0 -c:0 copy -map '[out1]' \
+  ducked.mp4
 ```
 
 ## 16. Picture-in-picture
@@ -318,7 +346,9 @@ FROM input(:'main') f, input(:'overlay') c
 
 ```
 $ sqlmpeg compile -f query.sql -o pip.mp4 -v main=film.mp4 -v overlay=camera.mp4
-ffmpeg -i film.mp4 -i camera.mp4 -filter_complex '[1:v:0]scale=width=iw/4:height=-2[n1];[0:v:0][n1]overlay=x=W-w-20:y=H-h-20[out0]' -map '[out0]' -map 0:a:0 -c:1 copy pip.mp4
+ffmpeg -i film.mp4 -i camera.mp4 -filter_complex \
+  '[1:v:0]scale=width=iw/4:height=-2[n1];[0:v:0][n1]overlay=x=W-w-20:y=H-h-20[out0]' \
+  -map '[out0]' -map 0:a:0 -c:1 copy pip.mp4
 ```
 
 ## 17. Insert a clip at a timestamp
@@ -335,7 +365,9 @@ SELECT g.video[1], g.audio[1] FROM input(:'main') g WHERE g.t >= :cut
 
 ```
 $ sqlmpeg compile -f query.sql -o spliced.mp4 -v main=film.mp4 -v insert=promo.mp4 -v cut=120
-ffmpeg -to 120 -i film.mp4 -i promo.mp4 -ss 120 -i film.mp4 -filter_complex '[0:v:0][0:a:0][1:v:0][1:a:0][2:v:0][2:a:0]concat=n=3:v=1:a=1[out0][out1]' -map '[out0]' -map '[out1]' spliced.mp4
+ffmpeg -to 120 -i film.mp4 -i promo.mp4 -ss 120 -i film.mp4 -filter_complex \
+  '[0:v:0][0:a:0][1:v:0][1:a:0][2:v:0][2:a:0]concat=n=3:v=1:a=1[out0][out1]' -map \
+  '[out0]' -map '[out1]' spliced.mp4
 ```
 
 Or keep the main video playing and overlay the insert on top: a delayed video stream is transparent until its start time (and after it ends), so it composes with a plain `overlay` - no timeline bookkeeping:
@@ -347,7 +379,9 @@ FROM input(:'main') f, input(:'insert') promo
 
 ```
 $ sqlmpeg compile -f query.sql -o overlaid.mp4 -v main=film.mp4 -v insert=promo.mp4
-ffmpeg -i film.mp4 -i promo.mp4 -filter_complex '[1:v:0]format=pix_fmts=yuva420p,tpad=start_duration=120:stop=1:color=black@0[n2];[0:v:0][n2]overlay=x=20:y=20[out0]' -map '[out0]' -map 0:a:0 -c:1 copy overlaid.mp4
+ffmpeg -i film.mp4 -i promo.mp4 -filter_complex \
+  '[1:v:0]format=pix_fmts=yuva420p,tpad=start_duration=120:stop=1:color=black@0[n2];'\
+'[0:v:0][n2]overlay=x=20:y=20[out0]' -map '[out0]' -map 0:a:0 -c:1 copy overlaid.mp4
 ```
 
 ## 18. Normalize loudness on every language track at once
@@ -361,7 +395,10 @@ FROM input('tests/fixtures/av2.mp4') f
 
 ```
 $ sqlmpeg compile -f query.sql -o broadcast.mkv
-ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:a:0]loudnorm=I=-23[out1];[0:a:1]loudnorm=I=-23[out2]' -map 0:v:0 -c:0 copy -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra broadcast.mkv
+ffmpeg -i tests/fixtures/av2.mp4 -filter_complex \
+  '[0:a:0]loudnorm=I=-23[out1];[0:a:1]loudnorm=I=-23[out2]' -map 0:v:0 -c:0 copy -map \
+  '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra \
+  broadcast.mkv
 ```
 
 ## 19. Blur a region, or blur during a time window
@@ -375,7 +412,11 @@ FROM input(:'source') f
 
 ```
 $ sqlmpeg compile -f query.sql -o anonymized.mp4 -v source=interview.mp4
-ffmpeg -i interview.mp4 -filter_complex '[0:v:0]split=2[src_f_v_0_split0][src_f_v_0_split1];[src_f_v_0_split0]crop=out_w=320:out_h=180:x=900:y=60,gblur=sigma=20[n2];[src_f_v_0_split1][n2]overlay=x=900:y=60[out0]' -map '[out0]' -map 0:a:0 -c:1 copy anonymized.mp4
+ffmpeg -i interview.mp4 -filter_complex \
+  '[0:v:0]split=2[src_f_v_0_split0][src_f_v_0_split1];'\
+'[src_f_v_0_split0]crop=out_w=320:out_h=180:x=900:y=60,gblur=sigma=20[n2];'\
+'[src_f_v_0_split1][n2]overlay=x=900:y=60[out0]' -map '[out0]' -map 0:a:0 -c:1 copy \
+  anonymized.mp4
 ```
 
 To apply an effect only during a time window, `enable` is the switch - no trimming, no branches, no concat, just a filter that turns itself on and off:
@@ -387,7 +428,8 @@ FROM input(:'source') a
 
 ```
 $ sqlmpeg compile -f query.sql -v source=clip.mp4
-ffmpeg -i clip.mp4 -filter_complex '[0:v:0]gblur=sigma=12:enable=between(t\,0.5\,1.5)[out0]' -map '[out0]' out.mp4
+ffmpeg -i clip.mp4 -filter_complex \
+  '[0:v:0]gblur=sigma=12:enable=between(t\,0.5\,1.5)[out0]' -map '[out0]' out.mp4
 ```
 
 ## 20. Generate test media
@@ -402,7 +444,9 @@ FROM ffmpeg.testsrc2(duration => 10, size => '1280x720', rate => 30) t,
 
 ```
 $ sqlmpeg compile -f query.sql -o bars.mp4
-ffmpeg -filter_complex 'testsrc2=duration=10:size=1280x720:rate=30[out0];sine=frequency=440:duration=10[out1]' -map '[out0]' -map '[out1]' bars.mp4
+ffmpeg -filter_complex \
+  'testsrc2=duration=10:size=1280x720:rate=30[out0];'\
+'sine=frequency=440:duration=10[out1]' -map '[out0]' -map '[out1]' bars.mp4
 ```
 
 They also solve a quieter problem: `UNION ALL` branches must match column for column, so appending a slate to a clip needs a silent audio track from somewhere. `anullsrc` is that somewhere:
@@ -417,7 +461,10 @@ FROM ffmpeg.color(color => 'black', duration => 3, size => '1280x720', rate => 3
 
 ```
 $ sqlmpeg compile -f query.sql -o with-slate.mp4 -v source=clip.mp4
-ffmpeg -i clip.mp4 -filter_complex 'color=color=black:duration=3:size=1280x720:rate=30[n1];anullsrc=duration=3[n2];[0:v:0][0:a:0][n1][n2]concat=n=2:v=1:a=1[out0][out1]' -map '[out0]' -map '[out1]' with-slate.mp4
+ffmpeg -i clip.mp4 -filter_complex \
+  'color=color=black:duration=3:size=1280x720:rate=30[n1];anullsrc=duration=3[n2];'\
+'[0:v:0][0:a:0][n1][n2]concat=n=2:v=1:a=1[out0][out1]' -map '[out0]' -map '[out1]' \
+  with-slate.mp4
 ```
 
 ## 21. Split a stereo track, or compress it in bands
@@ -431,7 +478,8 @@ FROM input(:'source') a
 
 ```
 $ sqlmpeg compile -f query.sql -o channels.mkv -v source=stereo.mp4
-ffmpeg -i stereo.mp4 -filter_complex '[0:a:0]channelsplit[out0][out1]' -map '[out0]' -map '[out1]' channels.mkv
+ffmpeg -i stereo.mp4 -filter_complex '[0:a:0]channelsplit[out0][out1]' -map '[out0]' \
+  -map '[out1]' channels.mkv
 ```
 
 `acrossover` splits by frequency instead - two split points make three bands - and that's the shape of multiband compression: split, compress each band on its own settings, mix back:
@@ -449,7 +497,12 @@ FROM bands
 
 ```
 $ sqlmpeg compile -f query.sql -o mastered.m4a -v source=song.m4a
-ffmpeg -i song.m4a -filter_complex '[0:a:0]acrossover=split=300\ 3000[n10][n11][n12];[n10]acompressor=threshold=0.1:ratio=4[n2];[n11]acompressor=threshold=0.05:ratio=6[n3];[n2][n3]amix=inputs=2[n4];[n12]acompressor=threshold=0.1:ratio=4[n5];[n4][n5]amix=inputs=2[out0]' -map '[out0]' mastered.m4a
+ffmpeg -i song.m4a -filter_complex \
+  '[0:a:0]acrossover=split=300\ 3000[n10][n11][n12];'\
+'[n10]acompressor=threshold=0.1:ratio=4[n2];'\
+'[n11]acompressor=threshold=0.05:ratio=6[n3];[n2][n3]amix=inputs=2[n4];'\
+'[n12]acompressor=threshold=0.1:ratio=4[n5];[n4][n5]amix=inputs=2[out0]' -map '[out0]' \
+  mastered.m4a
 ```
 
 ## 22. One decode, several outputs
@@ -470,7 +523,10 @@ TO :'podcast' WITH (audio_codec 'aac', audio_bitrate '128k')
 
 ```
 $ sqlmpeg compile -f query.sql -v main=film.mp4 -v overlay=watermark.png -v web=web.mp4 -v podcast=podcast.m4a
-ffmpeg -i film.mp4 -loop 1 -i watermark.png -filter_complex '[0:v:0][1:v:0]overlay=x=W-w-20:y=20,scale=width=1280:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:0 libx264 -crf:0 21 -c:1 aac web.mp4 -map 0:a:0 -c:0 aac -b:0 128k podcast.m4a
+ffmpeg -i film.mp4 -loop 1 -i watermark.png -filter_complex \
+  '[0:v:0][1:v:0]overlay=x=W-w-20:y=20,scale=width=1280:height=-2[out0]' -map '[out0]' \
+  -map 0:a:0 -c:0 libx264 -crf:0 21 -c:1 aac web.mp4 -map 0:a:0 -c:0 aac -b:0 128k \
+  podcast.m4a
 ```
 
 ## 23. Pick a track by what it is, not where it sits
@@ -502,7 +558,8 @@ WHERE s.language = 'eng'
 
 ```
 $ sqlmpeg compile -f query.sql -o subs.srt
-ffmpeg -i tests/fixtures/avs.mkv -map 0:s:0 -c:0 copy -metadata:s:0 language=eng subs.srt
+ffmpeg -i tests/fixtures/avs.mkv -map 0:s:0 -c:0 copy -metadata:s:0 language=eng \
+  subs.srt
 ```
 
 ## 25. Mix two files' tracks pairwise, matched by language
@@ -517,7 +574,9 @@ FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av3.mp4') g,
 
 ```
 $ sqlmpeg compile -f query.sql -o mixed.mka
-ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex '[0:a:0][1:a:0]amix=inputs=2[out0];[0:a:1][1:a:1]amix=inputs=2[out1]' -map '[out0]' -metadata:s:0 language=eng -map '[out1]' -metadata:s:1 language=fra mixed.mka
+ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex \
+  '[0:a:0][1:a:0]amix=inputs=2[out0];[0:a:1][1:a:1]amix=inputs=2[out1]' -map '[out0]' \
+  -metadata:s:0 language=eng -map '[out1]' -metadata:s:1 language=fra mixed.mka
 ```
 
 Result rows follow the LEFT side's track order, so the output track order is `f`'s - track order is player-visible surface, and nothing here resorts it. And when one file carries two English tracks (a 5.1 and a stereo, say), that's not an error, it's two pairs - real join semantics - and the fix is a wider key: `ON a.language = b.language AND a.channel_layout = b.channel_layout`.
@@ -534,7 +593,10 @@ FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
 
 ```
 $ sqlmpeg compile -f query.sql -o full.mka
-ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex 'anullsrc=duration=2[n1];[0:a:0][1:a:0]amix=inputs=2[out0];[0:a:1][n1]amix=inputs=2[out1]' -map '[out0]' -metadata:s:0 language=eng -map '[out1]' -metadata:s:1 language=fra full.mka
+ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex \
+  'anullsrc=duration=2[n1];[0:a:0][1:a:0]amix=inputs=2[out0];'\
+'[0:a:1][n1]amix=inputs=2[out1]' -map '[out0]' -metadata:s:0 language=eng -map '[out1]' \
+  -metadata:s:1 language=fra full.mka
 ```
 
 The second file has no French, so the French mix gets silence in that slot - and keeps its `fra` tag, because the tag came from the side that existed.
@@ -555,7 +617,11 @@ FROM input('tests/fixtures/av2.mp4') f2, input('tests/fixtures/av-eng.mp4') g2,
 
 ```
 $ sqlmpeg compile -f query.sql -o joined.mp4
-ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex 'anullsrc=duration=2[n1];[0:v:0][0:a:0][0:a:1][1:v:0][1:a:0][n1]concat=n=2:v=1:a=2[out0][out1][out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra joined.mp4
+ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex \
+  'anullsrc=duration=2[n1];'\
+'[0:v:0][0:a:0][0:a:1][1:v:0][1:a:0][n1]concat=n=2:v=1:a=2[out0][out1][out2]' -map \
+  '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 \
+  language=fra joined.mp4
 ```
 
 Both branches share one join shape, so both agree on track order, and eng concatenates with eng. Each file appears in two branches but gets ONE `-i`: untrimmed aliases over the same path share an input.
@@ -573,7 +639,8 @@ FROM input('tests/fixtures/testsrc.mp4') f, input('tests/fixtures/smptebars.mp4'
 
 ```
 $ sqlmpeg compile -f query.sql -o sxs.mp4
-ffmpeg -i tests/fixtures/testsrc.mp4 -i tests/fixtures/smptebars.mp4 -filter_complex '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' sxs.mp4
+ffmpeg -i tests/fixtures/testsrc.mp4 -i tests/fixtures/smptebars.mp4 -filter_complex \
+  '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' sxs.mp4
 ```
 
 A video gap in an outer join fills with `COALESCE(b.track, ffmpeg.color())` - black by default, size, rate and duration inherited from the paired row. A caption gap fills with `COALESCE(b.track, sqlmpeg.empty_captions())`: the track exists and takes its language tag, it just contains zero cues - nobody generates your subtitles for you.
