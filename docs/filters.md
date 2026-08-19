@@ -111,7 +111,7 @@ ffmpeg -i stereo.mp4 -filter_complex '[0:a:0]channelsplit[n10][n11];[n10]volume=
 
 Three N-input filters take however many streams you pass: `amix`, `hstack`, `vstack`. Their `inputs` option is set from the stream count; a written `inputs` that disagrees with the count is a typed error.
 
-To choose which tracks to pass in the first place (by language, codec, resolution), use track rows: [tracks.md](tracks.md).
+To choose which tracks to pass in the first place (by language, codec, resolution), use track rows: [rows.md](rows.md).
 
 ## Scope fence
 
