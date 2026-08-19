@@ -38,13 +38,13 @@ jobs:
       - name: Test (pytest, exec tests excluded by default)
         run: python -m pytest tests/
 
-      # A stuck apt mirror once held this step for the job's full ceiling;
-      # fail fast instead so a re-run is cheap.
-      - name: Install ffmpeg
+      # The provisioner sqlmpeg ships, not apt: same path a bare user machine
+      # takes, and GitHub-hosted downloads instead of apt mirrors (which have
+      # hung and failed runs here before).
+      - name: Provision ffmpeg (static-ffmpeg)
         timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          python -c "import os; from static_ffmpeg import run; print(os.path.dirname(run.get_or_fetch_platform_executables_else_raise()[0]))" >> "$GITHUB_PATH"
 
       - name: Generate synthetic media fixtures
         run: python scripts/gen_fixtures.py
