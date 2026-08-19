@@ -54,6 +54,7 @@ _SUBS_NAME = "subs.en.vtt"
 _AVS_NAME = "avs.mkv"
 _FRAME_PNG_NAME = "frame.png"
 _AV_CHAPTERS_NAME = "av-chapters.mkv"
+_TAGGED_NAME = "tagged.mp4"
 
 # Intro 0-1, Credits 1-2 -- matches cookbook recipe 39's pinned table exactly.
 _CHAPTERS_FFMETADATA = (
@@ -258,6 +259,25 @@ def _generate_av_chapters() -> None:
     )
 
 
+def _generate_tagged() -> None:
+    """testsrc2 video + sine audio with container tags (title/artist/date):
+    the container-tag read fixture. No comment tag, so a CASE fill has a
+    NULL to fill. mp4 adds its own `encoder` tag; its value varies by
+    ffmpeg version, so nothing may pin it."""
+    _run(
+        FIXTURES_DIR / _TAGGED_NAME,
+        [
+            "-f", "lavfi", "-i", f"testsrc2=duration={_DURATION}:size={_SIZE}:rate={_RATE}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:duration={_DURATION}",
+            "-metadata", "title=Angel One",
+            "-metadata", "artist=Docs Dept",
+            "-metadata", "date=2026",
+            "-pix_fmt", "yuv420p",
+            "-shortest",
+        ],
+    )
+
+
 def _generate_frame_png() -> None:
     """One still frame of testsrc.mp4 (RFC-005 SS4, plan 041's PNG title-card
     exec test): `input(frame.png, loop => true, framerate => 15)` needs a
@@ -288,6 +308,7 @@ def main() -> int:
     subs_path = _generate_subs_vtt()
     _generate_avs(subs_path)
     _generate_av_chapters()
+    _generate_tagged()
     _generate_frame_png()
     return 0
 

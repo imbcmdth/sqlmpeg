@@ -870,11 +870,13 @@ ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng
 
 ## 42. Title the file and keep its global tags
 
-`title` and `comment` tag the container (not a stream); `metadata_from` copies an input's global tags through:
+In a query without track rows an aliased non-stream column tags the container (not a stream); `metadata_from` copies an input's global tags through, and the tag column overrides its key:
 
 ```pgsql
-COPY (SELECT f.video[1], f.audio[1] FROM input(:'source') f)
-TO :'dest' WITH (title 'Director Cut', metadata_from f)
+COPY (
+  SELECT f.video[1], f.audio[1], 'Director Cut' AS title
+  FROM input(:'source') f
+) TO :'dest' WITH (metadata_from f)
 ```
 
 ```
@@ -1012,3 +1014,41 @@ ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -f flv -c:0 libx264 -c:1 aac \
 ```
 
 For SRT use `format 'mpegts'` with an `srt://` destination; UDP the same. Verified end to end: a query streamed over `udp://` to a listening receiver arrives intact, video and audio.
+
+## 51. Set the container's title, clear its artist
+
+In a query without track rows, an aliased non-stream column tags the CONTAINER - the alias is the key, free-form, same as track-row tags. `NULL` clears the tag in the output (ffmpeg copies input globals by default, so clearing is explicit):
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1], 'Remastered 2026' AS title, NULL AS artist
+  FROM input(:'source') f
+) TO :'dest'
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=out.mkv
+ffmpeg -i film.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata artist= -metadata \
+  'title=Remastered 2026' out.mkv
+```
+
+## 52. Read the container's tags, rewrite them with CASE
+
+Container tags are columns on the input alias - `f.title`, `f.artist`, `f.comment`, and the other common keys - NULL when the file doesn't carry them. So the full CASE toolkit works: fill missing tags, build new ones from old:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1],
+    f.title || ' (restored)' AS title,
+    CASE WHEN f.comment IS NULL THEN 'no notes' ELSE f.comment END AS comment
+  FROM input('tests/fixtures/tagged.mp4') f
+) TO 'restored.mp4'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/tagged.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata \
+  'comment=no notes' -metadata 'title=Angel One (restored)' restored.mp4
+```
+
+Reading needs the probe (the values live in the file), so this one is fixture-bound. The same columns work in table queries: `select f.title, f.artist, f.duration from input('movie.mp4') f` prints them.
