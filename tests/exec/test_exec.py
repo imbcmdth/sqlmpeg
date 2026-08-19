@@ -1891,9 +1891,30 @@ def test_the_printed_loudnorm2_command_runs_in_bash(tmp_path: Path) -> None:
     installed but the environment was never activated, its directory is put
     on PATH for the shell -- which is what activating would have done.
     """
-    bash = shutil.which("bash")
+    # System32's bash.exe is the WSL shim, which hangs when no distro is
+    # ready; prefer a real bash (Git Bash on Windows) and prove it answers.
+    candidates = [
+        shutil.which("bash"),
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files\Git\bin\bash.exe",
+    ]
+    bash = None
+    for candidate in candidates:
+        if not candidate or not Path(candidate).exists():
+            continue
+        if "system32" in candidate.lower():
+            continue
+        try:
+            probe = subprocess.run(
+                [candidate, "-c", "echo ok"], capture_output=True, text=True, timeout=10
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0 and probe.stdout.strip() == "ok":
+            bash = candidate
+            break
     if bash is None:
-        pytest.skip("bash not found on PATH (the printed chain is POSIX-shell only)")
+        pytest.skip("no working non-WSL bash found (the printed chain is POSIX-shell only)")
     console_script = shutil.which("sqlmpeg") or shutil.which(
         "sqlmpeg", path=str(Path(sys.executable).parent)
     )
