@@ -10,9 +10,11 @@ No ``extra_args`` escape hatch: arbitrary flag passthrough would break
 
 ``InputOptionSpec`` has no ``scope``/``per_stream`` (unlike ``SinkOptionSpec``)
 -- a demuxer-level flag applies once to the input's ``-i``, with no per-stream
-axis. It adds one type over the sink table: ``"num"`` (int or float, never
-bool) for ``framerate``/``itsoffset``, which are routinely fractional and, for
-``itsoffset``, legally negative (ffmpeg shifts a stream earlier).
+axis. ``"num"`` (int or float, never bool) covers ``framerate``/``itsoffset``/
+``seek_end``, which are routinely fractional and, for ``itsoffset``, legally
+negative (ffmpeg shifts a stream earlier). ``seek_end`` renders NEGATED
+(``-sseof -<v>``, value written as seconds from the end); ``realtime`` renders
+as a bare ``-re`` flag, no value.
 """
 
 from __future__ import annotations
@@ -32,6 +34,9 @@ class InputOptionSpec:
     type: InputOptionType
     doc: str  # one line; drives docs + prompt
     flag: str  # e.g. "-loop", "-framerate"
+    # True -> a boolean flag with no value (e.g. "-re"); rendered flag-only
+    # when the value is True, omitted entirely when False.
+    bare: bool = False
 
 
 INPUT_OPTIONS: dict[str, InputOptionSpec] = {
@@ -65,24 +70,61 @@ INPUT_OPTIONS: dict[str, InputOptionSpec] = {
         doc="Request a hardware decoder for this input, e.g. 'cuda'.",
         flag="-hwaccel",
     ),
-}
-
-
-# Flags the COMPILER sets on an input it minted itself; no user SQL can name
-# them. Kept out of `INPUT_OPTIONS` so the user-facing surface (docs, prompt,
-# validation) never learns of them: `validate_option` still rejects these names
-# as unknown, only `option_spec` (which emit renders through) resolves them.
-#
-# `format` is what `sqlmpeg.empty_captions()` needs: a `data:` URI carries no
-# extension, so the demuxer has to be named (`-f webvtt -i "data:..."`).
-_INTERNAL_INPUT_OPTIONS: dict[str, InputOptionSpec] = {
+    "seek_end": InputOptionSpec(
+        name="seek_end",
+        type="num",
+        doc="Seek this many seconds before the end of the file (rendered negated).",
+        flag="-sseof",
+    ),
     "format": InputOptionSpec(
         name="format",
         type="str",
-        doc="Force the demuxer of a compiler-minted input (internal).",
+        doc="Force the demuxer, e.g. for a capture device, rawvideo, or image2.",
         flag="-f",
     ),
+    "realtime": InputOptionSpec(
+        name="realtime",
+        type="bool",
+        doc="Read the input at its native frame rate, e.g. for a live source.",
+        flag="-re",
+        bare=True,
+    ),
+    "sub_charenc": InputOptionSpec(
+        name="sub_charenc",
+        type="str",
+        doc="Character encoding of a text subtitle input, e.g. 'CP1250'.",
+        flag="-sub_charenc",
+    ),
+    "start_number": InputOptionSpec(
+        name="start_number",
+        type="int",
+        doc="First index of an image2-sequence input.",
+        flag="-start_number",
+    ),
+    "subtitle_decoder": InputOptionSpec(
+        name="subtitle_decoder",
+        type="str",
+        doc="Force the subtitle decoder for this input, e.g. 'webvtt'.",
+        flag="-c:s",
+    ),
 }
+
+
+# Flags the COMPILER sets on an input it minted itself, for a name no user
+# SQL can also bind to `input()`. Kept out of `INPUT_OPTIONS` so the
+# user-facing surface (docs, prompt, validation) never learns of them:
+# `validate_option` still rejects these names as unknown, only `option_spec`
+# (which emit renders through) resolves them.
+#
+# Currently empty: `format` used to live here for `sqlmpeg.empty_captions()`
+# (a `data:` URI carries no extension, so the demuxer has to be named --
+# `-f webvtt -i "data:..."`), but `format` is now also a user-facing option
+# (capture devices, rawvideo, image2 need it too), so `INPUT_OPTIONS` alone
+# already resolves it -- `option_spec` never reaches this table for it.
+# `empty_captions` itself still bypasses `validate_option` entirely (its
+# option dict is built directly, not parsed from SQL); this table stays for
+# the next flag that is compiler-only from the start.
+_INTERNAL_INPUT_OPTIONS: dict[str, InputOptionSpec] = {}
 
 
 def option_spec(name: str) -> InputOptionSpec | None:

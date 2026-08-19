@@ -18,7 +18,7 @@ from typing import Literal
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 
 OptionScope = Literal["video", "audio", "subtitle", "container"]
-OptionType = Literal["str", "int", "bool"]
+OptionType = Literal["str", "int", "bool", "num"]  # "num" = int or float, never bool
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,22 @@ class SinkOptionSpec:
     flag: str  # e.g. "-c", "-crf", "-b", "-f", "-movflags"
     per_stream: bool  # True -> rendered as f"{flag}:{i}" per output
     value_template: str = "{v}"  # e.g. "+faststart" for the bool movflags case
+    # True -> a boolean flag with no value (e.g. "-shortest"); rendered flag-
+    # only when the value is True, omitted entirely when False. Mutually
+    # exclusive with per_stream (no bare option in the table is per-stream).
+    bare: bool = False
+
+
+# `codec_params`'s flag is the one derived-at-render-time exception to "flag
+# is static table data": its spec.flag carries a `{codec}` placeholder that
+# emit fills in from the SAME group's `video_codec` value. Verified against
+# real ffmpeg (9.0.1): `-x264-params`, `-x265-params`, `-svtav1-params` all
+# apply to their matching libx264/libx265/libsvtav1 encoder.
+CODEC_PARAMS_FLAGS: dict[str, str] = {
+    "libx264": "x264",
+    "libx265": "x265",
+    "libsvtav1": "svtav1",
+}
 
 
 SINK_OPTIONS: dict[str, SinkOptionSpec] = {
@@ -130,6 +146,98 @@ SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         flag="-movflags",
         per_stream=False,
         value_template="+faststart",
+    ),
+    "duration": SinkOptionSpec(
+        name="duration",
+        scope="container",
+        type="num",
+        doc="Stop the output after this many seconds (fractional allowed).",
+        flag="-t",
+        per_stream=False,
+    ),
+    "max_size": SinkOptionSpec(
+        name="max_size",
+        scope="container",
+        type="str",
+        doc="Stop the output once the file reaches this size, e.g. '10M'.",
+        flag="-fs",
+        per_stream=False,
+    ),
+    "shortest": SinkOptionSpec(
+        name="shortest",
+        scope="container",
+        type="bool",
+        doc="Stop the output as soon as its shortest stream ends.",
+        flag="-shortest",
+        per_stream=False,
+        bare=True,
+    ),
+    "maxrate": SinkOptionSpec(
+        name="maxrate",
+        scope="video",
+        type="str",
+        doc="Rate-control ceiling for a VBV-constrained encode, e.g. '2675k'.",
+        flag="-maxrate",
+        per_stream=True,
+    ),
+    "bufsize": SinkOptionSpec(
+        name="bufsize",
+        scope="video",
+        type="str",
+        doc="VBV buffer size paired with maxrate, e.g. '5350k'.",
+        flag="-bufsize",
+        per_stream=True,
+    ),
+    "gop": SinkOptionSpec(
+        name="gop",
+        scope="video",
+        type="int",
+        doc="Group-of-pictures size: the max distance between keyframes.",
+        flag="-g",
+        per_stream=True,
+    ),
+    "profile": SinkOptionSpec(
+        name="profile",
+        scope="video",
+        type="str",
+        doc="Encoder profile, e.g. 'baseline', 'main', 'high'.",
+        flag="-profile",
+        per_stream=True,
+    ),
+    "level": SinkOptionSpec(
+        name="level",
+        scope="video",
+        type="str",
+        doc="Encoder level, e.g. '3.1', '4.0'.",
+        flag="-level",
+        per_stream=True,
+    ),
+    "tune": SinkOptionSpec(
+        name="tune",
+        scope="video",
+        type="str",
+        doc="Encoder tuning, e.g. 'film', 'animation', 'zerolatency'.",
+        flag="-tune",
+        per_stream=True,
+    ),
+    "codec_params": SinkOptionSpec(
+        name="codec_params",
+        scope="video",
+        type="str",
+        doc=(
+            "Encoder-private key=value:key=value passthrough. Only libx264/"
+            "libx265/libsvtav1; needs a matching video_codec."
+        ),
+        flag="-{codec}-params",  # placeholder filled from video_codec; see CODEC_PARAMS_FLAGS
+        per_stream=True,
+    ),
+    "movflags": SinkOptionSpec(
+        name="movflags",
+        scope="container",
+        type="str",
+        doc="Raw -movflags value, e.g. '+faststart+frag_keyframe'. Conflicts with faststart.",
+        flag="-movflags",
+        per_stream=False,
     ),
 }
 
@@ -235,6 +343,17 @@ def _validate_against(
                 line=line,
                 col=col,
                 hint=f"{name} takes a bare integer literal, e.g. {name} 20",
+            )
+        return value
+
+    if spec.type == "num":
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise SqlmpegError(
+                ErrorCode.SINK_OPTION_TYPE,
+                f"option {name!r} expects a number, got {value!r}",
+                line=line,
+                col=col,
+                hint=f"{name} takes a bare numeric literal, e.g. {name} 30",
             )
         return value
 

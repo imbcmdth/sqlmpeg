@@ -358,10 +358,11 @@ def test_the_macro_namespace_hint_names_the_input_macro_too() -> None:
     assert "empty_captions" in (err.hint or "")
 
 
-def test_a_minted_input_is_not_a_user_facing_input_option() -> None:
-    """`format` renders like any other per-input flag but cannot be written:
-    it is not in the table `input('path', name => value)` validates against."""
-    assert "format" not in INPUT_OPTIONS
-    assert option_spec("format") is not None
-    err = _reject("SELECT a.frame FROM input('x.mp4', format => 'webvtt') a")
-    assert err.code == ErrorCode.UNKNOWN_INPUT_OPTION
+def test_format_is_both_the_minted_flag_and_a_user_facing_option() -> None:
+    """`format` renders the same per-input flag either way: minted here by
+    `empty_captions` (bypassing validation, built by the compiler) and, since
+    plan 075, also legal for a user to write on an ordinary input()."""
+    assert "format" in INPUT_OPTIONS
+    assert option_spec("format") is INPUT_OPTIONS["format"]
+    g = _lower("SELECT a.frame FROM input('x.mp4', format => 'webvtt') a")
+    assert g.input_options == {"a": {"format": "webvtt"}}

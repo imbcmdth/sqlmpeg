@@ -146,10 +146,12 @@ class InputMacro:
     demuxer, `path` is a self-contained ``data:`` URI, and the result is an
     ordinary passthrough subtitle stream that takes tags like any other.
 
-    `format` reaches emit as an INTERNAL per-input option (see
-    ``sqlmpeg.inputs.option_spec``), not through the user-facing
-    ``INPUT_OPTIONS`` table -- there is no ``input('x', format => ...)``
-    surface, this is the compiler minting its own input.
+    `format` is validated against the same ``sqlmpeg.inputs.INPUT_OPTIONS``
+    entry a user's own ``input('x', format => ...)`` would be (it is a
+    legitimate user-facing option too, e.g. for capture devices), but this
+    macro's own value is set directly on the minted alias's option dict,
+    bypassing ``validate_option`` -- the compiler already knows it is
+    well-formed, having written it itself.
     """
 
     name: str

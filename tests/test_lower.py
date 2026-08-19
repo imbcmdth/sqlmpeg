@@ -2320,6 +2320,72 @@ def test_sink_does_not_change_the_graph_shape() -> None:
     assert wrapped == plain
 
 
+def test_new_output_option_batch_lowers_in_written_order() -> None:
+    assert _sink_of(
+        "duration 30, max_size '10M', shortest true, maxrate '2675k', "
+        "bufsize '5350k', gop 48, profile 'high', level '4.0', tune 'film', "
+        "movflags '+faststart'"
+    ) == {
+        "duration": 30,
+        "max_size": "10M",
+        "shortest": True,
+        "maxrate": "2675k",
+        "bufsize": "5350k",
+        "gop": 48,
+        "profile": "high",
+        "level": "4.0",
+        "tune": "film",
+        "movflags": "+faststart",
+    }
+
+
+def test_duration_accepts_a_fractional_number() -> None:
+    assert _sink_of("duration 30.5") == {"duration": 30.5}
+
+
+def test_codec_params_with_a_matching_video_codec() -> None:
+    assert _sink_of("video_codec 'libx264', codec_params 'keyint=48'") == {
+        "video_codec": "libx264",
+        "codec_params": "keyint=48",
+    }
+
+
+def test_codec_params_without_video_codec_is_rejected() -> None:
+    err = _reject(f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH (codec_params 'keyint=48')")
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert "codec_params" in err.message
+    assert "video_codec" in err.message
+    assert err.hint is not None
+    assert "libx264" in err.hint
+
+
+def test_codec_params_with_an_unsupported_video_codec_is_rejected() -> None:
+    err = _reject(
+        f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH "
+        "(video_codec 'libvpx-vp9', codec_params 'keyint=48')"
+    )
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert "libvpx-vp9" in err.message
+
+
+def test_faststart_and_movflags_together_are_rejected() -> None:
+    err = _reject(
+        f"COPY ({SINK_QUERY}) TO 'out.mkv' WITH "
+        "(faststart true, movflags '+faststart')"
+    )
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert "faststart" in err.message
+    assert "movflags" in err.message
+
+
+def test_faststart_alone_is_still_fine() -> None:
+    assert _sink_of("faststart true") == {"faststart": True}
+
+
+def test_movflags_alone_is_still_fine() -> None:
+    assert _sink_of("movflags '+faststart'") == {"movflags": "+faststart"}
+
+
 # ---------------------------------------------------------------------------
 # input() named options
 # ---------------------------------------------------------------------------
@@ -2422,6 +2488,63 @@ def test_itsoffset_compiles_to_a_negative_argv_flag() -> None:
     emitted = emit(graph)
     args = build_ffmpeg_args(emitted, "out.mp4")
     assert args[:4] == ["ffmpeg", "-itsoffset", "-1.5", "-i"]
+
+
+def test_new_input_option_batch_lowers_in_written_order() -> None:
+    g = _lower(
+        "SELECT a.frame FROM input("
+        "'x.mp4', seek_end => 60, format => 'v4l2', realtime => true, "
+        "sub_charenc => 'CP1250', start_number => 3, subtitle_decoder => 'webvtt'"
+        ") a"
+    )
+    assert g.input_options == {
+        "a": {
+            "seek_end": 60,
+            "format": "v4l2",
+            "realtime": True,
+            "sub_charenc": "CP1250",
+            "start_number": 3,
+            "subtitle_decoder": "webvtt",
+        }
+    }
+
+
+def test_seek_end_compiles_to_a_negated_sseof_flag() -> None:
+    graph = compile_sql("SELECT a.frame FROM input('x.mp4', seek_end => 60) a")
+    args = build_ffmpeg_args(emit(graph), "out.mp4")
+    assert args[:4] == ["ffmpeg", "-sseof", "-60", "-i"]
+
+
+def test_realtime_compiles_to_a_bare_re_flag() -> None:
+    graph = compile_sql("SELECT a.frame FROM input('x.mp4', realtime => true) a")
+    args = build_ffmpeg_args(emit(graph), "out.mp4")
+    assert args[:3] == ["ffmpeg", "-re", "-i"]
+
+
+def test_realtime_false_emits_no_flag_at_all() -> None:
+    graph = compile_sql("SELECT a.frame FROM input('x.mp4', realtime => false) a")
+    args = build_ffmpeg_args(emit(graph), "out.mp4")
+    assert "-re" not in args
+
+
+def test_seek_end_together_with_a_where_window_is_rejected() -> None:
+    err = _reject(
+        "SELECT a.frame FROM input('x.mp4', seek_end => 60) a WHERE a.t >= 1"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "seek_end" in err.message
+    assert "'a'" in err.message
+
+
+def test_seek_end_alone_with_no_where_is_fine() -> None:
+    g = _lower("SELECT a.frame FROM input('x.mp4', seek_end => 60) a")
+    assert g.input_options == {"a": {"seek_end": 60}}
+    assert g.input_trims == {}
+
+
+def test_where_alone_with_no_seek_end_is_still_fine() -> None:
+    g = _lower("SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 1")
+    assert g.input_trims == {"a": (1, None)}
 
 
 # ---------------------------------------------------------------------------

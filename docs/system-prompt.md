@@ -67,6 +67,12 @@ statement is not. `--` and `/* */` comments are allowed.
   - `framerate` (num) -- Force the input's frame rate, e.g. for a looped still image.
   - `itsoffset` (num) -- Shift the input's timestamps by this many seconds (negative shifts earlier).
   - `hwaccel` (str) -- Request a hardware decoder for this input, e.g. 'cuda'.
+  - `seek_end` (num) -- Seek this many seconds before the end of the file (rendered negated).
+  - `format` (str) -- Force the demuxer, e.g. for a capture device, rawvideo, or image2.
+  - `realtime` (bool) -- Read the input at its native frame rate, e.g. for a live source.
+  - `sub_charenc` (str) -- Character encoding of a text subtitle input, e.g. 'CP1250'.
+  - `start_number` (int) -- First index of an image2-sequence input.
+  - `subtitle_decoder` (str) -- Force the subtitle decoder for this input, e.g. 'webvtt'.
   An option name outside this list is `UNKNOWN_INPUT_OPTION`; a value whose shape does not match the option's type is `INPUT_OPTION_TYPE` -- both typed and anchored, same as a sink option's rejections (see Repair loop). Example: a still-image title card, `input('logo.png', loop => true, framerate => 15)`.
 ### Columns
 - `<alias>.video`, `<alias>.audio`, `<alias>.subtitle`, and `<alias>.data` are
@@ -430,6 +436,17 @@ stream copy.
 - `frames` (int, video) -- Stop the video output after N frames.
 - `format` (str, container) -- Container format, e.g. 'mp4' (else inferred from the path extension).
 - `faststart` (bool, container) -- Move the MP4 moov atom to the front of the file for progressive playback.
+- `duration` (num, container) -- Stop the output after this many seconds (fractional allowed).
+- `max_size` (str, container) -- Stop the output once the file reaches this size, e.g. '10M'.
+- `shortest` (bool, container) -- Stop the output as soon as its shortest stream ends.
+- `maxrate` (str, video) -- Rate-control ceiling for a VBV-constrained encode, e.g. '2675k'.
+- `bufsize` (str, video) -- VBV buffer size paired with maxrate, e.g. '5350k'.
+- `gop` (int, video) -- Group-of-pictures size: the max distance between keyframes.
+- `profile` (str, video) -- Encoder profile, e.g. 'baseline', 'main', 'high'.
+- `level` (str, video) -- Encoder level, e.g. '3.1', '4.0'.
+- `tune` (str, video) -- Encoder tuning, e.g. 'film', 'animation', 'zerolatency'.
+- `codec_params` (str, video) -- Encoder-private key=value:key=value passthrough. Only libx264/libx265/libsvtav1; needs a matching video_codec.
+- `movflags` (str, container) -- Raw -movflags value, e.g. '+faststart+frag_keyframe'. Conflicts with faststart.
 
 An option name outside this list is `UNKNOWN_SINK_OPTION`; a value whose shape does not match the option's type is `SINK_OPTION_TYPE` -- both are typed, anchored rejections with repair guidance below (see Repair loop).
 

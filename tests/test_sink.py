@@ -11,6 +11,7 @@ import pytest
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.sink import (
+    CODEC_PARAMS_FLAGS,
     CSV_OPTIONS,
     SINK_OPTIONS,
     SinkOptionSpec,
@@ -32,11 +33,22 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "faststart": ("container", "bool"),
     "subtitle_codec": ("subtitle", "str"),
     "frames": ("video", "int"),
+    "duration": ("container", "num"),
+    "max_size": ("container", "str"),
+    "shortest": ("container", "bool"),
+    "maxrate": ("video", "str"),
+    "bufsize": ("video", "str"),
+    "gop": ("video", "int"),
+    "profile": ("video", "str"),
+    "level": ("video", "str"),
+    "tune": ("video", "str"),
+    "codec_params": ("video", "str"),
+    "movflags": ("container", "str"),
 }
 
 
-def test_table_has_exactly_twelve_entries() -> None:
-    assert len(SINK_OPTIONS) == 12
+def test_table_has_exactly_twenty_three_entries() -> None:
+    assert len(SINK_OPTIONS) == 23
     assert set(SINK_OPTIONS) == set(_EXPECTED)
 
 
@@ -82,6 +94,56 @@ def test_per_stream_options_use_colon_index_flags() -> None:
         "sample_rate",
         "subtitle_codec",
         "frames",
+        "maxrate",
+        "bufsize",
+        "gop",
+        "profile",
+        "level",
+        "tune",
+        "codec_params",
+    }
+
+
+def test_bare_options_are_container_scope_and_never_per_stream() -> None:
+    bare_names = {n for n, s in SINK_OPTIONS.items() if s.bare}
+    assert bare_names == {"shortest"}
+    for name in bare_names:
+        spec = SINK_OPTIONS[name]
+        assert spec.type == "bool"
+        assert spec.per_stream is False
+
+
+def test_shortest_renders_as_a_bare_flag() -> None:
+    spec = SINK_OPTIONS["shortest"]
+    assert spec.flag == "-shortest"
+    assert spec.bare is True
+
+
+def test_duration_is_a_num_type_container_option() -> None:
+    spec = SINK_OPTIONS["duration"]
+    assert spec.type == "num"
+    assert spec.scope == "container"
+    assert spec.flag == "-t"
+    assert spec.per_stream is False
+
+
+def test_movflags_and_faststart_share_the_same_flag() -> None:
+    assert SINK_OPTIONS["movflags"].flag == "-movflags"
+    assert SINK_OPTIONS["faststart"].flag == "-movflags"
+
+
+def test_codec_params_flag_is_a_codec_placeholder_template() -> None:
+    spec = SINK_OPTIONS["codec_params"]
+    assert spec.flag == "-{codec}-params"
+    assert spec.scope == "video"
+    assert spec.per_stream is True
+
+
+def test_codec_params_flags_cover_x264_x265_svtav1() -> None:
+    assert CODEC_PARAMS_FLAGS == {
+        "libx264": "x264",
+        "libx265": "x265",
+        "libsvtav1": "svtav1",
     }
 
 
@@ -127,6 +189,64 @@ def test_validate_option_happy_bool_true() -> None:
 
 def test_validate_option_happy_bool_false() -> None:
     assert validate_option("faststart", False) is False
+
+
+def test_validate_option_happy_num_int() -> None:
+    assert validate_option("duration", 30) == 30
+
+
+def test_validate_option_happy_num_float() -> None:
+    assert validate_option("duration", 30.5) == 30.5
+
+
+def test_validate_option_num_rejects_str() -> None:
+    with pytest.raises(SqlmpegError) as excinfo:
+        validate_option("duration", "30")
+    err = excinfo.value
+    assert err.code == ErrorCode.SINK_OPTION_TYPE
+    assert "expects a number" in err.message
+
+
+def test_validate_option_num_rejects_bool() -> None:
+    with pytest.raises(SqlmpegError) as excinfo:
+        validate_option("duration", True)
+    assert excinfo.value.code == ErrorCode.SINK_OPTION_TYPE
+
+
+def test_validate_option_happy_shortest() -> None:
+    assert validate_option("shortest", True) is True
+    assert validate_option("shortest", False) is False
+
+
+def test_validate_option_happy_maxrate_bufsize() -> None:
+    assert validate_option("maxrate", "2675k") == "2675k"
+    assert validate_option("bufsize", "5350k") == "5350k"
+
+
+def test_validate_option_happy_profile_level_tune() -> None:
+    assert validate_option("profile", "baseline") == "baseline"
+    assert validate_option("level", "3.1") == "3.1"
+    assert validate_option("tune", "film") == "film"
+
+
+def test_validate_option_happy_gop() -> None:
+    assert validate_option("gop", 48) == 48
+
+
+def test_validate_option_happy_codec_params() -> None:
+    assert validate_option("codec_params", "keyint=48:min-keyint=48") == (
+        "keyint=48:min-keyint=48"
+    )
+
+
+def test_validate_option_happy_movflags() -> None:
+    assert validate_option("movflags", "+faststart+frag_keyframe") == (
+        "+faststart+frag_keyframe"
+    )
+
+
+def test_validate_option_happy_max_size() -> None:
+    assert validate_option("max_size", "10M") == "10M"
 
 
 def test_validate_option_unknown_raises() -> None:

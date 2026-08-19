@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.inputs import INPUT_OPTIONS, InputOptionSpec, validate_option
+from sqlmpeg.inputs import INPUT_OPTIONS, InputOptionSpec, option_spec, validate_option
 
 # name -> type.
 _EXPECTED: dict[str, str] = {
@@ -20,11 +20,17 @@ _EXPECTED: dict[str, str] = {
     "framerate": "num",
     "itsoffset": "num",
     "hwaccel": "str",
+    "seek_end": "num",
+    "format": "str",
+    "realtime": "bool",
+    "sub_charenc": "str",
+    "start_number": "int",
+    "subtitle_decoder": "str",
 }
 
 
-def test_table_has_exactly_five_entries() -> None:
-    assert len(INPUT_OPTIONS) == 5
+def test_table_has_exactly_eleven_entries() -> None:
+    assert len(INPUT_OPTIONS) == 11
     assert set(INPUT_OPTIONS) == set(_EXPECTED)
 
 
@@ -51,6 +57,42 @@ def test_loop_renders_as_loop_flag() -> None:
 def test_itsoffset_and_framerate_are_num() -> None:
     assert INPUT_OPTIONS["itsoffset"].type == "num"
     assert INPUT_OPTIONS["framerate"].type == "num"
+
+
+def test_seek_end_is_num_and_maps_to_sseof() -> None:
+    spec = INPUT_OPTIONS["seek_end"]
+    assert spec.type == "num"
+    assert spec.flag == "-sseof"
+    assert spec.bare is False
+
+
+def test_realtime_is_the_only_bare_input_option() -> None:
+    bare_names = {n for n, s in INPUT_OPTIONS.items() if s.bare}
+    assert bare_names == {"realtime"}
+    spec = INPUT_OPTIONS["realtime"]
+    assert spec.type == "bool"
+    assert spec.flag == "-re"
+
+
+def test_format_is_a_public_input_option() -> None:
+    spec = INPUT_OPTIONS["format"]
+    assert spec.type == "str"
+    assert spec.flag == "-f"
+    assert option_spec("format") is spec
+
+
+def test_subtitle_decoder_flag_has_no_index() -> None:
+    assert INPUT_OPTIONS["subtitle_decoder"].flag == "-c:s"
+
+
+def test_start_number_is_an_int() -> None:
+    assert INPUT_OPTIONS["start_number"].type == "int"
+    assert INPUT_OPTIONS["start_number"].flag == "-start_number"
+
+
+def test_sub_charenc_is_a_str() -> None:
+    assert INPUT_OPTIONS["sub_charenc"].type == "str"
+    assert INPUT_OPTIONS["sub_charenc"].flag == "-sub_charenc"
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +128,32 @@ def test_validate_option_happy_num_negative() -> None:
 
 def test_validate_option_happy_str() -> None:
     assert validate_option("hwaccel", "cuda") == "cuda"
+
+
+def test_validate_option_happy_seek_end() -> None:
+    assert validate_option("seek_end", 60) == 60
+    assert validate_option("seek_end", 12.5) == 12.5
+
+
+def test_validate_option_happy_format() -> None:
+    assert validate_option("format", "v4l2") == "v4l2"
+
+
+def test_validate_option_happy_realtime() -> None:
+    assert validate_option("realtime", True) is True
+    assert validate_option("realtime", False) is False
+
+
+def test_validate_option_happy_sub_charenc() -> None:
+    assert validate_option("sub_charenc", "CP1250") == "CP1250"
+
+
+def test_validate_option_happy_start_number() -> None:
+    assert validate_option("start_number", 5) == 5
+
+
+def test_validate_option_happy_subtitle_decoder() -> None:
+    assert validate_option("subtitle_decoder", "webvtt") == "webvtt"
 
 
 def test_validate_option_unknown_raises() -> None:

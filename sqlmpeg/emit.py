@@ -74,13 +74,16 @@ BEFORE any ``-ss``/``-to``. ffmpeg input options are order-INSENSITIVE among
 themselves, but this fixed order -- options, seek flags, ``-i`` -- is what
 sqlmpeg always emits; measured against ffmpeg 7.1, ``-loop 1 -framerate 15
 -to 2 -i frame.png`` runs correctly. A ``False`` bool (``loop => false``) is
-never rendered, same as a sink option's False bool.
+never rendered, same as a sink option's False bool. A ``bare`` spec
+(``realtime`` -> ``-re``) renders the flag alone with no value, only when
+True. ``seek_end`` renders its value NEGATED (``-sseof -60`` for
+``seek_end => 60``).
 
 An option name resolves through ``sqlmpeg.inputs.option_spec``, not the
 user-facing table alone: lower mints inputs of its own
 (``sqlmpeg.empty_captions()``, whose ``data:`` URI needs ``-f webvtt``) and
-carries their flags as INTERNAL input options, rendered like any other but not
-nameable from SQL.
+carries their flags the same way, whether or not the name (like ``format``)
+also has a user-facing entry in ``INPUT_OPTIONS``.
 
 Pad label scheme
 ----------------
@@ -169,7 +172,7 @@ from dataclasses import dataclass, field, replace
 from .errors import ErrorCode, SqlmpegError
 from .inputs import InputOptionSpec, option_spec
 from .ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType, is_src, src_parts
-from .sink import SINK_OPTIONS, SinkOptionSpec
+from .sink import CODEC_PARAMS_FLAGS, SINK_OPTIONS, SinkOptionSpec
 
 OUTPUT_LABEL_PREFIX = "out"
 """Filtered outputs are labelled ``out0``, ``out1``, ... (without brackets)."""
@@ -442,10 +445,15 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
 
     Sink options render after each group's -map/-metadata block, in
     insertion order, purely from ``sqlmpeg.sink.SINK_OPTIONS`` table data --
-    no option-specific logic here. ``per_stream=True`` specs render
-    ``f"{flag}:{i}"`` for every output index `i` of THAT GROUP whose type
-    matches the spec's scope; ``per_stream=False`` renders ``flag`` once. A
-    False bool is never rendered (``faststart false`` emits nothing).
+    no option-specific logic here, with two derived exceptions: a ``bare``
+    spec (``shortest`` -> ``-shortest``) renders the flag alone with no
+    value, only when True; and ``codec_params``'s flag has a ``{codec}``
+    placeholder filled from THIS GROUP's own ``video_codec`` value via
+    ``sqlmpeg.sink.CODEC_PARAMS_FLAGS`` (``libx264`` -> ``-x264-params``).
+    ``per_stream=True`` specs render ``f"{flag}:{i}"`` for every output index
+    `i` of THAT GROUP whose type matches the spec's scope; ``per_stream=False``
+    renders ``flag`` once. A False bool is never rendered (``faststart false``
+    emits nothing).
 
     Copy suppression: a group whose options set a codec option (``flag ==
     "-c"``) scoped to video drops ``-c:<i> copy`` on its video passthrough
@@ -496,19 +504,20 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
 # input option rendering
 
 
-def _render_input_option_value(spec: InputOptionSpec, value: object) -> str | None:
+def _render_input_option_value(spec: InputOptionSpec, name: str, value: object) -> str | None:
     """Render one input option's value per its spec, or None to omit entirely.
 
     A bool value of False is always omitted (e.g. plain ``loop => false``);
     ``num``/``int`` go through :func:`_render_number` (so a negative
     ``itsoffset`` renders as ``-1``, not ``-1.0``); a bool True renders
     ``"1"`` (ffmpeg's own spelling for e.g. ``-loop 1``); ``str`` renders
-    as-is.
+    as-is. ``seek_end`` is the one NEGATED value: it is written as seconds
+    from the end but ``-sseof`` wants a negative offset.
     """
     if spec.type == "bool":
         return "1" if value is True else None
     if spec.type in ("int", "num") and isinstance(value, int | float):
-        return _render_number(value)
+        return _render_number(-value if name == "seek_end" else value)
     return str(value)
 
 
@@ -518,7 +527,11 @@ def _render_input_options(options: dict[str, object]) -> list[str]:
         spec = option_spec(name)
         if spec is None:  # defensive: lower validated every name it wrote
             raise _internal(f"unknown input option {name!r} reached emit")
-        rendered = _render_input_option_value(spec, value)
+        if spec.bare:
+            if value is True:
+                args.append(spec.flag)
+            continue
+        rendered = _render_input_option_value(spec, name, value)
         if rendered is None:
             continue
         args += [spec.flag, rendered]
@@ -544,20 +557,39 @@ def _render_option_value(spec: SinkOptionSpec, value: object) -> str | None:
     return spec.value_template.format(v=value)
 
 
+def _codec_params_flag(options: dict[str, object]) -> str:
+    """The derived ``-<codec>-params`` flag for THIS group's ``video_codec``.
+
+    Defensive only: ``lower`` already rejected ``codec_params`` set without a
+    ``video_codec`` in :data:`sqlmpeg.sink.CODEC_PARAMS_FLAGS`, so a miss here
+    means that check was bypassed (hand-built ``Emitted``/graph).
+    """
+    codec = options.get("video_codec")
+    codec_key = CODEC_PARAMS_FLAGS.get(codec) if isinstance(codec, str) else None
+    if codec_key is None:
+        raise _internal(f"codec_params has no matching video_codec (got {codec!r})")
+    return SINK_OPTIONS["codec_params"].flag.format(codec=codec_key)
+
+
 def _render_sink_options(group: OutputGroup) -> list[str]:
     args: list[str] = []
     for name, value in group.options.items():
         spec = SINK_OPTIONS[name]
+        if spec.bare:
+            if value is True:
+                args.append(spec.flag)
+            continue
         rendered = _render_option_value(spec, value)
         if rendered is None:
             continue
+        flag = _codec_params_flag(group.options) if name == "codec_params" else spec.flag
         if spec.per_stream:
             # Per-FILE stream indices, same as the -c/-metadata block above.
             for index, mapping in enumerate(group.maps):
                 if mapping.type == spec.scope:
-                    args += [f"{spec.flag}:{index}", rendered]
+                    args += [f"{flag}:{index}", rendered]
         else:
-            args += [spec.flag, rendered]
+            args += [flag, rendered]
     return args
 
 

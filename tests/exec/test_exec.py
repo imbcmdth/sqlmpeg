@@ -554,6 +554,64 @@ def test_copy_sink_codec_options_land_in_the_real_encode(tmp_path: Path) -> None
     assert streams[2]["codec_name"] == "aac"
 
 
+def _ffprobe_video_profile_level(path: Path) -> dict[str, object]:
+    args = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=profile,level",
+        "-of",
+        "json",
+        str(path),
+    ]
+    result = subprocess.run(args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    stream: dict[str, object] = data["streams"][0]
+    return stream
+
+
+def test_profile_level_maxrate_land_in_a_real_encode(tmp_path: Path) -> None:
+    """Recipe 35's option batch (profile/level/maxrate/bufsize), run for real:
+    ffprobe on the output confirms the encoder actually applied them, not
+    just that ffmpeg accepted the flags without complaint."""
+    _require_fixture(_TESTSRC)
+    out_path = tmp_path / "delivery.mp4"
+    query = (
+        "COPY (\n"
+        f"  SELECT a.frame FROM input('{_sql_path(_TESTSRC)}') a\n"
+        f") TO '{_sql_path(out_path)}' WITH (\n"
+        "  video_codec 'libx264', profile 'baseline', level '3.1', "
+        "maxrate '500k', bufsize '1000k'\n"
+        ")"
+    )
+    _run_sink_query(query, out_path)
+
+    stream = _ffprobe_video_profile_level(out_path)
+    assert "Baseline" in str(stream["profile"])
+    assert stream["level"] == 31  # ffprobe's own spelling of level "3.1"
+
+
+def test_seek_end_produces_a_shorter_file_than_the_source(tmp_path: Path) -> None:
+    """seek_end seeks from EOF: testsrc.mp4 is a known 2.000s, so keeping the
+    last second must produce a file shorter than the whole source."""
+    _require_fixture(_TESTSRC)
+    out_path = tmp_path / "tail.mp4"
+    query = (
+        f"SELECT a.frame FROM input('{_sql_path(_TESTSRC)}', seek_end => 1) a"
+    )
+
+    _compile_and_run(query, out_path)
+
+    source_duration = _ffprobe_duration(_TESTSRC)
+    tail_duration = _ffprobe_duration(out_path)
+    assert tail_duration < source_duration
+    assert tail_duration == pytest.approx(1.0, abs=0.3)
+
+
 # ---------------------------------------------------------------------------
 # SELECT *, subtitle streams, external caption joins
 # ---------------------------------------------------------------------------

@@ -1131,6 +1131,74 @@ def test_sink_faststart_false_omits_movflags_entirely() -> None:
     assert "+faststart" not in args
 
 
+def test_sink_shortest_renders_as_a_bare_flag() -> None:
+    sink = _sink(path="out.mp4", options={"shortest": True})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-map") :] == ["-map", "0:v:0", "-c:0", "copy", "-shortest", "out.mp4"]
+
+
+def test_sink_shortest_false_emits_nothing() -> None:
+    sink = _sink(path="out.mp4", options={"shortest": False})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert "-shortest" not in args
+
+
+def test_sink_duration_renders_a_fractional_number() -> None:
+    sink = _sink(path="out.mp4", options={"duration": 30.5})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-t") :] == ["-t", "30.5", "out.mp4"]
+
+
+def test_sink_movflags_renders_its_raw_value() -> None:
+    sink = _sink(path="out.mp4", options={"movflags": "+faststart+frag_keyframe"})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-movflags") :] == [
+        "-movflags",
+        "+faststart+frag_keyframe",
+        "out.mp4",
+    ]
+
+
+def test_sink_codec_params_derives_its_flag_from_video_codec() -> None:
+    sink = _sink(
+        path="out.mp4", options={"video_codec": "libx264", "codec_params": "keyint=48"}
+    )
+    g = _graph([_node("n1", "hflip", {}, ["src:a:v:0"])], [_out("n1")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-c:0") :] == [
+        "-c:0",
+        "libx264",
+        "-x264-params:0",
+        "keyint=48",
+        "out.mp4",
+    ]
+
+
+@pytest.mark.parametrize(
+    "codec, flag",
+    [("libx264", "-x264-params"), ("libx265", "-x265-params"), ("libsvtav1", "-svtav1-params")],
+)
+def test_sink_codec_params_flag_per_codec(codec: str, flag: str) -> None:
+    sink = _sink(path="out.mp4", options={"video_codec": codec, "codec_params": "k=1"})
+    g = _graph([_node("n1", "hflip", {}, ["src:a:v:0"])], [_out("n1")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert f"{flag}:0" in args
+
+
+def test_sink_codec_params_with_no_matching_video_codec_reaching_emit_is_internal() -> None:
+    """Defensive: lower already rejects this shape; a hand-built graph that
+    skips lower's check surfaces it as an internal-error backstop instead."""
+    sink = _sink(path="out.mp4", options={"codec_params": "keyint=48"})
+    g = _graph([_node("n1", "hflip", {}, ["src:a:v:0"])], [_out("n1")], sink=sink)
+    with pytest.raises(SqlmpegError) as excinfo:
+        build_ffmpeg_args(emit(g))
+    assert excinfo.value.code == ErrorCode.INTERNAL
+
+
 def test_sink_options_render_in_insertion_order_not_table_order() -> None:
     """SINK_OPTIONS lists video_codec before crf; Sink.options insertion order wins."""
     sink = _sink(path="out.mp4", options={"crf": 20, "video_codec": "libx264"})
@@ -1765,6 +1833,52 @@ def test_hwaccel_renders_as_a_bare_string() -> None:
     g = _graph([], [_out("src:a:v:0")], input_options={"a": {"hwaccel": "cuda"}})
     args = build_ffmpeg_args(emit(g), "out.mp4")
     assert args[:3] == ["ffmpeg", "-hwaccel", "cuda"]
+
+
+def test_realtime_renders_as_a_bare_re_flag() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_options={"a": {"realtime": True}})
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args[:3] == ["ffmpeg", "-re", "-i"]
+
+
+def test_realtime_false_is_never_rendered() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_options={"a": {"realtime": False}})
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert "-re" not in args
+
+
+def test_seek_end_renders_negated() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_options={"a": {"seek_end": 60}})
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args[:3] == ["ffmpeg", "-sseof", "-60"]
+
+
+def test_seek_end_renders_a_negated_fraction() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_options={"a": {"seek_end": 12.5}})
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args[:3] == ["ffmpeg", "-sseof", "-12.5"]
+
+
+def test_user_format_renders_the_f_flag_before_the_i() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_options={"a": {"format": "v4l2"}})
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args[:3] == ["ffmpeg", "-f", "v4l2"]
+
+
+def test_subtitle_decoder_renders_before_the_i() -> None:
+    g = _graph([], [_out("src:a:v:0")], input_options={"a": {"subtitle_decoder": "webvtt"}})
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args[:3] == ["ffmpeg", "-c:s", "webvtt"]
+
+
+def test_sub_charenc_and_start_number_render_as_bare_strings() -> None:
+    g = _graph(
+        [],
+        [_out("src:a:v:0")],
+        input_options={"a": {"sub_charenc": "CP1250", "start_number": 3}},
+    )
+    args = build_ffmpeg_args(emit(g), "out.mp4")
+    assert args[:5] == ["ffmpeg", "-sub_charenc", "CP1250", "-start_number", "3"]
 
 
 def test_input_options_render_in_insertion_order() -> None:

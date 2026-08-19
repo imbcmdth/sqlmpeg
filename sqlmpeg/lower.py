@@ -296,7 +296,7 @@ from sqlmpeg.parser import (
 from sqlmpeg.parser import _ident_name as _fold
 from sqlmpeg.probe import ProbeResult, StreamMeta
 from sqlmpeg.registry import DynamicFilter, FilterOption, Registry, SourceFilter
-from sqlmpeg.sink import validate_csv_option
+from sqlmpeg.sink import CODEC_PARAMS_FLAGS, validate_csv_option
 from sqlmpeg.sink import validate_option as validate_sink_option
 from sqlmpeg.table import CellValue, StreamCell, TableResult, TableSink
 
@@ -1019,6 +1019,41 @@ def _input_value(node: exp.Expr) -> object:
     return _Unrepresentable(_sink_describe(node))
 
 
+def _check_sink_option_conflicts(
+    options: dict[str, object],
+    option_nodes: dict[str, exp.Expr],
+    path_node: exp.Expr,
+) -> None:
+    """Reject two sink options that cannot both hold, once all are validated.
+
+    ``faststart``/``movflags`` both set: -movflags either way, so one would
+    silently win over the other's spelling. ``codec_params`` with no
+    matching ``video_codec``: its rendered flag (see
+    ``sqlmpeg.sink.CODEC_PARAMS_FLAGS``) is derived FROM ``video_codec``, so
+    it has nothing to derive from.
+    """
+    if "faststart" in options and "movflags" in options:
+        raise _error(
+            ErrorCode.SINK_OPTION_TYPE,
+            "'faststart' and 'movflags' both set -movflags",
+            option_nodes["movflags"],
+            fallback=path_node,
+            hint="use 'faststart true' for the common case, or 'movflags' "
+            "directly for anything else -- not both",
+        )
+    if "codec_params" in options:
+        codec = options.get("video_codec")
+        if not isinstance(codec, str) or codec not in CODEC_PARAMS_FLAGS:
+            raise _error(
+                ErrorCode.SINK_OPTION_TYPE,
+                f"'codec_params' needs a matching video_codec, got {codec!r}",
+                option_nodes["codec_params"],
+                fallback=path_node,
+                hint="set video_codec to one of: "
+                + ", ".join(sorted(CODEC_PARAMS_FLAGS)),
+            )
+
+
 # typed values, bindings, per-branch environment
 
 
@@ -1486,11 +1521,14 @@ class _Lowerer:
         """
         columns = self._lower_query(list(raw.branches), raw.query)
         options: dict[str, object] = {}
+        option_nodes: dict[str, exp.Expr] = {}
         for option in raw.options:
             line, col = _pos(option.name_node, option.value, raw.path_node)
             options[option.name] = validate_sink_option(
                 option.name, _sink_value(option.value), line=line, col=col
             )
+            option_nodes[option.name] = option.value
+        _check_sink_option_conflicts(options, option_nodes, raw.path_node)
         return SinkUnit(outputs=_outputs(columns), path=raw.path, options=options)
 
     # -- input() named options ---------------------
@@ -2756,6 +2794,18 @@ class _Lowerer:
                     hint="the start bound must be strictly before the end bound",
                 )
             if isinstance(env.bindings[alias], _InputBinding):
+                if any(
+                    opt.name == "seek_end"
+                    for opt in self.res.input_options.get(alias, ())
+                ):
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"'{alias}' sets seek_end and is also seeked by "
+                        f"'WHERE {alias}.t' -- one input, two seek origins",
+                        fallback=select,
+                        hint=f"drop seek_end from {alias}'s input(), or drop "
+                        f"the WHERE window on '{alias}'",
+                    )
                 self.graph.input_trims[alias] = window
             else:
                 env.trims[alias] = window
