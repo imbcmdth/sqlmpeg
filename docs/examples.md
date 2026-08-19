@@ -850,3 +850,66 @@ ffmpeg -i film.mkv -f ffmetadata -i \
 'O0ZGTUVUQURBVEExCltDSEFQVEVSXQpUSU1FQkFTRT0xLzEKU1RBUlQ9MApFTkQ9NjAKdGl0bGU9SW50cm8KW0NIQVBURVJdClRJTUVCQVNFPTEvMQpTVEFSVD02MApFTkQ9MzAwCnRpdGxlPUFjdCBPbmUK' \
   -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map_chapters 1 chaptered.mkv
 ```
+
+## 41. Flag the default track
+
+`disposition` is a reserved tag key: its value is ffmpeg's disposition spec ('default', 'forced', 'default+forced'; '0' clears). Players open the default track first, so this decides what people hear:
+
+```pgsql
+SELECT t.track,
+       CASE WHEN t.language = 'eng' THEN 'default' ELSE '0' END AS disposition
+FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+```
+
+```
+$ sqlmpeg compile -f query.sql -o flagged.mka
+ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng \
+  -disposition:0 default -map 0:a:1 -c:1 copy -metadata:s:1 language=fra -disposition:1 \
+  0 flagged.mka
+```
+
+## 42. Title the file and keep its global tags
+
+`title` and `comment` tag the container (not a stream); `metadata_from` copies an input's global tags through:
+
+```pgsql
+COPY (SELECT f.video[1], f.audio[1] FROM input(:'source') f)
+TO :'dest' WITH (title 'Director Cut', metadata_from f)
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=cut.mkv
+ffmpeg -i film.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata \
+  'title=Director Cut' -map_metadata 0 cut.mkv
+```
+
+## 43. Two-pass encode to a target bitrate
+
+`two_pass true` compiles to TWO chained ffmpeg commands: pass 1 encodes video only into ffmpeg's stats file and discards the output, pass 2 reads the stats and writes the file. `run` executes both in order; requires `video_bitrate` (two-pass exists to hit a bitrate):
+
+```pgsql
+COPY (SELECT f.video[1], f.audio[1] FROM input(:'source') f)
+TO :'dest' WITH (video_codec 'libx264', video_bitrate '2500k', two_pass true, audio_codec 'aac')
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=in.mkv -v dest=out.mp4
+ffmpeg -i in.mkv -map 0:v:0 -c:0 libx264 -b:0 2500k -pass 1 -passlogfile out.mp4 -f null \
+  - && ffmpeg -i in.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -b:0 2500k -pass 2 \
+  -passlogfile out.mp4 -c:1 aac out.mp4
+```
+
+## 44. Merge two audio tracks into one
+
+`amerge` combines tracks into a single multichannel stream (unlike `amix`, which sums them):
+
+```pgsql
+SELECT amerge(a.audio[1], b.audio[1])
+FROM input(:'first') a, input(:'second') b
+```
+
+```
+$ sqlmpeg compile -f query.sql -o merged.mka -v first=one.mp4 -v second=two.mp4
+ffmpeg -i one.mp4 -i two.mp4 -filter_complex '[0:a:0][1:a:0]amerge=inputs=2[out0]' -map \
+  '[out0]' merged.mka
+```
