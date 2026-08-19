@@ -1184,3 +1184,25 @@ def test_a_protocol_url_destination_skips_the_directory_check() -> None:
     assert cli._check_output_dir("udp://127.0.0.1:12399?pkt_size=1316") is None
     assert cli._check_output_dir("rtmp://live.example.com/app/key") is None
     assert cli._check_output_dir("no-such-dir/out.mp4") is not None
+
+
+def test_version_flag_prints_the_tool_version(capsys: pytest.CaptureFixture[str]) -> None:
+    """Both psql spellings; checked before the run dispatch would eat the flag."""
+    from importlib import metadata
+
+    expected = f"sqlmpeg {metadata.version('sqlmpeg')}\n"
+    assert cli.main(["--version"]) == 0
+    assert capsys.readouterr().out == expected
+    assert cli.main(["-V"]) == 0
+    assert capsys.readouterr().out == expected
+
+
+def test_help_output_names_the_version(capsys: pytest.CaptureFixture[str]) -> None:
+    """`sqlmpeg -h` lands on run's help; it must carry the version string."""
+    from importlib import metadata
+
+    version = metadata.version("sqlmpeg")
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["-h"])
+    assert excinfo.value.code == 0
+    assert f"sqlmpeg {version}" in capsys.readouterr().out

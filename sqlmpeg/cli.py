@@ -67,6 +67,7 @@ import re
 import shlex
 import subprocess
 import sys
+from importlib import metadata
 from pathlib import Path
 
 from . import binaries, loudnorm
@@ -99,9 +100,18 @@ _SUBCOMMANDS = frozenset(
 )
 
 
+def _version() -> str:
+    return metadata.version("sqlmpeg")
+
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    # psql's spelling (-v is taken by variables there too); checked before the
+    # run dispatch, which would otherwise hand the flag to the SQL parser.
+    if argv and argv[0] in ("--version", "-V"):
+        print(f"sqlmpeg {_version()}")
+        return 0
     if not argv or argv[0] not in _SUBCOMMANDS:
         argv = ["run", *argv]
 
@@ -137,8 +147,9 @@ def _add_query_arguments(subparser: argparse.ArgumentParser) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="sqlmpeg", description="SQL frontend for FFmpeg filtergraphs"
+        prog="sqlmpeg", description=f"sqlmpeg {_version()} - SQL frontend for FFmpeg filtergraphs"
     )
+    parser.add_argument("-V", "--version", action="version", version=f"sqlmpeg {_version()}")
     subparsers = parser.add_subparsers(dest="command")
 
     compile_p = subparsers.add_parser("compile", help="compile SQL to an ffmpeg command")
@@ -159,7 +170,13 @@ def _build_parser() -> argparse.ArgumentParser:
     validate_p.add_argument(
         "--json", action="store_true", dest="as_json", help="emit the error as JSON"
     )
-    run_p = subparsers.add_parser("run", help="compile and execute ffmpeg")
+    # `sqlmpeg -h` lands on run's help via the default dispatch, so run's
+    # description carries the version the way the top-level one does.
+    run_p = subparsers.add_parser(
+        "run",
+        help="compile and execute ffmpeg",
+        description=f"sqlmpeg {_version()} - compile and execute ffmpeg (the default subcommand)",
+    )
     _add_query_arguments(run_p)
     run_p.add_argument(
         "-o",
