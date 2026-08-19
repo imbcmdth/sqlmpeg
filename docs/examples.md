@@ -1149,3 +1149,47 @@ $ sqlmpeg -f query.sql
  fra      | {<audio 0:a:2>}
 (2 rows)
 ```
+
+## 57. Combine tracks selected by separate CTEs
+
+Each CTE picks its tracks with its own WHERE; the outer query is plain SQL over their rows - `FROM vid, aud` is a cross join, so gather the audio with `array_agg` and group by the video to get one row. The table form previews it; wrap it in COPY and the same relation becomes the file:
+
+```pgsql
+WITH vid AS (
+  SELECT v.track AS track FROM input('tests/fixtures/av-2eng.mp4') i1, unnest(i1.video) v
+),
+aud AS (
+  SELECT a.track AS track FROM input('tests/fixtures/av-2eng.mp4') i2, unnest(i2.audio) a
+  WHERE a.language = 'eng'
+)
+SELECT vid.track, array_agg(aud.track) FROM vid, aud GROUP BY vid.track
+```
+
+```
+$ sqlmpeg -f query.sql
+ track         | array_agg
+---------------+-------------------------------
+ <video 0:v:0> | {<audio 0:a:0>,<audio 0:a:1>}
+(1 row)
+```
+
+The same SELECT inside `COPY (...) TO 'combo.mkv'` compiles to:
+
+```pgsql
+COPY (
+  WITH vid AS (
+    SELECT v.track AS track FROM input('tests/fixtures/av-2eng.mp4') i1, unnest(i1.video) v
+  ),
+  aud AS (
+    SELECT a.track AS track FROM input('tests/fixtures/av-2eng.mp4') i2, unnest(i2.audio) a
+    WHERE a.language = 'eng'
+  )
+  SELECT vid.track, array_agg(aud.track) FROM vid, aud GROUP BY vid.track
+) TO 'combo.mkv'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av-2eng.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy \
+  -metadata:s:1 language=eng -map 0:a:1 -c:2 copy -metadata:s:2 language=eng combo.mkv
+```
