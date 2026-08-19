@@ -353,6 +353,10 @@ _JOIN_ON_HINT = (
     "a literal: =, !=, <, <=, >, >=, BETWEEN, IS [NOT] NULL, joined with "
     "AND/OR/NOT"
 )
+_VALUE_HINT = (
+    "a compile-time value is a literal, NULL, a track-row column, or CASE / "
+    "'||' over those"
+)
 _ROW_ORDER_HINT = (
     "ORDER BY sorts track rows by their metadata columns, "
     "e.g. ORDER BY t.language, t.channels DESC"
@@ -1859,11 +1863,27 @@ class _Resolver:
         scope = self._collect_scope(select, visible)
         for projection in projections:
             self._check_columns(projection, scope, select, table_mode=table_mode)
+            self._check_select_value(projection, scope, select)
         if isinstance(where, exp.Where):
             self._check_where(where, scope, select)
         order = select.args.get("order")
         if isinstance(order, exp.Order):
             self._check_order(order, scope, select)
+
+    def _check_select_value(
+        self, projection: exp.Expr, scope: dict[str, str], select: exp.Select
+    ) -> None:
+        """Type-check a SELECT column written as CASE or ``||``.
+
+        Neither shape can ever be a stream, so this runs whatever the query is:
+        lower decides whether the column is a metadata TAG (a media query over
+        track rows) or a rejection, and a tag's value has to type-check either
+        way.
+        """
+        inner = projection.this if isinstance(projection, exp.Alias) else projection
+        value = _unwrap_paren(inner) if isinstance(inner, exp.Expr) else None
+        if isinstance(value, exp.Case | exp.DPipe):
+            self._check_value_expr(value, scope, select)
 
     def _check_expression(self, node: exp.Expr, select: exp.Select) -> None:
         """Reject constructs no streaming filtergraph can express."""
@@ -2178,6 +2198,11 @@ class _Resolver:
             left = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
             right = node.args.get("expression")
             right = _unwrap_paren(right) if isinstance(right, exp.Expr) else None
+            if isinstance(left, exp.Case | exp.DPipe) or isinstance(
+                right, exp.Case | exp.DPipe
+            ):
+                self._check_value_pair(left, right, scope, join, _JOIN_ON_HINT)
+                return
             column, other = (left, right) if isinstance(left, exp.Column) else (right, left)
             if not isinstance(column, exp.Column):
                 raise _error(
@@ -3208,13 +3233,14 @@ class _Resolver:
         return True
 
     def _check_row_predicate(
-        self, node: exp.Expr, scope: dict[str, str], where: exp.Where
+        self, node: exp.Expr, scope: dict[str, str], where: exp.Expr
     ) -> None:
         """One compile-time row predicate, recursively.
 
         The grammar is small and closed: ``AND`` / ``OR`` / ``NOT`` over
-        comparisons of ONE row column against ONE literal, plus ``BETWEEN`` and
-        ``IS [NOT] NULL``. Evaluation is lower's (it has the probes); this
+        comparisons of ONE row column against ONE literal (or against a CASE /
+        ``||`` value), plus ``BETWEEN`` and ``IS [NOT] NULL``. Evaluation is
+        lower's (it has the probes); this
         checks the shape and the TYPES, which are static — a row column's type
         comes from :data:`ROW_SCHEMAS`, not from whatever the file happened to
         contain, so ``t.channels = 'stereo'`` is rejected even for a track
@@ -3287,6 +3313,11 @@ class _Resolver:
             left = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
             right = node.args.get("expression")
             right = _unwrap_paren(right) if isinstance(right, exp.Expr) else None
+            if isinstance(left, exp.Case | exp.DPipe) or isinstance(
+                right, exp.Case | exp.DPipe
+            ):
+                self._check_value_pair(left, right, scope, where, _ROW_WHERE_HINT)
+                return
             column, literal = (left, right) if isinstance(left, exp.Column) else (right, left)
             if not isinstance(column, exp.Column):
                 raise _error(
@@ -3348,6 +3379,143 @@ class _Resolver:
                 f"WHERE {alias}.language = 'eng'",
             )
         return column_type
+
+    # -- compile-time value expressions: literals, row columns, CASE, || ----
+
+    def _check_value_expr(
+        self, node: exp.Expr | None, scope: dict[str, str], fallback: exp.Expr
+    ) -> str | None:
+        """Static type of one compile-time value expression.
+
+        ``"text"``, ``"number"``, or None where the type is open — a bare NULL,
+        or a CASE whose every result is NULL. Static because both sources are:
+        a row column's type comes from :data:`ROW_SCHEMAS` and a literal's from
+        how it was written, so nothing here depends on what a file contained.
+        """
+        value = _unwrap_paren(node) if isinstance(node, exp.Expr) else None
+        if value is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "malformed value expression",
+                fallback=fallback,
+                hint=_VALUE_HINT,
+            )
+        if isinstance(value, exp.Null):
+            return None
+        if isinstance(value, exp.Column):
+            return self._row_operand(value, scope, fallback)
+        if isinstance(value, exp.Neg):
+            inner = _unwrap_paren(value.this) if isinstance(value.this, exp.Expr) else None
+            if not isinstance(inner, exp.Literal) or inner.is_string:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "negation needs a numeric literal",
+                    value,
+                    fallback=fallback,
+                    hint=_VALUE_HINT,
+                )
+            return "number"
+        if isinstance(value, exp.Literal):
+            return "text" if value.is_string else "number"
+        if isinstance(value, exp.Case):
+            return self._check_case(value, scope, fallback)
+        if isinstance(value, exp.DPipe):
+            return self._check_concat(value, scope, fallback)
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"unsupported value expression: {value.__class__.__name__.upper()}",
+            value,
+            fallback=fallback,
+            hint=_VALUE_HINT,
+        )
+
+    def _check_case(
+        self, node: exp.Case, scope: dict[str, str], fallback: exp.Expr
+    ) -> str | None:
+        """One CASE, searched or simple; its result type.
+
+        Searched (``CASE WHEN <predicate>``): each condition is an ordinary row
+        predicate, checked by the same grammar WHERE uses. Simple (``CASE <x>
+        WHEN <value>``): each WHEN is compared with the operand, so the two
+        must share a type. Either way the results must agree on ONE type, with
+        NULL fitting any of them — that agreement is what types the CASE.
+        """
+        operand = node.this if isinstance(node.this, exp.Expr) else None
+        results: list[exp.Expr | None] = []
+        for branch in node.args.get("ifs") or []:
+            if not isinstance(branch, exp.If) or not isinstance(branch.this, exp.Expr):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL, "malformed CASE", node,
+                    fallback=fallback, hint=_VALUE_HINT,
+                )
+            if operand is None:
+                self._check_row_predicate(branch.this, scope, fallback)
+            else:
+                self._check_value_pair(operand, branch.this, scope, fallback, _VALUE_HINT)
+            results.append(branch.args.get("true"))
+        default = node.args.get("default")
+        if isinstance(default, exp.Expr):
+            results.append(default)
+        found: str | None = None
+        for result in results:
+            result_type = self._check_value_expr(result, scope, fallback)
+            if result_type is None:
+                continue
+            if found is None:
+                found = result_type
+            elif found != result_type:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"CASE results must share one type, got {found} and "
+                    f"{result_type}",
+                    result,
+                    fallback=fallback,
+                    hint=_VALUE_HINT,
+                )
+        return found
+
+    def _check_concat(
+        self, node: exp.DPipe, scope: dict[str, str], fallback: exp.Expr
+    ) -> str:
+        """``||`` joins TEXT; its result is text.
+
+        A numeric operand is rejected rather than coerced. Postgres itself
+        wants the cast, and an implicit one would have this compiler decide how
+        to spell a number nobody asked it to format.
+        """
+        for side in (node.this, node.args.get("expression")):
+            if self._check_value_expr(side, scope, fallback) != "number":
+                continue
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "'||' joins text, but one side is a number",
+                side if isinstance(side, exp.Expr) else None,
+                fallback=fallback,
+                hint="quote the number, or join text columns: "
+                "'Audio (' || t.language || ')'",
+            )
+        return "text"
+
+    def _check_value_pair(
+        self,
+        left: exp.Expr | None,
+        right: exp.Expr | None,
+        scope: dict[str, str],
+        fallback: exp.Expr,
+        hint: str,
+    ) -> None:
+        """Two compile-time operands of one comparison: their types must match."""
+        left_type = self._check_value_expr(left, scope, fallback)
+        right_type = self._check_value_expr(right, scope, fallback)
+        if left_type is None or right_type is None or left_type == right_type:
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"a comparison needs one type, got {left_type} and {right_type}",
+            right if isinstance(right, exp.Expr) else None,
+            fallback=fallback,
+            hint=hint,
+        )
 
     def _check_row_literal(
         self,

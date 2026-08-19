@@ -6497,3 +6497,324 @@ def test_an_empty_captions_fill_muxes_a_real_track(tmp_path: Path) -> None:
     result = subprocess.run(args, capture_output=True, text=True, timeout=60.0)
     assert result.returncode == 0, result.stderr
     assert out.exists()
+
+
+# ---------------------------------------------------------------------------
+# metadata tag columns: CASE, ||, row-scoped overrides
+# ---------------------------------------------------------------------------
+#
+# Synthetic probes again: a tag's value is computed from probed columns and
+# lands in `Output.metadata`, so nothing here needs a file. The end-to-end
+# shapes are the cookbook's (recipes 37-38, exec tier).
+
+
+def _tag_query(tag: str, projection: str = "t.track", column: str = "audio") -> str:
+    return (
+        f"SELECT {projection}, {tag} FROM input('f.mkv') f, unnest(f.{column}) t"
+    )
+
+
+def test_a_tag_column_replaces_the_provenance_value() -> None:
+    g = _lower(_tag_query("'zxx' AS language"), _row_probes())
+    assert [o.metadata for o in g.outputs] == [{"language": "zxx"}] * 3
+
+
+def test_a_tag_column_adds_a_key_provenance_never_had() -> None:
+    g = _lower(_tag_query("'Main' AS title"), _row_probes())
+    assert [o.metadata for o in g.outputs] == [
+        {"language": "eng", "title": "Main"},
+        {"language": "fra", "title": "Main"},
+        {"title": "Main"},
+    ]
+
+
+def test_a_null_tag_clears_the_key_and_leaves_the_rest() -> None:
+    g = _lower(
+        _tag_query("NULL AS language", projection="t.track, 'Main' AS title"),
+        _row_probes(),
+    )
+    assert [o.metadata for o in g.outputs] == [{"title": "Main"}] * 3
+
+
+def test_an_unselected_tag_passes_through_unchanged() -> None:
+    probes = _row_probes(_track("audio", 0, language="eng", title="Commentary"))
+    g = _lower(_tag_query("'zxx' AS language"), probes)
+    assert [o.metadata for o in g.outputs] == [
+        {"language": "zxx", "title": "Commentary"}
+    ]
+
+
+def test_a_tag_column_produces_no_output_stream() -> None:
+    g = _lower(_tag_query("'Main' AS title"), _row_probes())
+    assert _outputs(g) == [
+        ("src:f:a:0", "audio", None),
+        ("src:f:a:1", "audio", None),
+        ("src:f:a:2", "audio", None),
+    ]
+
+
+def test_a_searched_case_takes_the_first_true_branch_per_row() -> None:
+    g = _lower(
+        _tag_query(
+            "CASE WHEN t.language = 'fra' THEN 'fre' "
+            "WHEN t.channels = 2 THEN 'two' ELSE 'other' END AS language"
+        ),
+        _row_probes(),
+    )
+    assert [o.metadata for o in g.outputs] == [
+        {"language": "two"},
+        {"language": "fre"},
+        {"language": "two"},
+    ]
+
+
+def test_a_simple_case_compares_its_operand_with_each_when() -> None:
+    g = _lower(
+        _tag_query(
+            "CASE t.language WHEN 'fra' THEN 'fre' WHEN 'eng' THEN 'en' "
+            "ELSE 'und' END AS language"
+        ),
+        _row_probes(),
+    )
+    assert [o.metadata for o in g.outputs] == [
+        {"language": "en"},
+        {"language": "fre"},
+        # The third track has no language tag: `NULL = 'fra'` is UNKNOWN, not
+        # TRUE, so no WHEN matches and ELSE answers.
+        {"language": "und"},
+    ]
+
+
+def test_an_unknown_case_condition_is_not_true() -> None:
+    """3VL straight through CASE: the untagged track's comparison is UNKNOWN,
+    so its branch is skipped exactly as a FALSE one is."""
+    g = _lower(
+        _tag_query("CASE WHEN t.language != 'fra' THEN 'kept' ELSE 'else' END AS title"),
+        _row_probes(),
+    )
+    assert [o.metadata["title"] for o in g.outputs] == ["kept", "else", "else"]
+
+
+def test_a_case_with_no_else_falls_through_to_null() -> None:
+    g = _lower(
+        _tag_query("CASE WHEN t.language = 'fra' THEN 'fre' END AS language"),
+        _row_probes(),
+    )
+    assert [o.metadata for o in g.outputs] == [{}, {"language": "fre"}, {}]
+
+
+def test_concatenation_builds_a_value_from_the_row() -> None:
+    g = _lower(_tag_query("'Audio (' || t.language || ')' AS title"), _row_probes())
+    assert [o.metadata.get("title") for o in g.outputs] == [
+        "Audio (eng)",
+        "Audio (fra)",
+        # NULL propagates: the untagged track's title is NULL, which CLEARS the
+        # key rather than writing "Audio ()".
+        None,
+    ]
+
+
+def test_a_tag_key_is_free_form() -> None:
+    g = _lower(_tag_query("'2026' AS date"), _row_probes(_track("audio", 0)))
+    assert [o.metadata for o in g.outputs] == [{"date": "2026"}]
+
+
+def test_a_tag_key_folds_like_any_identifier() -> None:
+    """Unquoted -> lowercase, quoted -> verbatim: Postgres's own rule, so the
+    key a container ends up carrying is the one the alias spells."""
+    g = _lower(
+        _tag_query("""'x' AS Title, 'y' AS "Sort Name\""""),
+        _row_probes(_track("audio", 0)),
+    )
+    assert [o.metadata for o in g.outputs] == [{"title": "x", "Sort Name": "y"}]
+
+
+def test_a_tag_is_row_scoped_across_every_track_the_row_carries() -> None:
+    """One result row, two tracks (a video and an audio one crossed): the tag
+    the row computes lands on both."""
+    probes = _row_probes(_track("video", 0), _track("audio", 0, language="eng"))
+    g = _lower(
+        "SELECT v.track, a.track, 'Feature' AS title FROM input('f.mkv') f, "
+        "unnest(f.video) v, unnest(f.audio) a",
+        probes,
+    )
+    assert _refs(g) == ["src:f:v:0", "src:f:a:0"]
+    assert [o.metadata for o in g.outputs] == [
+        {"title": "Feature"},
+        {"language": "eng", "title": "Feature"},
+    ]
+
+
+def test_a_joined_row_tags_one_sides_track_from_the_others_column() -> None:
+    probes = _pair_probes(
+        left=[_track("audio", 0, language="eng"), _track("audio", 1, language="fra")],
+        right=[
+            _track("audio", 0, language="eng", title="English"),
+            _track("audio", 1, language="fra", title="French"),
+        ],
+    )
+    g = _lower(_join_query(projection="a.track, b.title AS title"), probes)
+    assert _refs(g) == ["src:f:a:0", "src:f:a:1"]
+    assert [o.metadata for o in g.outputs] == [
+        {"language": "eng", "title": "English"},
+        {"language": "fra", "title": "French"},
+    ]
+
+
+def test_one_track_cannot_take_two_values_for_the_same_tag() -> None:
+    """A cross join repeats the left track once per right row; two different
+    values for its tag is a rejection, not a last-one-wins guess."""
+    probes = _pair_probes(
+        left=[_track("audio", 0, language="eng")],
+        right=[
+            _track("audio", 0, language="eng"),
+            _track("audio", 1, language="fra"),
+        ],
+    )
+    err = _reject_lower(
+        "SELECT a.track, b.language AS language FROM input('f.mkv') f, "
+        "input('g.mkv') g, unnest(f.audio) a, unnest(g.audio) b",
+        probes,
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "two different values" in err.message
+
+
+def test_a_tag_survives_a_filter_that_threads_provenance() -> None:
+    g = _lower(
+        _tag_query("'Loud' AS title", projection="volume(t.track, 2.0)"),
+        _row_probes(_track("audio", 0, language="eng")),
+    )
+    assert [o.metadata for o in g.outputs] == [{"language": "eng", "title": "Loud"}]
+
+
+def test_a_query_of_nothing_but_tags_selects_no_stream() -> None:
+    err = _reject_lower(
+        "SELECT 'Main' AS title FROM input('f.mkv') f, unnest(f.audio) t",
+        _row_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "selects no stream" in err.message
+
+
+def test_a_media_query_with_no_row_tables_keeps_the_old_rejection() -> None:
+    err = _reject("SELECT f.audio[1], 'Main' AS title FROM input('f.mkv') f")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "every SELECT column must be a stream expression" in err.message
+
+
+def test_a_case_column_with_no_row_tables_is_rejected_as_a_value() -> None:
+    err = _reject(
+        "SELECT f.audio[1], CASE WHEN 'a' = 'a' THEN 'x' END AS title "
+        "FROM input('f.mkv') f"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_an_unaliased_row_metadata_column_is_still_not_a_stream() -> None:
+    err = _reject_lower(
+        "SELECT t.track, t.language FROM input('f.mkv') f, unnest(f.audio) t",
+        _row_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is track metadata, not a stream" in err.message
+    assert "alias" in (err.hint or "")
+
+
+def test_where_accepts_a_case_operand() -> None:
+    g = _lower(
+        _row_query("t.language = CASE WHEN t.channels = 6 THEN 'fra' ELSE 'eng' END"),
+        _row_probes(),
+    )
+    assert _refs(g) == ["src:f:a:0", "src:f:a:1"]
+
+
+def test_where_accepts_a_concatenation_operand() -> None:
+    g = _lower(_row_query("'x' || t.language = 'xfra'"), _row_probes())
+    assert _refs(g) == ["src:f:a:1"]
+
+
+def test_an_on_predicate_accepts_a_case_operand() -> None:
+    g = _lower(
+        _join_query(
+            on="ON a.language = CASE WHEN b.channels = 2 THEN b.language ELSE 'zxx' END"
+        ),
+        _pair_probes(right=[_track("audio", 0, language="eng", channels=2)]),
+    )
+    assert _refs(g) == ["src:f:a:0", "src:g:a:0"]
+
+
+def test_concatenating_a_number_is_rejected_rather_than_coerced() -> None:
+    err = _reject(_tag_query("'ch' || t.channels AS title"))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'||' joins text" in err.message
+    assert "quote the number" in (err.hint or "")
+
+
+def test_case_results_must_share_one_type() -> None:
+    err = _reject(
+        _tag_query("CASE WHEN t.language = 'fra' THEN 'fre' ELSE 2 END AS language")
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "CASE results must share one type" in err.message
+
+
+def test_a_simple_case_types_its_whens_against_the_operand() -> None:
+    err = _reject(_tag_query("CASE t.language WHEN 2 THEN 'x' END AS language"))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "one type" in err.message
+
+
+def test_a_case_condition_is_type_checked_like_any_row_predicate() -> None:
+    err = _reject(_tag_query("CASE WHEN t.channels = 'two' THEN 'x' END AS title"))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is number" in err.message
+
+
+@pytest.mark.exec
+def test_a_written_tag_reads_back_out_of_the_file(tmp_path: Path) -> None:
+    """The claim end to end: the compiled command really does stamp the tag,
+    and ffprobe reads it back off the muxed stream."""
+    out = tmp_path / "tagged.mka"
+    query = (
+        "SELECT t.track, 'Audio (' || t.language || ')' AS title "
+        f"FROM input('{(FIXTURES_DIR / 'av-eng.mp4').as_posix()}') f, "
+        "unnest(f.audio) t"
+    )
+    args = build_ffmpeg_args(emit(compile_sql(query)), str(out))
+    args.insert(1, "-y")
+    result = subprocess.run(args, capture_output=True, text=True, timeout=60.0)
+    assert result.returncode == 0, result.stderr
+    probed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream_tags=title,language",
+            "-of", "default=noprint_wrappers=1", str(out),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60.0,
+    )
+    assert probed.returncode == 0, probed.stderr
+    assert "TAG:title=Audio (eng)" in probed.stdout
+    assert "TAG:language=eng" in probed.stdout
+
+
+def test_a_table_query_prints_what_a_tag_would_say() -> None:
+    """The same value expression, printed instead of written: how you check a
+    retag before running it."""
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT t.index, CASE WHEN t.language = 'fra' THEN 'fre' "
+                "ELSE t.language END AS lang, 'A (' || t.language || ')' AS title "
+                "FROM input('f.mkv') f, unnest(f.audio) t"
+            )
+        ),
+        _row_probes(),
+    )
+    assert sinks[0].result.rows == [
+        [1, "eng", "A (eng)"],
+        [2, "fre", "A (fra)"],
+        [3, None, None],
+    ]

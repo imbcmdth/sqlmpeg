@@ -365,7 +365,8 @@ _SOURCE_DURATION_HINT = (
 _ROW_METADATA_HINT = (
     "a track row's metadata columns are what you FILTER, JOIN and SORT rows by; "
     "the only column that is a stream — and therefore the only one that can be "
-    "an output — is <alias>.track"
+    "an output — is <alias>.track. Give the column an alias to write it back as "
+    "a TAG instead, e.g. SELECT t.track, t.language AS language"
 )
 _CAPTION_TRIM_HINT = (
     "trim the video/audio without selecting the subtitle/data columns, or select "
@@ -694,6 +695,10 @@ def _describe(node: exp.Expr) -> str:
         return "NULL"
     if isinstance(node, exp.Boolean):
         return "a boolean literal"
+    if isinstance(node, exp.Case):
+        return "a CASE expression"
+    if isinstance(node, exp.DPipe):
+        return "a '||' expression"
     return f"a {node.__class__.__name__.upper()} expression"
 
 
@@ -1245,6 +1250,10 @@ class _RowBinding:
 
 _Binding = _InputBinding | _CteBinding | _SourceBinding | _RowBinding
 
+# Metadata tag overrides for one query: probed StreamMeta identity -> the keys
+# its output streams set, with None for a key the query clears.
+_TagOverrides = dict[int, dict[str, str | None]]
+
 
 def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
     """One probed stream's row columns.
@@ -1469,6 +1478,9 @@ class _Lowerer:
         # alias -> its INTERNAL input options. Merged into `Graph.input_options`
         # by `_lower_input_options`, which is the only writer of that field.
         self.minted_input_options: dict[str, dict[str, object]] = {}
+        # The tag columns of the query being lowered; reset per query, since
+        # two COPYs may tag the same track differently.
+        self.tags: _TagOverrides = {}
         # True for the whole duration of `run_table()`; `run()` never sets it.
         # Table mode changes exactly one thing about the stream machinery it
         # otherwise reuses verbatim: an outer join's NULL row is an empty cell
@@ -1499,8 +1511,8 @@ class _Lowerer:
         if self.res.sinks:
             self.graph.sinks = [self._lower_sink(raw) for raw in self.res.sinks]
         else:
-            columns = self._lower_query(self.res.branches, self.res.select)
-            self.graph.sinks = [SinkUnit(outputs=_outputs(columns))]
+            columns = self._lower_query(self.res.branches, self.res.select, tags=True)
+            self.graph.sinks = [SinkUnit(outputs=_outputs(columns, self.tags))]
         self.graph.input_options = self._lower_input_options()
         return self.graph
 
@@ -1519,7 +1531,7 @@ class _Lowerer:
         node to the value node to the path literal — which at least keeps
         every rejection on (or just above) the ``WITH`` block.
         """
-        columns = self._lower_query(list(raw.branches), raw.query)
+        columns = self._lower_query(list(raw.branches), raw.query, tags=True)
         options: dict[str, object] = {}
         option_nodes: dict[str, exp.Expr] = {}
         for option in raw.options:
@@ -1529,7 +1541,9 @@ class _Lowerer:
             )
             option_nodes[option.name] = option.value
         _check_sink_option_conflicts(options, option_nodes, raw.path_node)
-        return SinkUnit(outputs=_outputs(columns), path=raw.path, options=options)
+        return SinkUnit(
+            outputs=_outputs(columns, self.tags), path=raw.path, options=options
+        )
 
     # -- input() named options ---------------------
 
@@ -1560,11 +1574,12 @@ class _Lowerer:
     # -- a query (one SELECT, or a UNION ALL of them) ----------------------
 
     def _lower_query(
-        self, branches: list[exp.Select], anchor: exp.Expr
+        self, branches: list[exp.Select], anchor: exp.Expr, *, tags: bool = False
     ) -> list[_Column]:
         if not branches:
             raise _error(ErrorCode.UNSUPPORTED_SQL, "query has no SELECT", anchor)
-        lowered = [self._lower_branch(branch) for branch in branches]
+        self.tags = {}
+        lowered = [self._lower_branch(branch, tags=tags) for branch in branches]
         if len(lowered) == 1:
             # A single branch keeps its arrays: a CTE body's array column stays
             # an array for `<cte>.<name>` to splat, broadcast over, or subscript.
@@ -1681,7 +1696,7 @@ class _Lowerer:
 
     # -- one SELECT branch ------------------------------------------------
 
-    def _lower_branch(self, select: exp.Select) -> list[_Column]:
+    def _lower_branch(self, select: exp.Select, *, tags: bool = False) -> list[_Column]:
         env = self._scope(select)
         # One WHERE clause, three languages. A conjunct over track-row columns
         # is decided HERE and never reaches ffmpeg; a subscript metadata
@@ -1709,13 +1724,83 @@ class _Lowerer:
             if qualifier is not None:
                 columns += self._expand_star(qualifier, projection, env, select)
                 continue
+            # A tag column produces no stream, so it never becomes an output;
+            # `tags` is False for a CTE body, where there is no output to tag.
+            if tags and env.relation is not None and _is_tag_column(projection, env):
+                self._collect_tag(projection, env, select)
+                continue
             columns.append(
                 _Column(
                     name=_projection_name(projection),
                     value=self._lower_expr(projection, env, select),
                 )
             )
+        if not columns:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "every SELECT column is a metadata tag, so the query selects no "
+                "stream",
+                fallback=select,
+                hint="a tag rides on an output stream; select the tracks too, "
+                "e.g. SELECT t.track, ... AS title",
+            )
         return columns
+
+    # -- metadata tag columns ---------------------------------------------
+
+    def _collect_tag(
+        self, projection: exp.Expr, env: _Env, select: exp.Select
+    ) -> None:
+        """One tag column, evaluated once per result row.
+
+        ROW-SCOPED: the value a result row computes is written onto every track
+        that row carries, so a row holding a video and an audio track tags both,
+        and a joined row can tag one side's track with the other side's column.
+        """
+        key = _projection_name(projection)
+        relation = env.relation
+        if key is None or relation is None:  # defensive: `_is_tag_column` checked
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, "malformed tag column", projection,
+                fallback=select,
+            )
+        value_node = _unwrap(projection)
+        for row in relation.tuples:
+            value = self._eval_value(value_node, env, row, select)
+            text = None if value is None else _tag_text(value)
+            for track in row.values():
+                if track is not None:
+                    self._record_tag(track.stream.source, key, text, projection, select)
+
+    def _record_tag(
+        self,
+        source: StreamMeta | None,
+        key: str,
+        value: str | None,
+        anchor: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """Note one track's override for one key; disagreement is a rejection.
+
+        Keyed by the identity of the probed :class:`StreamMeta`, which is the
+        same thing :func:`_provenance` reads off an output stream — so an
+        override finds its track through any chain of filters that threads
+        provenance, not just a passthrough. The probes hold every StreamMeta for
+        the whole lowering, so the ids stay valid.
+        """
+        if source is None:
+            return
+        overrides = self.tags.setdefault(id(source), {})
+        if key in overrides and overrides[key] != value:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"tag '{key}' takes two different values on the same track",
+                anchor,
+                fallback=select,
+                hint="a tag is row-scoped, so a track selected by several result "
+                "rows must get the same value in each",
+            )
+        overrides[key] = value
 
     # -- SELECT * / <alias>.* ------------------------------------
 
@@ -2359,28 +2444,18 @@ class _Lowerer:
             return not is_null if node.args.get("negate") else is_null
         if isinstance(node, exp.Between):
             value = self._row_value_of(node.this, env, rows, select)
-            low = self._operand_of(node.args.get("low"), env, rows, select)
-            high = self._operand_of(node.args.get("high"), env, rows, select)
+            low = self._eval_value(node.args.get("low"), env, rows, select)
+            high = self._eval_value(node.args.get("high"), env, rows, select)
             return _kleene_and(
                 _compare(exp.GTE(), value, low), _compare(exp.LTE(), value, high)
             )
         if isinstance(node, exp.EQ | exp.NEQ | exp.GT | exp.GTE | exp.LT | exp.LTE):
-            left_node = node.this
-            right_node = node.args.get("expression")
-            if isinstance(_unwrap(left_node), exp.Column):
-                return _compare(
-                    node,
-                    self._row_value_of(left_node, env, rows, select),
-                    self._operand_of(right_node, env, rows, select),
-                )
-            # `'eng' = t.language` compares the same pair the other way round,
-            # and every operator here is its own mirror when the operands swap
-            # -- except the ordering four, which invert.
-            mirrored = _MIRRORED_COMPARISONS[type(node)]()
+            # Both sides go through one value evaluator, so the operands stay in
+            # written order and `'eng' = t.language` needs no mirroring.
             return _compare(
-                mirrored,
-                self._row_value_of(right_node, env, rows, select),
-                self._operand_of(left_node, env, rows, select),
+                node,
+                self._eval_value(node.this, env, rows, select),
+                self._eval_value(node.args.get("expression"), env, rows, select),
             )
         raise _error(  # defensive: resolve accepted only the shapes above
             ErrorCode.UNSUPPORTED_SQL,
@@ -2434,18 +2509,86 @@ class _Lowerer:
         row = rows.get(binding.alias)
         return None if row is None else row.columns.get(name)
 
-    def _operand_of(
+    def _eval_value(
         self,
         node: exp.Expr | None,
         env: _Env,
         rows: dict[str, _TrackRow | None],
         select: exp.Select,
     ) -> RowValue:
-        """A comparison's other operand: another row column, or a literal."""
+        """One compile-time value over a result row.
+
+        The whole value grammar: a literal, NULL, a row's metadata column,
+        ``CASE`` and ``||``. Shared by the predicate evaluator (a comparison's
+        operands, a BETWEEN bound) and by tag columns, so WHERE, ON and a tag
+        value all speak the same language.
+        """
         value = _unwrap(node) if isinstance(node, exp.Expr) else None
+        if isinstance(value, exp.Null):
+            return None
         if isinstance(value, exp.Column):
             return self._row_value_of(value, env, rows, select)
-        return self._literal_of(node, select)
+        if isinstance(value, exp.Case):
+            return self._eval_case(value, env, rows, select)
+        if isinstance(value, exp.DPipe):
+            return self._eval_concat(value, env, rows, select)
+        return self._literal_of(value, select)
+
+    def _eval_case(
+        self,
+        node: exp.Case,
+        env: _Env,
+        rows: dict[str, _TrackRow | None],
+        select: exp.Select,
+    ) -> RowValue:
+        """CASE, searched and simple: the first TRUE branch, else ELSE, else NULL.
+
+        A searched branch's condition is an ordinary row predicate, so its
+        three-valued logic carries straight over: only TRUE takes a branch, and
+        UNKNOWN falls through exactly as FALSE does. The simple form compares
+        the operand with ``=``, which makes a NULL operand match no WHEN — SQL's
+        rule, and the same 3VL again.
+        """
+        operand_node = node.this if isinstance(node.this, exp.Expr) else None
+        operand = (
+            self._eval_value(operand_node, env, rows, select)
+            if operand_node is not None
+            else None
+        )
+        for branch in node.args.get("ifs") or []:
+            if not isinstance(branch, exp.If) or not isinstance(branch.this, exp.Expr):
+                raise _error(  # defensive: resolve checked the shape
+                    ErrorCode.UNSUPPORTED_SQL, "malformed CASE", node, fallback=select
+                )
+            matched = (
+                self._eval_row(branch.this, env, rows, select)
+                if operand_node is None
+                else _compare(
+                    exp.EQ(),
+                    operand,
+                    self._eval_value(branch.this, env, rows, select),
+                )
+            )
+            if matched is True:
+                return self._eval_value(branch.args.get("true"), env, rows, select)
+        default = node.args.get("default")
+        if not isinstance(default, exp.Expr):
+            return None
+        return self._eval_value(default, env, rows, select)
+
+    def _eval_concat(
+        self,
+        node: exp.DPipe,
+        env: _Env,
+        rows: dict[str, _TrackRow | None],
+        select: exp.Select,
+    ) -> RowValue:
+        """``a || b``: NULL when either side is NULL, else the two texts joined."""
+        left = self._eval_value(node.this, env, rows, select)
+        right = self._eval_value(node.args.get("expression"), env, rows, select)
+        if left is None or right is None:
+            return None
+        return f"{left}{right}"
 
     def _literal_of(self, node: exp.Expr | None, select: exp.Select) -> RowValue:
         """A row predicate's literal operand as a python scalar."""
@@ -2924,6 +3067,18 @@ class _Lowerer:
             # Not a call: COALESCE resolves against the ROW model, not the
             # registry -- it is how a nullable track column is spelled.
             return self._lower_coalesce(node, env, select)
+        if isinstance(node, exp.Case | exp.DPipe):
+            # A value expression, never a stream. Reaching here means it is not
+            # a tag column either: unaliased, or in a query with no track rows.
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"every SELECT column must be a stream expression, got "
+                f"{_describe(node)}",
+                node,
+                fallback=select,
+                hint="a value expression names a metadata TAG: give it an alias "
+                "for the tag key, in a query over unnest'd track rows",
+            )
         call = _call_parts(node)
         if call is not None:
             return self._lower_call(node, call, env, select)
@@ -4844,12 +4999,28 @@ class _Lowerer:
                     name = _fold(expr.this)
                     if name != ROW_STREAM_COLUMN:
                         return self._row_metadata_cells(binding, name, expr, select)
+        if isinstance(expr, exp.Case | exp.DPipe):
+            return self._value_cells(expr, env, select, cardinality)
         shape = subscript_metadata_shape(expr)
         if shape is not None and shape[1] != ROW_STREAM_COLUMN:
             metadata_value = self._accessor_value(expr, select)
             return [metadata_value] * cardinality
         stream_value = self._lower_expr(projection, env, select)
         return self._value_to_cells(stream_value, cardinality)
+
+    def _value_cells(
+        self, node: exp.Expr, env: _Env, select: exp.Select, cardinality: int
+    ) -> list[CellValue]:
+        """A CASE / ``||`` column, evaluated once per row.
+
+        The same expression a media query writes back as a tag, PRINTED
+        instead: a table query is how you check what the tag would say before
+        writing it.
+        """
+        relation = env.relation
+        if relation is None:
+            return [self._eval_value(node, env, {}, select)] * cardinality
+        return [self._eval_value(node, env, row, select) for row in relation.tuples]
 
     def _row_metadata_cells(
         self, binding: _RowBinding, name: str, anchor: exp.Expr, select: exp.Select
@@ -4938,7 +5109,7 @@ def _agreed_source(segments: list[_Stream]) -> StreamMeta | None:
     return segments[0].source
 
 
-def _outputs(columns: list[_Column]) -> list[Output]:
+def _outputs(columns: list[_Column], tags: _TagOverrides) -> list[Output]:
     """One :class:`~sqlmpeg.ir.Output` per stream a SELECT list carries.
 
     The SELECT list IS the output stream list, and an array column is several
@@ -4951,11 +5122,63 @@ def _outputs(columns: list[_Column]) -> list[Output]:
             ref=stream.ref,
             type=stream.type,
             name=column.name,
-            metadata=_provenance(stream),
+            metadata=_metadata(stream, tags),
         )
         for column in columns
         for stream in column.value.streams
     ]
+
+
+def _metadata(stream: _Stream, tags: _TagOverrides) -> dict[str, str]:
+    """One output's tags: its provenance, with this query's overrides applied.
+
+    An override REPLACES the provenance value for its key, a NULL one removes
+    the key, and a key nothing overrode passes through untouched.
+    """
+    metadata = _provenance(stream)
+    if stream.source is None:
+        return metadata
+    for key, value in tags.get(id(stream.source), {}).items():
+        if value is None:
+            metadata.pop(key, None)
+        else:
+            metadata[key] = value
+    return metadata
+
+
+def _tag_text(value: str | int | float) -> str:
+    """A tag value as the text ffmpeg receives."""
+    return value if isinstance(value, str) else str(value)
+
+
+def _is_tag_column(projection: exp.Expr, env: _Env) -> bool:
+    """True for a SELECT column that sets a metadata TAG rather than a stream.
+
+    A tag column is aliased — the alias IS the tag key — and its value is a
+    compile-time expression over the row: a literal, NULL, a row's metadata
+    column, CASE or ``||``. Everything else is a stream expression and lowers
+    as one.
+    """
+    if _projection_name(projection) is None:
+        return False
+    value = _unwrap(projection)
+    if isinstance(value, exp.Case | exp.DPipe | exp.Null | exp.Literal | exp.Neg):
+        return True
+    return _row_metadata_column(value, env) is not None
+
+
+def _row_metadata_column(node: exp.Expr, env: _Env) -> str | None:
+    """The metadata column `node` reads off a row alias, else None (``track``
+    is a stream, not metadata)."""
+    if not isinstance(node, exp.Column):
+        return None
+    table_node = node.args.get("table")
+    if table_node is None:
+        return None
+    if not isinstance(env.bindings.get(_fold(table_node)), _RowBinding):
+        return None
+    name = _fold(node.this)
+    return None if name == ROW_STREAM_COLUMN else name
 
 
 def _flatten(columns: list[_Column]) -> list[_Column]:
