@@ -72,6 +72,8 @@ _DUMMY_VALUES = {
     "rate": "1",
     "prefix": "ch",
     "ext": "m4a",
+    "title": "My Film",
+    "artist": "Me",
 }
 
 

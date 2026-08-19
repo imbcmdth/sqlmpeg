@@ -244,6 +244,24 @@ def test_sink_unit_round_trip() -> None:
     }
 
 
+def test_sink_unit_container_tags_round_trip() -> None:
+    unit = SinkUnit(
+        outputs=[Output(ref="n2", type="video", name=None, metadata={})],
+        path="out.mkv",
+        tags={"title": "Cut", "artist": None},
+    )
+    d = unit.to_dict()
+    assert d["tags"] == {"title": "Cut", "artist": None}
+    assert SinkUnit.from_dict(d) == unit
+
+
+def test_a_sink_unit_tagging_nothing_omits_the_tags_key() -> None:
+    """Same shape the goldens pin: an empty optional field is not serialized."""
+    unit = SinkUnit(outputs=[], path="out.mkv")
+    assert "tags" not in unit.to_dict()
+    assert SinkUnit.from_dict(unit.to_dict()).tags == {}
+
+
 def test_bare_select_sink_unit_emits_an_explicit_null_path() -> None:
     g = _build_graph()
     unit = _serialized_sinks(g.to_dict())[0]

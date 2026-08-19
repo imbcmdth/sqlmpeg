@@ -57,9 +57,15 @@ def _out(
     return Output(ref=ref, type=type, name=name, metadata=dict(metadata or {}))
 
 
-def _sink(path: str, options: dict[str, object] | None = None) -> SinkUnit:
+def _sink(
+    path: str,
+    options: dict[str, object] | None = None,
+    tags: dict[str, str | None] | None = None,
+) -> SinkUnit:
     """A destination with no outputs yet -- `_graph` fills them in."""
-    return SinkUnit(outputs=[], path=path, options=dict(options or {}))
+    return SinkUnit(
+        outputs=[], path=path, options=dict(options or {}), tags=dict(tags or {})
+    )
 
 
 def _graph(
@@ -81,7 +87,14 @@ def _graph(
     if sinks is not None:
         units = list(sinks)
     elif sink is not None:
-        units = [SinkUnit(outputs=list(outputs), path=sink.path, options=dict(sink.options))]
+        units = [
+            SinkUnit(
+                outputs=list(outputs),
+                path=sink.path,
+                options=dict(sink.options),
+                tags=dict(sink.tags),
+            )
+        ]
     else:
         units = [SinkUnit(outputs=list(outputs))]
     return Graph(
@@ -1219,8 +1232,8 @@ def test_sink_movflags_renders_its_raw_value() -> None:
     ]
 
 
-def test_sink_title_and_comment_render_as_global_metadata_flags() -> None:
-    sink = _sink(path="out.mp4", options={"title": "Director's Cut", "comment": "ripped"})
+def test_container_tags_render_as_global_metadata_flags_keys_sorted() -> None:
+    sink = _sink(path="out.mp4", tags={"title": "Director's Cut", "comment": "ripped"})
     g = _graph([], [_out("src:a:v:0")], sink=sink)
     args = build_ffmpeg_args(emit(g))
     assert args[args.index("-map") :] == [
@@ -1229,9 +1242,30 @@ def test_sink_title_and_comment_render_as_global_metadata_flags() -> None:
         "-c:0",
         "copy",
         "-metadata",
-        "title=Director's Cut",
-        "-metadata",
         "comment=ripped",
+        "-metadata",
+        "title=Director's Cut",
+        "out.mp4",
+    ]
+
+
+def test_container_tag_with_a_null_value_renders_an_empty_assignment() -> None:
+    """A cleared key is written out: ffmpeg copies input globals by default."""
+    sink = _sink(path="out.mp4", tags={"artist": None})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-metadata") :] == ["-metadata", "artist=", "out.mp4"]
+
+
+def test_container_tags_render_before_the_sink_options() -> None:
+    sink = _sink(path="out.mp4", options={"metadata_from": 0}, tags={"title": "Cut"})
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-metadata") :] == [
+        "-metadata",
+        "title=Cut",
+        "-map_metadata",
+        "0",
         "out.mp4",
     ]
 

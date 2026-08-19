@@ -181,6 +181,7 @@ from sqlmpeg.errors import ErrorCode, SqlmpegError
 __all__ = [
     "FILTER_NAMESPACE",
     "INPUT_DURATION_COLUMN",
+    "INPUT_TAG_COLUMNS",
     "MACRO_NAMESPACE",
     "ROW_SCHEMAS",
     "ROW_STREAM_COLUMN",
@@ -252,13 +253,35 @@ _COPY_ALLOWED = frozenset({"this", "kind", "credentials", "files", "params"})
 # compile-time expression; lower reads it off the probe.
 INPUT_DURATION_COLUMN = "duration"
 
-# The only column names an INPUT alias exposes. A CTE alias exposes whatever its
-# body named with AS, so the whitelist does not apply there (lower checks those).
-# `subtitle`/`data` have the same array/subscript/splat surface as video/audio
-# but are passthrough-only downstream (lower enforces that half).
+# The structural column names an INPUT alias exposes. A CTE alias exposes
+# whatever its body named with AS, so the whitelist does not apply there (lower
+# checks those). `subtitle`/`data` have the same array/subscript/splat surface
+# as video/audio but are passthrough-only downstream (lower enforces that half).
 _INPUT_COLUMNS = frozenset(
     {"frame", "video", "audio", "subtitle", "data", "t", INPUT_DURATION_COLUMN}
 )
+
+# The container tags an INPUT alias also exposes, as text pseudo-columns read
+# off the probe's `format.tags`. Values, never streams, like `duration`; a key
+# the file does not carry reads NULL. Ordered as the hints name them.
+INPUT_TAG_COLUMNS = (
+    "title",
+    "artist",
+    "album",
+    "album_artist",
+    "date",
+    "genre",
+    "comment",
+    "composer",
+    "track",
+    "copyright",
+    "encoder",
+    "description",
+)
+_INPUT_TAG_COLUMNS = frozenset(INPUT_TAG_COLUMNS)
+
+# What a hint says about them: three keys standing for the twelve.
+_INPUT_TAGS_HINT = f"container tags ({', '.join(INPUT_TAG_COLUMNS[:3])}, ...)"
 
 # The array columns `unnest(<alias>.<name>)` accepts. Exactly the
 # array-typed half of `_INPUT_COLUMNS`: `frame` is one stream, `t` is a
@@ -484,17 +507,30 @@ def is_value_expr(node: exp.Expr | None) -> bool:
     return isinstance(node, exp.Case | exp.DPipe | exp.Cast | _ARITHMETIC)
 
 
+def _is_input_column(name: str) -> bool:
+    """True for a column name an INPUT alias exposes, structural or tag."""
+    return name in _INPUT_COLUMNS or name in _INPUT_TAG_COLUMNS
+
+
 def _is_input_duration(node: exp.Expr | None, scope: dict[str, str]) -> bool:
-    """True for ``<input alias>.duration``, the one scalar an input exposes."""
+    """True for ``<input alias>.duration``, the one numeric scalar an input exposes."""
+    return _input_value_name(node, scope) == INPUT_DURATION_COLUMN
+
+
+def _is_input_tag(node: exp.Expr | None, scope: dict[str, str]) -> bool:
+    """True for ``<input alias>.<container tag>``, a text scalar."""
+    name = _input_value_name(node, scope)
+    return name is not None and name in _INPUT_TAG_COLUMNS
+
+
+def _input_value_name(node: exp.Expr | None, scope: dict[str, str]) -> str | None:
+    """The column name `node` reads off an INPUT alias, else None."""
     if not isinstance(node, exp.Column):
-        return False
+        return None
     table_node = node.args.get("table")
-    if table_node is None:
-        return False
-    return (
-        scope.get(_ident_name(table_node)) == "input"
-        and _ident_name(node.this) == INPUT_DURATION_COLUMN
-    )
+    if table_node is None or scope.get(_ident_name(table_node)) != "input":
+        return None
+    return _ident_name(node.this)
 
 
 def _is_row_column(node: exp.Expr | None, scope: dict[str, str]) -> bool:
@@ -3128,13 +3164,14 @@ class _Resolver:
             # whatever its body named with AS, and a generated source exposes
             # exactly one stream of a type only the registry knows, so only
             # lower can check either of those.
-            if kind == "input" and _ident_name(sub.this) not in _INPUT_COLUMNS:
+            if kind == "input" and not _is_input_column(_ident_name(sub.this)):
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"unknown column '{name}.{sub.name}'",
                     sub,
                     fallback=select,
-                    hint=f"an input exposes {', '.join(sorted(_INPUT_COLUMNS))}",
+                    hint=f"an input exposes {', '.join(sorted(_INPUT_COLUMNS))} "
+                    f"and {_INPUT_TAGS_HINT}",
                 )
             # A track-row table's schema is fixed by the stream type it
             # unnested, so it is checkable HERE -- unlike
@@ -3822,8 +3859,8 @@ class _Resolver:
     ) -> str:
         """Check one value-expression column operand and return its type.
 
-        A track-row column, or an input alias's ``duration``; ``track`` is a
-        stream and is rejected as one.
+        A track-row column, or an input alias's ``duration`` / container tag;
+        ``track`` is a stream and is rejected as one.
         """
         table_node = column.args.get("table")
         if table_node is None:
@@ -3841,6 +3878,10 @@ class _Resolver:
             # and lower rejects it on an input it could not probe.
             if _is_input_duration(column, scope):
                 return "number"
+            # A container tag reads off the same probe, one line down: text,
+            # NULL when the file carries no such key.
+            if _is_input_tag(column, scope):
+                return "text"
             if alias not in scope:
                 raise _error(
                     ErrorCode.UNKNOWN_ALIAS,
@@ -3854,8 +3895,9 @@ class _Resolver:
                 f"unknown column '{alias}.{column.name}'",
                 column,
                 fallback=where,
-                hint=f"'{alias}' is not a track-row table; the only value an "
-                f"input alias carries is '{alias}.{INPUT_DURATION_COLUMN}'",
+                hint=f"'{alias}' is not a track-row table; the values an input "
+                f"alias carries are '{alias}.{INPUT_DURATION_COLUMN}' and its "
+                f"{_INPUT_TAGS_HINT}",
             )
         column_type = self._check_row_column(column, alias, where)
         if column_type == "stream":

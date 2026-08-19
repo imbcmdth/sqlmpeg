@@ -82,6 +82,10 @@ class ProbeResult:
     streams: list[StreamMeta]  # file order
     duration: float | None = None  # container-level, from -show_format
     chapters: list[ChapterMeta] = field(default_factory=list)
+    # Container-level tags from -show_format, keys lowercased, values verbatim.
+    # The WHOLE tag dict, not a whitelist: which keys a query may read is
+    # decided where they resolve, not here.
+    tags: dict[str, str] = field(default_factory=dict)
 
     def by_type(self, t: StreamType) -> list[StreamMeta]:
         return [s for s in self.streams if s.type == t]
@@ -279,13 +283,20 @@ def _parse_streams(data: object) -> ProbeResult | None:
             # other codec_type values (attachment, ...) are ignored.
 
         container_duration = None
+        container_tags: dict[str, str] = {}
         raw_format = data.get("format")
         if isinstance(raw_format, dict):
             container_duration = _float_opt(raw_format, "duration")
+            container_tags = _container_tags(raw_format)
 
         chapters = _parse_chapters(data.get("chapters"))
 
-        return ProbeResult(streams=streams, duration=container_duration, chapters=chapters)
+        return ProbeResult(
+            streams=streams,
+            duration=container_duration,
+            chapters=chapters,
+            tags=container_tags,
+        )
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -348,6 +359,14 @@ def _str_opt(raw: dict[str, object], key: str) -> str | None:
     if key not in raw or raw[key] is None:
         return None
     return str(raw[key])
+
+
+def _container_tags(raw_format: dict[str, object]) -> dict[str, str]:
+    """``format.tags`` in full, keys lowercased (muxers vary the case)."""
+    tags = raw_format.get("tags")
+    if not isinstance(tags, dict):
+        return {}
+    return {str(key).lower(): str(value) for key, value in tags.items()}
 
 
 def _tags(raw: dict[str, object]) -> dict[str, str]:

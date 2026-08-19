@@ -180,6 +180,7 @@ def insert_splits(g: Graph) -> Graph:
             ],
             path=unit.path,
             options=dict(unit.options),
+            tags=dict(unit.tags),
         )
         for unit in g.sinks
     ]

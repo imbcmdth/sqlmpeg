@@ -191,6 +191,9 @@ class SinkUnit:
       CLI's ``-o``, or a placeholder) supplies one; ``options`` is empty then.
     * ``options`` is insertion-ordered with values already validated against
       `sqlmpeg.sink.SINK_OPTIONS` by lower.
+    * ``tags`` are the file's CONTAINER tags, key -> value, rendered as
+      ``-metadata key=value``. A None value CLEARS the key and still renders
+      (``-metadata key=``): ffmpeg copies an input's globals by default.
 
     Filtergraph LABELS are graph-scoped, not file-scoped: one
     ``-filter_complex`` serves every unit, so emit keeps ``out<i>`` unique
@@ -200,27 +203,42 @@ class SinkUnit:
     outputs: list[Output] = field(default_factory=list)
     path: str | None = None
     options: dict[str, object] = field(default_factory=dict)
+    tags: dict[str, str | None] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        d: dict[str, object] = {
             "outputs": [output.to_dict() for output in self.outputs],
             "path": self.path,  # explicit null for the bare-SELECT case
             "options": dict(self.options),
         }
+        # Emitted only when non-empty, like Graph's own optional fields: a unit
+        # tagging nothing keeps the smaller shape the goldens pin.
+        if self.tags:
+            d["tags"] = dict(self.tags)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, object]) -> SinkUnit:
         raw_outputs = d["outputs"]
         raw_path = d["path"]
         raw_options = d["options"]
+        raw_tags = d.get("tags")
         assert isinstance(raw_outputs, list)
         assert raw_path is None or isinstance(raw_path, str)
         assert isinstance(raw_options, dict)
+        assert raw_tags is None or isinstance(raw_tags, dict)
         outputs: list[Output] = []
         for raw_output in raw_outputs:
             assert isinstance(raw_output, dict)
             outputs.append(Output.from_dict(raw_output))
-        return cls(outputs=outputs, path=raw_path, options=dict(raw_options))
+        tags: dict[str, str | None] = {}
+        if raw_tags is not None:
+            tags = {
+                str(k): None if v is None else str(v) for k, v in raw_tags.items()
+            }
+        return cls(
+            outputs=outputs, path=raw_path, options=dict(raw_options), tags=tags
+        )
 
 
 @dataclass

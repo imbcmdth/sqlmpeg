@@ -44,6 +44,8 @@ _STEREO = _FIXTURES_DIR / "stereo.mp4"
 # language=eng; subs.en.vtt is a standalone 3-cue WebVTT file (no tags).
 _AVS = _FIXTURES_DIR / "avs.mkv"
 _SUBS_VTT = _FIXTURES_DIR / "subs.en.vtt"
+# Video + audio carrying container tags (title/artist/date, no comment).
+_TAGGED = _FIXTURES_DIR / "tagged.mp4"
 
 _SRC_WIDTH = 320
 _SRC_HEIGHT = 240
@@ -1668,6 +1670,30 @@ def test_metadata_from_copies_an_inputs_global_tags_through(tmp_path: Path) -> N
     # case-insensitively, since it's the VALUE round-tripping that's under test.
     tags = {k.lower(): v for k, v in _ffprobe_format_tags(out_path).items()}
     assert tags.get("genre") == "Test Genre"
+
+
+def test_container_tag_columns_round_trip_through_real_ffmpeg(tmp_path: Path) -> None:
+    """Recipe 52 for real: read the input's tags, rewrite them, clear one.
+
+    The fixture's `encoder` tag is written by the muxer and varies by ffmpeg
+    version, so nothing here reads it.
+    """
+    _require_fixture(_TAGGED)
+    out_path = tmp_path / "restored.mkv"
+    query = (
+        "COPY (SELECT f.video[1], f.audio[1], "
+        "f.title || ' (restored)' AS title, "
+        "CASE WHEN f.comment IS NULL THEN 'no notes' ELSE f.comment END AS comment, "
+        "NULL AS artist "
+        f"FROM input('{_sql_path(_TAGGED)}') f) TO '{_sql_path(out_path)}';"
+    )
+
+    _run_sink_query(query, out_path)
+
+    tags = {k.lower(): v for k, v in _ffprobe_format_tags(out_path).items()}
+    assert tags.get("title") == "Angel One (restored)"
+    assert tags.get("comment") == "no notes"
+    assert not tags.get("artist")  # cleared: absent, or present and empty
 
 
 # ---------------------------------------------------------------------------

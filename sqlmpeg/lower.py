@@ -283,6 +283,7 @@ from sqlmpeg.parser import (
     _ARITHMETIC_NAMES,
     FILTER_NAMESPACE,
     INPUT_DURATION_COLUMN,
+    INPUT_TAG_COLUMNS,
     MACRO_NAMESPACE,
     ROW_SCHEMAS,
     ROW_STREAM_COLUMN,
@@ -1492,6 +1493,10 @@ _Binding = _InputBinding | _CteBinding | _SourceBinding | _RowBinding
 # its output streams set, with None for a key the query clears.
 _TagOverrides = dict[int, dict[str, str | None]]
 
+# The reserved per-stream key emit renders as `-disposition:<i>`. A container
+# has no disposition, so it is not a container tag key.
+_DISPOSITION_TAG = "disposition"
+
 
 def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
     """One probed stream's row columns.
@@ -1720,6 +1725,9 @@ class _Lowerer:
         # The tag columns of the query being lowered; reset per query, since
         # two COPYs may tag the same track differently.
         self.tags: _TagOverrides = {}
+        # The same for the CONTAINER tags of the file being written, key ->
+        # value, None meaning "clear this key".
+        self.container_tags: dict[str, str | None] = {}
         # Output fan-out: which row of the sink's relation THIS run binds, the
         # sink's TO expression once it is known to reference a row column, and
         # the pinned row / its branch environment once `_pin_fanout_row` runs.
@@ -1766,7 +1774,12 @@ class _Lowerer:
             _check_two_pass_is_single_sink(self.graph.sinks, self.res.sinks)
         else:
             columns = self._lower_query(self.res.branches, self.res.select, tags=True)
-            self.graph.sinks = [SinkUnit(outputs=_outputs(columns, self.tags))]
+            self.graph.sinks = [
+                SinkUnit(
+                    outputs=_outputs(columns, self.tags),
+                    tags=dict(self.container_tags),
+                )
+            ]
         self._check_loudnorm2()
         self.graph.input_options = self._lower_input_options()
         return self.graph
@@ -1896,7 +1909,12 @@ class _Lowerer:
         if raw.path_expr is not None:
             self._check_fanout_options(options, raw)
             path = self._sink_path(raw)
-        return SinkUnit(outputs=outputs, path=path, options=options)
+        return SinkUnit(
+            outputs=outputs,
+            path=path,
+            options=options,
+            tags=dict(self.container_tags),
+        )
 
     # -- the fan-out TO expression ------------------------------------
 
@@ -2099,6 +2117,7 @@ class _Lowerer:
         if not branches:
             raise _error(ErrorCode.UNSUPPORTED_SQL, "query has no SELECT", anchor)
         self.tags = {}
+        self.container_tags = {}
         lowered = [self._lower_branch(branch, tags=tags) for branch in branches]
         if len(lowered) == 1:
             # A single branch keeps its arrays: a CTE body's array column stays
@@ -2253,8 +2272,13 @@ class _Lowerer:
                 continue
             # A tag column produces no stream, so it never becomes an output;
             # `tags` is False for a CTE body, where there is no output to tag.
-            if tags and env.relation is not None and _is_tag_column(projection, env):
-                self._collect_tag(projection, env, select)
+            # With track rows the tag is per-stream, without them it is a
+            # container tag on the file being written.
+            if tags and _is_tag_column(projection, env):
+                if env.relation is None:
+                    self._collect_container_tag(projection, env, select)
+                else:
+                    self._collect_tag(projection, env, select)
                 continue
             columns.append(
                 _Column(
@@ -2268,12 +2292,48 @@ class _Lowerer:
                 "every SELECT column is a metadata tag, so the query selects no "
                 "stream",
                 fallback=select,
-                hint="a tag rides on an output stream; select the tracks too, "
-                "e.g. SELECT t.track, ... AS title",
+                hint="a tag rides on the file the query writes; select its "
+                "tracks too, e.g. SELECT t.track, ... AS title",
             )
         return columns
 
     # -- metadata tag columns ---------------------------------------------
+
+    def _collect_container_tag(
+        self, projection: exp.Expr, env: _Env, select: exp.Select
+    ) -> None:
+        """One tag column in a branch with no track rows: a CONTAINER tag.
+
+        The alias is the key, free-form, and the value is evaluated once over
+        no row. NULL CLEARS the key rather than leaving it alone: ffmpeg copies
+        an input's global tags by default, so the clear has to be written out.
+        """
+        key = _projection_name(projection)
+        if key is None:  # defensive: `_is_tag_column` checked
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, "malformed tag column", projection,
+                fallback=select,
+            )
+        if key == _DISPOSITION_TAG:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{_DISPOSITION_TAG}' is a per-stream key, not a container tag",
+                projection,
+                fallback=select,
+                hint="a disposition rides on a track row, e.g. SELECT t.track, "
+                "'default' AS disposition FROM input('f.mkv') f, unnest(f.audio) t",
+            )
+        value = self._eval_value(_unwrap(projection), env, {}, select)
+        text = None if value is None else _tag_text(value)
+        if key in self.container_tags and self.container_tags[key] != text:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"container tag '{key}' takes two different values",
+                projection,
+                fallback=select,
+                hint="one value per key; a file has one set of container tags",
+            )
+        self.container_tags[key] = text
 
     def _collect_tag(
         self, projection: exp.Expr, env: _Env, select: exp.Select
@@ -3125,8 +3185,8 @@ class _Lowerer:
         counterpart) reads NULL in every column — the one thing an absent row
         can honestly say about itself.
 
-        ``<input alias>.duration`` is the one column that comes from no row at
-        all: it is the probed container length, read straight off the input.
+        ``<input alias>.duration`` and the container tags come from no row at
+        all: they are probed off the input itself.
         """
         column = _unwrap(node) if isinstance(node, exp.Expr) else None
         if not isinstance(column, exp.Column):
@@ -3139,8 +3199,12 @@ class _Lowerer:
             )
         table_node = column.args.get("table")
         binding = env.bindings.get(_fold(table_node)) if table_node is not None else None
-        if isinstance(binding, _InputBinding) and _fold(column.this) == INPUT_DURATION_COLUMN:
-            return self._input_duration(binding.alias, column, select)
+        if isinstance(binding, _InputBinding):
+            name = _fold(column.this)
+            if name == INPUT_DURATION_COLUMN:
+                return self._input_duration(binding.alias, column, select)
+            if name in INPUT_TAG_COLUMNS:
+                return self._input_tag(binding.alias, name, column, select)
         if not isinstance(binding, _RowBinding):  # defensive: resolve checked it
             raise _error(
                 ErrorCode.UNKNOWN_ALIAS,
@@ -3448,6 +3512,28 @@ class _Lowerer:
                 "input that declares one has it",
             )
         return duration
+
+    def _input_tag(
+        self, alias: str, key: str, anchor: exp.Expr, select: exp.Select
+    ) -> str | None:
+        """``<input>.<tag>``: one probed container tag, NULL when absent.
+
+        An absent key is NULL — that is what lets a CASE fill it — but an input
+        this compile could not probe is a rejection, the same rule
+        ``duration`` follows: a file nobody read says nothing about its tags.
+        """
+        result = self.probes.get(alias)
+        if result is None:
+            raise _error(
+                ErrorCode.INPUT_NOT_FOUND,
+                f"'{alias}.{key}' is unknown: '{self._path_of(alias)}' could "
+                "not be probed",
+                anchor,
+                fallback=select,
+                hint="container tags are read from the file; only a readable "
+                "input has them",
+            )
+        return result.tags.get(key)
 
     def _accessor_value(self, node: exp.Expr | None, select: exp.Select) -> RowValue:
         """The probed value one ``<alias>.<type>[k].<column>`` accessor names.
@@ -3852,7 +3938,7 @@ class _Lowerer:
             return self._lower_coalesce(node, env, select)
         if is_value_expr(node):
             # A value expression, never a stream. Reaching here means it is not
-            # a tag column either: unaliased, or in a query with no track rows.
+            # a tag column either: unaliased, or inside a CTE body.
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"every SELECT column must be a stream expression, got "
@@ -3860,7 +3946,7 @@ class _Lowerer:
                 node,
                 fallback=select,
                 hint="a value expression names a metadata TAG: give it an alias "
-                "for the tag key, in a query over unnest'd track rows",
+                "for the tag key",
             )
         call = _call_parts(node)
         if call is not None:
@@ -4503,6 +4589,15 @@ class _Lowerer:
                 f"expression, e.g. WHERE {alias}.t <= {alias}."
                 f"{INPUT_DURATION_COLUMN} - 60",
             )
+        if name in INPUT_TAG_COLUMNS:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{name}' is a text tag, not a stream",
+                anchor,
+                fallback=select,
+                hint=f"give it an alias to write it back, e.g. SELECT "
+                f"{alias}.video[1], {alias}.{name} AS {name}",
+            )
         if name == _FRAME_COLUMN:
             if index is not None:
                 raise _error(
@@ -4522,8 +4617,10 @@ class _Lowerer:
                     f"unknown column '{alias}.{name}'",
                     anchor,
                     fallback=select,
-                    hint=f"an input exposes {alias}.frame, {alias}.video, "
-                    f"{alias}.audio, {alias}.subtitle, {alias}.data and {alias}.t",
+                    hint=f"an input exposes the streams {alias}.frame, "
+                    f"{alias}.video, {alias}.audio, {alias}.subtitle and "
+                    f"{alias}.data, plus the values {alias}.t, "
+                    f"{alias}.{INPUT_DURATION_COLUMN} and its container tags",
                 )
             if index is None:
                 return self._enumerate(alias, array_type, anchor, select)
@@ -5914,7 +6011,7 @@ class _Lowerer:
                     name = _fold(expr.this)
                     if name != ROW_STREAM_COLUMN:
                         return self._row_metadata_cells(binding, name, expr, select)
-        if is_value_expr(expr) or _is_input_duration_column(expr, env):
+        if is_value_expr(expr) or _is_input_value_column(expr, env):
             return self._value_cells(expr, env, select, cardinality)
         shape = subscript_metadata_shape(expr)
         if shape is not None and shape[1] != ROW_STREAM_COLUMN:
@@ -6071,27 +6168,34 @@ def _is_tag_column(projection: exp.Expr, env: _Env) -> bool:
 
     A tag column is aliased — the alias IS the tag key — and its value is a
     compile-time expression over the row: a literal, NULL, a row's metadata
-    column, an input's ``duration``, CASE, ``||``, arithmetic or ``::text``.
-    Everything else is a stream expression and lowers as one.
+    column, an input's ``duration`` or container tag, CASE, ``||``, arithmetic
+    or ``::text``. Everything else is a stream expression and lowers as one.
+
+    The branch decides what it tags: one with track rows tags THOSE (per
+    stream), one without tags the CONTAINER.
     """
     if _projection_name(projection) is None:
         return False
     value = _unwrap(projection)
     if isinstance(value, exp.Null | exp.Literal | exp.Neg) or is_value_expr(value):
         return True
-    if _is_input_duration_column(value, env):
+    if _is_input_value_column(value, env):
         return True
     return _row_metadata_column(value, env) is not None
 
 
-def _is_input_duration_column(node: exp.Expr, env: _Env) -> bool:
-    """True for ``<input alias>.duration`` — a value column, never a stream."""
-    if not isinstance(node, exp.Column) or _fold(node.this) != INPUT_DURATION_COLUMN:
+def _is_input_value_column(node: exp.Expr, env: _Env) -> bool:
+    """True for an input alias's scalar column — ``duration`` or a container
+    tag — a value, never a stream."""
+    if not isinstance(node, exp.Column):
         return False
     table_node = node.args.get("table")
     if table_node is None:
         return False
-    return isinstance(env.bindings.get(_fold(table_node)), _InputBinding)
+    if not isinstance(env.bindings.get(_fold(table_node)), _InputBinding):
+        return False
+    name = _fold(node.this)
+    return name == INPUT_DURATION_COLUMN or name in INPUT_TAG_COLUMNS
 
 
 def _row_metadata_column(node: exp.Expr, env: _Env) -> str | None:

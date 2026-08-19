@@ -267,12 +267,14 @@ class OutputGroup:
     index — per file, since ffmpeg restarts numbering at every output — so
     ``-c:<i>``/``-metadata:s:<i>`` are computed from it and nothing wider.
     `path` is None only for a bare-SELECT graph, where the caller supplies the
-    destination. `options` are the validated ``WITH (...)`` sink options.
+    destination. `options` are the validated ``WITH (...)`` sink options, and
+    `tags` that file's container tags (a None value clears its key).
     """
 
     maps: list[OutputMap]
     path: str | None = None
     options: dict[str, object] = field(default_factory=dict)
+    tags: dict[str, str | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -406,6 +408,7 @@ def _output_group(g: Graph, unit: SinkUnit, labels: dict[str, str]) -> OutputGro
         maps=[_output_map(g, output, labels) for output in unit.outputs],
         path=unit.path,
         options=dict(unit.options),
+        tags=dict(unit.tags),
     )
 
 
@@ -654,6 +657,10 @@ def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> li
                 args += [f"-metadata:s:{index}", f"{key}={mapping.metadata[key]}"]
             if _DISPOSITION_KEY in mapping.metadata:
                 args += [f"-disposition:{index}", mapping.metadata[_DISPOSITION_KEY]]
+        # Ahead of the sink options. ffmpeg applies `-metadata` after
+        # `-map_metadata` whatever the argv order, so a tag column wins over
+        # `metadata_from`/`strip_metadata` either way.
+        args += _render_container_tags(group.tags)
         args += _render_sink_options(group, pass_)
         args.append(path)
     return args
@@ -693,6 +700,22 @@ def _render_input_options(options: dict[str, object]) -> list[str]:
         if rendered is None:
             continue
         args += [spec.flag, rendered]
+    return args
+
+
+# container tag rendering
+
+
+def _render_container_tags(tags: dict[str, str | None]) -> list[str]:
+    """One file's container tags as ``-metadata key=value``, keys sorted.
+
+    A None value renders ``-metadata key=``, which is how ffmpeg is told to
+    clear a key it would otherwise copy from the input.
+    """
+    args: list[str] = []
+    for key in sorted(tags):
+        value = tags[key]
+        args += ["-metadata", f"{key}={'' if value is None else value}"]
     return args
 
 

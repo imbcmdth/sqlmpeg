@@ -290,24 +290,6 @@ SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         flag="-map_chapters",
         per_stream=False,
     ),
-    "title": SinkOptionSpec(
-        name="title",
-        scope="container",
-        type="str",
-        doc="Container-level title tag, e.g. 'Director Cut'.",
-        flag="-metadata",
-        per_stream=False,
-        value_template="title={v}",
-    ),
-    "comment": SinkOptionSpec(
-        name="comment",
-        scope="container",
-        type="str",
-        doc="Container-level comment tag.",
-        flag="-metadata",
-        per_stream=False,
-        value_template="comment={v}",
-    ),
     # `metadata_from`'s value is a bare identifier (an input() alias), never a
     # str/int/bool/num literal -- lower resolves it directly (bypassing
     # `validate_option`) into `options["metadata_from"]`, the input index

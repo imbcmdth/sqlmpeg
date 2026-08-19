@@ -254,6 +254,56 @@ def test_compile_on_a_table_query_is_a_typed_usage_message(
     assert "run" in captured.err
 
 
+@pytest.fixture
+def _tagged_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A synthetic probe carrying container tags, for the same reason
+    `_two_track_probe` is synthetic: the default tier reads no file."""
+    from sqlmpeg import compiler
+    from sqlmpeg.probe import ProbeResult, StreamMeta
+
+    video = StreamMeta(
+        type="video",
+        index=0,
+        metadata={},
+        width=320,
+        height=240,
+        fps="15/1",
+        sample_rate=None,
+        codec="h264",
+    )
+    result = ProbeResult(streams=[video], tags={"title": "Angel One"})
+    monkeypatch.setattr(compiler, "probe_path", lambda path: result)
+
+
+def test_compile_writes_container_tags_read_from_the_input(
+    capsys: pytest.CaptureFixture[str], _tagged_probe: None
+) -> None:
+    """The whole path, end to end: a probed tag read, rewritten, cleared."""
+    code = cli.main(
+        [
+            "compile",
+            "COPY (SELECT f.video[1], f.title || ' (restored)' AS title, "
+            "NULL AS artist FROM input('film.mkv') f) TO 'out.mkv'",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out.strip() == (
+        "ffmpeg -i film.mkv -map 0:v:0 -c:0 copy -metadata artist= "
+        "-metadata 'title=Angel One (restored)' out.mkv"
+    )
+
+
+def test_run_prints_container_tags_as_a_table(
+    capsys: pytest.CaptureFixture[str], _tagged_probe: None
+) -> None:
+    code = cli.main(["run", "SELECT f.title, f.artist FROM input('film.mkv') f"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "Angel One" in captured.out
+    assert captured.out.startswith(" title")
+
+
 def test_compile_dash_o_still_works_on_a_bare_stream_select(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

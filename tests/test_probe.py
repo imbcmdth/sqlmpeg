@@ -551,6 +551,88 @@ def test_container_duration_absent_when_format_key_missing(
     assert result.duration is None
 
 
+# --- container tags (monkeypatched, offline) --------------------------------
+
+
+def _probe_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw_format: object
+) -> ProbeResult:
+    """One probe of a file whose ffprobe output carries `raw_format`."""
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch, stdout=json.dumps({"streams": [], "format": raw_format}))
+    result = probe(str(f))
+    assert result is not None
+    return result
+
+
+def test_container_tags_are_captured_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The FULL tag dict, not the language/title pair streams get."""
+    result = _probe_format(
+        tmp_path,
+        monkeypatch,
+        {
+            "duration": "2.000000",
+            "tags": {
+                "title": "Angel One",
+                "artist": "Docs Dept",
+                "major_brand": "isom",
+            },
+        },
+    )
+    assert result.tags == {
+        "title": "Angel One",
+        "artist": "Docs Dept",
+        "major_brand": "isom",
+    }
+
+
+def test_container_tag_keys_are_lowercased(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _probe_format(
+        tmp_path, monkeypatch, {"tags": {"TITLE": "Angel One", "Artist": "Docs Dept"}}
+    )
+    assert result.tags == {"title": "Angel One", "artist": "Docs Dept"}
+
+
+def test_container_tag_values_are_strings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _probe_format(tmp_path, monkeypatch, {"tags": {"date": 2026}})
+    assert result.tags == {"date": "2026"}
+
+
+def test_container_tags_absent_are_an_empty_dict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _probe_format(tmp_path, monkeypatch, {"duration": "2.0"}).tags == {}
+
+
+def test_container_tags_wrong_typed_are_an_empty_dict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Permissive like every other field: a malformed value nulls that column,
+    it does not fail the whole probe."""
+    assert _probe_format(tmp_path, monkeypatch, {"tags": "nope"}).tags == {}
+
+
+def test_container_tags_empty_when_format_key_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch, stdout=json.dumps({"streams": []}))
+
+    result = probe(str(f))
+    assert result is not None
+    assert result.tags == {}
+
+
 # --- caching (monkeypatched, offline) ---------------------------------------
 
 
@@ -700,6 +782,22 @@ def test_probe_av_eng_fixture_language_and_duration(_fixtures: Path) -> None:
     assert audio[0].metadata.get("language") == "eng"
     assert audio[0].duration == pytest.approx(2.0, abs=0.2)
     assert audio[0].codec is not None
+
+
+@pytest.mark.exec
+def test_probe_tagged_fixture_carries_its_container_tags(_fixtures: Path) -> None:
+    """tagged.mp4: title/artist/date written by the generator, no comment.
+
+    The mp4 muxer adds an `encoder` tag of its own whose value tracks the
+    ffmpeg build, so only its presence is checked, never its value.
+    """
+    result = probe(str(_fixtures / "tagged.mp4"))
+    assert result is not None
+    assert result.tags["title"] == "Angel One"
+    assert result.tags["artist"] == "Docs Dept"
+    assert result.tags["date"] == "2026"
+    assert "comment" not in result.tags
+    assert "encoder" in result.tags
 
 
 @pytest.mark.exec

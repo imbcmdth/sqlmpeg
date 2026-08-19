@@ -2525,3 +2525,29 @@ def test_only_duration_is_readable_off_an_input_alias() -> None:
     err = _reject("SELECT f.video[1] FROM input('x.mp4') f WHERE f.t <= f.width - 1")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unknown column 'f.width'" in err.message
+
+
+def test_a_container_tag_types_as_text_in_the_value_grammar() -> None:
+    """`f.title` is text, so `||` takes it and arithmetic does not."""
+    _resolve(
+        "SELECT f.video[1], f.title || ' (restored)' AS title "
+        "FROM input('x.mp4') f"
+    )
+    err = _reject(
+        "SELECT f.video[1], f.title + 1 AS title FROM input('x.mp4') f"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_a_container_tag_is_readable_in_a_case_condition() -> None:
+    _resolve(
+        "SELECT f.video[1], CASE WHEN f.comment IS NULL THEN 'none' "
+        "ELSE f.comment END AS comment FROM input('x.mp4') f"
+    )
+
+
+def test_an_input_column_outside_the_tag_list_is_still_unknown() -> None:
+    err = _reject("SELECT f.video[1], f.mood AS mood FROM input('x.mp4') f")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 'f.mood'" in err.message
+    assert "container tags" in (err.hint or "")

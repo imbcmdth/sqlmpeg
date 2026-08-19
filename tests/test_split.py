@@ -452,6 +452,21 @@ def test_sink_paths_and_options_survive_the_split_pass() -> None:
     assert g.sinks[0].options == {"crf": 20}
 
 
+def test_container_tags_survive_the_split_pass() -> None:
+    g = Graph(input_paths=["a.mp4"], sources={"a": 0})
+    g.nodes["n0"] = Node(
+        id="n0", filter="scale", args={}, inputs=["src:a:v:0"], outputs=["video"]
+    )
+    g.sinks = [
+        SinkUnit(outputs=[_out("n0")], path="one.mp4", tags={"title": "One"}),
+        SinkUnit(outputs=[_out("n0")], path="two.mp4", tags={"artist": None}),
+    ]
+    out = insert_splits(g)
+    assert [unit.tags for unit in out.sinks] == [{"title": "One"}, {"artist": None}]
+    out.sinks[0].tags["title"] = "changed"  # purity: copied, not shared
+    assert g.sinks[0].tags == {"title": "One"}
+
+
 # ---------------------------------------------------------------------------
 # input seek: input_trims are not part of the pad shape
 # ---------------------------------------------------------------------------

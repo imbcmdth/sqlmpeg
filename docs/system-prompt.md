@@ -116,6 +116,12 @@ statement is not. `--` and `/* */` comments are allowed.
   compile-time expression (`WHERE f.t <= f.duration - 60`), never in the
   SELECT list on its own. An input this compile could not probe, or a
   container that declares no duration, makes it a typed rejection.
+- The container's own tags are text columns on an `input()` alias too:
+  `title`, `artist`, `album`, `album_artist`, `date`, `genre`, `comment`,
+  `composer`, `track`, `copyright`, `encoder`, `description`. Values like
+  `duration`, never streams; a key the file does not carry reads NULL, so
+  `CASE WHEN f.comment IS NULL THEN 'none' ELSE f.comment END` fills it. An
+  input this compile could not probe is a typed rejection.
 - There are no other columns on an `input()` or generated-source alias --
   `unnest(...)` row tables have a column model of their own (see Track rows
   below).
@@ -157,8 +163,11 @@ statement is not. `--` and `/* */` comments are allowed.
   `::text` / `CAST(x AS text)` to spell a number for `||`. NULL propagates.
   An aliased expression column is a metadata TAG on that row's tracks, the
   alias being the key: `SELECT t.track, 'Audio (' || t.language || ')' AS
-  title`. Same grammar in a filter option over a row table, evaluated per
-  row: `SELECT scale(t.track, t.width / 2, -2)`.
+  title`. In a query with NO track rows the same aliased column tags the
+  CONTAINER instead (`SELECT f.video[1], 'Remastered' AS title`), and `NULL
+  AS artist` clears that key in the output. Same grammar in a filter option
+  over a row table, evaluated per row: `SELECT scale(t.track, t.width / 2,
+  -2)`.
 - `unnest(...) a JOIN unnest(...) b ON <predicate>` matches ROWS between two
   unnest tables: `INNER JOIN`, `LEFT [OUTER] JOIN`, `FULL OUTER JOIN` (a
   bare `FULL JOIN` means the same thing), each requiring its own `ON`.
@@ -529,8 +538,6 @@ stream copy.
 - `movflags` (str, container) -- Raw -movflags value, e.g. '+faststart+frag_keyframe'. Conflicts with faststart.
 - `chapters` (str, container) -- Write chapters from a VALUES CTE (bare name, not quoted): WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro'), ...) ... WITH (chapters marks). Conflicts with chapters_from.
 - `chapters_from` (str, container) -- Copy chapters through from an input() alias (bare name, not quoted), e.g. chapters_from f. Conflicts with chapters.
-- `title` (str, container) -- Container-level title tag, e.g. 'Director Cut'.
-- `comment` (str, container) -- Container-level comment tag.
 - `metadata_from` (str, container) -- Copy an input()'s global tags through (bare name, not quoted), e.g. metadata_from f. Conflicts with strip_metadata.
 - `strip_metadata` (bool, container) -- Drop the tags the muxer would otherwise copy implicitly (sqlmpeg's own per-stream tags still apply). Conflicts with metadata_from.
 

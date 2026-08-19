@@ -6324,17 +6324,25 @@ def test_chapters_values_cte_rejects_an_unescapable_title() -> None:
 
 
 # ---------------------------------------------------------------------------
-# title / comment / metadata_from / strip_metadata sink options
+# metadata_from / strip_metadata sink options
 # ---------------------------------------------------------------------------
 
 
-def test_title_and_comment_land_in_sink_options_verbatim() -> None:
-    g = _lower(
+def test_title_is_no_longer_a_sink_option() -> None:
+    """Container tags are tag columns now; the option was removed."""
+    err = _reject(
         "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (title 'Director Cut', comment 'ripped')"
+        "TO 'out.mkv' WITH (title 'Director Cut')"
     )
-    assert g.sinks[0].options["title"] == "Director Cut"
-    assert g.sinks[0].options["comment"] == "ripped"
+    assert err.code is ErrorCode.UNKNOWN_SINK_OPTION
+
+
+def test_comment_is_no_longer_a_sink_option() -> None:
+    err = _reject(
+        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (comment 'ripped')"
+    )
+    assert err.code is ErrorCode.UNKNOWN_SINK_OPTION
 
 
 def test_metadata_from_resolves_an_input_alias_to_its_index() -> None:
@@ -7126,18 +7134,180 @@ def test_a_query_of_nothing_but_tags_selects_no_stream() -> None:
     assert "selects no stream" in err.message
 
 
-def test_a_media_query_with_no_row_tables_keeps_the_old_rejection() -> None:
-    err = _reject("SELECT f.audio[1], 'Main' AS title FROM input('f.mkv') f")
+def test_a_media_query_with_no_row_tables_tags_the_container() -> None:
+    g = _lower("SELECT f.audio[1], 'Main' AS title FROM input('f.mkv') f")
+    assert g.sinks[0].tags == {"title": "Main"}
+    assert [o.metadata for o in g.outputs] == [{}]
+
+
+def test_an_unaliased_value_column_is_still_not_a_stream() -> None:
+    err = _reject(
+        "SELECT f.audio[1], 'a' || 'b' FROM input('f.mkv') f"
+    )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "every SELECT column must be a stream expression" in err.message
+    assert err.hint is not None and "give it an alias" in err.hint
 
 
-def test_a_case_column_with_no_row_tables_is_rejected_as_a_value() -> None:
+def test_a_case_column_over_literals_is_still_not_a_row_predicate() -> None:
     err = _reject(
         "SELECT f.audio[1], CASE WHEN 'a' = 'a' THEN 'x' END AS title "
         "FROM input('f.mkv') f"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+# ---------------------------------------------------------------------------
+# container tags: <input>.<key> read, aliased columns written
+# ---------------------------------------------------------------------------
+
+
+def _tagged_probes(**tags: str) -> dict[str, ProbeResult | None]:
+    """One probed input `f` -- a video and an audio track -- carrying `tags`."""
+    return {
+        "f": ProbeResult(
+            streams=[_track("video", 0), _track("audio", 0)], tags=dict(tags)
+        )
+    }
+
+
+def _container_query(projection: str) -> str:
+    return f"SELECT f.video[1], {projection} FROM input('f.mkv') f"
+
+
+def test_a_container_tag_column_reads_the_probed_value() -> None:
+    g = _lower(
+        _container_query("f.title AS title"), _tagged_probes(title="Angel One")
+    )
+    assert g.sinks[0].tags == {"title": "Angel One"}
+
+
+def test_a_container_tag_concatenates_like_any_text_value() -> None:
+    g = _lower(
+        _container_query("f.title || ' (restored)' AS title"),
+        _tagged_probes(title="Angel One"),
+    )
+    assert g.sinks[0].tags == {"title": "Angel One (restored)"}
+
+
+def test_an_absent_container_tag_reads_null_so_case_can_fill_it() -> None:
+    g = _lower(
+        _container_query(
+            "CASE WHEN f.comment IS NULL THEN 'no notes' ELSE f.comment END AS comment"
+        ),
+        _tagged_probes(title="Angel One"),
+    )
+    assert g.sinks[0].tags == {"comment": "no notes"}
+
+
+def test_a_present_container_tag_wins_the_case_fill() -> None:
+    g = _lower(
+        _container_query(
+            "CASE WHEN f.comment IS NULL THEN 'no notes' ELSE f.comment END AS comment"
+        ),
+        _tagged_probes(comment="ripped"),
+    )
+    assert g.sinks[0].tags == {"comment": "ripped"}
+
+
+def test_a_container_tag_on_an_unprobed_input_is_input_not_found() -> None:
+    err = _reject_lower(_container_query("f.title AS title"), {"f": None})
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+    assert "'f.title' is unknown" in err.message
+
+
+def test_a_container_tag_in_stream_position_is_rejected() -> None:
+    err = _reject_lower(
+        "SELECT f.title FROM input('f.mkv') f", _tagged_probes(title="Angel One")
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.title' is a text tag, not a stream" in err.message
+    assert "give it an alias" in (err.hint or "")
+
+
+def test_an_unknown_input_column_still_names_the_structural_columns() -> None:
+    err = _reject("SELECT f.bogus FROM input('f.mkv') f")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    hint = err.hint or ""
+    for column in ("frame", "video", "audio", "subtitle", "data", "t", "duration"):
+        assert column in hint
+    assert "container tags" in hint
+
+
+def test_a_literal_container_tag_needs_no_probe_at_all() -> None:
+    g = _lower(_container_query("'Remastered 2026' AS title"))
+    assert g.sinks[0].tags == {"title": "Remastered 2026"}
+
+
+def test_a_null_container_tag_column_clears_the_key() -> None:
+    g = _lower(_container_query("NULL AS artist"))
+    assert g.sinks[0].tags == {"artist": None}
+
+
+def test_a_container_tag_key_is_free_form() -> None:
+    g = _lower(_container_query("""'sqlmpeg' AS "encoded_by\""""))
+    assert g.sinks[0].tags == {"encoded_by": "sqlmpeg"}
+
+
+def test_a_number_container_tag_is_spelled_out() -> None:
+    g = _lower(_container_query("2026 AS date"))
+    assert g.sinks[0].tags == {"date": "2026"}
+
+
+def test_disposition_is_not_a_container_tag_key() -> None:
+    err = _reject(_container_query("'default' AS disposition"))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "per-stream key" in err.message
+
+
+def test_one_container_tag_key_cannot_take_two_values() -> None:
+    err = _reject(_container_query("'a' AS title, 'b' AS title"))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "two different values" in err.message
+
+
+def test_one_container_tag_key_repeated_with_the_same_value_is_fine() -> None:
+    g = _lower(_container_query("'a' AS title, 'a' AS title"))
+    assert g.sinks[0].tags == {"title": "a"}
+
+
+def test_a_row_table_branch_still_tags_per_stream() -> None:
+    """The container-tag branch is the NO-row-table one; row queries are
+    untouched."""
+    g = _lower(
+        _tag_query("'Main' AS title"), _row_probes(_track("audio", 0, language="eng"))
+    )
+    assert g.sinks[0].tags == {}
+    assert [o.metadata for o in g.outputs] == [{"language": "eng", "title": "Main"}]
+
+
+def test_a_row_table_branch_reads_container_tags_onto_its_streams() -> None:
+    """`f.title` is a value wherever the value grammar runs; with track rows
+    it lands on each row's stream, not on the container."""
+    probes = {
+        "f": ProbeResult(
+            streams=[_track("audio", 0, language="eng")], tags={"artist": "Docs Dept"}
+        )
+    }
+    g = _lower(_tag_query("f.artist AS artist"), probes)
+    assert g.sinks[0].tags == {}
+    assert [o.metadata for o in g.outputs] == [
+        {"language": "eng", "artist": "Docs Dept"}
+    ]
+
+
+def test_two_copys_get_their_own_container_tags() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], 'one' AS title FROM input('f.mkv') f) TO 'a.mkv'; "
+        "COPY (SELECT g.video[1], 'two' AS title FROM input('g.mkv') g) TO 'b.mkv'"
+    )
+    assert [unit.tags for unit in g.sinks] == [{"title": "one"}, {"title": "two"}]
+
+
+def test_container_tags_survive_the_ir_round_trip() -> None:
+    g = _lower(_container_query("'Cut' AS title, NULL AS artist"))
+    restored = Graph.from_dict(g.to_dict())
+    assert restored.sinks[0].tags == {"title": "Cut", "artist": None}
 
 
 def test_an_unaliased_row_metadata_column_is_still_not_a_stream() -> None:
@@ -7246,6 +7416,38 @@ def test_a_table_query_prints_what_a_tag_would_say() -> None:
         [1, "eng", "A (eng)"],
         [2, "fre", "A (fra)"],
         [3, None, None],
+    ]
+
+
+def test_a_table_query_prints_container_tags_beside_the_duration() -> None:
+    sinks = lower_table(
+        resolve(parse("SELECT f.title, f.artist, f.comment, f.duration "
+                      "FROM input('f.mkv') f")),
+        {
+            "f": ProbeResult(
+                streams=[_track("video", 0)],
+                duration=2.0,
+                tags={"title": "Angel One", "artist": "Docs Dept"},
+            )
+        },
+    )
+    assert sinks[0].result.columns == ["title", "artist", "comment", "duration"]
+    assert sinks[0].result.rows == [["Angel One", "Docs Dept", None, 2.0]]
+
+
+def test_a_table_query_broadcasts_a_container_tag_over_track_rows() -> None:
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT t.index, f.title FROM input('f.mkv') f, unnest(f.audio) t"
+            )
+        ),
+        {"f": ProbeResult(streams=list(_ROW_TRACKS), tags={"title": "Angel One"})},
+    )
+    assert sinks[0].result.rows == [
+        [1, "Angel One"],
+        [2, "Angel One"],
+        [3, "Angel One"],
     ]
 
 
