@@ -27,6 +27,7 @@ Stdlib only -- no third-party imports, so this script itself never needs the
 
 from __future__ import annotations
 
+import base64
 import shutil
 import subprocess
 import sys
@@ -52,6 +53,14 @@ _STEREO_NAME = "stereo.mp4"
 _SUBS_NAME = "subs.en.vtt"
 _AVS_NAME = "avs.mkv"
 _FRAME_PNG_NAME = "frame.png"
+_AV_CHAPTERS_NAME = "av-chapters.mkv"
+
+# Intro 0-1, Credits 1-2 -- matches cookbook recipe 39's pinned table exactly.
+_CHAPTERS_FFMETADATA = (
+    ";FFMETADATA1\n"
+    "[CHAPTER]\nTIMEBASE=1/1\nSTART=0\nEND=1\ntitle=Intro\n"
+    "[CHAPTER]\nTIMEBASE=1/1\nSTART=1\nEND=2\ntitle=Credits\n"
+)
 
 _SUBS_VTT = """WEBVTT
 
@@ -227,6 +236,28 @@ def _generate_avs(subs_path: Path) -> None:
     )
 
 
+def _generate_av_chapters() -> None:
+    """av.mp4 remuxed with two chapters, via ffmpeg's own ffmetadata `data:` URI.
+
+    The chapters(f) read fixture (plan 077): same mechanism the compiler
+    itself uses to WRITE chapters, run once by hand to build a file to READ
+    them back from. Must run after av.mp4 exists.
+    """
+    uri = "data:text/plain;base64," + base64.b64encode(
+        _CHAPTERS_FFMETADATA.encode()
+    ).decode()
+    _run(
+        FIXTURES_DIR / _AV_CHAPTERS_NAME,
+        [
+            "-i", str(FIXTURES_DIR / _AV_NAME),
+            "-f", "ffmetadata", "-i", uri,
+            "-map_metadata", "1",
+            "-map_chapters", "1",
+            "-c", "copy",
+        ],
+    )
+
+
 def _generate_frame_png() -> None:
     """One still frame of testsrc.mp4 (RFC-005 SS4, plan 041's PNG title-card
     exec test): `input(frame.png, loop => true, framerate => 15)` needs a
@@ -256,6 +287,7 @@ def main() -> int:
     _generate_stereo()
     subs_path = _generate_subs_vtt()
     _generate_avs(subs_path)
+    _generate_av_chapters()
     _generate_frame_png()
     return 0
 

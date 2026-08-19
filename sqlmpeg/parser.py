@@ -184,6 +184,7 @@ __all__ = [
     "RawRowJoin",
     "RawSourceOption",
     "RawTrackRows",
+    "RawValuesTable",
     "Resolved",
     "from_entries",
     "from_items",
@@ -291,6 +292,15 @@ ROW_SCHEMAS: dict[str, dict[str, RowColumnType]] = {
     },
     "subtitle": dict(_ROW_COMMON),
     "data": dict(_ROW_COMMON),
+    # `chapters(f)` rows: no `track` column at all -- a chapter is not a
+    # stream, so there is nothing to select as output, only metadata to read
+    # or filter on. `index` is ffprobe's own chapter order, 1-based.
+    "chapters": {
+        "index": "number",
+        "title": "text",
+        "start_t": "number",
+        "end_t": "number",
+    },
 }
 
 # sqlglot's Postgres dialect INDEX_OFFSET. Parsing rebases a subscript by
@@ -869,11 +879,34 @@ class RawTrackRows:
     ``video``/``audio``/``subtitle``/``data`` and decides the row schema.
     `node` is the ``exp.Unnest`` itself, the anchor for anything lower rejects
     about the table rather than about a column of it.
+
+    ``chapters(<alias>) c`` in FROM binds one of these too -- a sibling shape,
+    not a variant of unnest: `column` is the literal string ``"chapters"``
+    (its own ``ROW_SCHEMAS`` entry, no ``track`` column) and `node` is the
+    ``exp.Table`` the call itself parsed as.
     """
 
     alias: str
     source: str
     column: str
+    node: exp.Expr
+
+
+@dataclass(frozen=True)
+class RawValuesTable:
+    """``WITH <alias>(<columns>) AS (VALUES (...), ...)`` -- a literal row table.
+
+    Reachable only as a sink option's value (``chapters <alias>``) in v1;
+    selecting FROM one directly stays rejected (see ``_add_table``). `columns`
+    is the alias's column list, in written order; `rows` is one tuple of
+    literal expressions (or ``NULL``) per VALUES row, each the same length as
+    `columns`. Types are whatever each cell's own literal is -- there is no
+    declared schema, just literals read at face value.
+    """
+
+    alias: str
+    columns: tuple[str, ...]
+    rows: tuple[tuple[exp.Literal | exp.Null, ...], ...]
     node: exp.Expr
 
 
@@ -937,7 +970,13 @@ class Resolved:
     order across the whole script (RFC-009). Disjoint from every other name
     table: a row alias takes no ``-i`` of its own — its streams belong to the
     input alias named in ``RawTrackRows.source`` — and shares the one flat
-    namespace views, CTEs and aliases live in."""
+    namespace views, CTEs and aliases live in. ``chapters(<input>) c`` also
+    lands here, `column` set to ``"chapters"``."""
+
+    values_ctes: dict[str, RawValuesTable] = field(default_factory=dict)
+    """``WITH <alias>(<cols>) AS (VALUES ...)`` records, keyed by alias.
+    Disjoint from ``ctes``: a VALUES CTE is never FROM-selectable, only usable
+    as a sink option's value (``chapters <alias>``)."""
 
 
 def _listed_columns(names: Iterable[str]) -> str:
@@ -1060,8 +1099,21 @@ def from_items(select: exp.Select) -> list[exp.Expr]:
 
 
 def _has_unnest(select: exp.Select) -> bool:
-    """True if this branch's FROM clause holds at least one ``unnest``."""
-    return any(isinstance(item, exp.Unnest) for item in from_items(select))
+    """True if this branch's FROM clause holds a row table: ``unnest(...)``
+    or its sibling ``chapters(...)`` -- either admits the ORDER BY carve-out."""
+    return any(
+        isinstance(item, exp.Unnest) or _is_chapters_call(item)
+        for item in from_items(select)
+    )
+
+
+def _is_chapters_call(item: exp.Expr) -> bool:
+    """True for a bare ``chapters(...)`` FROM item, shape only (unvalidated)."""
+    return (
+        isinstance(item, exp.Table)
+        and isinstance(item.this, exp.Anonymous)
+        and str(item.this.this).lower() == "chapters"
+    )
 
 
 def _unwrap(node: exp.Expr) -> exp.Expr:
@@ -1450,6 +1502,7 @@ class _Resolver:
         self.input_options: dict[str, tuple[RawInputOption, ...]] = {}
         self.source_filters: dict[str, RawSource] = {}
         self.track_rows: dict[str, RawTrackRows] = {}
+        self.values_ctes: dict[str, RawValuesTable] = {}
 
     # -- entry point ------------------------------------------------------
 
@@ -1552,6 +1605,7 @@ class _Resolver:
             input_options=self.input_options,
             source_filters=self.source_filters,
             track_rows=self.track_rows,
+            values_ctes=self.values_ctes,
         )
 
     def _resolve_query(
@@ -1765,14 +1819,19 @@ class _Resolver:
             alias = cte.args.get("alias")
             if not isinstance(alias, exp.TableAlias) or alias.this is None:
                 raise _error(ErrorCode.UNSUPPORTED_SQL, "CTE is missing a name", cte)
-            if alias.args.get("columns"):
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    "CTE column lists are not supported",
-                    alias,
-                    hint="name the CTE's columns with AS inside its SELECT",
-                )
             name = _ident_name(alias.this)
+
+            # A column list is CTE syntax stock Postgres uses for two things:
+            # naming a VALUES CTE's columns (there is nothing else to name
+            # them from), or renaming an ordinary SELECT's. Only the first is
+            # supported -- sqlglot's own shape tells them apart, since a
+            # `(VALUES ...)` body always parses as `Select(expressions=[Star],
+            # from_=From(this=Values(...)))`.
+            if alias.args.get("columns"):
+                self._reserve(name, alias.this)
+                self._add_values_cte(name, alias, cte)
+                continue
+
             self._reserve(name, alias.this)
 
             body = _unwrap(cte.this)
@@ -1796,6 +1855,91 @@ class _Resolver:
             for branch in union_branches(body):
                 self._validate_select(branch, visible)
             self.ctes[name] = body
+
+    def _add_values_cte(self, name: str, alias: exp.TableAlias, cte: exp.CTE) -> None:
+        """``WITH <name>(<cols>) AS (VALUES ...)`` -- a compile-time row table.
+
+        Shape only: sqlglot always wraps a parenthesized ``VALUES`` in
+        ``Select(expressions=[Star()], from_=From(this=Values(...)))``, so
+        that exact shape is what tells a real VALUES CTE apart from a column-
+        renamed SELECT (which is not supported: ``AS`` inside the SELECT is
+        the one way to name a SELECT CTE's columns).
+        """
+        columns_list = alias.args.get("columns") or []
+        column_names = [_ident_name(c) for c in columns_list]
+        if len(set(column_names)) != len(column_names):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"duplicate column name in '{name}({', '.join(column_names)})'",
+                alias,
+                hint="every VALUES column needs its own name",
+            )
+
+        body = _unwrap(cte.this)
+        if not isinstance(body, exp.Select):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"CTE '{name}' has a column list, so it must be VALUES (...)",
+                cte.this,
+                fallback=cte,
+                hint="name a SELECT CTE's columns with AS inside the SELECT instead",
+            )
+        _check_query_args(body, frozenset({"expressions", "from_"}), f"VALUES CTE '{name}'")
+        exprs = body.expressions
+        from_ = body.args.get("from_")
+        if len(exprs) != 1 or not isinstance(exprs[0], exp.Star) or not isinstance(
+            from_, exp.From
+        ):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"CTE '{name}' has a column list, so it must be VALUES (...)",
+                cte.this,
+                fallback=cte,
+                hint="name a SELECT CTE's columns with AS inside the SELECT instead",
+            )
+        values = from_.this
+        if not isinstance(values, exp.Values):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"CTE '{name}' has a column list, so it must be VALUES (...)",
+                cte.this,
+                fallback=cte,
+                hint="name a SELECT CTE's columns with AS inside the SELECT instead",
+            )
+        _check_query_args(from_, frozenset({"this"}), f"VALUES CTE '{name}' FROM")
+        _check_query_args(values, frozenset({"expressions", "alias"}), "VALUES")
+
+        rows: list[tuple[exp.Literal | exp.Null, ...]] = []
+        for tup in values.expressions:
+            if not isinstance(tup, exp.Tuple):
+                raise _error(ErrorCode.UNSUPPORTED_SQL, "malformed VALUES row", tup, fallback=cte)
+            cells = tup.expressions
+            if len(cells) != len(column_names):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"VALUES row has {len(cells)} values, but "
+                    f"'{name}({', '.join(column_names)})' names {len(column_names)}",
+                    tup,
+                    fallback=cte,
+                )
+            checked: list[exp.Literal | exp.Null] = []
+            for cell in cells:
+                unwrapped = _unwrap(cell) if isinstance(cell, exp.Expr) else cell
+                if not isinstance(unwrapped, exp.Literal | exp.Null):
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        "a VALUES cell must be a literal",
+                        cell if isinstance(cell, exp.Expr) else tup,
+                        fallback=cte,
+                        hint="VALUES rows are compile-time literals: numbers, "
+                        "quoted strings, or NULL -- no expressions",
+                    )
+                checked.append(unwrapped)
+            rows.append(tuple(checked))
+
+        self.values_ctes[name] = RawValuesTable(
+            alias=name, columns=tuple(column_names), rows=tuple(rows), node=cte
+        )
 
     def _reserve(self, name: str, node: exp.Expr | None) -> None:
         if not name:
@@ -1821,6 +1965,7 @@ class _Resolver:
             or name in self.sources
             or name in self.source_filters
             or name in self.track_rows
+            or name in self.values_ctes
         ):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -2307,11 +2452,22 @@ class _Resolver:
         if namespaced:
             self._add_source(table, inner, alias_node, scope)
             return
+        if isinstance(inner, exp.Anonymous) and str(inner.this).lower() == "chapters":
+            self._add_chapters_table(table, inner, alias_node, scope)
+            return
         if isinstance(inner, exp.Anonymous):
             self._add_input(table, inner, alias_node, scope)
             return
         if isinstance(inner, exp.Identifier):
             name = _ident_name(inner)
+            if name in self.values_ctes:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{name}' is a VALUES CTE, and cannot be selected from directly",
+                    inner,
+                    fallback=table,
+                    hint=f"pass it to a sink option instead: WITH (chapters {name})",
+                )
             if name not in visible:
                 raise _error(
                     ErrorCode.UNKNOWN_ALIAS,
@@ -2467,8 +2623,107 @@ class _Resolver:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
             )
+        if any(self.track_rows[a].column == "chapters" for a in scope if scope[a] == "row"):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "unnest(...) cannot combine with chapters(...) in the same query",
+                unnest,
+                hint="chapters(f) is its own row table; read it in a separate query",
+            )
         self.track_rows[alias] = RawTrackRows(
             alias=alias, source=source, column=column, node=unnest
+        )
+        scope[alias] = "row"
+
+    def _add_chapters_table(
+        self,
+        table: exp.Table,
+        func: exp.Anonymous,
+        alias_node: exp.Expr | None,
+        scope: dict[str, str],
+    ) -> None:
+        """``chapters(<input alias>) <alias>`` in FROM -- a sibling of unnest.
+
+        One argument: a bare, comma-visible INPUT alias (not a stream array,
+        not a subscript -- chapters belong to the whole file). At most one
+        chapters(f) row table per query, and it may not combine with an
+        unnest(...) track-row table: neither has anything to align against
+        the other, so there is no join to make of them.
+        """
+        args = func.expressions
+        if len(args) != 1:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "chapters() takes exactly one input alias",
+                _first_expression(args[1:]) or table,
+                fallback=table,
+                hint="e.g. FROM input('film.mkv') f, chapters(f) c",
+            )
+        argument = args[0]
+        if (
+            not isinstance(argument, exp.Column)
+            or isinstance(argument.this, exp.Star)
+            or argument.args.get("table") is not None
+        ):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "chapters() takes a bare input alias, not "
+                f"{_describe_unnest_arg(argument)}",
+                argument if isinstance(argument, exp.Expr) else table,
+                fallback=table,
+                hint="e.g. FROM input('film.mkv') f, chapters(f) c",
+            )
+        source = _ident_name(argument.this)
+        kind = scope.get(source)
+        if kind is None:
+            raise _error(
+                ErrorCode.UNKNOWN_ALIAS,
+                f"unknown alias '{source}'",
+                argument,
+                fallback=table,
+                hint=self._known_hint(scope),
+            )
+        if kind != "input":
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{source}' is a {kind}, and chapters() only reads an input's "
+                "own chapters",
+                argument,
+                fallback=table,
+                hint="chapters(f) takes an input('path') alias",
+            )
+        if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"chapters({source}) requires an alias",
+                table,
+                hint=f"name the rows, e.g. chapters({source}) c",
+            )
+        if alias_node.args.get("columns"):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "table column aliases are not supported",
+                alias_node,
+                fallback=table,
+                hint="a chapter row's columns are fixed: "
+                f"{_listed_columns(ROW_SCHEMAS['chapters'])}",
+            )
+        alias = _ident_name(alias_node.this)
+        self._reserve(alias, alias_node.this)
+        if alias in scope:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
+            )
+        if "row" in scope.values():
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "chapters(...) cannot combine with another row table in the "
+                "same query",
+                table,
+                hint="chapters(f) is its own row table; read it in a separate query",
+            )
+        self.track_rows[alias] = RawTrackRows(
+            alias=alias, source=source, column="chapters", node=table
         )
         scope[alias] = "row"
 

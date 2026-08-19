@@ -30,6 +30,7 @@ real installed ffmpeg, where only what ffmpeg itself guarantees is asserted.
 
 from __future__ import annotations
 
+import base64
 import functools
 import re
 import shlex
@@ -49,7 +50,7 @@ from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.ir import Graph, StreamType
 from sqlmpeg.lower import lower, lower_table
 from sqlmpeg.parser import parse, resolve
-from sqlmpeg.probe import ProbeResult, StreamMeta
+from sqlmpeg.probe import ChapterMeta, ProbeResult, StreamMeta
 from sqlmpeg.registry import Registry, load_reference
 from sqlmpeg.split import insert_splits
 
@@ -5957,6 +5958,148 @@ def test_a_track_row_query_runs_end_to_end(tmp_path: Path) -> None:
     result = subprocess.run(args, capture_output=True, text=True, timeout=60.0)
     assert result.returncode == 0, result.stderr
     assert out.exists()
+
+
+# ---------------------------------------------------------------------------
+# chapters(f) read, and the `chapters`/`chapters_from` sink options
+# ---------------------------------------------------------------------------
+
+
+def _chapter_probes(*chapters: ChapterMeta) -> dict[str, ProbeResult | None]:
+    return {"f": ProbeResult(streams=[_track("video", 0), _track("audio", 0)], chapters=list(chapters))}
+
+
+_TWO_CHAPTERS = [
+    ChapterMeta(index=1, start_t=0.0, end_t=1.0, title="Intro"),
+    ChapterMeta(index=2, start_t=1.0, end_t=2.0, title="Credits"),
+]
+
+
+def test_chapters_table_output_reads_the_fixed_schema() -> None:
+    sinks = lower_table(
+        resolve(parse(
+            "SELECT c.index, c.title, c.start_t, c.end_t "
+            "FROM input('f.mkv') f, chapters(f) c"
+        )),
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    assert len(sinks) == 1
+    assert sinks[0].result.columns == ["index", "title", "start_t", "end_t"]
+    assert sinks[0].result.rows == [[1, "Intro", 0.0, 1.0], [2, "Credits", 1.0, 2.0]]
+
+
+def test_chapters_where_and_order_by_use_the_same_row_machinery_unnest_does() -> None:
+    sinks = lower_table(
+        resolve(parse(
+            "SELECT c.title FROM input('f.mkv') f, chapters(f) c "
+            "WHERE c.start_t >= 1 ORDER BY c.title DESC"
+        )),
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    assert sinks[0].result.rows == [["Credits"]]
+
+
+def test_an_unreadable_input_rejects_chapters_like_unnest() -> None:
+    err = _reject_lower(
+        "SELECT c.title FROM input('f.mkv') f, chapters(f) c", {"f": None}
+    )
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+
+
+def test_a_chapters_column_in_a_media_copy_is_a_typed_rejection_not_a_tag() -> None:
+    """A row column with no alias would otherwise be checked as a tag
+    (plan 076); a chapters row has no stream to tag at all, so it must fall
+    through to the ordinary "not an output" rejection instead."""
+    err = _reject_lower(
+        "COPY (SELECT c.title FROM input('f.mkv') f, chapters(f) c) TO 'out.mkv'",
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'c.title' is track metadata, not a stream" in err.message
+    assert "chapters(f) has no stream column" in (err.hint or "")
+
+
+def test_chapters_write_mints_an_ffmetadata_input_and_sets_map_chapters() -> None:
+    g = _lower(
+        "COPY (WITH marks(start_t, end_t, title) AS "
+        "(VALUES (0, 60, 'Intro'), (60, 300, 'Act One')) "
+        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters marks)"
+    )
+    assert len(g.input_paths) == 2
+    assert g.input_paths[1].startswith("data:text/plain;base64,")
+    assert g.sinks[0].options["chapters"] == 1
+    minted_alias = next(alias for alias, index in g.sources.items() if index == 1)
+    assert g.input_options[minted_alias] == {"format": "ffmetadata"}
+
+
+def test_chapters_from_reuses_an_existing_inputs_index_with_no_extra_i() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters_from f)"
+    )
+    assert len(g.input_paths) == 1
+    assert g.sinks[0].options["chapters"] == 0
+
+
+def test_chapters_and_chapters_from_together_are_rejected() -> None:
+    err = _reject(
+        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro')) "
+        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters marks, chapters_from f)"
+    )
+    assert err.code is ErrorCode.SINK_OPTION_TYPE
+    assert "cannot both be set" in err.message
+
+
+def test_chapters_option_must_name_a_real_values_cte() -> None:
+    err = _reject(
+        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters nope)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "names a VALUES CTE" in err.message
+
+
+def test_chapters_values_cte_needs_start_t_end_t_title_by_name() -> None:
+    err = _reject(
+        "COPY (WITH marks(a, b, c) AS (VALUES (0, 60, 'Intro')) "
+        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters marks)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "must define exactly start_t, end_t, title" in err.message
+
+
+def test_chapters_values_cte_rejects_a_non_numeric_start_t() -> None:
+    err = _reject(
+        "COPY (WITH marks(start_t, end_t, title) AS (VALUES ('x', 60, 'Intro')) "
+        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters marks)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "start_t' must be a number" in err.message
+
+
+def test_chapters_values_cte_null_title_omits_the_title_line() -> None:
+    g = _lower(
+        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 60, NULL)) "
+        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters marks)"
+    )
+    payload = base64.b64decode(g.input_paths[1].split(",", 1)[1]).decode()
+    assert "title=" not in payload
+    assert "START=0\nEND=60\n" in payload
+
+
+def test_chapters_values_cte_rejects_an_unescapable_title() -> None:
+    err = _reject(
+        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'a=b')) "
+        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters marks)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot represent unescaped" in err.message
 
 
 # ---------------------------------------------------------------------------

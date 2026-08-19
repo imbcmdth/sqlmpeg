@@ -846,6 +846,7 @@ COPY (
 $ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=chaptered.mkv
 ffmpeg -i film.mkv -f ffmetadata -i \
   'data:text/plain;'\
-  'base64,O0ZGTUVUQURBVEExCltDSEFQVEVSXQpUSU1FQkFTRT0xLzEKU1RBUlQ9MApFTkQ9NjAKdGl0bGU9SW50cm8KW0NIQVBURVJdClRJTUVCQVNFPTEvMQpTVEFSVD02MApFTkQ9MzAwCnRpdGxlPUFjdCBPbmUK' \
+'base64,'\
+'O0ZGTUVUQURBVEExCltDSEFQVEVSXQpUSU1FQkFTRT0xLzEKU1RBUlQ9MApFTkQ9NjAKdGl0bGU9SW50cm8KW0NIQVBURVJdClRJTUVCQVNFPTEvMQpTVEFSVD02MApFTkQ9MzAwCnRpdGxlPUFjdCBPbmUK' \
   -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map_chapters 1 chaptered.mkv
 ```

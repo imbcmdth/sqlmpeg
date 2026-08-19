@@ -2297,3 +2297,149 @@ def test_never_raises_anything_but_sqlmpeg_error(sql: str) -> None:
     except SqlmpegError as err:
         assert err.code is not ErrorCode.INTERNAL
         assert err.line is not None
+
+
+# ---------------------------------------------------------------------------
+# chapters(f) in FROM, and VALUES CTEs
+# ---------------------------------------------------------------------------
+
+
+def test_chapters_binds_a_row_table_shaped_like_a_track_row() -> None:
+    res = _resolve(
+        "SELECT c.index, c.title, c.start_t, c.end_t "
+        "FROM input('f.mkv') f, chapters(f) c"
+    )
+    assert list(res.track_rows) == ["c"]
+    rows = res.track_rows["c"]
+    assert (rows.alias, rows.source, rows.column) == ("c", "f", "chapters")
+
+
+def test_chapters_accepts_the_as_spelling_and_folds_the_alias() -> None:
+    res = _resolve("SELECT C.title FROM input('f.mkv') f, chapters(f) AS C")
+    assert list(res.track_rows) == ["c"]
+
+
+def test_chapters_requires_an_alias() -> None:
+    err = _reject("SELECT 1 FROM input('f.mkv') f, chapters(f)")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "requires an alias" in err.message
+
+
+def test_chapters_takes_exactly_one_bare_input_alias() -> None:
+    err = _reject("SELECT 1 FROM input('f.mkv') f, input('g.mkv') g, chapters(f, g) c")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "exactly one input alias" in err.message
+
+    err = _reject("SELECT 1 FROM input('f.mkv') f, chapters(f.audio) c")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+    err = _reject("SELECT 1 FROM input('f.mkv') f, chapters(nope) c")
+    assert err.code is ErrorCode.UNKNOWN_ALIAS
+
+
+def test_chapters_needs_an_input_not_a_cte_or_row() -> None:
+    err = _reject(f"WITH x AS ({SINK_QUERY}) SELECT 1 FROM x, chapters(x) c")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "chapters() only reads an input's own chapters" in err.message
+
+    err = _reject(
+        "SELECT 1 FROM input('f.mkv') f, unnest(f.audio) t, chapters(t) c"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_chapters_cannot_combine_with_unnest_either_direction() -> None:
+    err = _reject(
+        "SELECT 1 FROM input('f.mkv') f, chapters(f) c, unnest(f.audio) t"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot combine" in err.message
+
+    err = _reject(
+        "SELECT 1 FROM input('f.mkv') f, unnest(f.audio) t, chapters(f) c"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot combine" in err.message
+
+
+def test_only_one_chapters_table_per_query() -> None:
+    err = _reject(
+        "SELECT 1 FROM input('f.mkv') f, input('g.mkv') g, "
+        "chapters(f) c, chapters(g) d"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cannot combine" in err.message
+
+
+def test_chapters_column_list_is_rejected() -> None:
+    err = _reject("SELECT 1 FROM input('f.mkv') f, chapters(f) c(x)")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "table column aliases are not supported" in err.message
+
+
+def test_chapters_row_columns_are_the_fixed_schema() -> None:
+    err = _reject("SELECT c.track FROM input('f.mkv') f, chapters(f) c")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 'c.track'" in err.message
+
+
+def test_values_cte_binds_a_row_table_not_a_normal_cte() -> None:
+    res = _resolve(
+        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro')) "
+        f"{SINK_QUERY}) TO 'x.mkv' WITH (chapters marks)"
+    )
+    assert list(res.values_ctes) == ["marks"]
+    table = res.values_ctes["marks"]
+    assert table.columns == ("start_t", "end_t", "title")
+    assert len(table.rows) == 1
+    assert "marks" not in res.ctes
+
+
+def test_values_cte_column_order_is_whatever_was_written() -> None:
+    res = _resolve(
+        "COPY (WITH marks(title, start_t, end_t) AS (VALUES ('Intro', 0, 60)) "
+        f"{SINK_QUERY}) TO 'x.mkv' WITH (chapters marks)"
+    )
+    assert res.values_ctes["marks"].columns == ("title", "start_t", "end_t")
+
+
+def test_values_cte_cannot_be_selected_from_directly() -> None:
+    err = _reject(
+        "WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro')) "
+        "SELECT * FROM marks"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "VALUES CTE" in err.message
+
+
+def test_ordinary_cte_column_renaming_still_stays_rejected() -> None:
+    err = _reject("WITH x(a, b) AS (SELECT 1, 2) SELECT * FROM x")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "must be VALUES" in err.message
+
+
+def test_values_cte_row_arity_must_match_its_column_list() -> None:
+    err = _reject(
+        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 60)) "
+        f"{SINK_QUERY}) TO 'x.mkv' WITH (chapters marks)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "VALUES row has 2 values" in err.message
+
+
+def test_values_cte_cell_must_be_a_literal() -> None:
+    err = _reject(
+        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 1 + 1, 'Intro')) "
+        f"{SINK_QUERY}) TO 'x.mkv' WITH (chapters marks)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "must be a literal" in err.message
+
+
+def test_values_cte_rejects_duplicate_column_names() -> None:
+    err = _reject(
+        "COPY (WITH marks(start_t, start_t, title) AS (VALUES (0, 60, 'Intro')) "
+        f"{SINK_QUERY}) TO 'x.mkv' WITH (chapters marks)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "duplicate column name" in err.message

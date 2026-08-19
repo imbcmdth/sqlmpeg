@@ -59,6 +59,25 @@ Fills carry the paired row's tags, so a silence-filled French slot still emits `
 
 To inspect rows before acting, use a table query (SELECT with no COPY) or CSV - [recipes 30-32](examples.md#30-look-at-a-files-tracks-as-a-table). The concat-with-fill pattern is [recipe 27](examples.md#27-concatenate-files-with-different-track-counts); recipes 23-28 cover the rest of this surface.
 
+## Editing tags
+
+In a media query over track rows, a non-stream column sets a tag on that row's output stream(s). The alias is the tag key (free-form; quoted identifiers for unusual keys), the value is any compile-time expression over the row - literals, row columns, `CASE`, `||` concatenation - and `NULL` clears the key. Unselected tags pass through unchanged. Row-scoped: the tag applies to every stream the row carries.
+
+```sql
+SELECT t.track,
+       CASE WHEN t.language IN ('en', 'english') THEN 'eng' ELSE t.language END AS language,
+       'Audio (' || t.language || ')' AS title
+FROM input('film.mkv') f, unnest(f.audio) t
+```
+
+Compiles to `-metadata:s:N` flags only - no filter nodes. The same columns in a table/CSV query print as plain data, which previews what a retag will write. Container-level tags are not per-row; recipes [37-38](examples.md#37-retitle-tracks-from-their-own-metadata) are the worked versions.
+
+## Chapters
+
+`chapters(f)` in FROM is a row table - `index`, `title`, `start_t`, `end_t` per chapter, from the container. It composes with WHERE/ORDER BY and table/CSV output; chapters are not streams, so selecting them into a media query is rejected.
+
+Writing: define chapters with a `VALUES` CTE and hand it to the sink - `WITH marks(start_t, end_t, title) AS (VALUES ...) COPY (...) TO 'out.mkv' WITH (chapters marks)`. Compiles to one extra self-contained input carrying the chapter list; `chapters_from <alias>` copies an input's chapters through instead. Recipes [39-40](examples.md#39-list-a-files-chapters).
+
 ## Fences
 
-Row tables need probeable inputs. Metadata columns as outputs are legal only in table/CSV queries, not media queries. `track` is not usable inside ON. Aggregates and `GROUP BY` stay rejected.
+Row tables need probeable inputs. Metadata columns as outputs are legal in table/CSV queries and as tag columns in row-table media queries; a media query with no row tables keeps the old rejection. `track` is not usable inside ON. Aggregates and `GROUP BY` stay rejected.

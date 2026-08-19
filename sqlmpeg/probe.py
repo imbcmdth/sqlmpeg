@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlmpeg import binaries
 from sqlmpeg.ir import StreamType
@@ -60,9 +60,28 @@ class StreamMeta:
 
 
 @dataclass(frozen=True)
+class ChapterMeta:
+    """One chapter, from ``ffprobe -show_chapters``.
+
+    `index` is 1-based, in ffprobe's own order -- the raw ``id`` field is
+    container-specific (a remuxed mkv starts it at 1, not 0) and not reused
+    here. `start_t`/`end_t` are seconds, read from ``start_time``/``end_time``
+    (already decimal strings ffprobe derives from the chapter's own time
+    base); `title` comes from the chapter's tags, same convention as a
+    stream's. Every field is opportunistic, like :class:`StreamMeta`.
+    """
+
+    index: int
+    start_t: float | None
+    end_t: float | None
+    title: str | None
+
+
+@dataclass(frozen=True)
 class ProbeResult:
     streams: list[StreamMeta]  # file order
     duration: float | None = None  # container-level, from -show_format
+    chapters: list[ChapterMeta] = field(default_factory=list)
 
     def by_type(self, t: StreamType) -> list[StreamMeta]:
         return [s for s in self.streams if s.type == t]
@@ -126,6 +145,7 @@ def _cached_ffprobe(
         "json",
         "-show_streams",
         "-show_format",
+        "-show_chapters",
         spec,
     ]
     try:
@@ -263,9 +283,37 @@ def _parse_streams(data: object) -> ProbeResult | None:
         if isinstance(raw_format, dict):
             container_duration = _float_opt(raw_format, "duration")
 
-        return ProbeResult(streams=streams, duration=container_duration)
+        chapters = _parse_chapters(data.get("chapters"))
+
+        return ProbeResult(streams=streams, duration=container_duration, chapters=chapters)
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _parse_chapters(raw_chapters: object) -> list[ChapterMeta]:
+    """``data["chapters"]`` as a list of :class:`ChapterMeta`, in ffprobe's order.
+
+    Permissive like everything else here: a malformed chapter entry is
+    dropped rather than failing the whole probe -- the file's streams are
+    still good even when one chapter's tags are not.
+    """
+    if not isinstance(raw_chapters, list):
+        return []
+    chapters: list[ChapterMeta] = []
+    for index, raw in enumerate(raw_chapters):
+        if not isinstance(raw, dict):
+            continue
+        tags = raw.get("tags", {})
+        title = str(tags["title"]) if isinstance(tags, dict) and "title" in tags else None
+        chapters.append(
+            ChapterMeta(
+                index=index + 1,
+                start_t=_float_opt(raw, "start_time"),
+                end_t=_float_opt(raw, "end_time"),
+                title=title,
+            )
+        )
+    return chapters
 
 
 def _int_opt(raw: dict[str, object], key: str) -> int | None:

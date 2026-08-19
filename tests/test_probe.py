@@ -339,6 +339,108 @@ def test_per_type_index_counted_in_file_order(
     assert [s.index for s in result.streams] == [0, 0, 1]
 
 
+# --- chapters (monkeypatched, offline) ---------------------------------------
+
+
+def test_show_chapters_flag_is_passed_to_ffprobe(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_ffprobe_present(monkeypatch)
+    calls = _fake_run(monkeypatch)
+    probe("https://example.com/master.mpd")
+    assert "-show_chapters" in calls[0]
+
+
+def test_chapters_are_mapped_one_based_from_ffprobe_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "x.mkv"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    chapters_json = json.dumps(
+        {
+            "streams": [{"codec_type": "video"}],
+            "chapters": [
+                {
+                    "id": 7,  # container-specific; never reused as `index`
+                    "start_time": "0.000000",
+                    "end_time": "1.000000",
+                    "tags": {"title": "Intro"},
+                },
+                {
+                    "id": 8,
+                    "start_time": "1.000000",
+                    "end_time": "2.000000",
+                    "tags": {"title": "Credits"},
+                },
+            ],
+        }
+    )
+    _fake_run(monkeypatch, stdout=chapters_json)
+
+    result = probe(str(f))
+    assert result is not None
+    assert [c.index for c in result.chapters] == [1, 2]
+    assert [c.title for c in result.chapters] == ["Intro", "Credits"]
+    assert [c.start_t for c in result.chapters] == [0.0, 1.0]
+    assert [c.end_t for c in result.chapters] == [1.0, 2.0]
+
+
+def test_a_chapter_missing_its_title_is_null(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Permissive like everything else here: no `tags` at all is a NULL
+    title, not a dropped chapter or a failed probe."""
+    f = tmp_path / "x.mkv"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    chapters_json = json.dumps(
+        {
+            "streams": [{"codec_type": "video"}],
+            "chapters": [{"start_time": "0.000000", "end_time": "1.000000"}],
+        }
+    )
+    _fake_run(monkeypatch, stdout=chapters_json)
+
+    result = probe(str(f))
+    assert result is not None
+    assert len(result.chapters) == 1
+    assert result.chapters[0].title is None
+
+
+def test_a_malformed_chapter_is_dropped_not_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One bad chapter entry does not null the whole probe -- the streams
+    (and the other chapters) are still good."""
+    f = tmp_path / "x.mkv"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    chapters_json = json.dumps(
+        {
+            "streams": [{"codec_type": "video"}],
+            "chapters": ["not a dict", {"start_time": "0.000000", "end_time": "1.000000"}],
+        }
+    )
+    _fake_run(monkeypatch, stdout=chapters_json)
+
+    result = probe(str(f))
+    assert result is not None
+    assert len(result.chapters) == 1
+    assert result.chapters[0].index == 2  # ffprobe's own position, malformed entry included
+
+
+def test_no_chapters_key_is_an_empty_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch)  # FAKE_JSON has no "chapters" key
+
+    result = probe(str(f))
+    assert result is not None
+    assert result.chapters == []
+
+
 # --- probe enrichment: opportunistic, never raises -----
 
 

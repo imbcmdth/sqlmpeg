@@ -31,6 +31,7 @@ pytestmark = pytest.mark.exec
 _FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures"
 _TESTSRC = _FIXTURES_DIR / "testsrc.mp4"
 _FRAME_PNG = _FIXTURES_DIR / "frame.png"
+_AV = _FIXTURES_DIR / "av.mp4"
 _AV2 = _FIXTURES_DIR / "av2.mp4"
 _AV3 = _FIXTURES_DIR / "av3.mp4"
 # The one fixture with a genuinely 2-CHANNEL audio track (440 Hz
@@ -148,6 +149,17 @@ def _ffprobe_streams(path: Path) -> list[dict[str, object]]:
     data = json.loads(result.stdout)
     streams: list[dict[str, object]] = data["streams"]
     return streams
+
+
+def _ffprobe_chapters(path: Path) -> list[dict[str, object]]:
+    args = ["ffprobe", "-v", "error", "-show_chapters", "-of", "json", str(path)]
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    chapters: list[dict[str, object]] = data["chapters"]
+    return chapters
 
 
 def _extract_frame(video: Path, t: float, out_png: Path) -> None:
@@ -1491,3 +1503,50 @@ def test_extractplanes_extracts_the_luma_plane_as_grey(tmp_path: Path) -> None:
     # A luma plane rendered as video is grey: every pixel's channels agree,
     # give or take the yuv420p round trip's chroma rounding.
     assert max(max(p) - min(p) for p in pixels) <= 8
+
+
+# ---------------------------------------------------------------------------
+# chapters: write from a VALUES CTE, read back with ffprobe
+# ---------------------------------------------------------------------------
+
+
+def test_values_cte_chapters_are_written_and_read_back(tmp_path: Path) -> None:
+    """The whole round trip plan 077 exists for: define chapter rows with
+    VALUES, compile them into a real ffmetadata `-i`, run it, and read the
+    titles and times back with ffprobe -- proving the extra input actually
+    carries chapters, not just that the command has the right shape."""
+    _require_fixture(_AV)
+    out_path = tmp_path / "chaptered.mkv"
+    query = (
+        "COPY (\n"
+        "  WITH marks(start_t, end_t, title) AS (\n"
+        "    VALUES (0, 1, 'Intro'), (1, 2, 'Credits')\n"
+        "  )\n"
+        f"  SELECT f.video[1], f.audio[1] FROM input('{_sql_path(_AV)}') f\n"
+        f") TO '{_sql_path(out_path)}' WITH (chapters marks);"
+    )
+
+    _run_sink_query(query, out_path)
+
+    chapters = _ffprobe_chapters(out_path)
+    assert [c["tags"]["title"] for c in chapters] == ["Intro", "Credits"]
+    assert [float(c["start_time"]) for c in chapters] == [0.0, 1.0]
+    assert [float(c["end_time"]) for c in chapters] == [1.0, 2.0]
+
+
+def test_chapters_from_copies_an_inputs_own_chapters_through(tmp_path: Path) -> None:
+    """`chapters_from` needs no VALUES CTE at all: it just re-maps an
+    existing input's chapters onto the output, unchanged."""
+    _require_fixture(_FIXTURES_DIR / "av-chapters.mkv")
+    source = _FIXTURES_DIR / "av-chapters.mkv"
+    out_path = tmp_path / "recopied.mkv"
+    query = (
+        "COPY (SELECT f.video[1], f.audio[1] "
+        f"FROM input('{_sql_path(source)}') f) "
+        f"TO '{_sql_path(out_path)}' WITH (chapters_from f);"
+    )
+
+    _run_sink_query(query, out_path)
+
+    chapters = _ffprobe_chapters(out_path)
+    assert [c["tags"]["title"] for c in chapters] == ["Intro", "Credits"]

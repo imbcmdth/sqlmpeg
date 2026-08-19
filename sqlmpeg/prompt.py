@@ -239,6 +239,27 @@ _DIALECT_TAIL = """\
   fill -- avoid its gaps with an `INNER`/`LEFT` join that never selects the
   missing side.
 
+### Chapters
+- `chapters(<alias>)` in `FROM` is a sibling of `unnest(...)`: a compile-time
+  TABLE, one row per chapter of that input, straight from its container.
+  `chapters(f)` takes exactly one bare input alias (no array, no subscript)
+  and needs its own alias: `FROM input('film.mkv') f, chapters(f) c`. It may
+  not combine with `unnest(...)` or a second `chapters(...)` in the same
+  query -- neither has anything to align against the other.
+- Every row carries `index` (1-based, ffprobe's own chapter order), `title`,
+  `start_t`, `end_t` (seconds). There is no `track` column at all -- a
+  chapter is not a stream -- so `chapters(...)` can only be read as a
+  metadata query (no `COPY`, or `COPY ... WITH (FORMAT csv)`); selecting one
+  of its columns into a media `COPY` is a typed rejection. `WHERE`/`ORDER BY`
+  over its columns work exactly like a track row's.
+- To WRITE chapters, define them with a VALUES CTE and hand it to a sink
+  option: `WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro'),
+  (60, 300, 'Act One')) COPY (...) TO 'out.mkv' WITH (chapters marks)`. The
+  CTE needs exactly `start_t`, `end_t` (numbers, seconds) and `title` (text)
+  columns, matched by NAME not position; a VALUES CTE is reachable only this
+  way -- selecting `FROM` one directly is rejected. `chapters_from <alias>`
+  copies an input's own chapters through instead; setting both is rejected.
+
 ### Broadcasting
 - Passing a bare array where a function expects one stream applies the call
   once per element: `reverb(a.audio, 0.3)` over a 3-track file produces 3
