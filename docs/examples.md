@@ -731,3 +731,18 @@ ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -c:1 aac out.mkv
 ```
 
 Swap the `-v` values and the same file transcodes anything. The [queries/](../queries/) directory collects ready-to-run programs built this way.
+
+## 34. Grab a poster frame
+
+`frames 1` stops the output after one frame, and `video_codec 'png'` forces the decode a PNG needs (an unfiltered stream would otherwise try to stream-copy). The seek puts the frame where you want it:
+
+```pgsql
+COPY (
+  SELECT f.video[1] FROM input(:'source') f WHERE f.t >= :at
+) TO :'dest' WITH (video_codec 'png', frames 1)
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v at=90 -v dest=poster.png
+ffmpeg -ss 90 -i film.mkv -map 0:v:0 -c:0 png -frames:0 1 poster.png
+```
