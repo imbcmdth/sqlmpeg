@@ -59,10 +59,10 @@ from pathlib import Path
 
 from . import binaries
 from . import registry as registry_module
-from .compiler import classify, compile_sql, compile_table_sql
+from .compiler import classify, compile_commands, compile_table_sql
 from .emit import Emitted, build_ffmpeg_commands, emit
 from .errors import SqlmpegError
-from .ir import Graph
+from .ir import Graph, SinkUnit
 from .prompt import build_system_prompt
 from .table import TableSink, render_csv, render_table
 from .vars import substitute
@@ -267,32 +267,38 @@ def _check_output_dir(out_path: str) -> str | None:
     return None
 
 
-def _reject_output_override(cli_output: str | None, graph: Graph) -> str | None:
-    """``-o`` names ONE file, so it is illegal against a multi-sink script.
+def _sinks(graphs: list[Graph]) -> list[SinkUnit]:
+    """Every command's sink units, in command order."""
+    return [unit for graph in graphs for unit in graph.sinks]
 
-    Each COPY carries its own destination, and one ``-o`` would
-    silently write every group over the same file. Returns the stderr message
-    (usage error, exit 2), or None.
+
+def _reject_output_override(cli_output: str | None, graphs: list[Graph]) -> str | None:
+    """``-o`` names ONE file, so it is illegal against a multi-file compile.
+
+    Each COPY -- and each row of a fan-out COPY -- carries its own destination,
+    and one ``-o`` would silently write them all over the same file. Returns
+    the stderr message (usage error, exit 2), or None.
     """
-    if cli_output is None or len(graph.sinks) <= 1:
+    units = _sinks(graphs)
+    if cli_output is None or len(units) <= 1:
         return None
-    paths = ", ".join(repr(unit.path) for unit in graph.sinks)
+    paths = ", ".join(repr(unit.path) for unit in units)
     return (
-        f"error: -o takes one path, but this script writes {len(graph.sinks)} "
-        f"files ({paths}); drop -o and let each COPY write its own"
+        f"error: -o takes one path, but this script writes {len(units)} "
+        f"files ({paths}); drop -o and let the query write its own"
     )
 
 
-def _needs_out_path(graph: Graph) -> bool:
+def _needs_out_path(graphs: list[Graph]) -> bool:
     """True if some sink names no destination — i.e. the bare-SELECT case."""
-    return any(unit.path is None for unit in graph.sinks)
+    return any(unit.path is None for unit in _sinks(graphs))
 
 
-def _output_paths(out_path: str | None, graph: Graph) -> list[str]:
+def _output_paths(out_path: str | None, graphs: list[Graph]) -> list[str]:
     """Every file this command will write, for the directory-existence check."""
     if out_path is not None:
         return [out_path]
-    return [unit.path for unit in graph.sinks if unit.path is not None]
+    return [unit.path for unit in _sinks(graphs) if unit.path is not None]
 
 
 def _is_table_capable_query(text: str) -> bool:
@@ -346,8 +352,8 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         text, code = _resolve_query(args)
         if text is None:
             return code
-        graph = compile_sql(text)
-        emitted = emit(graph)
+        graphs = compile_commands(text)
+        emitted = [emit(graph) for graph in graphs]
     except SqlmpegError as err:
         # A query with no streaming representation at all (metadata
         # columns, an un-COALESCEd join gap) fails HERE, so table mode is the
@@ -364,10 +370,11 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         return 1
 
     if args.graph_only:
-        print(emitted.filter_complex)
+        # One line per command; a fan-out query has one graph per row.
+        print("\n".join(e.filter_complex for e in emitted))
         return 0
 
-    override_error = _reject_output_override(args.output, graph)
+    override_error = _reject_output_override(args.output, graphs)
     if override_error is not None:
         print(override_error, file=sys.stderr)
         return 2
@@ -375,9 +382,11 @@ def _cmd_compile(args: argparse.Namespace) -> int:
     # `-o`, else each COPY's own path (build_ffmpeg_args reads them off the
     # groups), with the placeholder standing in for a bare SELECT.
     out_path = args.output
-    if out_path is None and _needs_out_path(graph):
+    if out_path is None and _needs_out_path(graphs):
         out_path = _DEFAULT_OUT
-    commands = build_ffmpeg_commands(emitted, out_path)
+    commands = [
+        command for e in emitted for command in build_ffmpeg_commands(e, out_path)
+    ]
     print(_CHAIN.join(shlex.join(command) for command in commands))
     return 0
 
@@ -387,12 +396,16 @@ def _cmd_explain(args: argparse.Namespace) -> int:
         text, code = _resolve_query(args)
         if text is None:
             return code
-        graph = compile_sql(text)
+        graphs = compile_commands(text)
     except SqlmpegError as err:
         _print_error(err, source=args.query)
         return 1
 
-    print(json.dumps(graph.to_dict(), indent=2))
+    # One object for a single command, a JSON ARRAY for a fan-out query's.
+    payload: object = graphs[0].to_dict() if len(graphs) == 1 else [
+        graph.to_dict() for graph in graphs
+    ]
+    print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -402,7 +415,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         text, code = _resolve_query(args)
         if text is None:
             return code
-        compile_sql(text)
+        compile_commands(text)
     except SqlmpegError as err:
         # "compiles = valid" still holds: a table/csv query compiles through
         # its own lenient pipeline, tried here exactly as in `_cmd_compile`.
@@ -446,26 +459,26 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return _print_table_sinks(sinks)
 
     try:
-        graph: Graph = compile_sql(text)
-        emitted: Emitted = emit(graph)
+        graphs: list[Graph] = compile_commands(text)
+        emitted: list[Emitted] = [emit(graph) for graph in graphs]
     except SqlmpegError as err:
         _print_error(err, source=args.query)
         return 1
 
-    override_error = _reject_output_override(args.output, graph)
+    override_error = _reject_output_override(args.output, graphs)
     if override_error is not None:
         print(override_error, file=sys.stderr)
         return 2
 
     out_path = args.output
-    if out_path is None and _needs_out_path(graph):
+    if out_path is None and _needs_out_path(graphs):
         print(
             "error: no output path given: pass -o, or use COPY ... TO in the query",
             file=sys.stderr,
         )
         return 2
 
-    for path in _output_paths(out_path, graph):
+    for path in _output_paths(out_path, graphs):
         dir_error = _check_output_dir(path)
         if dir_error is not None:
             print(dir_error, file=sys.stderr)
@@ -475,10 +488,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"error: ffmpeg not found: {binaries.INSTALL_HINT}", file=sys.stderr)
         return 1
 
-    # A two-pass sink compiles to two commands; every other query to one. They
-    # run in order and the first nonzero exit is the run's exit code, so a
-    # failed pass 1 never writes the destination. The timeout is per command.
-    for ffmpeg_args in build_ffmpeg_commands(emitted, out_path):
+    # A two-pass sink compiles to two commands, a fan-out COPY to one per row,
+    # every other query to one. They run in order and the first nonzero exit is
+    # the run's exit code, so a failed pass 1 never writes the destination. The
+    # timeout is per command.
+    commands = [
+        command for e in emitted for command in build_ffmpeg_commands(e, out_path)
+    ]
+    for ffmpeg_args in commands:
         if args.overwrite:
             ffmpeg_args.insert(1, "-y")
         else:

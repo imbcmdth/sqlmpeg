@@ -24,6 +24,12 @@ Notes for downstream passes (lower):
   goes through the EXACT same validation a bare SELECT does; a bare SELECT
   leaves ``sinks`` empty. Only the shape is checked here — option NAMES and
   VALUES are validated against ``sqlmpeg.sink.SINK_OPTIONS`` by lower.
+* A media COPY's destination may be a parenthesized EXPRESSION,
+  ``TO ('ch' || c.index::text || '.mkv')``, kept on ``RawSink.path_expr``. One
+  reading a track-row column fans the COPY out into one command per surviving
+  row (lower evaluates it per row); one reading none is a constant path. The
+  fan-out shape also reopens a WHERE mix resolve otherwise rejects: a time
+  window on an input alias whose bounds are row columns.
 
 * Input text may be a SCRIPT: ``CREATE VIEW <name> AS <query>;``* followed by
   ``COPY ...;``+. See :func:`_statements` and :meth:`_Resolver._view` for the
@@ -491,6 +497,41 @@ def _is_input_duration(node: exp.Expr | None, scope: dict[str, str]) -> bool:
     )
 
 
+def _is_row_column(node: exp.Expr | None, scope: dict[str, str]) -> bool:
+    """True for ``<track-row alias>.<column>``."""
+    if not isinstance(node, exp.Column):
+        return False
+    table_node = node.args.get("table")
+    return table_node is not None and scope.get(_ident_name(table_node)) == "row"
+
+
+def references_row_alias(node: exp.Expr, row_aliases: set[str]) -> bool:
+    """True if `node` reads any column of a track-row table in `row_aliases`.
+
+    The fan-out dispatch: a ``TO`` expression that reads one is one file per
+    row, and one that reads none is an ordinary constant path.
+    """
+    for sub in node.walk():
+        if not isinstance(sub, exp.Column):
+            continue
+        table_node = sub.args.get("table")
+        if table_node is not None and _ident_name(table_node) in row_aliases:
+            return True
+    return False
+
+
+def _is_row_bounded_window(conjunct: exp.Expr, scope: dict[str, str]) -> bool:
+    """True for a time window on a non-row alias with row columns as bounds."""
+    parsed = _time_bounds(conjunct)
+    if parsed is None:
+        return False
+    column = parsed[0]
+    table_node = column.args.get("table")
+    if table_node is None or scope.get(_ident_name(table_node)) == "row":
+        return False
+    return _ident_name(column.this) == "t"
+
+
 # subscripts
 
 
@@ -817,8 +858,13 @@ class RawSink:
     allowed to select (metadata columns become legal SELECT outputs) and
     whether ``TO STDOUT`` is a legal target — both decided before the option
     VALUES are otherwise interpreted, which stays lower's job as always.
-    ``path`` is None only for a csv sink's ``TO STDOUT``; a media sink's path
+    ``path`` is None for a csv sink's ``TO STDOUT`` and for a parenthesized
+    ``TO (<expression>)``, whose text lower computes; a plain media sink's path
     is always a real string.
+
+    ``path_expr`` is that parenthesized expression, or None for a quoted path.
+    It fans the COPY out into one command per surviving row when it references
+    a track-row column, and is an ordinary constant path when it does not.
     """
 
     path: str | None
@@ -827,6 +873,7 @@ class RawSink:
     branches: tuple[exp.Select, ...]
     options: tuple[RawSinkOption, ...] = ()
     is_csv: bool = False
+    path_expr: exp.Expr | None = None
 
 
 @dataclass(frozen=True)
@@ -1294,9 +1341,9 @@ def _is_csv_format(options: tuple[RawSinkOption, ...]) -> bool:
 
 def _sink(
     copy: exp.Copy,
-) -> tuple[str | None, exp.Expr, tuple[RawSinkOption, ...], exp.Expr, bool]:
+) -> tuple[str | None, exp.Expr | None, exp.Expr, tuple[RawSinkOption, ...], exp.Expr, bool]:
     """Validate a top-level COPY into
-    ``(path, path node, options, wrapped query, is_csv)``.
+    ``(path, path expression, path node, options, wrapped query, is_csv)``.
 
     The pieces rather than a :class:`RawSink`: a sink also carries its
     VALIDATED query, and that validation is the resolver's job, so
@@ -1309,10 +1356,12 @@ def _sink(
       ``COPY ... TO``. It is NOT an expression, so it has no position.
     * ``files`` is a list — ``TO 'a', 'b'`` gives two entries, and ``TO STDOUT``
       / ``TO x`` / ``TO PROGRAM 'cat'`` give an ``exp.Identifier`` rather than a
-      ``Literal``. A media COPY still rejects anything but a literal path; a
+      ``Literal``. ``TO (<expression>)`` gives an ``exp.Paren``, the media
+      COPY's computed destination. A media COPY rejects every other shape; a
       CSV COPY additionally accepts ``TO STDOUT`` — the
       one-word ``exp.Identifier`` case — since a table sink prints, it does
-      not always write a file.
+      not always write a file, and rejects the ``exp.Paren`` form, which has
+      no row set to fan a printed table out over.
     * ``credentials`` is always an EMPTY ``exp.Credentials()`` — writing an
       actual ``CREDENTIALS (...)`` clause makes sqlglot fall back to
       ``exp.Command`` for the whole statement, which resolve rejects anyway.
@@ -1346,7 +1395,7 @@ def _sink(
             hint=_SINK_HINT,
         )
     target = files[0]
-    if not isinstance(target, exp.Literal | exp.Identifier):
+    if not isinstance(target, exp.Literal | exp.Identifier | exp.Paren):
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             "COPY target must be a single-quoted file path",
@@ -1358,7 +1407,19 @@ def _sink(
     is_csv = _is_csv_format(options)
 
     path: str | None
-    if isinstance(target, exp.Literal) and target.is_string:
+    path_expr: exp.Expr | None = None
+    if isinstance(target, exp.Paren) and isinstance(target.this, exp.Expr):
+        if is_csv:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a csv COPY takes a quoted path or STDOUT, not a TO expression",
+                target,
+                fallback=copy,
+                hint="a TO expression writes one MEDIA file per track row; a "
+                "csv sink prints one table",
+            )
+        path, path_expr = None, target.this
+    elif isinstance(target, exp.Literal) and target.is_string:
         path = str(target.this)
     elif is_csv and isinstance(target, exp.Identifier) and _ident_name(target) == "stdout":
         path = None
@@ -1382,7 +1443,7 @@ def _sink(
             hint=_SINK_HINT,
         )
 
-    return path, target, options, query, is_csv
+    return path, path_expr, target, options, query, is_csv
 
 
 def _sink_options(copy: exp.Copy, target: exp.Expr) -> tuple[RawSinkOption, ...]:
@@ -1593,8 +1654,10 @@ class _Resolver:
                 # Peel the COPY wrapper off; what it wraps is validated exactly
                 # like a bare SELECT from here on -- except a csv sink is table
                 # mode, where metadata columns are legal SELECT outputs.
-                path, path_node, options, wrapped, is_csv = _sink(statement)
-                query, query_branches = self._resolve_query(wrapped, table_mode=is_csv)
+                path, path_expr, path_node, options, wrapped, is_csv = _sink(statement)
+                query, query_branches = self._resolve_query(
+                    wrapped, table_mode=is_csv, path_expr=path_expr
+                )
                 sinks.append(
                     RawSink(
                         path=path,
@@ -1603,6 +1666,7 @@ class _Resolver:
                         branches=tuple(query_branches),
                         options=options,
                         is_csv=is_csv,
+                        path_expr=path_expr,
                     )
                 )
                 if select is None:
@@ -1643,6 +1707,7 @@ class _Resolver:
                 hint=_SCRIPT_HINT,
             )
         self._check_views_are_used()
+        self._check_fanout_is_alone(sinks)
 
         return Resolved(
             select=select,
@@ -1658,8 +1723,25 @@ class _Resolver:
             values_ctes=self.values_ctes,
         )
 
+    def _check_fanout_is_alone(self, sinks: list[RawSink]) -> None:
+        """A fan-out COPY is the only statement of its script, v1."""
+        if len(sinks) <= 1:
+            return
+        row_aliases = set(self.track_rows)
+        for sink in sinks:
+            if sink.path_expr is None or not references_row_alias(sink.path_expr, row_aliases):
+                continue
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a TO expression writes one file per row, so it cannot share a "
+                f"script with another COPY ({len(sinks)} here)",
+                sink.path_expr,
+                fallback=sink.path_node,
+                hint="split the fan-out COPY into its own query",
+            )
+
     def _resolve_query(
-        self, node: exp.Expr, *, table_mode: bool = False
+        self, node: exp.Expr, *, table_mode: bool = False, path_expr: exp.Expr | None = None
     ) -> tuple[QueryExpr, list[exp.Select]]:
         """Validate one whole query — a view body, a COPY's, or a bare SELECT.
 
@@ -1683,9 +1765,20 @@ class _Resolver:
             )
         self._resolve_ctes(query)
         branches = union_branches(query)
+        if path_expr is not None and len(branches) > 1:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a TO expression writes one file per row, and UNION ALL has one "
+                "row set per branch",
+                path_expr,
+                fallback=query,
+                hint="give the concatenated query a quoted TO path",
+            )
         visible = set(self.ctes)
         for branch in branches:
-            self._validate_select(branch, visible, table_mode=table_mode)
+            self._validate_select(
+                branch, visible, table_mode=table_mode, path_expr=path_expr
+            )
         return query, branches
 
     # -- CREATE VIEW --------------------------------------------
@@ -2028,7 +2121,12 @@ class _Resolver:
     # -- selects ----------------------------------------------------------
 
     def _validate_select(
-        self, select: exp.Select, visible: set[str], *, table_mode: bool = False
+        self,
+        select: exp.Select,
+        visible: set[str],
+        *,
+        table_mode: bool = False,
+        path_expr: exp.Expr | None = None,
     ) -> None:
         # `ORDER BY` is admitted for TRACK-ROW queries and nowhere else. The
         # carve-out is decided from the FROM clause alone, before any of it is
@@ -2060,10 +2158,27 @@ class _Resolver:
             self._check_columns(projection, scope, select, table_mode=table_mode)
             self._check_select_value(projection, scope, select)
         if isinstance(where, exp.Where):
-            self._check_where(where, scope, select)
+            self._check_where(where, scope, select, fanout=path_expr is not None)
         order = select.args.get("order")
         if isinstance(order, exp.Order):
             self._check_order(order, scope, select)
+        if path_expr is not None:
+            self._check_path_expr(path_expr, scope, select)
+
+    def _check_path_expr(
+        self, node: exp.Expr, scope: dict[str, str], select: exp.Select
+    ) -> None:
+        """``TO (<expression>)``: one text value over this query's row columns."""
+        kind = self._check_value_expr(node, scope, select)
+        if kind == "text":
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "a TO expression must be text, got " + ("NULL" if kind is None else kind),
+            node,
+            fallback=select,
+            hint="build the name from text: 'ch' || c.index::text || '.mkv'",
+        )
 
     def _check_select_value(
         self, projection: exp.Expr, scope: dict[str, str], select: exp.Select
@@ -3376,7 +3491,12 @@ class _Resolver:
         )
 
     def _check_where(
-        self, where: exp.Where, scope: dict[str, str], select: exp.Select
+        self,
+        where: exp.Where,
+        scope: dict[str, str],
+        select: exp.Select,
+        *,
+        fanout: bool = False,
     ) -> None:
         conjuncts: list[exp.Expr] = []
         self._flatten_and(where.this, conjuncts, select)
@@ -3389,7 +3509,7 @@ class _Resolver:
         conjuncts = [
             conjunct
             for conjunct in conjuncts
-            if not self._check_row_conjunct(conjunct, scope, where)
+            if not self._check_row_conjunct(conjunct, scope, where, fanout=fanout)
             and not self._check_subscript_conjunct(conjunct, scope, where)
         ]
 
@@ -3448,7 +3568,7 @@ class _Resolver:
             for kind, bound in (("low", low), ("high", high)):
                 if bound is None:
                     continue
-                self._check_time_bound(bound, scope, where)
+                self._check_time_bound(bound, scope, where, fanout=fanout)
                 if kind in alias_bounds:
                     bound_name = "lower" if kind == "low" else "upper"
                     raise _error(
@@ -3484,19 +3604,28 @@ class _Resolver:
             )
 
     def _check_time_bound(
-        self, bound: exp.Expr, scope: dict[str, str], where: exp.Where
+        self,
+        bound: exp.Expr,
+        scope: dict[str, str],
+        where: exp.Where,
+        *,
+        fanout: bool = False,
     ) -> None:
         """One trim bound: a number of seconds, literal or computed.
 
         A bound is still a SEEK on the input, so it has to be a number by the
         time lower reads it -- but which number may be arithmetic over probed
         scalars (``f.duration - 0.5``), so the value grammar types it here.
+
+        Under a fan-out ``TO`` a bare row column (``c.start_t``) is a bound
+        too: each command binds its own row, so the window is that row's.
         """
         if isinstance(bound, exp.Literal) and not bound.is_string:
             return
-        if (is_value_expr(bound) or _is_input_duration(bound, scope)) and (
-            self._check_value_expr(bound, scope, where) == "number"
-        ):
+        if (
+            (is_value_expr(bound) or _is_input_duration(bound, scope))
+            or (fanout and _is_row_column(bound, scope))
+        ) and (self._check_value_expr(bound, scope, where) == "number"):
             return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -3509,7 +3638,12 @@ class _Resolver:
     # -- WHERE over track-row columns ---------------------------
 
     def _check_row_conjunct(
-        self, conjunct: exp.Expr, scope: dict[str, str], where: exp.Where
+        self,
+        conjunct: exp.Expr,
+        scope: dict[str, str],
+        where: exp.Where,
+        *,
+        fanout: bool = False,
     ) -> bool:
         """Shape-check `conjunct` if it is a ROW predicate; say whether it was one.
 
@@ -3523,6 +3657,11 @@ class _Resolver:
         the ffmpeg command line, one in this compiler), and quietly cutting the
         expression in half is the kind of approximation guardrail #3 bans.
 
+        A fan-out ``TO`` reopens exactly one mixed shape: a time window on a
+        non-row alias whose BOUNDS are row columns (``WHERE f.t BETWEEN
+        c.start_t AND c.end_t``). Both halves then run in one world -- the
+        command being built for that row -- so there is nothing to cut in half.
+
         Returns True when the conjunct was a row predicate (and is now
         validated), False when it belongs to the time-window path.
         """
@@ -3532,6 +3671,8 @@ class _Resolver:
             return False
         others = aliases - rows
         if others:
+            if fanout and _is_row_bounded_window(conjunct, scope):
+                return False
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 "a WHERE predicate cannot mix track-row columns "

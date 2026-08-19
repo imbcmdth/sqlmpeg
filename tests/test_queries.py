@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 from sqlmpeg import cli, compiler
-from sqlmpeg.probe import ProbeResult, StreamMeta
+from sqlmpeg.probe import ChapterMeta, ProbeResult, StreamMeta
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 QUERIES_DIR = REPO_ROOT / "queries"
@@ -70,6 +70,8 @@ _DUMMY_VALUES = {
     "duration": "1",
     "dir": "clock",
     "rate": "1",
+    "prefix": "ch",
+    "ext": "m4a",
 }
 
 
@@ -113,7 +115,14 @@ def _synthetic_probe(monkeypatch: pytest.MonkeyPatch) -> None:
         sample_rate=None,
         codec="srt",
     )
-    result = ProbeResult(streams=[video, audio, subtitle])
+    result = ProbeResult(
+        streams=[video, audio, subtitle],
+        # split-chapters.sql fans out over these, one command per chapter.
+        chapters=[
+            ChapterMeta(index=1, start_t=0.0, end_t=30.0, title="Intro"),
+            ChapterMeta(index=2, start_t=30.0, end_t=90.0, title="Credits"),
+        ],
+    )
     monkeypatch.setattr(compiler, "probe_path", lambda path: result)
 
 

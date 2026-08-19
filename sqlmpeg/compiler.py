@@ -31,14 +31,14 @@ from __future__ import annotations
 from . import registry as registry_module
 from .errors import ErrorCode, SqlmpegError
 from .ir import Graph
-from .lower import lower, lower_table
+from .lower import lower_commands, lower_table
 from .parser import Resolved, parse, resolve
 from .probe import ProbeResult
 from .probe import probe as probe_path
 from .split import insert_splits
 from .table import TableSink
 
-__all__ = ["classify", "compile_sql", "compile_table_sql"]
+__all__ = ["classify", "compile_commands", "compile_sql", "compile_table_sql"]
 
 
 def _probe_inputs(res: Resolved) -> dict[str, ProbeResult | None]:
@@ -56,6 +56,9 @@ def _probe_inputs(res: Resolved) -> dict[str, ProbeResult | None]:
 def compile_sql(text: str) -> Graph:
     """Compile SQL `text` into a split-complete IR graph.
 
+    The FIRST command's graph, which is the whole query for everything but a
+    fan-out COPY; :func:`compile_commands` returns every command's.
+
     Every input is probed opportunistically (see module docstring). The
     installed ffmpeg's filter set IS the function surface, so what
     compiles depends on what that ffmpeg reports; tests wanting a fixed,
@@ -64,10 +67,23 @@ def compile_sql(text: str) -> Graph:
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
+    return compile_commands(text)[0]
+
+
+def compile_commands(text: str) -> list[Graph]:
+    """Compile SQL `text` into one split-complete IR graph per ffmpeg COMMAND.
+
+    One graph for every query but a fan-out ``COPY ... TO (<expression>)``,
+    which writes one file per surviving row and so compiles to one graph per
+    row. Same probing and registry contract as :func:`compile_sql`.
+
+    Raises ``SqlmpegError`` — and nothing else — on every rejection.
+    """
     try:
         res = resolve(parse(text))
         probes = _probe_inputs(res)
-        return insert_splits(lower(res, probes, registry=registry_module.load()))
+        graphs = lower_commands(res, probes, registry=registry_module.load())
+        return [insert_splits(graph) for graph in graphs]
     except SqlmpegError:
         raise
     except RecursionError as err:

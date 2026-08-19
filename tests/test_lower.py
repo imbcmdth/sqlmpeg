@@ -2160,10 +2160,10 @@ def test_split_pass_picks_asplit_for_audio() -> None:
 def test_compile_sql_wraps_unexpected_exceptions_as_internal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def boom(res: object, probes: object, **kwargs: object) -> Graph:
+    def boom(res: object, probes: object, **kwargs: object) -> list[Graph]:
         raise ValueError("kaboom")
 
-    monkeypatch.setattr(compiler, "lower", boom)
+    monkeypatch.setattr(compiler, "lower_commands", boom)
     with pytest.raises(SqlmpegError) as excinfo:
         compile_sql("SELECT a.frame FROM input('x.mp4') a")
     assert excinfo.value.code is ErrorCode.INTERNAL

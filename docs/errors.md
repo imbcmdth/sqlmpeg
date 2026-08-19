@@ -174,6 +174,15 @@ Three script rejections (RFC-006: `CREATE VIEW name AS <query>;`* followed by `C
 - a bare `SELECT` sitting among other statements. Only `COPY` carries a destination, so a lone `SELECT` in a multi-statement script has nowhere to send its streams -- wrap it in `COPY (<query>) TO '<path>'`;
 - a `CREATE VIEW` written after the first `COPY`. Every view must precede every `COPY`, so the whole script can resolve names left-to-right in one pass.
 
+The output fan-out rejections land here too. `COPY (...) TO (<expression>)` writes one file per surviving track row when the expression reads that row table's columns, and everything about that shape that cannot be answered is typed rather than guessed at:
+
+- a computed path segment holding a path separator or `..` -- a directory chosen by file metadata, named with the offending value;
+- two rows naming the same file, naming both rows and the collision;
+- zero surviving rows, and a `TO` expression that comes out NULL for a row (naming the column that was never probed);
+- a `TO` expression that is not text;
+- a trim bound over track-row columns (`WHERE f.t BETWEEN c.start_t AND c.end_t`) under a quoted `TO`, which has one command and so one window;
+- and, in this version, fan-out combined with `two_pass`, `chapters`/`chapters_from`/`metadata_from`, `FORMAT csv`, `UNION ALL`, or another `COPY` in the same script.
+
 **Fires when:** (one example among many) the query selects a subtitle stream that sits inside its own alias's `WHERE` time window.
 
 **Example query** (`tests/fixtures/avs.mkv` has one subtitle stream):

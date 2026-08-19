@@ -297,6 +297,7 @@ from sqlmpeg.parser import (
     from_entries,
     is_value_expr,
     kwarg_name,
+    references_row_alias,
     star_qualifier,
     subscript_index,
     subscript_metadata_shape,
@@ -713,6 +714,26 @@ def _error(
 ) -> SqlmpegError:
     line, col = _pos(node, fallback)
     return SqlmpegError(code, message, line=line, col=col, hint=hint)
+
+
+def _computed_segments(expression: exp.Expr, row_aliases: set[str]) -> list[exp.Expr]:
+    """The pieces of a path expression whose text comes from row metadata.
+
+    A ``||`` chain is split at its operands, so the literal directory in
+    ``'out/' || t.language`` stays a literal and only ``t.language`` is
+    checked. Anything else is one segment, computed if it reads a row at all.
+    """
+    node = _unwrap(expression)
+    if isinstance(node, exp.DPipe):
+        expression_node = node.args.get("expression")
+        sides = [node.this, expression_node if isinstance(expression_node, exp.Expr) else None]
+        return [
+            segment
+            for side in sides
+            if isinstance(side, exp.Expr)
+            for segment in _computed_segments(side, row_aliases)
+        ]
+    return [node] if references_row_alias(node, row_aliases) else []
 
 
 def _describe(node: exp.Expr) -> str:
@@ -1684,6 +1705,7 @@ class _Lowerer:
         res: Resolved,
         probes: dict[str, ProbeResult | None],
         registry: Registry | None,
+        fanout_index: int = 0,
     ) -> None:
         self.res = res
         self.probes = probes
@@ -1698,6 +1720,17 @@ class _Lowerer:
         # The tag columns of the query being lowered; reset per query, since
         # two COPYs may tag the same track differently.
         self.tags: _TagOverrides = {}
+        # Output fan-out: which row of the sink's relation THIS run binds, the
+        # sink's TO expression once it is known to reference a row column, and
+        # the pinned row / its branch environment once `_pin_fanout_row` runs.
+        # `fanout_count` is the relation's surviving row count, i.e. how many
+        # commands the query compiles to; None until a pin happens, which is
+        # what tells `lower_commands` this was not a fan-out query at all.
+        self.fanout_index = fanout_index
+        self.fanout_expr: exp.Expr | None = None
+        self.fanout_row: dict[str, _TrackRow | None] = {}
+        self.fanout_env: _Env | None = None
+        self.fanout_count: int | None = None
         # True for the whole duration of `run_table()`; `run()` never sets it.
         # Table mode changes exactly one thing about the stream machinery it
         # otherwise reuses verbatim: an outer join's NULL row is an empty cell
@@ -1756,7 +1789,17 @@ class _Lowerer:
         them. Both resolve into the SAME rendered option, ``options
         ["chapters"]`` -- the ffmpeg input index ``-map_chapters`` names --
         which is why at most one of them may be set.
+
+        A ``TO (<expression>)`` reaching here is a fan-out sink exactly when it
+        reads a track-row column; that decision is made FIRST, since it changes
+        how the wrapped query lowers (one pinned row, per-row seek bounds).
         """
+        self.fanout_expr = (
+            raw.path_expr
+            if raw.path_expr is not None
+            and references_row_alias(raw.path_expr, set(self.res.track_rows))
+            else None
+        )
         columns = self._lower_query(list(raw.branches), raw.query, tags=True)
         options: dict[str, object] = {}
         option_nodes: dict[str, exp.Expr] = {}
@@ -1801,7 +1844,106 @@ class _Lowerer:
         _check_sink_option_conflicts(options, option_nodes, raw.path_node)
         outputs = _outputs(columns, self.tags)
         _check_two_pass_outputs(options, outputs, raw.path_node)
-        return SinkUnit(outputs=outputs, path=raw.path, options=options)
+        path = raw.path
+        if raw.path_expr is not None:
+            self._check_fanout_options(options, raw)
+            path = self._sink_path(raw)
+        return SinkUnit(outputs=outputs, path=path, options=options)
+
+    # -- the fan-out TO expression ------------------------------------
+
+    def _check_fanout_options(self, options: dict[str, object], raw: RawSink) -> None:
+        """The sink options a fan-out COPY does not take, v1.
+
+        ``two_pass`` already compiles to a command SEQUENCE of its own, and the
+        chapter/metadata options name one input per file; both are small
+        matrices left closed rather than guessed at.
+        """
+        if self.fanout_expr is None:
+            return
+        # `chapters`/`metadata_from` carry an input INDEX, so 0 is a set value;
+        # only `two_pass false` is a set option that asks for nothing.
+        for name in ("two_pass", "chapters", "metadata_from"):
+            if name not in options or options[name] is False:
+                continue
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{name}' and a fan-out TO cannot both be set",
+                raw.path_expr,
+                fallback=raw.path_node,
+                hint=f"a TO expression writes one file per row; drop {name}, or "
+                "write a quoted TO path",
+            )
+
+    def _sink_path(self, raw: RawSink) -> str:
+        """``TO (<expression>)`` evaluated: this command's destination.
+
+        A constant expression is an ordinary path. A fan-out one is the pinned
+        row's, and is checked for the two things a name built from file
+        metadata must not smuggle in: a NULL (an unprobed column, named), and a
+        path separator or ``..`` inside a COMPUTED segment.
+        """
+        expression = raw.path_expr
+        if expression is None:  # defensive: the caller checked it
+            raise _error(ErrorCode.INTERNAL, "sink path expression is missing")
+        env = self.fanout_env if self.fanout_env is not None else _Env()
+        # The wrapped query's first branch is the anchor every rejection below
+        # falls back to; `raw.query` may be a Union, which `_eval_value` is not
+        # typed for.
+        anchor = raw.branches[0] if raw.branches else exp.Select()
+        if self.fanout_expr is not None and self.fanout_env is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a TO expression reads a track-row table this COPY's FROM does "
+                "not bind",
+                expression,
+                fallback=raw.path_node,
+                hint="unnest the rows in the COPY's own FROM, e.g. FROM "
+                "input(:'src') f, unnest(f.audio) t",
+            )
+        for segment in _computed_segments(expression, set(self.res.track_rows)):
+            self._check_path_segment(segment, env, raw, anchor)
+        value = self._eval_value(expression, env, self.fanout_row, anchor)
+        if value is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "the TO expression is NULL for this row: "
+                + self._null_field(expression, env, anchor),
+                expression,
+                fallback=raw.path_node,
+                hint="COALESCE the column, or filter the rows that lack it",
+            )
+        return _tag_text(value)
+
+    def _check_path_segment(
+        self, segment: exp.Expr, env: _Env, raw: RawSink, anchor: exp.Select
+    ) -> None:
+        """One computed piece of a path: no separator, no ``..``."""
+        value = self._eval_value(segment, env, self.fanout_row, anchor)
+        if not isinstance(value, str):
+            return
+        found = next((bad for bad in ("/", "\\", "..") if bad in value), None)
+        if found is None:
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"a computed path segment may not contain {found!r}, got {value!r}",
+            segment,
+            fallback=raw.path_node,
+            hint="write the directory as a literal: 'out/' || t.language || "
+            "'.m4a'; metadata never chooses the directory",
+        )
+
+    def _null_field(self, expression: exp.Expr, env: _Env, anchor: exp.Select) -> str:
+        """Which column of the path expression read NULL, for the message."""
+        for sub in expression.walk():
+            if not isinstance(sub, exp.Column):
+                continue
+            if self._eval_value(sub, env, self.fanout_row, anchor) is None:
+                table_node = sub.args.get("table")
+                prefix = f"{_fold(table_node)}." if table_node is not None else ""
+                return f"'{prefix}{sub.name}' was never probed"
+        return "no column of it has a value"
 
     # -- chapters sink options ----------------------------------------
 
@@ -2033,12 +2175,19 @@ class _Lowerer:
         # conjunct is a compile-time ASSERTION (nothing to filter -- the SELECT
         # list already names the exact stream the subscript picked); a time
         # window is a seek on an input. Resolve already rejected a conjunct
-        # mixing any two, so the split is total.
+        # mixing any two, so the split is total -- except for the one mix a
+        # fan-out TO admits, a time window bounded by row columns.
         time_conjuncts, row_conjuncts, assertion_conjuncts = self._split_where(select, env)
-        self._collect_trims(select, env, time_conjuncts)
+        fanout = self.fanout_expr is not None
+        # Under fan-out the trims wait for the pin: a bound may name that row.
+        if not fanout:
+            self._collect_trims(select, env, time_conjuncts)
         self._filter_rows(row_conjuncts, env, select)
         self._check_assertions(assertion_conjuncts, select)
         self._order_rows(select, env)
+        self._pin_fanout_row(env, select)
+        if fanout:
+            self._collect_trims(select, env, time_conjuncts)
 
         projections = select.expressions
         if not projections:
@@ -2739,6 +2888,21 @@ class _Lowerer:
             if not rows:
                 time_conjuncts.append(conjunct)
                 continue
+            if aliases - rows and len(rows) == 1 and self._is_row_window(conjunct, env):
+                # A time window whose BOUNDS are row columns: one seek per row,
+                # so it needs the row a fan-out TO pins.
+                if self.fanout_expr is None:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        "a trim bound may reference track-row columns only under "
+                        "a fan-out TO",
+                        conjunct,
+                        fallback=where,
+                        hint="write TO ('ch' || c.index::text || '.mkv') to get "
+                        "one command per row, each with its own window",
+                    )
+                time_conjuncts.append(conjunct)
+                continue
             if aliases - rows or len(rows) > 1:  # defensive: resolve rejected both
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -2749,6 +2913,16 @@ class _Lowerer:
                 )
             row_conjuncts.append(conjunct)
         return time_conjuncts, row_conjuncts, assertion_conjuncts
+
+    def _is_row_window(self, conjunct: exp.Expr, env: _Env) -> bool:
+        """True for a time window on a non-row alias bounded by row columns."""
+        parsed = _time_bounds(conjunct)
+        if parsed is None:
+            return False
+        table_node = parsed[0].args.get("table")
+        if table_node is None or _fold(parsed[0].this) != _TIME_COLUMN:
+            return False
+        return not isinstance(env.bindings.get(_fold(table_node)), _RowBinding)
 
     # -- compile-time row filtering / ordering -------------------
 
@@ -2772,6 +2946,39 @@ class _Lowerer:
                 for row in relation.tuples
                 if self._eval_row(conjunct, env, row, select) is True
             ]
+
+    def _pin_fanout_row(self, env: _Env, select: exp.Select) -> None:
+        """Cut the branch's relation down to the ONE row this command writes.
+
+        Everything downstream then works unchanged: a one-row relation makes
+        ``t.track`` a one-element array, tag columns read one row, and the trim
+        bounds and the path expression read `fanout_row`. `fanout_count` is
+        recorded so :func:`lower_commands` knows how many more runs to make.
+        """
+        if self.fanout_expr is None or env.relation is None:
+            return
+        tuples = env.relation.tuples
+        if not tuples:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a TO expression writes one file per row, and no row survives "
+                "the WHERE clause",
+                self.fanout_expr,
+                fallback=select,
+                hint="loosen the filter, or write a quoted TO path",
+            )
+        if not 0 <= self.fanout_index < len(tuples):
+            raise _error(
+                ErrorCode.INTERNAL,
+                f"fan-out row {self.fanout_index} is outside the {len(tuples)} "
+                "surviving rows",
+                fallback=select,
+                hint="please report this query as a bug",
+            )
+        self.fanout_count = len(tuples)
+        self.fanout_row = tuples[self.fanout_index]
+        self.fanout_env = env
+        env.relation.tuples = [self.fanout_row]
 
     def _row_binding_of(
         self, node: exp.Expr, env: _Env, select: exp.Select
@@ -3465,8 +3672,11 @@ class _Lowerer:
         one way it could come out NULL — an input whose duration was never
         probed — is already a rejection naming that field
         (:meth:`_input_duration`), so the raise below is the defensive floor.
+
+        A fan-out command evaluates the bound against ITS pinned row, which is
+        what makes ``WHERE f.t BETWEEN c.start_t AND c.end_t`` a per-row seek.
         """
-        value = self._eval_value(bound, env, {}, select)
+        value = self._eval_value(bound, env, self.fanout_row, select)
         if isinstance(value, int | float):
             return value
         raise _error(
@@ -6114,7 +6324,10 @@ def lower(
     *,
     registry: Registry | None = None,
 ) -> Graph:
-    """Lower a resolved query into an IR graph.
+    """Lower a resolved query into an IR graph -- its FIRST command's.
+
+    The whole query for everything but a fan-out COPY, which compiles to one
+    graph per row; :func:`lower_commands` returns them all.
 
     `probes` is keyed by input ALIAS (``compiler.compile_sql`` builds it, one
     ``probe()`` per distinct path); a missing or ``None`` entry means that
@@ -6128,8 +6341,37 @@ def lower(
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
+    return lower_commands(res, probes, registry=registry)[0]
+
+
+def lower_commands(
+    res: Resolved,
+    probes: dict[str, ProbeResult | None],
+    *,
+    registry: Registry | None = None,
+) -> list[Graph]:
+    """Lower a resolved query into one IR graph per ffmpeg COMMAND.
+
+    One graph for every query but a fan-out COPY, whose ``TO`` expression reads
+    a track-row column: that one is lowered once per surviving row, each run
+    binding its own row, so each graph carries that row's seek window, streams,
+    tags and destination. The row COUNT is a property of the probed file, so it
+    comes back from the first run rather than being known up front.
+
+    Same probing/registry contract as :func:`lower`; raises ``SqlmpegError``
+    -- and nothing else -- on every rejection.
+    """
     try:
-        return _Lowerer(res, probes, registry).run()
+        first = _Lowerer(res, probes, registry)
+        graphs = [first.run()]
+        count = first.fanout_count
+        if count is not None:
+            graphs += [
+                _Lowerer(res, probes, registry, fanout_index=index).run()
+                for index in range(1, count)
+            ]
+            _check_distinct_paths(graphs, res)
+        return graphs
     except SqlmpegError:
         raise
     except Exception as err:  # backstop: guardrail #7, no panics on user input
@@ -6140,6 +6382,27 @@ def lower(
             col=1,
             hint="please report this query as a bug",
         ) from err
+
+
+def _check_distinct_paths(graphs: list[Graph], res: Resolved) -> None:
+    """No two fan-out commands may write the same file."""
+    seen: dict[str, int] = {}
+    anchor = res.sinks[0].path_expr if res.sinks else None
+    fallback = res.sinks[0].path_node if res.sinks else None
+    for index, graph in enumerate(graphs):
+        path = graph.sinks[0].path if graph.sinks else None
+        if path is None:
+            continue
+        if path in seen:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"rows {seen[path] + 1} and {index + 1} both name '{path}'",
+                anchor,
+                fallback=fallback,
+                hint="add a column that tells the rows apart, e.g. "
+                "t.index::text, to the TO expression",
+            )
+        seen[path] = index
 
 
 def lower_table(
