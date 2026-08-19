@@ -1,16 +1,8 @@
 # sqlmpeg error contract
 
-Every rejection sqlmpeg produces is a `SqlmpegError`: a typed `code`, a human-readable `message`, an optional `line`/`col` anchor into the query text, and an optional `hint`. Error quality is a feature here, with tests, because the errors are what make the generate, `validate --json`, repair loop converge when an LLM is writing the SQL - and what make debugging pleasant when a human is.
+Every rejection is a `SqlmpegError`: a typed `code`, a `message`, an optional `line`/`col` anchor, and an optional `hint`. `code` is an `ErrorCode` value from `sqlmpeg/errors.py`; the JSON shape is `docs/error-schema.json`.
 
-`code` is one of the `ErrorCode` enum values in `sqlmpeg/errors.py`. The JSON shape is formalized in `docs/error-schema.json`.
-
-Get the structured form from the CLI:
-
-```
-sqlmpeg validate --json "<query>"
-```
-
-(or `sqlmpeg validate --json -f query.sql` when the query lives in a file). Success prints nothing and exits 0. Rejection prints one JSON object to stdout and exits 1. Every example below is real output captured by running that exact command against the example query; nothing in this document is invented. Errors that require reading a file (`STREAM_NOT_FOUND`, `BROADCAST_MISMATCH`, some `INPUT_NOT_FOUND` cases, the caption/trim example under `UNSUPPORTED_SQL`) were captured against the real fixtures in `tests/fixtures/` (`av.mp4`: one video stream, one audio stream; `av2.mp4`: one video stream, two audio streams tagged `language=eng`/`language=fra`; `avs.mkv`: one video stream, one audio stream, one subtitle stream tagged `language=eng`).
+Structured form: `sqlmpeg validate --json "<query>"` (or `-f query.sql`). Success prints nothing, exit 0; rejection prints one JSON object to stdout, exit 1. Every example below is real captured output; probe-dependent ones were captured against `tests/fixtures/` (`av.mp4`: 1 video + 1 audio; `av2.mp4`: 1 video + 2 audio tagged eng/fra; `avs.mkv`: video + audio + eng subtitle).
 
 ## PARSE_ERROR
 
@@ -96,7 +88,7 @@ The arity flavor, captured too - the hint lists the filter's options in the orde
 {"line": 1, "col": 30, "code": "UDF_ARG_TYPE", "message": "setsar() got 3 positional options, but the 'setsar' filter has 2", "hint": "its options, in the order they bind: ratio, max"}
 ```
 
-And the macro flavor, whose hint can afford to be specific because there are only three macros:
+The macro flavor:
 
 ```json
 {"line": 1, "col": 22, "code": "UDF_ARG_TYPE", "message": "sqlmpeg.delay() takes a video stream as its 'f' argument, got audio", "hint": "sqlmpeg.delay() is the video (transparent-canvas) macro; delay an audio stream with the bare filter directly, in milliseconds, e.g. adelay(a.audio[1], delays => '2000')"}
@@ -338,7 +330,7 @@ FROM input('x.mp4') a
 
 The anchor lands on the option's VALUE: sqlglot records no token position on the `exp.Var` holding a named argument's name (the same gap `COPY ... WITH` option names have), so `line`/`col` point at the `5`.
 
-Machine-dependence is the entire point of this code: a query using it compiles only where that ffmpeg does. With no working ffmpeg at all (a failed provisioner) the failure comes earlier, as `UNKNOWN_FUNCTION` on the filter name itself.
+A query using this code compiles only where that ffmpeg does. With no working ffmpeg at all (a failed provisioner) the failure comes earlier, as `UNKNOWN_FUNCTION` on the filter name.
 
 **Also fires for `enable`:** `enable` is never a real option of any filter (it is framework-level, see [docs/filters.md](filters.md)), so the validator special-cases the name instead of looking it up — but it names this same code, worded to say so, when the target filter isn't one your ffmpeg flags as timeline-capable (the `T` column of `ffmpeg -filters`):
 

@@ -1,16 +1,16 @@
 # Track rows
 
-Every real library has the file with the tracks in the wrong order, the one with two English audios, and the pair that should concatenate except one of them never got a French dub. Fixing those by counting streams in ffprobe output is exactly the bookkeeping SQL was built to delete, so sqlmpeg gives you the real SQL tools: `unnest` turns a track array into rows, the probed metadata becomes columns, and selection, ordering, and alignment become `WHERE`, `ORDER BY`, and `JOIN`.
+`unnest` turns a track array into rows with the probed metadata as columns; `WHERE`, `ORDER BY`, and `JOIN` then select, sort, and align tracks by what they are instead of by index.
 
-One thing to hold onto: **everything on this page happens at compile time.** The columns are ffprobe results, so every predicate is decidable while compiling, and no join, filter, or sort survives into the ffmpeg command. What ffmpeg receives is the wiring these decisions produced, the same way a `WHERE t BETWEEN` window vanishes into `-ss`/`-to`. Nothing here decodes a frame, and none of it works on an input ffprobe cannot read (that is a typed rejection, not a guess).
+Everything on this page evaluates at **compile time**. The columns are ffprobe results, so no join, filter, or sort reaches the ffmpeg command - only the wiring they decided. Inputs must be probeable (typed rejection otherwise).
 
 ## The shape of the model
 
-An `input()` alias is one row with four array columns - `video`, `audio`, `subtitle`, `data` - because that is what a container file IS. `unnest` is the standard SQL move from that nested shape to rows. On the way out, no re-nesting is required: the query's result is being written into a container, and containers are flat ordered stream lists, so the sink serializes the result the way `COPY ... TO ... (FORMAT csv)` serializes a relation into lines. (The splat itself has Postgres precedent too: a set-returning `unnest` in a SELECT list explodes into rows there as well.) Nested in, relational in the middle, flat out - each end is the honest shape of a media file.
+An `input()` alias is one row with four array columns - `video`, `audio`, `subtitle`, `data` - the shape of a container file. `unnest` goes from that to rows. No re-nesting on output: the sink serializes the result set into a flat stream list (a container) or lines (CSV).
 
 ## Rows and columns
 
-`unnest(<alias>.audio)` (or `.video`, `.subtitle`, `.data`) in `FROM` makes a table with one row per track. It needs an alias, like every table in the dialect, and its argument must be a bare array of an input declared earlier in the same FROM list - stock Postgres scoping, where a function call in FROM may reference the tables before it:
+`unnest(<alias>.audio)` (or `.video`, `.subtitle`, `.data`) in `FROM` yields one row per track. Alias mandatory; the argument is a bare array of an input declared earlier in the same FROM list:
 
 ```sql
 SELECT t.track
@@ -20,23 +20,21 @@ WHERE t.language = 'eng' AND t.channel_layout = 'stereo'
 
 | column | audio | video | subtitle/data |
 | --- | --- | --- | --- |
-| `track` | the stream itself | the stream itself | the stream itself (passthrough-only, as captions are everywhere) |
+| `track` | the stream | the stream | the stream (passthrough-only) |
 | `index` | 1-based, agrees with `f.audio[1]` | same | same |
 | `language`, `title` | tags | tags | tags |
-| `codec` | codec name | codec name | codec name |
+| `codec` | yes | yes | yes |
 | `channels`, `channel_layout`, `sample_rate` | yes | - | - |
 | `width`, `height`, `fps`, `color_transfer` | - | yes | - |
 | `bitrate`, `duration` | yes | yes | - |
 
-A field ffprobe didn't report is NULL, and NULL behaves the way SQL says it behaves: it equals nothing, it compares to nothing, and `WHERE` drops the row. An untagged track simply never matches `t.language = 'eng'` - and never matches `t.language != 'eng'` either. `IS NULL` / `IS NOT NULL` ask the question directly.
+Unreported fields are NULL with SQL semantics: NULL matches nothing (`=` and `!=` both fail); use `IS [NOT] NULL`.
 
-The row columns are also reachable straight off a subscript, no unnest needed: `f.audio[1].language` is the first track's tag (the strictly-Postgres spelling `(f.audio[1]).language` works too, and `f.audio[1]` itself is sugar for `f.audio[1].track`). In a `WHERE` this is an **assertion** rather than a filter - a subscript names one specific track, so `WHERE f.audio[1].language = 'eng'` means "I believe track 1 is English; refuse to compile if not". [Cookbook recipe 29](examples.md#29-assert-what-youre-shipping) is the worked version.
+Subscripts reach the same columns without unnest: `f.audio[1].language` (or the strict-Postgres `(f.audio[1]).language`; `f.audio[1]` is sugar for `f.audio[1].track`). In a `WHERE` this is an **assertion** - the subscript names one track, so a false predicate refuses to compile. See [recipe 29](examples.md#29-assert-what-youre-shipping).
 
-`ORDER BY` over row columns re-sorts the tracks (multi-key, `NULLS FIRST`/`LAST` honored, Postgres defaults). It is allowed only here, where the rows are compile-time metadata - frames still never sort, and the `NO_STREAMING_EQUIVALENT` fence on everything else hasn't moved. Without an `ORDER BY`, rows keep the file's own track order. That default is deliberate: track order is player-visible surface (players open the first audio track), so nothing reorders it behind your back.
+`ORDER BY` over row columns re-sorts tracks (multi-key, Postgres NULL placement). Allowed only on row queries; frames never sort. Without it, rows keep file order - track order is player-visible and is never changed implicitly.
 
-## Joins: aligning tracks across files
-
-Two multi-language files, every track mixed with its counterpart, whatever order each file stores them in - that is an inner join, written the way Postgres writes it:
+## Joins
 
 ```sql
 SELECT amix(a.track, b.track)
@@ -44,28 +42,23 @@ FROM input('film.mkv') f, input('commentary.mkv') g,
      unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language
 ```
 
-Result rows follow the LEFT side's track order (unmatched right rows, in a `FULL` join, append after in their own order), so the output track order is `f`'s. When one file carries two English tracks - a 5.1 and a stereo - that is not an error: real join semantics pair the one against both, and the fix, when you didn't want that, is a wider key:
+- `INNER`, `LEFT`, `FULL OUTER` between unnest tables; comma between them is a cross join. Joins anywhere else stay rejected.
+- Result order: the left side's track order; a FULL join appends unmatched right rows after, in their order.
+- Real join multiplicity: one row matching two pairs with both. To pair a 5.1 and a stereo English track separately, widen the key: `ON a.language = b.language AND a.channel_layout = b.channel_layout`.
+- ON takes the same compile-time grammar as WHERE (`=`, `!=`, `<`, `>`, `<=`, `>=`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`), column vs column or literal, statically type-checked.
 
-```sql
-ON a.language = b.language AND a.channel_layout = b.channel_layout
-```
+## Fills
 
-`INNER`, `LEFT`, and `FULL OUTER` joins are supported between unnest tables (a comma between them is the cross join, bounded and occasionally useful). Joins anywhere else in the dialect remain rejected; input-level FROM stays the comma cross-join it has always been. ON predicates take the same compile-time grammar WHERE does: `=`, `!=`, `<`, `>`, `<=`, `>=`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, column against column or column against literal, type-checked statically (`a.language = b.channels` is rejected as never-matchable, not silently false).
+An outer join's gap side has a NULL `track`. Selecting it bare is a typed rejection; fill it with `COALESCE`, by stream type:
 
-## Fills: what stands in for a missing track
+- **Audio: `ffmpeg.anullsrc(...)`** - silence. `duration` inherits from the paired track when omitted; no probed or written duration anywhere is a rejection (an unbounded generator would hang concat). Nothing else is injected.
+- **Video: `ffmpeg.color(...)`** - black by default; `size`, `rate`, `duration` inherit from the paired row when omitted.
+- **Captions: `sqlmpeg.empty_captions()`** - a zero-cue subtitle track, emitted as one extra self-contained `data:`-URI input. No cues are generated.
 
-An outer join keeps rows only one side has, and the gap side's `track` is NULL. Selecting it bare is a typed rejection naming the row and the key that failed to match; `COALESCE` is the accepted spelling, and what you coalesce WITH depends on the stream type:
+Fills carry the paired row's tags, so a silence-filled French slot still emits `-metadata:s:N language=fra`.
 
-- **Audio: `ffmpeg.anullsrc(...)`** - silence. When you omit `duration`, it inherits the paired track's probed duration, because a stand-in for a 2-second track should be 2 seconds long; an unbounded generator with no duration anywhere is rejected rather than hanging your concat. Nothing else is injected - what you write is what compiles.
-- **Video: `ffmpeg.color(...)`** - a canvas, black by default, inheriting `size`, `rate`, and `duration` from the paired row the same way.
-- **Captions: `sqlmpeg.empty_captions()`** - an EMPTY subtitle track: it exists, it takes the paired row's language tag, and it contains zero cues, because nobody generates your subtitles for you. It costs one extra input in the command, a self-contained `data:` URI holding a bare WEBVTT header - no file on disk.
+To inspect rows before acting, use a table query (SELECT with no COPY) or CSV - [recipes 30-32](examples.md#30-look-at-a-files-tracks-as-a-table). The concat-with-fill pattern is [recipe 27](examples.md#27-concatenate-files-with-different-track-counts); recipes 23-28 cover the rest of this surface.
 
-A fill carries the paired row's tags as provenance, so a silence-filled French slot still emits `-metadata:s:N language=fra` and players still see a French track.
+## Fences
 
-And before committing to any of it, you can LOOK at the rows: a SELECT with no COPY prints the result set as a table (stream cells as placeholders, an outer join's gaps as empty cells), and `COPY ... TO STDOUT WITH (FORMAT csv)` makes it scriptable - [cookbook recipes 30-32](examples.md#30-look-at-a-files-tracks-as-a-table) show all three.
-
-The founding use case ties it together - concatenating two files where one lacks a track. `concat` demands identical segment shapes, so each `UNION ALL` branch runs the same outer join and selects its own side, fills included. The worked version, byte-checked against the real compiler, is [cookbook recipe 27](examples.md#27-concatenate-files-with-different-track-counts); recipes 23 through 28 cover the rest of this page's surface the same way.
-
-## The fences, briefly
-
-Row tables need probeable inputs. Metadata columns are not selectable as outputs (streams are the only outputs) and `track` is not usable inside ON (keys are metadata, not streams). Aggregates, `GROUP BY`, and friends stay rejected. And nothing on this page changes what reaches ffmpeg: by the time the command exists, every row, join, and fill has already been decided.
+Row tables need probeable inputs. Metadata columns as outputs are legal only in table/CSV queries, not media queries. `track` is not usable inside ON. Aggregates and `GROUP BY` stay rejected.
