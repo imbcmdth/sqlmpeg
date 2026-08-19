@@ -270,6 +270,7 @@ import base64
 import difflib
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
+from typing import Literal
 
 from sqlglot import exp
 
@@ -1493,6 +1494,11 @@ _Binding = _InputBinding | _CteBinding | _SourceBinding | _RowBinding
 # its output streams set, with None for a key the query clears.
 _TagOverrides = dict[int, dict[str, str | None]]
 
+# What a query being lowered can tag. "sink" is a query that writes a file:
+# per-stream tags where it has track rows, container tags where it has none.
+# "rows" is a CTE body -- per-stream tags only, since a CTE has no container.
+_TagScope = Literal["sink", "rows"]
+
 # The reserved per-stream key emit renders as `-disposition:<i>`. A container
 # has no disposition, so it is not a container tag key.
 _DISPOSITION_TAG = "disposition"
@@ -1725,6 +1731,10 @@ class _Lowerer:
         # The tag columns of the query being lowered; reset per query, since
         # two COPYs may tag the same track differently.
         self.tags: _TagOverrides = {}
+        # The tag columns of every CTE body, harvested as each one lowers and
+        # kept for the whole pass: a CTE's streams carry their tags into
+        # whichever sink maps them, under that sink's own tags.
+        self.cte_tags: _TagOverrides = {}
         # The same for the CONTAINER tags of the file being written, key ->
         # value, None meaning "clear this key".
         self.container_tags: dict[str, str | None] = {}
@@ -1767,16 +1777,17 @@ class _Lowerer:
         """
         for name, body in self.res.ctes.items():
             self.cte_columns[name] = tuple(
-                self._lower_query(union_branches(body), body)
+                self._lower_query(union_branches(body), body, tags="rows")
             )
+            self._harvest_cte_tags(body)
         if self.res.sinks:
             self.graph.sinks = [self._lower_sink(raw) for raw in self.res.sinks]
             _check_two_pass_is_single_sink(self.graph.sinks, self.res.sinks)
         else:
-            columns = self._lower_query(self.res.branches, self.res.select, tags=True)
+            columns = self._lower_query(self.res.branches, self.res.select, tags="sink")
             self.graph.sinks = [
                 SinkUnit(
-                    outputs=_outputs(columns, self.tags),
+                    outputs=_outputs(columns, self._layered_tags()),
                     tags=dict(self.container_tags),
                 )
             ]
@@ -1861,7 +1872,7 @@ class _Lowerer:
             else None
         )
         self.fanout_seen = self.fanout_seen or self.fanout_expr is not None
-        columns = self._lower_query(list(raw.branches), raw.query, tags=True)
+        columns = self._lower_query(list(raw.branches), raw.query, tags="sink")
         options: dict[str, object] = {}
         option_nodes: dict[str, exp.Expr] = {}
         chapters_opt: RawSinkOption | None = None
@@ -1903,7 +1914,7 @@ class _Lowerer:
             )
             option_nodes["metadata_from"] = metadata_from_opt.value
         _check_sink_option_conflicts(options, option_nodes, raw.path_node)
-        outputs = _outputs(columns, self.tags)
+        outputs = _outputs(columns, self._layered_tags())
         _check_two_pass_outputs(options, outputs, raw.path_node)
         path = raw.path
         if raw.path_expr is not None:
@@ -2112,7 +2123,7 @@ class _Lowerer:
     # -- a query (one SELECT, or a UNION ALL of them) ----------------------
 
     def _lower_query(
-        self, branches: list[exp.Select], anchor: exp.Expr, *, tags: bool = False
+        self, branches: list[exp.Select], anchor: exp.Expr, *, tags: _TagScope
     ) -> list[_Column]:
         if not branches:
             raise _error(ErrorCode.UNSUPPORTED_SQL, "query has no SELECT", anchor)
@@ -2235,7 +2246,7 @@ class _Lowerer:
 
     # -- one SELECT branch ------------------------------------------------
 
-    def _lower_branch(self, select: exp.Select, *, tags: bool = False) -> list[_Column]:
+    def _lower_branch(self, select: exp.Select, *, tags: _TagScope) -> list[_Column]:
         env = self._scope(select)
         # One WHERE clause, three languages. A conjunct over track-row columns
         # is decided HERE and never reaches ffmpeg; a subscript metadata
@@ -2270,15 +2281,26 @@ class _Lowerer:
             if qualifier is not None:
                 columns += self._expand_star(qualifier, projection, env, select)
                 continue
-            # A tag column produces no stream, so it never becomes an output;
-            # `tags` is False for a CTE body, where there is no output to tag.
+            # A tag column produces no stream, so it never becomes an output.
             # With track rows the tag is per-stream, without them it is a
-            # container tag on the file being written.
-            if tags and _is_tag_column(projection, env):
-                if env.relation is None:
+            # container tag on the file being written -- which a CTE body
+            # ("rows" scope) has no way to name.
+            if _is_tag_column(projection, env):
+                if env.relation is not None:
+                    self._collect_tag(projection, env, select)
+                elif tags == "sink":
                     self._collect_container_tag(projection, env, select)
                 else:
-                    self._collect_tag(projection, env, select)
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"tag column '{_projection_name(projection)}' in a CTE "
+                        "body has no track row to tag",
+                        projection,
+                        fallback=select,
+                        hint="a CTE tags the rows it selects, e.g. FROM "
+                        "input('f.mkv') f, unnest(f.audio) t; a container tag "
+                        "belongs in the outer SELECT",
+                    )
                 continue
             columns.append(
                 _Column(
@@ -2298,6 +2320,46 @@ class _Lowerer:
         return columns
 
     # -- metadata tag columns ---------------------------------------------
+
+    def _harvest_cte_tags(self, body: exp.Expr) -> None:
+        """Move the tags one CTE body just recorded into the carry-over dict.
+
+        ``_lower_query`` clears ``self.tags`` at entry, so a CTE's tags would be
+        gone by the time a sink's ``_outputs`` reads them. The clearing itself
+        is right -- two COPYs may tag one track differently -- so what the CTE
+        recorded moves somewhere that outlives the reset instead.
+
+        The CTE bodies of one script all pour into the SAME dict, though, so
+        unlike two COPYs they cannot disagree: whatever any of them says about a
+        track is what every sink reading that track sees.
+        """
+        for source_id, overrides in self.tags.items():
+            carried = self.cte_tags.setdefault(source_id, {})
+            for key, value in overrides.items():
+                if key in carried and carried[key] != value:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"tag '{key}' takes two different values on the same track",
+                        body,
+                        hint="two CTE bodies tag one track's '"
+                        f"{key}' differently; give it a single value, or set it "
+                        "in the outer SELECT, which overrides them both",
+                    )
+                carried[key] = value
+
+    def _layered_tags(self) -> _TagOverrides:
+        """The CTE bodies' tags with this sink's laid over them, per track.
+
+        Two scopes, written inner to outer, so on a key both set the sink wins.
+        That is layering, not the disagreement ``_record_tag`` rejects: that
+        check stays inside one query.
+        """
+        merged: _TagOverrides = {
+            source_id: dict(overrides) for source_id, overrides in self.cte_tags.items()
+        }
+        for source_id, overrides in self.tags.items():
+            merged.setdefault(source_id, {}).update(overrides)
+        return merged
 
     def _collect_container_tag(
         self, projection: exp.Expr, env: _Env, select: exp.Select
@@ -5916,7 +5978,10 @@ class _Lowerer:
     def run_table(self) -> list[TableSink]:
         """One :class:`~sqlmpeg.table.TableSink` per COPY, or one bare-select."""
         for name, body in self.res.ctes.items():
-            self.cte_columns[name] = tuple(self._lower_query(union_branches(body), body))
+            self.cte_columns[name] = tuple(
+                self._lower_query(union_branches(body), body, tags="rows")
+            )
+            self._harvest_cte_tags(body)
         self.table_mode = True
         sinks: list[TableSink] = []
         if self.res.sinks:

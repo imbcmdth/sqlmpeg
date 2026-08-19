@@ -1329,6 +1329,24 @@ def test_cte_union_all_gets_its_own_concat() -> None:
     assert g.nodes["n2"].inputs == ["n1"]
 
 
+def test_a_cte_body_unnests_its_input_and_filters_the_rows() -> None:
+    """A row table inside a CTE body: the WHERE picks rows at compile time and
+    the survivors are the streams the outer SELECT maps."""
+    g = _lower(
+        "WITH tracks AS ("
+        "  SELECT t.track AS track FROM input('x.mp4') f, unnest(f.audio) t"
+        "  WHERE t.language = 'fra'"
+        ") SELECT tracks.track FROM tracks",
+        {
+            "f": _probe_result(
+                per_audio_tags=[{"language": "eng"}, {"language": "fra"}]
+            )
+        },
+    )
+    assert _filters(g) == []
+    assert _outputs(g) == [("src:f:a:1", "audio", None)]
+
+
 # ---------------------------------------------------------------------------
 # UNION ALL -> concat
 # ---------------------------------------------------------------------------
@@ -7449,6 +7467,159 @@ def test_a_table_query_broadcasts_a_container_tag_over_track_rows() -> None:
         [2, "Angel One"],
         [3, "Angel One"],
     ]
+
+
+# ---------------------------------------------------------------------------
+# tag columns in a CTE body: per-stream tags that ride into the outer query
+# ---------------------------------------------------------------------------
+#
+# The two levels, in one query text: inside a WITH rows are tracks, so a tag
+# column tags streams; outside it the same column tags the container (the
+# section above). A CTE's tags are recorded once, when its body lowers, and
+# layered UNDER whatever the sink's own branch sets.
+
+
+_TAGGED_CTE = (
+    "WITH tagged AS ("
+    "  SELECT t.track AS track, 'Audio (' || t.language || ')' AS title"
+    "  FROM input('f.mkv') f, unnest(f.audio) t"
+    ") "
+)
+
+
+def _shared_probes() -> dict[str, ProbeResult | None]:
+    """Two aliases over ONE file, the way ``compile_sql`` probes them: the same
+    ProbeResult object, so both see the same StreamMeta identities -- which is
+    what lets an outer row table name the very tracks a CTE tagged."""
+    result = ProbeResult(streams=list(_ROW_TRACKS))
+    return {"f": result, "g": result}
+
+
+def test_a_tag_column_in_a_cte_body_tags_that_rows_streams() -> None:
+    """The bare column splats, each stream carrying the tag its row computed."""
+    g = _lower(_TAGGED_CTE + "SELECT tagged.track FROM tagged", _row_probes())
+    assert [o.metadata for o in g.outputs] == [
+        {"language": "eng", "title": "Audio (eng)"},
+        {"language": "fra", "title": "Audio (fra)"},
+        # The third track has no language: the `||` is NULL, which clears the key.
+        {},
+    ]
+
+
+def test_a_cte_tag_survives_a_subscript_of_the_column() -> None:
+    g = _lower(_TAGGED_CTE + "SELECT tagged.track[2] FROM tagged", _row_probes())
+    assert [o.metadata for o in g.outputs] == [
+        {"language": "fra", "title": "Audio (fra)"}
+    ]
+
+
+def test_a_cte_tag_survives_a_filter_in_the_outer_query() -> None:
+    g = _lower(
+        _TAGGED_CTE + "SELECT volume(tagged.track[1], 0.5) FROM tagged", _row_probes()
+    )
+    assert [o.metadata for o in g.outputs] == [
+        {"language": "eng", "title": "Audio (eng)"}
+    ]
+
+
+def test_a_null_cte_tag_clears_the_key_as_it_does_in_a_sink() -> None:
+    g = _lower(
+        "WITH tagged AS ("
+        "  SELECT t.track AS track, NULL AS language"
+        "  FROM input('f.mkv') f, unnest(f.audio) t"
+        ") SELECT tagged.track FROM tagged",
+        _row_probes(),
+    )
+    assert [o.metadata for o in g.outputs] == [{}, {}, {}]
+
+
+def test_the_sinks_own_tag_wins_over_the_ctes_on_the_same_key() -> None:
+    """Inner then outer is LAYERING, not the disagreement `_record_tag` rejects
+    -- that check stays inside one query."""
+    g = _lower(
+        _TAGGED_CTE + "SELECT tagged.track, 'Outer' AS title "
+        "FROM tagged, input('f.mkv') g, unnest(g.audio) u",
+        _shared_probes(),
+    )
+    assert [o.metadata.get("title") for o in g.outputs] == ["Outer"] * 3
+
+
+def test_two_sinks_over_one_tagged_view_each_carry_its_tags() -> None:
+    g = _lower(
+        "CREATE VIEW tagged AS"
+        "  SELECT t.track AS track, 'Inner' AS title"
+        "  FROM input('f.mkv') f, unnest(f.audio) t;"
+        "COPY (SELECT tagged.track FROM tagged) TO 'a.mka';"
+        "COPY (SELECT tagged.track FROM tagged) TO 'b.mka';",
+        _row_probes(),
+    )
+    assert [unit.path for unit in g.sinks] == ["a.mka", "b.mka"]
+    assert [[o.metadata.get("title") for o in unit.outputs] for unit in g.sinks] == [
+        ["Inner"] * 3,
+        ["Inner"] * 3,
+    ]
+
+
+def test_two_cte_bodies_cannot_tag_one_track_two_ways() -> None:
+    """Unlike two COPYs, the CTE bodies of one script pour into a single
+    carry-over dict, so a disagreement between them has no representation."""
+    err = _reject_lower(
+        "WITH one AS ("
+        "  SELECT t.track AS track, 'One' AS title"
+        "  FROM input('f.mkv') f, unnest(f.audio) t"
+        "), two AS ("
+        "  SELECT u.track AS track, 'Two' AS title"
+        "  FROM input('g.mkv') g, unnest(g.audio) u"
+        ") SELECT one.track FROM one",
+        _shared_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "two different values on the same track" in err.message
+
+
+def test_a_cte_body_with_no_track_rows_cannot_tag_a_container() -> None:
+    """A CTE writes no file, so there is no container for a rowless tag column
+    to name."""
+    err = _reject(
+        "WITH tagged AS (SELECT f.audio[1] AS snd, 'Main' AS title "
+        "FROM input('f.mkv') f) SELECT tagged.snd FROM tagged"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "tag column 'title' in a CTE body has no track row to tag" in err.message
+    assert err.hint is not None and "outer SELECT" in err.hint
+
+
+def test_the_two_level_query_tags_the_streams_and_the_container() -> None:
+    """Recipe 53's shape: per-stream titles from the WITH, the file's title
+    from the outer SELECT, one query."""
+    g = _lower(
+        _TAGGED_CTE + "SELECT g.video, tagged.track, 'Director Cut' AS title "
+        "FROM input('f.mkv') g, tagged",
+        _shared_probes(),
+    )
+    assert g.sinks[0].tags == {"title": "Director Cut"}
+    assert [o.metadata for o in g.outputs] == [
+        {},
+        {"language": "eng", "title": "Audio (eng)"},
+        {"language": "fra", "title": "Audio (fra)"},
+        {},
+    ]
+
+
+def test_a_table_query_over_a_tagged_cte_prints_the_same_rows() -> None:
+    """A table query has no ffmpeg output for a tag to land on: the CTE's tag
+    column is accepted and changes nothing that gets printed."""
+    plain = (
+        "WITH tagged AS ("
+        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        ") SELECT tagged.track FROM tagged"
+    )
+    tagged = lower_table(
+        resolve(parse(_TAGGED_CTE + "SELECT tagged.track FROM tagged")), _row_probes()
+    )[0]
+    untagged = lower_table(resolve(parse(plain)), _row_probes())[0]
+    assert tagged.result.columns == untagged.result.columns
+    assert list(tagged.result.rows) == list(untagged.result.rows)
 
 
 # ---------------------------------------------------------------------------

@@ -1060,7 +1060,7 @@ Two levels, two scopes, visible in the query text: inside the `WITH`, rows are t
 ```pgsql
 COPY (
   WITH tagged AS (
-    SELECT a.track, 'Audio (' || a.language || ')' AS title
+    SELECT a.track AS track, 'Audio (' || a.language || ')' AS title
     FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) a
   )
   SELECT g.video, tagged.track, 'Director Cut' AS title

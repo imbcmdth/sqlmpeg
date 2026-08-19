@@ -174,6 +174,28 @@ def test_a_row_tag_column_tags_only_its_own_command() -> None:
     ]
 
 
+def test_a_tagged_ctes_tags_reach_every_command() -> None:
+    """Each row lowers the whole query for itself, CTE bodies included, so the
+    per-stream tags a CTE sets ride into every command the fan-out writes."""
+    sql = (
+        "COPY ("
+        "  WITH capt AS ("
+        "    SELECT s.track AS track, 'Subs' AS title"
+        f"    FROM input('{SRC}') g, unnest(g.subtitle) s"
+        "  )"
+        f"  SELECT t.track, capt.track FROM input('{SRC}') f, unnest(f.audio) t, capt"
+        ") TO (t.language || '.mkv')"
+    )
+    graphs = compile_commands(sql)
+    assert [graph.sinks[0].path for graph in graphs] == ["eng.mkv", "fra.mkv"]
+    for graph in graphs:
+        assert [output.metadata.get("title") for output in graph.outputs] == [
+            None,
+            "Subs",
+            "Subs",
+        ]
+
+
 def test_with_options_apply_to_every_command() -> None:
     sql = (
         f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "

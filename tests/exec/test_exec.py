@@ -1697,6 +1697,56 @@ def test_container_tag_columns_round_trip_through_real_ffmpeg(tmp_path: Path) ->
 
 
 # ---------------------------------------------------------------------------
+# two-level tagging: the WITH tags the streams, the outer SELECT the file
+# ---------------------------------------------------------------------------
+
+
+def _ffprobe_stream_titles(path: Path) -> list[str | None]:
+    """Each stream's `title` tag in file order, None where it has none."""
+    args = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "stream_tags=title",
+        "-of",
+        "json",
+        str(path),
+    ]
+    result = subprocess.run(
+        args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    return [stream.get("tags", {}).get("title") for stream in data["streams"]]
+
+
+def test_a_cte_tags_the_streams_while_the_outer_select_tags_the_file(
+    tmp_path: Path,
+) -> None:
+    """Recipe 53 for real: both scopes written in one query, both read back off
+    the written file."""
+    _require_fixture(_AV2)
+    out_path = tmp_path / "two-level.mkv"
+    query = (
+        "COPY ("
+        "  WITH tagged AS ("
+        "    SELECT a.track AS track, 'Audio (' || a.language || ')' AS title"
+        f"    FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) a"
+        "  )"
+        "  SELECT g.video, tagged.track, 'Director Cut' AS title"
+        f"  FROM input('{_sql_path(_AV2)}') g, tagged"
+        f") TO '{_sql_path(out_path)}';"
+    )
+
+    _run_sink_query(query, out_path)
+
+    assert _ffprobe_stream_titles(out_path) == [None, "Audio (eng)", "Audio (fra)"]
+    tags = {k.lower(): v for k, v in _ffprobe_format_tags(out_path).items()}
+    assert tags.get("title") == "Director Cut"
+
+
+# ---------------------------------------------------------------------------
 # two_pass: a compile that is a SEQUENCE of ffmpeg commands
 # ---------------------------------------------------------------------------
 
