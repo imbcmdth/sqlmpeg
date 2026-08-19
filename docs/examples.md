@@ -779,3 +779,73 @@ FROM input(:'source', seek_end => 60) a
 $ sqlmpeg compile -f query.sql -o tail.mp4 -v source=clip.mp4
 ffmpeg -sseof -60 -i clip.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy tail.mp4
 ```
+
+## 37. Retitle tracks from their own metadata
+
+A non-stream column in a media query sets a tag on that row's output. The alias names the tag, the value is any compile-time expression over the row - here a title built from the language tag with `||`:
+
+```pgsql
+SELECT t.track, 'Audio (' || t.language || ')' AS title
+FROM input('tests/fixtures/av-eng.mp4') f, unnest(f.audio) t
+```
+
+```
+$ sqlmpeg compile -f query.sql -o titled.mka
+ffmpeg -i tests/fixtures/av-eng.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng \
+  -metadata:s:0 'title=Audio (eng)' titled.mka
+```
+
+## 38. Normalize language tags
+
+CASE makes the edit conditional, and it runs over every row - one expression fixes the whole file. Tags you don't select pass through unchanged; `NULL` as the value clears one:
+
+```pgsql
+SELECT t.track,
+       CASE WHEN t.language = 'fra' THEN 'fre' ELSE t.language END AS language
+FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+```
+
+```
+$ sqlmpeg compile -f query.sql -o retagged.mka
+ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng -map \
+  0:a:1 -c:1 copy -metadata:s:1 language=fre retagged.mka
+```
+
+## 39. List a file's chapters
+
+`chapters(f)` is a table: one row per chapter, straight from the container. Like every metadata query, no COPY means it prints and nothing runs:
+
+```pgsql
+SELECT c.index, c.title, c.start_t, c.end_t
+FROM input('tests/fixtures/av-chapters.mkv') f, chapters(f) c
+```
+
+```
+$ sqlmpeg -f query.sql
+ index | title   | start_t | end_t
+-------+---------+---------+-------
+ 1     | Intro   | 0.0     | 1.0
+ 2     | Credits | 1.0     | 2.0
+(2 rows)
+```
+
+## 40. Write chapters
+
+Chapters are rows too, so define them with `VALUES` and hand them to the sink. They compile to one extra self-contained input - no file on disk:
+
+```pgsql
+COPY (
+  WITH marks(start_t, end_t, title) AS (
+    VALUES (0, 60, 'Intro'), (60, 300, 'Act One')
+  )
+  SELECT f.video[1], f.audio[1] FROM input(:'source') f
+) TO :'dest' WITH (chapters marks)
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=chaptered.mkv
+ffmpeg -i film.mkv -f ffmetadata -i \
+  'data:text/plain;'\
+  'base64,O0ZGTUVUQURBVEExCltDSEFQVEVSXQpUSU1FQkFTRT0xLzEKU1RBUlQ9MApFTkQ9NjAKdGl0bGU9SW50cm8KW0NIQVBURVJdClRJTUVCQVNFPTEvMQpTVEFSVD02MApFTkQ9MzAwCnRpdGxlPUFjdCBPbmUK' \
+  -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map_chapters 1 chaptered.mkv
+```
