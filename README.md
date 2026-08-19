@@ -162,4 +162,4 @@ The prompt's filter reference is rendered from the same registry the compiler re
 
 ---
 
-Docs: [cookbook](docs/examples.md) · [filters](docs/filters.md) · [track rows](docs/tracks.md) · [trimming](docs/trimming.md) · [error contract](docs/errors.md) · [project spec](sqlmpeg-project.md)
+Docs: [cookbook](docs/examples.md) · [filters](docs/filters.md) · [track rows](docs/tracks.md) · [trimming](docs/trimming.md) · [error contract](docs/errors.md) · [known gaps](docs/known_gaps.md) · [project spec](sqlmpeg-project.md)
