@@ -295,6 +295,7 @@ from sqlmpeg.parser import (
     RawValuesTable,
     Resolved,
     _pos,
+    _projection_expr,
     _time_bounds,
     from_entries,
     group_keys,
@@ -312,7 +313,7 @@ from sqlmpeg.probe import ProbeResult, StreamMeta
 from sqlmpeg.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from sqlmpeg.sink import CODEC_PARAMS_FLAGS, TWO_PASS_CODECS, validate_csv_option
 from sqlmpeg.sink import validate_option as validate_sink_option
-from sqlmpeg.table import CellValue, StreamCell, TableResult, TableSink
+from sqlmpeg.table import ArrayCell, CellValue, StreamCell, TableResult, TableSink
 
 __all__ = ["lower", "lower_table"]
 
@@ -815,6 +816,8 @@ def _table_column_name(node: exp.Expr) -> str:
     inner = _unwrap(node)
     if isinstance(inner, exp.Column):
         return _fold(inner.this)
+    if isinstance(inner, exp.ArrayAgg):
+        return "array_agg"  # Postgres's own convention for the unaliased column
     shape = subscript_metadata_shape(inner)
     if shape is not None:
         return shape[1]
@@ -6122,25 +6125,29 @@ class _Lowerer:
         Cardinality is the branch's shared row relation --
         every row alias's column stays aligned to it, joins included -- or 1
         for a branch with no ``unnest`` at all (a plain metadata/stream
-        SELECT has exactly one row, the same way a bare scalar broadcasts).
+        SELECT has exactly one row, the same way a bare scalar broadcasts). A
+        GROUPED branch (a GROUP BY, an ``array_agg``, or both) prints one row
+        per group instead -- see :meth:`_lower_grouped_table_branch`.
         """
         env = self._scope(select)
+        env.grouped = is_grouped(select)
+        env.group_keys = tuple(
+            key
+            for key in group_keys(select)
+            if references_row_alias(key, set(self.res.track_rows))
+        )
         time_conjuncts, row_conjuncts, assertion_conjuncts = self._split_where(select, env)
         self._collect_trims(select, env, time_conjuncts)
         self._filter_rows(row_conjuncts, env, select)
         self._check_assertions(assertion_conjuncts, select)
         self._order_rows(select, env)
 
-        cardinality = len(env.relation.tuples) if env.relation is not None else 1
-
         projections = select.expressions
         if not projections:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL, "SELECT has no output column", fallback=select
             )
-
         names: list[str] = []
-        per_column: list[list[CellValue]] = []
         for projection in projections:
             if star_qualifier(projection) is not None:
                 raise _error(
@@ -6151,16 +6158,80 @@ class _Lowerer:
                     hint="name the columns explicitly",
                 )
             names.append(_table_column_name(projection))
-            per_column.append(self._table_projection(projection, env, select, cardinality))
 
+        if env.grouped:
+            return self._lower_grouped_table_branch(select, env, projections, names)
+
+        cardinality = len(env.relation.tuples) if env.relation is not None else 1
+        per_column = [
+            self._table_projection(projection, env, select, cardinality)
+            for projection in projections
+        ]
         rows = [[per_column[c][r] for c in range(len(names))] for r in range(cardinality)]
         return TableResult(columns=names, rows=rows)
+
+    def _lower_grouped_table_branch(
+        self,
+        select: exp.Select,
+        env: _Env,
+        projections: list[exp.Expr],
+        names: list[str],
+    ) -> TableResult:
+        """One printed row per GROUP BY group -- 085's partition, no fan-out sink.
+
+        Reuses the exact per-row machinery: for each group, the relation's
+        tuples are pinned to that group (the array_agg column sees every tuple,
+        so it collects the whole group; every other column -- a key or a
+        constant, the only shapes grouping validity admits -- sees just the
+        first, since it is the same value for the whole group by construction)
+        and every projection lowers as one ordinary, single-row column.
+        """
+        relation = env.relation
+        assert relation is not None  # is_grouped implies unnest; resolve enforced it
+        groups = self._grouped_partitions(env, select)
+        original = relation.tuples
+        rows: list[list[CellValue]] = []
+        try:
+            for group in groups:
+                row: list[CellValue] = []
+                for projection in projections:
+                    aggregate = isinstance(_projection_expr(projection), exp.ArrayAgg)
+                    relation.tuples = list(group) if aggregate else group[:1]
+                    row.append(self._table_projection(projection, env, select, 1)[0])
+                rows.append(row)
+        finally:
+            relation.tuples = original
+        return TableResult(columns=names, rows=rows)
+
+    def _grouped_partitions(
+        self, env: _Env, select: exp.Select
+    ) -> list[list[dict[str, _TrackRow | None]]]:
+        """The relation's tuples partitioned into the groups a table query
+        prints, one row each.
+
+        A row-referencing GROUP BY key partitions in FIRST-APPEARANCE order,
+        the same partition a media fan-out builds. With no such key the whole
+        relation is ONE group -- Postgres's own rule for an aggregate with
+        nothing to partition by (unlike a media fan-out's ungrouped case,
+        where every row writes its own file).
+        """
+        relation = env.relation
+        tuples = relation.tuples if relation is not None else []
+        if not env.group_keys:
+            return [list(tuples)]
+        groups: dict[tuple[RowValue, ...], list[dict[str, _TrackRow | None]]] = {}
+        for row in tuples:
+            key = tuple(self._eval_value(node, env, row, select) for node in env.group_keys)
+            groups.setdefault(key, []).append(row)
+        return list(groups.values())
 
     def _table_projection(
         self, projection: exp.Expr, env: _Env, select: exp.Select, cardinality: int
     ) -> list[CellValue]:
         """One SELECT column, per row: a metadata value, or a stream cell."""
         expr = _unwrap(projection)
+        if isinstance(expr, exp.ArrayAgg):
+            return self._array_cell_broadcast(expr, env, select, cardinality)
         if isinstance(expr, exp.Column):
             table_node = expr.args.get("table")
             if table_node is not None:
@@ -6169,6 +6240,11 @@ class _Lowerer:
                     name = _fold(expr.this)
                     if name != ROW_STREAM_COLUMN:
                         return self._row_metadata_cells(binding, name, expr, select)
+                elif (
+                    isinstance(binding, _InputBinding | _SourceBinding)
+                    and _fold(expr.this) in _ARRAY_COLUMNS
+                ):
+                    return self._array_cell_broadcast(expr, env, select, cardinality)
         if is_value_expr(expr) or _is_input_value_column(expr, env):
             return self._value_cells(expr, env, select, cardinality)
         shape = subscript_metadata_shape(expr)
@@ -6207,8 +6283,23 @@ class _Lowerer:
             )
         return [None if row is None else row.columns.get(name) for row in binding.rows]
 
+    def _array_cell_broadcast(
+        self, node: exp.Expr, env: _Env, select: exp.Select, cardinality: int
+    ) -> list[CellValue]:
+        """A bare input array column (``f.video``/``f.audio``/...) or a whole
+        ``array_agg(...)`` column: every element as ONE array cell,
+        broadcasting to every row -- the value does not depend on which row
+        (or, grouped, which group) is printing it."""
+        value = self._lower_expr(node, env, select)
+        cell = ArrayCell(
+            elements=tuple(self._stream_to_cell(stream) for stream in value.streams)
+        )
+        return [cell] * cardinality
+
     def _value_to_cells(self, value: _Value, cardinality: int) -> list[CellValue]:
-        """A lowered stream `_Value` as one cell per row (a scalar broadcasts)."""
+        """A lowered stream `_Value` as one cell per row: a scalar broadcasts,
+        and a row column's array (``t.track`` over N surviving rows) splats
+        one stream cell per row -- the array IS the row set, not one cell."""
         if value.is_array:
             return [self._stream_to_cell(stream) for stream in value.streams]
         cell = self._stream_to_cell(value.streams[0])

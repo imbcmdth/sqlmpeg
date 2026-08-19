@@ -1,6 +1,8 @@
 # Cookbook
 
-Real tasks, in roughly the order people meet them. Each recipe is the question as it's usually asked, the query that answers it, and exactly what sqlmpeg prints for it - the compiled ffmpeg command for a media query, the result table or CSV for a metadata one. Every shown output on this page is real - a test reruns all of them and diffs byte for byte, so if a recipe is here, it works. Most recipes are parameterized (`:'source'`-style variables, filled by the `-v` flags in the shown command), so they are programs: swap the `-v` values and they run against your files. Recipe 33 explains the mechanism; [queries/](../queries/) collects ready-made programs.
+Real tasks. Every shown output on this page is real - a test reruns all of them and diffs the resulting ffmpeg commands, so if a recipe is here, it works.
+
+Most recipes are parameterized (`:'source'`-style variables, filled by the `-v` flags in the shown command), so they are programs: swap the `-v` values and they run against your files. Recipe 33 explains the mechanism; [queries/](../queries/) collects a few handy ready-made programs.
 
 ## 1. Transcode a file to H.264/AAC
 

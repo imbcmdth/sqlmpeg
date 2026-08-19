@@ -53,6 +53,7 @@ from sqlmpeg.parser import parse, resolve
 from sqlmpeg.probe import ChapterMeta, ProbeResult, StreamMeta
 from sqlmpeg.registry import Registry, load_reference
 from sqlmpeg.split import insert_splits
+from sqlmpeg.table import ArrayCell, StreamCell, render_csv
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
@@ -7470,6 +7471,80 @@ def test_a_table_query_broadcasts_a_container_tag_over_track_rows() -> None:
 
 
 # ---------------------------------------------------------------------------
+# arrays as table cells: a bare input array column, with and without rows
+# ---------------------------------------------------------------------------
+#
+# `f.audio` etc. have no scalar table-cell representation, so a bare selection
+# of one prints its WHOLE array as one Postgres-style array cell (braces even
+# for one element), broadcasting like a subscript already does when track
+# rows are also in the branch.
+
+
+def test_a_rowless_bare_array_column_prints_every_element() -> None:
+    """No row relation at all -- used to keep only the array's first stream."""
+    sinks = lower_table(
+        resolve(parse("SELECT f.audio FROM input('f.mkv') f")), _row_probes()
+    )
+    assert sinks[0].result.columns == ["audio"]
+    assert sinks[0].result.rows == [
+        [
+            ArrayCell(
+                elements=(
+                    StreamCell(type="audio", spec="0:a:0"),
+                    StreamCell(type="audio", spec="0:a:1"),
+                    StreamCell(type="audio", spec="0:a:2"),
+                )
+            )
+        ]
+    ]
+
+
+def test_csv_rowless_bare_array_column_matches_the_table_cell_text() -> None:
+    sinks = lower_table(
+        resolve(parse("SELECT f.video FROM input('f.mkv') f")), _row_probes()
+    )
+    assert render_csv(sinks[0].result, header=False) == "{<video 0:v:0>}\n"
+
+
+def test_a_bare_array_column_broadcasts_beside_a_row_relation() -> None:
+    """A bare array column alongside unnested rows used to panic on the
+    cardinality mismatch; it now broadcasts one array cell over every row."""
+    sinks = lower_table(
+        resolve(
+            parse("SELECT f.video, t.language FROM input('f.mkv') f, unnest(f.audio) t")
+        ),
+        _row_probes(),
+    )
+    video_cell = ArrayCell(elements=(StreamCell(type="video", spec="0:v:0"),))
+    assert sinks[0].result.rows == [
+        [video_cell, "eng"],
+        [video_cell, "fra"],
+        [video_cell, None],
+    ]
+
+
+def test_csv_bare_array_column_broadcasts_beside_a_row_relation() -> None:
+    sinks = lower_table(
+        resolve(
+            parse("SELECT f.video, t.language FROM input('f.mkv') f, unnest(f.audio) t")
+        ),
+        _row_probes(),
+    )
+    assert render_csv(sinks[0].result, header=False) == (
+        "{<video 0:v:0>},eng\n{<video 0:v:0>},fra\n{<video 0:v:0>},\n"
+    )
+
+
+def test_a_subscripted_array_column_still_keeps_its_plain_cell() -> None:
+    """The one array-typed shape that stays a plain stream cell: a subscript
+    already picks ONE element, so there is nothing to brace."""
+    sinks = lower_table(
+        resolve(parse("SELECT f.audio[1] FROM input('f.mkv') f")), _row_probes()
+    )
+    assert sinks[0].result.rows == [[StreamCell(type="audio", spec="0:a:0")]]
+
+
+# ---------------------------------------------------------------------------
 # tag columns in a CTE body: per-stream tags that ride into the outer query
 # ---------------------------------------------------------------------------
 #
@@ -7928,6 +8003,123 @@ def test_grouping_by_a_row_column_needs_a_fan_out_destination() -> None:
     assert "TO (t.language" in (err.hint or "")
 
 
+# ---------------------------------------------------------------------------
+# grouped table queries: GROUP BY / array_agg print instead of write
+# ---------------------------------------------------------------------------
+#
+# Table mode reuses 085's exact grouping validity and partition, but a table
+# query has no destination -- every group is just a printed row, so the
+# media-side "row-column GROUP BY needs a fan-out TO" rule does not apply.
+
+
+def _reject_table(sql: str) -> SqlmpegError:
+    with pytest.raises(SqlmpegError) as excinfo:
+        resolve(parse(sql))
+    return _anchored(excinfo.value)
+
+
+def test_a_grouped_table_query_over_an_input_level_key_is_one_group() -> None:
+    """``GROUP BY f.video`` never varies per row, so the whole relation is one
+    group -- the single-file COPY's own shape, printed instead of written."""
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT f.video, array_agg(t.track) FROM input('f.mkv') f, "
+                "unnest(f.audio) t GROUP BY f.video"
+            )
+        ),
+        _row_probes(),
+    )
+    assert sinks[0].result.columns == ["video", "array_agg"]
+    assert sinks[0].result.rows == [
+        [
+            ArrayCell(elements=(StreamCell(type="video", spec="0:v:0"),)),
+            ArrayCell(
+                elements=(
+                    StreamCell(type="audio", spec="0:a:0"),
+                    StreamCell(type="audio", spec="0:a:1"),
+                    StreamCell(type="audio", spec="0:a:2"),
+                )
+            ),
+        ]
+    ]
+
+
+_LANG_TRACKS = [
+    _track("audio", 0, language="eng", codec="aac"),
+    _track("audio", 1, language="eng", codec="aac"),
+    _track("audio", 2, language="fra", codec="aac"),
+]
+
+
+def test_a_grouped_table_query_over_a_row_key_is_one_row_per_group() -> None:
+    """A row-column key partitions in FIRST-APPEARANCE order -- the same
+    partition a fan-out COPY would write as separate files."""
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT t.language, array_agg(t.track) FROM input('f.mkv') f, "
+                "unnest(f.audio) t GROUP BY t.language"
+            )
+        ),
+        {"f": ProbeResult(streams=_LANG_TRACKS)},
+    )
+    assert sinks[0].result.rows == [
+        [
+            "eng",
+            ArrayCell(
+                elements=(
+                    StreamCell(type="audio", spec="0:a:0"),
+                    StreamCell(type="audio", spec="0:a:1"),
+                )
+            ),
+        ],
+        ["fra", ArrayCell(elements=(StreamCell(type="audio", spec="0:a:2"),))],
+    ]
+
+
+def test_unaliased_array_agg_column_is_named_array_agg() -> None:
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT f.video, array_agg(t.track) FROM input('f.mkv') f, "
+                "unnest(f.audio) t GROUP BY f.video"
+            )
+        ),
+        _row_probes(),
+    )
+    assert sinks[0].result.columns == ["video", "array_agg"]
+
+
+def test_an_aliased_array_agg_column_keeps_its_alias() -> None:
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT f.video, array_agg(t.track) AS tracks FROM input('f.mkv') f, "
+                "unnest(f.audio) t GROUP BY f.video"
+            )
+        ),
+        _row_probes(),
+    )
+    assert sinks[0].result.columns == ["video", "tracks"]
+
+
+def test_table_query_grouping_still_enforces_the_grouping_rule() -> None:
+    """No GROUP BY key at all makes the whole relation one group, so an
+    ungrouped row scalar beside ``array_agg`` still has nothing to match."""
+    err = _reject_table(
+        "SELECT t.language, array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t"
+    )
+    assert "'t.language' is neither aggregated nor a GROUP BY key" in err.message
+
+
+def test_table_query_still_rejects_order_by_inside_array_agg() -> None:
+    err = _reject_table(
+        "SELECT array_agg(t.track ORDER BY t.index) FROM input('f.mkv') f, unnest(f.audio) t"
+    )
+    assert "ORDER BY inside array_agg() is not supported" in err.message
+
+
 def test_order_by_inside_array_agg_is_rejected() -> None:
     err = _reject(
         _agg_copy(
@@ -7968,11 +8160,6 @@ def test_the_other_aggregates_keep_their_typed_rejection(name: str) -> None:
 
 
 _AGG_CONTEXTS = [
-    (
-        "a table query",
-        "SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t "
-        "GROUP BY f.video",
-    ),
     (
         "a UNION ALL branch",
         "COPY (SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t "

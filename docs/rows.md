@@ -97,4 +97,6 @@ COPY (
 
 ## Inspecting
 
-Any of these shapes prints as a table with a bare SELECT (no COPY), or as CSV with `COPY ... TO STDOUT WITH (format 'csv')` - [recipes 30-32](examples.md#30-look-at-a-files-tracks-as-a-table). Aggregates and `GROUP BY` are media-query-only; in a table query they stay rejected.
+Any of these shapes prints as a table with a bare SELECT (no COPY), or as CSV with `COPY ... TO STDOUT WITH (format 'csv')` - [recipes 30-32](examples.md#30-look-at-a-files-tracks-as-a-table). A bare input array column (`f.audio`, not subscripted) prints as one cell, Postgres array-literal style - `{<audio 0:a:0>,<audio 0:a:1>}`, braces even for one element; a subscript (`f.audio[1]`) or a track row's own `.track` still prints its plain `<audio 0:a:0>` placeholder.
+
+`GROUP BY` and `array_agg` are legal here too - table mode has no destination to fan out over, so every group just prints as one row, in first-appearance order, `array_agg` an array cell of the group's tracks. It is how you preview a fan-out COPY's partitions before writing any file - [recipe 56](examples.md#56-preview-a-grouped-shape-as-a-table).

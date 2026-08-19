@@ -1879,9 +1879,9 @@ class _Resolver:
                 hint="give the concatenated query a quoted TO path",
             )
         # Where aggregation is NOT available, and what to call the place.
+        # A table query (bare SELECT or csv COPY) has no such restriction --
+        # grouping is legal there, printing one row per group.
         no_aggregate = context
-        if no_aggregate is None and table_mode:
-            no_aggregate = "a table query"
         if no_aggregate is None and len(branches) > 1:
             no_aggregate = "a UNION ALL branch"
         visible = set(self.ctes)
@@ -2288,10 +2288,11 @@ class _Resolver:
         if path_expr is not None:
             self._check_path_expr(path_expr, scope, select)
         if is_grouped(select):
-            self._check_grouping(select, scope, path_expr)
+            self._check_grouping(select, scope, path_expr, table_mode=table_mode)
 
     def _check_aggregate_context(self, select: exp.Select, where: str | None) -> None:
-        """Aggregation is a branch-local feature of one media COPY, v1.
+        """Aggregation belongs to a query's own top-level SELECT, never a
+        UNION ALL branch or a CTE body.
 
         Fires only for a branch that HAS track rows: without them the generic
         ``GROUP BY has no streaming equivalent`` / ``aggregate function ...``
@@ -2321,7 +2322,12 @@ class _Resolver:
     # -- grouping validity ------------------------------------------------
 
     def _check_grouping(
-        self, select: exp.Select, scope: dict[str, str], path_expr: exp.Expr | None
+        self,
+        select: exp.Select,
+        scope: dict[str, str],
+        path_expr: exp.Expr | None,
+        *,
+        table_mode: bool = False,
     ) -> None:
         """Postgres's rule: every column is aggregated, constant, or a key.
 
@@ -2332,8 +2338,10 @@ class _Resolver:
         aggregate must match a GROUP BY key verbatim (sqlglot ``.sql()``
         equality), and everything else passes.
 
-        Keys that read a row column partition the branch into one file per
-        group, which only a fan-out ``TO (<expression>)`` can write.
+        Keys that read a row column partition a MEDIA branch into one file per
+        group, which only a fan-out ``TO (<expression>)`` can write -- a table
+        query needs no destination, every group is just a printed row, so
+        `table_mode` skips that requirement entirely.
         """
         keys = group_keys(select)
         key_texts = {key.sql() for key in keys}
@@ -2359,7 +2367,7 @@ class _Resolver:
         if path_expr is not None:
             self._check_grouped_expr(path_expr, scope, select, key_texts)
         row_keys = [key for key in keys if _references_row(key, scope)]
-        if not row_keys:
+        if table_mode or not row_keys:
             return
         if path_expr is None or not _references_row(path_expr, scope):
             raise _error(

@@ -24,6 +24,7 @@ from .ir import StreamType
 
 __all__ = [
     "StreamCell",
+    "ArrayCell",
     "CellValue",
     "TableResult",
     "TableSink",
@@ -46,10 +47,21 @@ class StreamCell:
     spec: str
 
 
-# One table cell: NULL (empty, psql-style), a probed scalar, or a stream
-# placeholder. Never a raw FrameRef -- that would leak IR shape into
-# printable data.
-CellValue = str | int | float | bool | None | StreamCell
+@dataclass(frozen=True)
+class ArrayCell:
+    """A bare input array column's full stream list, one table cell.
+
+    Postgres array-literal style over the elements' own cell text --
+    ``{<audio 0:a:0>,<audio 0:a:1>}`` -- braces even for one element.
+    """
+
+    elements: tuple[CellValue, ...]
+
+
+# One table cell: NULL (empty, psql-style), a probed scalar, a stream
+# placeholder, or an array of cells. Never a raw FrameRef -- that would leak
+# IR shape into printable data.
+CellValue = str | int | float | bool | None | StreamCell | ArrayCell
 
 
 @dataclass(frozen=True)
@@ -83,6 +95,8 @@ def _cell_text(cell: CellValue) -> str:
         return ""
     if isinstance(cell, StreamCell):
         return f"<{cell.type} {cell.spec}>"
+    if isinstance(cell, ArrayCell):
+        return "{" + ",".join(_cell_text(element) for element in cell.elements) + "}"
     return str(cell)
 
 

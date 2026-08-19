@@ -9,7 +9,7 @@ singular, and the stream-placeholder forms -- built directly against
 
 from __future__ import annotations
 
-from sqlmpeg.table import StreamCell, TableResult, render_csv, render_table
+from sqlmpeg.table import ArrayCell, StreamCell, TableResult, render_csv, render_table
 
 
 def test_widths_are_max_of_header_and_values() -> None:
@@ -121,3 +121,54 @@ def test_csv_uses_lf_not_crlf() -> None:
 def test_csv_stream_cell_placeholder() -> None:
     result = TableResult(columns=["t"], rows=[[StreamCell(type="audio", spec="0:a:0")]])
     assert render_csv(result, header=False) == "<audio 0:a:0>\n"
+
+
+# ---------------------------------------------------------------------------
+# ArrayCell
+# ---------------------------------------------------------------------------
+
+
+def test_array_cell_braces_the_comma_joined_elements() -> None:
+    result = TableResult(
+        columns=["a"],
+        rows=[
+            [
+                ArrayCell(
+                    elements=(
+                        StreamCell(type="audio", spec="0:a:0"),
+                        StreamCell(type="audio", spec="0:a:1"),
+                    )
+                )
+            ]
+        ],
+    )
+    text = render_table(result)
+    assert "{<audio 0:a:0>,<audio 0:a:1>}" in text.split("\n")[2]
+
+
+def test_array_cell_single_element_still_braces() -> None:
+    result = TableResult(
+        columns=["v"],
+        rows=[[ArrayCell(elements=(StreamCell(type="video", spec="0:v:0"),))]],
+    )
+    text = render_table(result)
+    assert text.split("\n")[2].strip() == "{<video 0:v:0>}"
+
+
+def test_csv_array_cell_placeholder() -> None:
+    result = TableResult(
+        columns=["a"],
+        rows=[
+            [
+                ArrayCell(
+                    elements=(
+                        StreamCell(type="audio", spec="0:a:0"),
+                        StreamCell(type="audio", spec="0:a:1"),
+                    )
+                )
+            ]
+        ],
+    )
+    # The comma inside the braces is a real field separator to `csv`, which
+    # quotes the whole field -- stock `QUOTE_MINIMAL`, same as any other value.
+    assert render_csv(result, header=False) == '"{<audio 0:a:0>,<audio 0:a:1>}"\n'
