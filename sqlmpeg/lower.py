@@ -1363,10 +1363,19 @@ class _Column:
     An array column carries every one of its streams here, so a CTE records an
     array column's LENGTH statically and a later ``<cte>.<name>[k]`` is
     bounds-checked without re-probing anything.
+
+    `splat` matters only when `value.is_array`: True means the array IS a row
+    set (a row alias's stream column, or a call over one) that a table query
+    prints one row per element, like :meth:`_Lowerer._value_to_cells` already
+    does outside a CTE. False means the array is a single unit -- an
+    ``array_agg`` or a bare input array column -- that a table query
+    broadcasts as ONE cell instead (see :meth:`_Lowerer._array_cell_broadcast`).
+    Ignored for a scalar column.
     """
 
     name: str | None
     value: _Value
+    splat: bool = True
 
 
 @dataclass(frozen=True)
@@ -2334,6 +2343,7 @@ class _Lowerer:
                 _Column(
                     name=_projection_name(projection),
                     value=self._lower_expr(projection, env, select),
+                    splat=self._is_splat_projection(projection, env),
                 )
             )
         if not columns:
@@ -2346,6 +2356,37 @@ class _Lowerer:
                 "tracks too, e.g. SELECT t.track, ... AS title",
             )
         return columns
+
+    def _is_splat_projection(self, projection: exp.Expr, env: _Env) -> bool:
+        """True when this stream column's array value (if it turns out to be
+        one) is a row set rather than a single broadcast unit.
+
+        Mirrors :meth:`_table_projection`'s own dispatch, computed here (at
+        the projection's OWN scope, CTE body or bare SELECT) because that is
+        the only place its AST shape is still visible -- an outer table query
+        sees just ``<cte>.<name>`` and has to trust what got recorded.
+        Broadcast shapes: an ``array_agg`` and a bare input/source array
+        column (``f.audio``); everything else -- a row alias's own stream
+        column, or any call over one -- is a row set, and a CTE column that
+        reads ANOTHER CTE's column inherits that column's own answer.
+        """
+        expr = _unwrap(projection)
+        if isinstance(expr, exp.ArrayAgg):
+            return False
+        if isinstance(expr, exp.Column):
+            table_node = expr.args.get("table")
+            if table_node is not None:
+                binding = env.bindings.get(_fold(table_node))
+                if (
+                    isinstance(binding, _InputBinding | _SourceBinding)
+                    and _fold(expr.this) in _ARRAY_COLUMNS
+                ):
+                    return False
+                if isinstance(binding, _CteBinding):
+                    column = self._cte_column(binding, _fold(expr.this))
+                    if column is not None:
+                        return column.splat
+        return True
 
     # -- metadata tag columns ---------------------------------------------
 
@@ -6122,12 +6163,14 @@ class _Lowerer:
     def _lower_table_branch(self, select: exp.Select) -> TableResult:
         """One table/csv branch: row cardinality, then every column, per row.
 
-        Cardinality is the branch's shared row relation --
-        every row alias's column stays aligned to it, joins included -- or 1
-        for a branch with no ``unnest`` at all (a plain metadata/stream
-        SELECT has exactly one row, the same way a bare scalar broadcasts). A
-        GROUPED branch (a GROUP BY, an ``array_agg``, or both) prints one row
-        per group instead -- see :meth:`_lower_grouped_table_branch`.
+        Cardinality is the branch's shared row relation -- every row alias's
+        column stays aligned to it, joins included; a CTE-ONLY FROM has no
+        relation, so it comes from whichever splat CTE array column the
+        SELECT list reads instead (see :meth:`_table_cardinality`); a branch
+        with neither is 1 (a plain metadata/stream SELECT has exactly one
+        row, the same way a bare scalar broadcasts). A GROUPED branch (a
+        GROUP BY, an ``array_agg``, or both) prints one row per group instead
+        -- see :meth:`_lower_grouped_table_branch`.
         """
         env = self._scope(select)
         env.grouped = is_grouped(select)
@@ -6162,13 +6205,84 @@ class _Lowerer:
         if env.grouped:
             return self._lower_grouped_table_branch(select, env, projections, names)
 
-        cardinality = len(env.relation.tuples) if env.relation is not None else 1
+        cardinality = self._table_cardinality(projections, env, select)
         per_column = [
             self._table_projection(projection, env, select, cardinality)
             for projection in projections
         ]
         rows = [[per_column[c][r] for c in range(len(names))] for r in range(cardinality)]
         return TableResult(columns=names, rows=rows)
+
+    def _table_cardinality(
+        self, projections: list[exp.Expr], env: _Env, select: exp.Select
+    ) -> int:
+        """The branch's row count, from its row relation or its CTE columns.
+
+        ``FROM aud`` has no relation at all: cardinality has to come from the
+        row set a splat CTE array column carries. Same-CTE columns share one
+        body and so agree by construction -- one entry is kept per alias --
+        but two DIFFERENT array-valued sources (two CTEs, or a CTE beside an
+        unnest relation) have no natural join between them, so disagreeing OR
+        NOT, mixing them is rejected rather than guessed at.
+        """
+        widths = self._cte_row_widths(projections, env)
+        if env.relation is not None:
+            if widths:
+                anchor, label, _ = widths[0]
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{label}' is a CTE array column and this table query "
+                    "also unnests its own row table: there is no way to "
+                    "align the two independent row sets",
+                    anchor,
+                    fallback=select,
+                    hint="select them in separate queries",
+                )
+            return len(env.relation.tuples)
+        if not widths:
+            return 1
+        first_anchor, first_label, first_width = widths[0]
+        for anchor, label, width in widths[1:]:
+            if width != first_width:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{first_label}' has {_stream_count(first_width)} but "
+                    f"'{label}' has {_stream_count(width)}: a table query "
+                    "needs a single row count",
+                    anchor,
+                    fallback=select,
+                    hint="select them in separate queries",
+                )
+        return first_width
+
+    def _cte_row_widths(
+        self, projections: list[exp.Expr], env: _Env
+    ) -> list[tuple[exp.Expr, str, int]]:
+        """``(anchor, "<cte>.<name>", row count)`` per splat CTE array column
+        the SELECT list bare-references, one entry per DISTINCT CTE alias.
+        """
+        widths: list[tuple[exp.Expr, str, int]] = []
+        seen: set[str] = set()
+        for projection in projections:
+            expr = _unwrap(projection)
+            if not isinstance(expr, exp.Column):
+                continue
+            table_node = expr.args.get("table")
+            if table_node is None:
+                continue
+            alias = _fold(table_node)
+            if alias in seen:
+                continue
+            binding = env.bindings.get(alias)
+            if not isinstance(binding, _CteBinding):
+                continue
+            name = _fold(expr.this)
+            column = self._cte_column(binding, name)
+            if column is None or not column.splat or not column.value.is_array:
+                continue
+            seen.add(alias)
+            widths.append((projection, f"{alias}.{name}", len(column.value.streams)))
+        return widths
 
     def _lower_grouped_table_branch(
         self,
@@ -6245,6 +6359,14 @@ class _Lowerer:
                     and _fold(expr.this) in _ARRAY_COLUMNS
                 ):
                     return self._array_cell_broadcast(expr, env, select, cardinality)
+                elif isinstance(binding, _CteBinding):
+                    column = self._cte_column(binding, _fold(expr.this))
+                    # A splat column falls through to `_value_to_cells` below,
+                    # which is where its per-row cardinality is already
+                    # honored; a non-splat one (array_agg / a bare input
+                    # array, re-exposed through the CTE) stays ONE cell.
+                    if column is not None and column.value.is_array and not column.splat:
+                        return self._array_cell_broadcast(expr, env, select, cardinality)
         if is_value_expr(expr) or _is_input_value_column(expr, env):
             return self._value_cells(expr, env, select, cardinality)
         shape = subscript_metadata_shape(expr)

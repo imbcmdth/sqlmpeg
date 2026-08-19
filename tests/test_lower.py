@@ -7695,6 +7695,159 @@ def test_a_table_query_over_a_tagged_cte_prints_the_same_rows() -> None:
     untagged = lower_table(resolve(parse(plain)), _row_probes())[0]
     assert tagged.result.columns == untagged.result.columns
     assert list(tagged.result.rows) == list(untagged.result.rows)
+    # Not just mutually equal -- both sides really do carry every row: this
+    # comparison used to pass by both being wrongly truncated to one.
+    assert len(untagged.result.rows) == 3
+    assert untagged.result.rows == [
+        [StreamCell(type="audio", spec="0:a:0")],
+        [StreamCell(type="audio", spec="0:a:1")],
+        [StreamCell(type="audio", spec="0:a:2")],
+    ]
+
+
+# ---------------------------------------------------------------------------
+# a CTE's own array column in a table query -- one row per element
+# ---------------------------------------------------------------------------
+#
+# `FROM aud` binds no row relation of its own (a CTE is not `unnest`), so a
+# table branch used to fall back to cardinality 1 unconditionally and a
+# splat CTE column's later elements were silently dropped. The row count of
+# a CTE-only FROM has to come from the CTE's own splat array column instead.
+
+
+def _cte_report_query(where: str = "t.language = 'eng'") -> str:
+    return (
+        "WITH aud AS ("
+        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        + (f" WHERE {where}" if where else "")
+        + ") SELECT aud.track FROM aud"
+    )
+
+
+def test_a_cte_array_column_prints_one_row_per_element() -> None:
+    """The maintainer's exact report shape: a WHERE-filtered CTE array column
+    used to print its first row and stop."""
+    sinks = lower_table(
+        resolve(parse(_cte_report_query())), {"f": ProbeResult(streams=_LANG_TRACKS)}
+    )
+    assert sinks[0].result.columns == ["track"]
+    assert sinks[0].result.rows == [
+        [StreamCell(type="audio", spec="0:a:0")],
+        [StreamCell(type="audio", spec="0:a:1")],
+    ]
+
+
+def test_csv_cte_array_column_prints_one_row_per_element() -> None:
+    sinks = lower_table(
+        resolve(parse(_cte_report_query())), {"f": ProbeResult(streams=_LANG_TRACKS)}
+    )
+    assert render_csv(sinks[0].result, header=False) == "<audio 0:a:0>\n<audio 0:a:1>\n"
+
+
+def test_a_media_copy_of_the_report_query_still_maps_both_streams() -> None:
+    """The media path this bug never touched, kept as a regression fence."""
+    g = _lower(_cte_report_query(), {"f": ProbeResult(streams=_LANG_TRACKS)})
+    assert [o.ref for o in g.outputs] == ["src:f:a:0", "src:f:a:1"]
+
+
+def test_a_cte_column_broadcasts_an_input_scalar_beside_it() -> None:
+    """Input-level scalars beside a CTE array column repeat per row, exactly
+    as they do beside an ordinary row relation."""
+    query = (
+        "WITH aud AS ("
+        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        ") SELECT aud.track, g.duration FROM aud, input('f.mkv') g"
+    )
+    sinks = lower_table(
+        resolve(parse(query)),
+        {
+            "f": ProbeResult(streams=_LANG_TRACKS),
+            "g": ProbeResult(streams=_LANG_TRACKS, duration=12.5),
+        },
+    )
+    assert sinks[0].result.rows == [
+        [StreamCell(type="audio", spec="0:a:0"), 12.5],
+        [StreamCell(type="audio", spec="0:a:1"), 12.5],
+        [StreamCell(type="audio", spec="0:a:2"), 12.5],
+    ]
+
+
+def test_a_subscripted_cte_column_stays_one_broadcast_cell() -> None:
+    """`aud.track[1]`-style: the CTE stored an array, but a subscript already
+    picked one element, so it stays a single row like any other subscript."""
+    query = (
+        "WITH aud AS ("
+        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        ") SELECT aud.track[1] FROM aud"
+    )
+    sinks = lower_table(resolve(parse(query)), {"f": ProbeResult(streams=_LANG_TRACKS)})
+    assert sinks[0].result.rows == [[StreamCell(type="audio", spec="0:a:0")]]
+
+
+def test_two_columns_from_the_same_cte_stay_aligned() -> None:
+    """One CTE body, one row count: two of its own splat columns line up row
+    for row without any extra bookkeeping."""
+    query = (
+        "WITH aud AS ("
+        "  SELECT t.track AS track, v.track AS frame FROM input('f.mkv') f, "
+        "  unnest(f.audio) t, unnest(f.video) v"
+        ") SELECT aud.track, aud.frame FROM aud"
+    )
+    probes = {"f": ProbeResult(streams=[_track("video", 0), *_LANG_TRACKS])}
+    sinks = lower_table(resolve(parse(query)), probes)
+    assert sinks[0].result.rows == [
+        [StreamCell(type="audio", spec="0:a:0"), StreamCell(type="video", spec="0:v:0")],
+        [StreamCell(type="audio", spec="0:a:1"), StreamCell(type="video", spec="0:v:0")],
+        [StreamCell(type="audio", spec="0:a:2"), StreamCell(type="video", spec="0:v:0")],
+    ]
+
+
+def _reject_lower_table(sql: str, probes: dict[str, ProbeResult | None]) -> SqlmpegError:
+    with pytest.raises(SqlmpegError) as excinfo:
+        lower_table(resolve(parse(sql)), probes)
+    return _anchored(excinfo.value)
+
+
+def test_two_ctes_with_disagreeing_row_counts_are_rejected() -> None:
+    query = (
+        "WITH a1 AS ("
+        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        "), a2 AS ("
+        "  SELECT v.track AS track FROM input('g.mkv') g, unnest(g.video) v"
+        ") SELECT a1.track, a2.track FROM a1, a2"
+    )
+    err = _reject_lower_table(
+        query,
+        {
+            "f": ProbeResult(streams=_LANG_TRACKS),
+            "g": ProbeResult(streams=[_track("video", 0), _track("video", 1)]),
+        },
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a1.track" in err.message and "a2.track" in err.message
+    assert "3" in err.message and "2" in err.message
+    assert "separate queries" in (err.hint or "")
+
+
+def test_a_cte_array_column_beside_an_unnest_relation_is_rejected() -> None:
+    """Even when the counts happen to agree, a CTE's own row set and a fresh
+    `unnest` relation are two independent things with no natural join, so
+    the simplest safe choice rejects the combination outright."""
+    query = (
+        "WITH aud AS ("
+        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        ") SELECT aud.track, v.track FROM aud, input('g.mkv') g, unnest(g.video) v"
+    )
+    err = _reject_lower_table(
+        query,
+        {
+            "f": ProbeResult(streams=_LANG_TRACKS),
+            "g": ProbeResult(streams=[_track("video", 0), _track("video", 1), _track("video", 2)]),
+        },
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "aud.track" in err.message
+    assert "separate queries" in (err.hint or "")
 
 
 # ---------------------------------------------------------------------------
