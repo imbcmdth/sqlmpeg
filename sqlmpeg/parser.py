@@ -427,7 +427,7 @@ _ARRAY_AGG_PLACE_HINT = (
 )
 _GROUP_STREAM_HINT = (
     "a grouped query aggregates its streams: wrap it in array_agg(...), or "
-    "drop the GROUP BY and let the implicit aggregation do it"
+    "make it the group's key"
 )
 _GROUP_VALUE_HINT = (
     "add it to the GROUP BY to make it the group's key, or tag the tracks "
@@ -1884,12 +1884,10 @@ class _Resolver:
                 fallback=query,
                 hint="give the concatenated query a quoted TO path",
             )
-        # Where aggregation is NOT available, and what to call the place.
-        # A table query (bare SELECT or csv COPY) has no such restriction --
-        # grouping is legal there, printing one row per group.
+        # Where aggregation is NOT available, and what to call the place. A
+        # UNION ALL branch aggregates like any other: it is one concat segment,
+        # and a segment with several rows has to gather them the same way.
         no_aggregate = context
-        if no_aggregate is None and len(branches) > 1:
-            no_aggregate = "a UNION ALL branch"
         visible = set(self.ctes)
         for branch in branches:
             self._validate_select(
@@ -2297,12 +2295,11 @@ class _Resolver:
             self._check_grouping(select, scope, path_expr, table_mode=table_mode)
 
     def _check_aggregate_context(self, select: exp.Select, where: str | None) -> None:
-        """Aggregation belongs to a query's own top-level SELECT, never a
-        UNION ALL branch or a CTE body.
+        """Aggregation belongs to a query's own SELECT, never a CTE body.
 
         Fires only for a branch that HAS rows: without them the generic
         ``GROUP BY has no streaming equivalent`` / ``aggregate function ...``
-        fences already say the right thing.
+        rejections already say the right thing.
         """
         if where is None:
             return

@@ -399,12 +399,15 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         # A query with no streaming representation at all (metadata
         # columns, an un-COALESCEd join gap) fails HERE, so table mode is the
         # fallback -- tried only after compilation failed, and only for a
-        # query that could BE one. A sinkless SELECT of real streams compiled
-        # above and never reaches this branch. If the fallback fails too, the
-        # original error surfaces; it is usually more informative.
+        # query that could BE one. If the fallback fails too, the original
+        # error surfaces; it is usually more informative.
+        # `-o` takes the fallback away: it NAMES a media destination, so the
+        # hint below ("no COPY, no -o") would be false and the real rejection
+        # -- which is usually about the file this was meant to write -- is
+        # what the reader needs.
         # `text` is None only when `err` came from `-v` substitution, which
         # cannot be table-capable either, so it is guarded out of `classify`.
-        if text is not None and _is_table_capable_query(text):
+        if text is not None and args.output is None and _is_table_capable_query(text):
             print(_TABLE_USAGE_HINT, file=sys.stderr)
             return 2
         _print_error(err, source=args.query)

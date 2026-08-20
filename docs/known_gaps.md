@@ -28,6 +28,11 @@ output is plain ffmpeg, so the two mix freely in a script.
   back to fontconfig, which depends on how the local ffmpeg was built —
   some Windows builds crash instead of picking a default. When in
   doubt, name the font.
+- **A CTE-keyed group cannot fan out.** A fan-out `TO (expression)`
+  builds its filename from row metadata columns, and a CTE's columns
+  are streams - so a `GROUP BY` over a CTE column with more than one
+  group has no way to name its files yet. Group inside the CTE's body
+  (where metadata columns exist) instead.
 - **Streams ffmpeg cannot identify are rejected at compile time.**
   Some sources carry streams with no detectable codec (certain DASH
   text tracks, for example). Selecting one is a compile error; table

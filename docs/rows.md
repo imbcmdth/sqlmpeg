@@ -52,12 +52,12 @@ Writing chapters is the reverse shape: a `VALUES` CTE with exactly these columns
 
 ## CTE rows - `WITH x AS (...)`
 
-A CTE exposes whatever its body named with `AS` - streams stay streams (a multi-row body's stream column splats in the outer query, in row order), and tag columns in the body ride on its streams (see Tags below). No other columns exist on a CTE alias; there is no natural naming from a bare `a.track`.
+A CTE exposes whatever its body named with `AS`, and referencing it in FROM contributes its body's ROWS - a two-row CTE is a two-row source, and comma between sources is a cross join with real multiplicity, exactly as SQL says. Tag columns in the body ride on its streams (see Tags below). No other columns exist on a CTE alias; there is no natural naming from a bare `a.track`. Views referenced in FROM follow the same rules.
 
 ## Joins
 
 ```sql
-SELECT amix(a.track, b.track)
+SELECT array_agg(amix(a.track, b.track))
 FROM input('film.mkv') f, input('commentary.mkv') g,
      unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language
 ```
@@ -75,13 +75,18 @@ An aliased non-stream SELECT column is a metadata tag; the alias is the key (fre
 
 - **Over track rows**: tags that row's stream(s) - `-metadata:s:N`. `CASE WHEN t.language IN ('en', 'english') THEN 'eng' ELSE t.language END AS language` retags a library in one expression. Unselected tags pass through unchanged. Recipes [37-38](examples.md#37-retitle-tracks-from-their-own-metadata).
 - **Over input rows only** (no track rows in the branch): tags the container - `-metadata`. The input's own tag columns feed the expressions, so `CASE WHEN f.title IS NULL THEN 'Untitled' ELSE f.title END AS title` fills a missing title. [Recipe 52](examples.md#52-read-the-containers-tags-rewrite-them-with-case).
-- **Both in one query**: layer with a CTE - tag columns in the body are per-stream, in the outer SELECT container-level; the outer value wins on a shared key. [Recipe 53](examples.md#53-tag-the-tracks-and-the-container-in-one-query).
+- **Both in one query**: layer with a CTE - tag columns in the body are per-stream, in the outer SELECT container-level, and the outer SELECT gathers the CTE's rows (`array_agg` + `GROUP BY`, see Combining rows); the outer value wins on a shared key. [Recipe 53](examples.md#53-tag-the-tracks-and-the-container-in-one-query).
 
 `disposition` is a reserved key: its value is ffmpeg's disposition spec (`'default'`, `'forced'`, `'default+forced'`, `'0'` clears) and it emits `-disposition:N` instead - [recipe 41](examples.md#41-flag-the-default-track). `metadata_from <alias>` copies an input's global tags, `strip_metadata true` drops them; a tag column overrides either for its key. The same columns in a table/CSV query print as plain data, which previews what a retag will write.
 
-## Grouping: the aggregation made explicit
+## Combining rows
 
-A multi-row media query writing one file implicitly aggregates: the destination is the group key, row streams are gathered in row order. Both halves can be written out - `GROUP BY` and `array_agg` are legal over track rows, and the explicit form compiles to the same bytes as the sugar:
+Four rules, no exceptions:
+
+1. A query produces a relation. A bare SELECT prints it; COPY serializes it. Same relation.
+2. A single destination takes exactly ONE row - any container, manifests included. Rows combine only when written: `array_agg` gathers a column's streams in row order, `GROUP BY` names what stays constant (an aggregate with no `GROUP BY` is one group, Postgres's own rule).
+3. `TO (expression over row columns)` writes one file per row - rule 2, applied N times.
+4. A multi-row relation into a single path is a compile error (`ROW_COUNT_MISMATCH`) naming the row count, the destination, and both ways out.
 
 ```sql
 COPY (
@@ -91,9 +96,11 @@ COPY (
 ) TO 'out.mp4'
 ```
 
-`array_agg` takes any per-row stream expression (`array_agg(volume(a.track, 0.5))`) and must be a whole SELECT column; row order is the aggregation order (`ORDER BY` before the aggregate reorders it; `ORDER BY` inside `array_agg` is rejected). Postgres's grouping rule is enforced: outside an aggregate, a row-referencing expression must match a `GROUP BY` key.
+The row count is the RESOLVED count against the actual file: a `WHERE` that narrows a row table to one row needs no aggregate. Queries with only input aliases in FROM are one row - arrays are values inside it, so splats, subscripts, and `SELECT *` never need gathering.
 
-`GROUP BY` a row column partitions the rows, and each group is one output file - this requires a fan-out `TO (expression over the group keys)` and is how rows *share* a destination (the ungrouped fan-out still rejects two rows naming one file). Group keys are group-constants, so they double as container tag columns. [Recipe 55](examples.md#55-one-file-per-language-all-its-tracks-inside) writes one file per language with all of that language's tracks inside, titled by its key.
+`array_agg` takes any per-row stream expression (`array_agg(volume(a.track, 0.5))`) and must be a whole SELECT column; row order is the aggregation order (`ORDER BY` before the aggregate reorders it; `ORDER BY` inside `array_agg` is rejected). Postgres's grouping rule is enforced: outside an aggregate, a row-varying expression must match a `GROUP BY` key. Group keys may be stream columns (`GROUP BY vid.track`, `GROUP BY f.video[1]`).
+
+`GROUP BY` a row column partitions the rows, one output file per group - this requires a fan-out `TO (expression over the group keys)` (N groups are N rows; rule 2). Group keys are group-constants, so they double as container tag columns. [Recipe 55](examples.md#55-one-file-per-language-all-its-tracks-inside) writes one file per language with all of that language's tracks inside, titled by its key; [recipe 57](examples.md#57-combine-tracks-selected-by-separate-ctes) gathers across CTE boundaries.
 
 ## Inspecting
 

@@ -112,10 +112,12 @@ def test_a_constant_to_expression_is_just_a_path() -> None:
     assert graphs[0].sinks[0].path == "out.m4a"
 
 
-def test_a_constant_to_over_a_row_table_keeps_todays_splat() -> None:
-    """Both tracks land in ONE file when the TO names no row column."""
+def test_a_constant_to_over_a_row_table_gathers_into_one_file() -> None:
+    """Both tracks land in ONE file when the TO names no row column -- and the
+    aggregate is what says so."""
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) TO 'both.mka'"
+        f"COPY (SELECT array_agg(t.track) FROM input('{SRC}') f, unnest(f.audio) t) "
+        "TO 'both.mka'"
     )
     graphs = compile_commands(sql)
     assert len(graphs) == 1

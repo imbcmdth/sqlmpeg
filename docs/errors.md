@@ -270,6 +270,31 @@ FROM input('tests/fixtures/av2.mp4') a, input('tests/fixtures/av.mp4') b
 {"line": 1, "col": 8, "code": "BROADCAST_MISMATCH", "message": "amix() cannot broadcast over arrays of different lengths: a.audio has 2 streams, b.audio has 1 stream", "hint": "broadcast arrays zip elementwise, one output per element; subscript one of them to pair a single stream with the other, e.g. a.audio[1]"}
 ```
 
+## ROW_COUNT_MISMATCH
+
+**Meaning:** One row is one file. A query whose relation resolves to more than one row (or, once it aggregates, more than one group) names a single destination, and rows are never combined behind your back. The two ways to combine them are both in the SQL: `array_agg(...)` gathers a branch's rows into the one file it writes (with `GROUP BY` when another column has to stay unaggregated), and `TO (<expression>)` gives every row a destination of its own.
+
+**Fires when:** an `unnest(...)` table, a join, a `chapters(...)` table or a multi-row CTE reference leaves several rows in a media `COPY` (or a bare `SELECT` compiled with `-o`) that writes one path. The count is the RESOLVED one, after the `WHERE` and the joins: a predicate that narrows the rows to one on the actual file compiles as it always did.
+
+**Anchor:** the `TO` the file is named at, or the query itself when the path came from `-o`.
+
+**Example query** (`tests/fixtures/av2.mp4` has 2 audio streams):
+
+```sql
+COPY (
+  SELECT t.track
+  FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+) TO 'out.mka'
+```
+
+**Error JSON:**
+
+```json
+{"line": 4, "col": 6, "code": "ROW_COUNT_MISMATCH", "message": "this query has 2 rows, and 'out.mka' is one file", "hint": "gather the rows into that one file with array_agg(...), adding GROUP BY the column they share when they share one; or give each row a file of its own with a TO expression, e.g. TO (t.language || '.mka')"}
+```
+
+Both exits compile: `SELECT array_agg(t.track)` writes both tracks into `out.mka`, and `TO (t.language || '.mka')` writes one file per track instead.
+
 ## UNKNOWN_SINK_OPTION
 
 **Meaning:** A `COPY (query) TO 'path' WITH (...)` option name is not one of the entries in `sqlmpeg.sink.SINK_OPTIONS`.

@@ -566,10 +566,10 @@ ffmpeg -i tests/fixtures/avs.mkv -map 0:s:0 -c:0 copy -metadata:s:0 language=eng
 
 ## 25. Mix two files' tracks pairwise, matched by language
 
-Two multi-language files, and every track should mix with its counterpart - English with English, French with French, whatever order each file stores them in. That is a JOIN, written exactly the way Postgres writes it, evaluated entirely at compile time (the metadata is probed, so ffmpeg only ever sees the wiring the join decided):
+Two multi-language files, and every track should mix with its counterpart - English with English, French with French, whatever order each file stores them in. That is a JOIN, written exactly the way Postgres writes it, evaluated entirely at compile time (the metadata is probed, so ffmpeg only ever sees the wiring the join decided). The join leaves one row per pair, and `array_agg` is what puts all those pairs in one file:
 
 ```pgsql
-SELECT amix(a.track, b.track)
+SELECT array_agg(amix(a.track, b.track))
 FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av3.mp4') g,
      unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language
 ```
@@ -588,7 +588,7 @@ Result rows follow the LEFT side's track order, so the output track order is `f`
 An outer join keeps the rows only one side has, and `COALESCE` fills the gap - for audio, with generated silence:
 
 ```pgsql
-SELECT amix(a.track, COALESCE(b.track, ffmpeg.anullsrc(duration => 2)))
+SELECT array_agg(amix(a.track, COALESCE(b.track, ffmpeg.anullsrc(duration => 2))))
 FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
      unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.language = b.language
 ```
@@ -605,16 +605,18 @@ The second file has no French, so the French mix gets silence in that slot - and
 
 ## 27. Concatenate files with different track counts
 
-The founding case. `concat` demands identical segment shapes, so the file that lacks a French track needs a silent stand-in - which is the same outer join, once per branch, each branch selecting its own side. (Aliases respell in the second branch because alias names are script-wide.)
+The founding case. `concat` demands identical segment shapes, so the file that lacks a French track needs a silent stand-in - which is the same outer join, once per branch, each branch selecting its own side and gathering its rows into that segment. (Aliases respell in the second branch because alias names are script-wide.)
 
 ```pgsql
-SELECT f.video[1], a.track
+SELECT f.video[1], array_agg(a.track)
 FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
      unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.language = b.language
+GROUP BY f.video[1]
 UNION ALL
-SELECT g2.video[1], COALESCE(b2.track, ffmpeg.anullsrc(duration => 2))
+SELECT g2.video[1], array_agg(COALESCE(b2.track, ffmpeg.anullsrc(duration => 2)))
 FROM input('tests/fixtures/av2.mp4') f2, input('tests/fixtures/av-eng.mp4') g2,
      unnest(f2.audio) a2 FULL OUTER JOIN unnest(g2.audio) b2 ON a2.language = b2.language
+GROUP BY g2.video[1]
 ```
 
 ```
@@ -799,12 +801,15 @@ ffmpeg -i tests/fixtures/av-eng.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=
 
 ## 38. Normalize language tags
 
-CASE makes the edit conditional, and it runs over every row - one expression fixes the whole file. Tags you don't select pass through unchanged; `NULL` as the value clears one:
+CASE makes the edit conditional, and it runs over every row - one expression fixes the whole file. Tags you don't select pass through unchanged; `NULL` as the value clears one. Rows are tracks inside the `WITH`, which is where a tag column can name one; the outer `array_agg` puts the tagged tracks in the file:
 
 ```pgsql
-SELECT t.track,
-       CASE WHEN t.language = 'fra' THEN 'fre' ELSE t.language END AS language
-FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+WITH retagged AS (
+  SELECT t.track AS track,
+         CASE WHEN t.language = 'fra' THEN 'fre' ELSE t.language END AS language
+  FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+)
+SELECT array_agg(retagged.track) FROM retagged
 ```
 
 ```
@@ -855,12 +860,15 @@ ffmpeg -i film.mkv -f ffmetadata -i \
 
 ## 41. Flag the default track
 
-`disposition` is a reserved tag key: its value is ffmpeg's disposition spec ('default', 'forced', 'default+forced'; '0' clears). Players open the default track first, so this decides what people hear:
+`disposition` is a reserved tag key: its value is ffmpeg's disposition spec ('default', 'forced', 'default+forced'; '0' clears). Players open the default track first, so this decides what people hear. Same two levels as recipe 38: flag the rows in the `WITH`, gather them outside it:
 
 ```pgsql
-SELECT t.track,
-       CASE WHEN t.language = 'eng' THEN 'default' ELSE '0' END AS disposition
-FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+WITH flagged AS (
+  SELECT t.track AS track,
+         CASE WHEN t.language = 'eng' THEN 'default' ELSE '0' END AS disposition
+  FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+)
+SELECT array_agg(flagged.track) FROM flagged
 ```
 
 ```
@@ -1065,8 +1073,9 @@ COPY (
     SELECT a.track AS track, 'Audio (' || a.language || ')' AS title
     FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) a
   )
-  SELECT g.video, tagged.track, 'Director Cut' AS title
+  SELECT g.video, array_agg(tagged.track), 'Director Cut' AS title
   FROM input('tests/fixtures/av2.mp4') g, tagged
+  GROUP BY g.video
 ) TO 'out.mkv'
 ```
 
@@ -1077,9 +1086,9 @@ ffmpeg -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -meta
   language=fra -metadata:s:2 'title=Audio (fra)' -metadata 'title=Director Cut' out.mkv
 ```
 
-## 54. The implicit aggregate, written out
+## 54. Gather rows into one file
 
-A multi-row query writing one file is sugar: the destination is the GROUP BY key, row streams are gathered with `array_agg`. You can always say it explicitly - both forms compile to the same bytes:
+A single destination takes exactly one row, so a multi-row query says how its rows combine: `array_agg` gathers streams in row order, `GROUP BY` names what stays constant. (Without them, a multi-row query into one path is a compile error naming both ways out.)
 
 ```pgsql
 COPY (

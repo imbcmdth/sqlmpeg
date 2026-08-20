@@ -22,6 +22,7 @@ class ErrorCode(str, Enum):
     STREAM_NOT_FOUND = "STREAM_NOT_FOUND"  # probed subscript out of range
     INPUT_NOT_FOUND = "INPUT_NOT_FOUND"  # */splat/broadcast with no readable input
     BROADCAST_MISMATCH = "BROADCAST_MISMATCH"  # zip length mismatch across arrays
+    ROW_COUNT_MISMATCH = "ROW_COUNT_MISMATCH"  # several rows, one destination path
     UNKNOWN_SINK_OPTION = "UNKNOWN_SINK_OPTION"  # name not in sink.SINK_OPTIONS
     SINK_OPTION_TYPE = "SINK_OPTION_TYPE"  # value vs declared str/int/bool
     UNKNOWN_FILTER_OPTION = "UNKNOWN_FILTER_OPTION"  # `name => value` the filter lacks

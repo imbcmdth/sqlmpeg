@@ -315,6 +315,25 @@ def test_compile_dash_o_still_works_on_a_bare_stream_select(
     assert "ffmpeg" in captured.out
 
 
+def test_compile_dash_o_reports_the_real_rejection_not_the_table_hint(
+    capsys: pytest.CaptureFixture[str], _two_track_probe: None
+) -> None:
+    """`-o` names a media destination, so the table fallback is off: a query
+    that could print as a table but was asked to WRITE reports why it cannot."""
+    code = cli.main(
+        [
+            "compile",
+            "SELECT t.track FROM input('film.mkv') f, unnest(f.audio) t",
+            "-o",
+            "out.mka",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "ROW_COUNT_MISMATCH" in captured.err
+    assert "2 rows" in captured.err
+
+
 def test_validate_accepts_a_table_query(
     capsys: pytest.CaptureFixture[str], _two_track_probe: None
 ) -> None:

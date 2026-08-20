@@ -397,6 +397,20 @@ _ARRAY_AGG_HINT = (
     "array_agg takes one track-row stream expression, e.g. array_agg(t.track) "
     "over FROM input('f.mkv') f, unnest(f.audio) t"
 )
+_ONE_FILE_PER_ROW_HINT = (
+    "gather the rows into that one file with array_agg(...), adding GROUP BY "
+    "the column they share when they share one; or give each row a file of its "
+    "own with a TO expression, e.g. TO (t.language || '.mka')"
+)
+_ONE_FILE_PER_GROUP_HINT = (
+    "one group is one file, so the destination has to name the group, e.g. "
+    "TO (t.language || '.mka'); group by a column every row agrees on to write "
+    "a single file instead"
+)
+_GROUPED_CTE_HINT = (
+    "a CTE with several rows varies inside the group: wrap the column in "
+    "array_agg(...), or add it to the GROUP BY to make it the group's key"
+)
 _CHAPTER_ROW_HINT = (
     "chapters(f) has no stream column at all — a chapter is not a track — "
     "so it can only be read as a metadata query, e.g. no COPY, or COPY ... "
@@ -1839,6 +1853,11 @@ class _Lowerer:
         # True when the pin partitioned by a GROUP BY key rather than by row,
         # so a collision message names groups.
         self.fanout_grouped = False
+        # The COPY whose query is lowering: the node its row-count rejection
+        # anchors on, and the path it names. Both None for a bare SELECT,
+        # whose destination is the `-o` the command line supplies.
+        self.sink_anchor: exp.Expr | None = None
+        self.sink_path: str | None = None
         # True for the whole duration of `run_table()`; `run()` never sets it.
         # Table mode changes exactly one thing about the stream machinery it
         # otherwise reuses verbatim: an outer join's NULL row is an empty cell
@@ -1959,6 +1978,8 @@ class _Lowerer:
             else None
         )
         self.fanout_seen = self.fanout_seen or self.fanout_expr is not None
+        self.sink_anchor = raw.path_expr if raw.path_expr is not None else raw.path_node
+        self.sink_path = raw.path
         columns = self._lower_query(list(raw.branches), raw.query, tags="sink")
         options: dict[str, object] = {}
         option_nodes: dict[str, exp.Expr] = {}
@@ -2337,6 +2358,7 @@ class _Lowerer:
         env = self._scope(select)
         env.grouped = is_grouped(select)
         env.group_keys = _partition_keys(select, env)
+        self._check_grouped_cte_columns(select, env)
         # One WHERE clause, three languages. A conjunct over track-row columns
         # is decided HERE and never reaches ffmpeg; a subscript metadata
         # conjunct is a compile-time ASSERTION (nothing to filter -- the SELECT
@@ -2409,26 +2431,123 @@ class _Lowerer:
                 hint="a tag rides on the file the query writes; select its "
                 "tracks too, e.g. SELECT t.track, ... AS title",
             )
+        if tags == "sink":
+            self._check_one_row_per_file(select, env)
         return columns
+
+    # -- one row, one file -------------------------------------------------
+
+    def _check_one_row_per_file(self, select: exp.Select, env: _Env) -> None:
+        """One row is one file, so a single destination needs a single row.
+
+        The count is the RESOLVED one -- the relation as the WHERE clause and
+        the joins left it, partitioned into groups where the branch groups --
+        so a row table a predicate narrows to one track writes its one file,
+        and rows are combined only where the query says to combine them:
+        ``array_agg`` (with ``GROUP BY`` when they share a key), or a fan-out
+        ``TO (<expression>)`` that gives each row a destination of its own.
+
+        A fan-out has already been pinned to the one group this command
+        writes, so it never reaches the count.
+        """
+        if self.fanout_expr is not None:
+            return
+        if env.grouped:
+            count = len(self._grouped_partitions(env, select))
+            what = "group" if count == 1 else "groups"
+            hint = _ONE_FILE_PER_GROUP_HINT
+        else:
+            count = len(env.relation.tuples) if env.relation is not None else 1
+            what = "row" if count == 1 else "rows"
+            hint = _ONE_FILE_PER_ROW_HINT
+        if count <= 1:
+            return
+        destination = (
+            f"'{self.sink_path}' is one file" if self.sink_path else "it writes one file"
+        )
+        raise _error(
+            ErrorCode.ROW_COUNT_MISMATCH,
+            f"this query has {count} {what}, and {destination}",
+            self.sink_anchor,
+            fallback=select,
+            hint=hint,
+        )
+
+    def _check_grouped_cte_columns(self, select: exp.Select, env: _Env) -> None:
+        """Postgres's grouping rule for the columns only lowering can judge.
+
+        Resolve enforces the rule wherever the SQL text settles it -- a track
+        row's columns vary within a group, an input alias's do not. A CTE
+        column is neither until its body has been lowered: it varies exactly
+        when the body produced more than one row and the column carries one
+        stream per row. So the same rejection is raised here, with the same
+        wording, for the shape resolve could not see.
+        """
+        if not env.grouped:
+            return
+        key_texts = {key.sql() for key in group_keys(select)}
+        for projection in select.expressions:
+            if isinstance(projection, exp.Expr) and star_qualifier(projection) is None:
+                self._check_grouped_cte_expr(
+                    _projection_expr(projection), env, select, key_texts
+                )
+
+    def _check_grouped_cte_expr(
+        self, node: exp.Expr, env: _Env, select: exp.Select, key_texts: set[str]
+    ) -> None:
+        """One expression of a grouped branch, recursively."""
+        if node.sql() in key_texts or isinstance(node, exp.ArrayAgg):
+            return
+        if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star):
+            table_node = node.args.get("table")
+            binding = (
+                env.bindings.get(_fold(table_node)) if table_node is not None else None
+            )
+            name = _fold(node.this)
+            if isinstance(binding, _CteBinding) and self._varies_per_row(binding, name):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{binding.name}.{name}' is neither aggregated nor a GROUP "
+                    "BY key",
+                    node,
+                    fallback=select,
+                    hint=_GROUPED_CTE_HINT,
+                )
+            return
+        for value in node.args.values():
+            items = value if isinstance(value, list) else [value]
+            for item in items:
+                if isinstance(item, exp.Expr):
+                    self._check_grouped_cte_expr(item, env, select, key_texts)
+
+    def _varies_per_row(self, binding: _CteBinding, name: str) -> bool:
+        """True when a CTE column carries a stream per body row, and there is
+        more than one of them -- the shape that differs tuple by tuple."""
+        if binding.rows <= 1:
+            return False
+        column = self._cte_column(binding, name)
+        return column is not None and column.splat and column.value.is_array
 
     def _branch_value(
         self, projection: exp.Expr, env: _Env, select: exp.Select
     ) -> _Value:
         """One SELECT column's streams, group by group where that matters.
 
-        A branch whose GROUP BY partitions the relation gathers each group in
-        turn: an aggregate sees its whole group, every other column the
-        group's first tuple -- which is what makes ``SELECT vid.track,
-        array_agg(aud.track) ... GROUP BY vid.track`` map the video once and
-        every audio of its group after it. The same split holds under a
-        fan-out ``TO``, where the pin already cut the relation to one group.
-        Without a partitioning key the column lowers over the relation as it
-        stands, which is every ungrouped query.
+        A grouped branch gathers each group in turn: an aggregate sees its
+        whole group, every other column the group's first tuple -- which is
+        what makes ``SELECT vid.track, array_agg(aud.track) ... GROUP BY
+        vid.track`` map the video once and every audio of its group after it.
+        With no partitioning key there is a single group, and the same split
+        holds inside it: a group-constant column is mapped ONCE however many
+        tuples the relation carries (:meth:`_lower_grouped_table_branch` reads
+        it the same way, which is what keeps a table preview and its COPY
+        agreeing). Under a fan-out ``TO`` the pin already cut the relation to
+        one group. An ungrouped branch lowers over the relation as it stands.
         """
-        if not env.group_keys:
+        if not env.grouped:
             return self._lower_expr(projection, env, select)
         relation = env.relation
-        if relation is None:  # defensive: a partitioning key implies a relation
+        if relation is None:  # a query with no rows has nothing to partition
             return self._lower_expr(projection, env, select)
         groups = self._grouped_partitions(env, select)
         if not groups:
@@ -2453,32 +2572,39 @@ class _Lowerer:
         """True when this stream column's array value (if it turns out to be
         one) is a row set rather than a single broadcast unit.
 
-        Mirrors :meth:`_table_projection`'s own dispatch, computed here (at
-        the projection's OWN scope, CTE body or bare SELECT) because that is
-        the only place its AST shape is still visible -- an outer table query
-        sees just ``<cte>.<name>`` and has to trust what got recorded.
-        Broadcast shapes: an ``array_agg`` and a bare input/source array
-        column (``f.audio``); everything else -- a row alias's own stream
-        column, or any call over one -- is a row set, and a CTE column that
-        reads ANOTHER CTE's column inherits that column's own answer.
+        Computed here (at the projection's OWN scope, CTE body or bare SELECT)
+        because that is the only place its AST shape is still visible -- an
+        outer table query sees just ``<cte>.<name>`` and has to trust what got
+        recorded.
+
+        A column is a row set exactly when it READS one: a row alias's stream
+        column, a call over one, or another CTE's row-set column (which it
+        inherits). A bare input/source array (``f.audio``) and anything
+        broadcast over one is a single row carrying an array VALUE, and an
+        ``array_agg`` is one unit by definition.
         """
         expr = _unwrap(projection)
         if isinstance(expr, exp.ArrayAgg):
             return False
-        if isinstance(expr, exp.Column):
-            table_node = expr.args.get("table")
-            if table_node is not None:
-                binding = env.bindings.get(_fold(table_node))
-                if (
-                    isinstance(binding, _InputBinding | _SourceBinding)
-                    and _fold(expr.this) in _ARRAY_COLUMNS
-                ):
-                    return False
-                if isinstance(binding, _CteBinding):
-                    column = self._cte_column(binding, _fold(expr.this))
-                    if column is not None:
-                        return column.splat
-        return True
+        return self._reads_row_set(expr, env)
+
+    def _reads_row_set(self, node: exp.Expr, env: _Env) -> bool:
+        """True when `node` reads a row alias's column, or a CTE column that
+        is itself a row set."""
+        for sub in node.walk():
+            if not isinstance(sub, exp.Column):
+                continue
+            table_node = sub.args.get("table")
+            if table_node is None:
+                continue
+            binding = env.bindings.get(_fold(table_node))
+            if isinstance(binding, _RowBinding):
+                return True
+            if isinstance(binding, _CteBinding):
+                column = self._cte_column(binding, _fold(sub.this))
+                if column is not None and column.splat and column.value.is_array:
+                    return True
+        return False
 
     # -- metadata tag columns ---------------------------------------------
 
@@ -6378,6 +6504,7 @@ class _Lowerer:
         env = self._scope(select)
         env.grouped = is_grouped(select)
         env.group_keys = _partition_keys(select, env)
+        self._check_grouped_cte_columns(select, env)
         time_conjuncts, row_conjuncts, assertion_conjuncts = self._split_where(select, env)
         self._collect_trims(select, env, time_conjuncts)
         self._filter_rows(row_conjuncts, env, select)

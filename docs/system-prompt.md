@@ -170,9 +170,10 @@ statement is not. `--` and `/* */` comments are allowed.
   outer value wins on a shared key). Same grammar in a filter option
   over a row table, evaluated per row: `SELECT scale(t.track, t.width / 2,
   -2)`.
-- The implicit aggregation has an explicit spelling: `array_agg(<per-row
-  stream expression>)` as a whole SELECT column gathers the rows' streams in
-  row order, and `GROUP BY` names the keys (Postgres's rule enforced: outside
+- Several rows and one destination is a rejection, never a silent gather.
+  `array_agg(<per-row stream expression>)` as a whole SELECT column gathers
+  the rows' streams, in row order, into the one file the query writes, and
+  `GROUP BY` names the keys (Postgres's rule enforced: outside
   an aggregate, a row-referencing expression must match a key). `GROUP BY` an
   input-level key is the one-file shape; `GROUP BY` a row column partitions
   rows into one output file per group -- it requires a fan-out `TO
@@ -1212,10 +1213,10 @@ Keep absolutely everything in film.mkv untouched -- every video, audio, subtitle
 SELECT * FROM input('film.mkv') a
 ```
 
-Pull the English audio track out of film.mkv, whatever subscript it happens to sit at.
+Pull every English audio track out of film.mkv, whatever subscript each one happens to sit at.
 
 ```sql-probed
-SELECT t.track
+SELECT array_agg(t.track)
 FROM input('film.mkv') f, unnest(f.audio) t
 WHERE t.language = 'eng'
 ```
@@ -1223,7 +1224,9 @@ WHERE t.language = 'eng'
 Mix film.mkv's audio with commentary.mkv's, matched by language; where commentary.mkv has no matching language, fill with 2 seconds of silence instead.
 
 ```sql-probed
-SELECT amix(a.track, COALESCE(b.track, ffmpeg.anullsrc(duration => 2)))
+SELECT array_agg(
+         amix(a.track, COALESCE(b.track, ffmpeg.anullsrc(duration => 2)))
+       )
 FROM input('film.mkv') f, input('commentary.mkv') g,
      unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b
        ON a.language = b.language
@@ -1259,6 +1262,7 @@ not in the dialect.
 - `STREAM_NOT_FOUND` -- The subscript is out of range for the actual stream count named in `message` (from the probed file, or a CTE array column's recorded length). Subscripts are 1-based -- lower the number into range, or select a different alias/column/element.
 - `INPUT_NOT_FOUND` -- A bare array (`<alias>.video` / `<alias>.audio` with no subscript, splatted or handed to a function) needs to read the file to know how many streams it has, and this input cannot be read (missing path or a URL). Subscript one specific stream instead -- `hint` names one -- or point at a path you know is readable.
 - `BROADCAST_MISMATCH` -- Two array arguments to the same call have different lengths (both named in `message`) and cannot zip elementwise. Subscript one of them down to a single stream, e.g. `<alias>.audio[1]`, so it broadcasts as a scalar instead, or make both arrays the same length.
+- `ROW_COUNT_MISMATCH` -- The query's relation has more rows (or more groups) than the one file it writes, and rows are never combined silently. Two fixes, and `message` says which count is involved: wrap the row column in `array_agg(...)` so the rows land in that one file as consecutive streams -- add `GROUP BY <the column they share>` when another column has to stay unaggregated -- or write one file per row by replacing the quoted `TO 'path'` with `TO (<expression over the row's columns>)`, e.g. `TO (t.language || '.mka')`. Narrowing the `WHERE` until one row survives also works when a single track is what you meant.
 - `UNKNOWN_SINK_OPTION` -- The name inside `COPY ... WITH (...)` is not a known sink option. Take the did-you-mean from `hint` if there is one, otherwise pick from the exact set of option names sqlmpeg supports; do not invent an ffmpeg flag name or option that isn't in that set.
 - `SINK_OPTION_TYPE` -- The value given for that `COPY ... WITH (...)` option does not match its expected type, named in `message`. A `str` option needs a single-quoted literal (e.g. `video_codec 'libx264'`), an `int` option needs a bare integer literal with no quotes and no decimal point (e.g. `crf 20`), and a `bool` option needs exactly `true` or `false` with no quotes.
 - `UNKNOWN_FILTER_OPTION` -- A `<name> => <value>` argument names an option the ffmpeg filter does not have. Take the did-you-mean from `hint` if there is one; otherwise pick from the option names `hint` lists -- they were read out of the installed ffmpeg, so they are the complete set for that filter. Never invent an option name, and never move the value to a positional argument: a dynamic filter takes only its stream inputs positionally.

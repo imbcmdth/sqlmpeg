@@ -236,9 +236,10 @@ _DIALECT_TAIL = """\
   outer value wins on a shared key). Same grammar in a filter option
   over a row table, evaluated per row: `SELECT scale(t.track, t.width / 2,
   -2)`.
-- The implicit aggregation has an explicit spelling: `array_agg(<per-row
-  stream expression>)` as a whole SELECT column gathers the rows' streams in
-  row order, and `GROUP BY` names the keys (Postgres's rule enforced: outside
+- Several rows and one destination is a rejection, never a silent gather.
+  `array_agg(<per-row stream expression>)` as a whole SELECT column gathers
+  the rows' streams, in row order, into the one file the query writes, and
+  `GROUP BY` names the keys (Postgres's rule enforced: outside
   an aggregate, a row-referencing expression must match a key). `GROUP BY` an
   input-level key is the one-file shape; `GROUP BY` a row column partitions
   rows into one output file per group -- it requires a fan-out `TO
@@ -839,16 +840,18 @@ _PROBED_EXAMPLES: tuple[tuple[str, str], ...] = (
         "SELECT * FROM input('film.mkv') a",
     ),
     (
-        "Pull the English audio track out of film.mkv, whatever subscript "
-        "it happens to sit at.",
-        "SELECT t.track\nFROM input('film.mkv') f, unnest(f.audio) t\n"
+        "Pull every English audio track out of film.mkv, whatever subscript "
+        "each one happens to sit at.",
+        "SELECT array_agg(t.track)\nFROM input('film.mkv') f, unnest(f.audio) t\n"
         "WHERE t.language = 'eng'",
     ),
     (
         "Mix film.mkv's audio with commentary.mkv's, matched by language; "
         "where commentary.mkv has no matching language, fill with 2 "
         "seconds of silence instead.",
-        "SELECT amix(a.track, COALESCE(b.track, ffmpeg.anullsrc(duration => 2)))\n"
+        "SELECT array_agg(\n"
+        "         amix(a.track, COALESCE(b.track, ffmpeg.anullsrc(duration => 2)))\n"
+        "       )\n"
         "FROM input('film.mkv') f, input('commentary.mkv') g,\n"
         "     unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b\n"
         "       ON a.language = b.language",
@@ -990,6 +993,17 @@ _REPAIR: dict[ErrorCode, str] = {
         "named in `message`) and cannot zip elementwise. Subscript one of "
         "them down to a single stream, e.g. `<alias>.audio[1]`, so it "
         "broadcasts as a scalar instead, or make both arrays the same length."
+    ),
+    ErrorCode.ROW_COUNT_MISMATCH: (
+        "The query's relation has more rows (or more groups) than the one file "
+        "it writes, and rows are never combined silently. Two fixes, and "
+        "`message` says which count is involved: wrap the row column in "
+        "`array_agg(...)` so the rows land in that one file as consecutive "
+        "streams -- add `GROUP BY <the column they share>` when another column "
+        "has to stay unaggregated -- or write one file per row by replacing the "
+        "quoted `TO 'path'` with `TO (<expression over the row's columns>)`, "
+        "e.g. `TO (t.language || '.mka')`. Narrowing the `WHERE` until one row "
+        "survives also works when a single track is what you meant."
     ),
     ErrorCode.UNSUPPORTED_SQL: (
         "The construct is outside the dialect. Read `hint` -- it names the "

@@ -5867,8 +5867,15 @@ def _row_probes(*streams: StreamMeta) -> dict[str, ProbeResult | None]:
 
 
 def _row_query(where: str = "", order: str = "", column: str = "audio") -> str:
+    """The canonical row query: every surviving row gathered into one file.
+
+    ``array_agg`` is what a several-row query writing one destination has to
+    say, so it is part of the shape under test here rather than an extra --
+    the aggregate gathers whatever rows the WHERE and the ORDER BY left, in
+    their order, which is exactly what these tests are about.
+    """
     return (
-        f"SELECT t.track FROM input('f.mkv') f, unnest(f.{column}) t"
+        f"SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.{column}) t"
         + (f" WHERE {where}" if where else "")
         + (f" ORDER BY {order}" if order else "")
     )
@@ -6112,7 +6119,8 @@ def test_a_star_cannot_expand_a_row_table() -> None:
 
 def test_the_track_column_is_an_array_and_subscripts_like_one() -> None:
     g = _lower(
-        "SELECT t.track[2] FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
+        "SELECT array_agg(t.track[2]) FROM input('f.mkv') f, unnest(f.audio) t",
+        _row_probes(),
     )
     assert _outputs(g) == [("src:f:a:1", "audio", None)]
     err = _reject_lower(
@@ -6124,8 +6132,8 @@ def test_the_track_column_is_an_array_and_subscripts_like_one() -> None:
 
 def test_the_track_array_broadcasts_a_call_like_any_other_array() -> None:
     g = _lower(
-        "SELECT volume(t.track, 0.5) FROM input('f.mkv') f, unnest(f.audio) t "
-        "WHERE t.channels = 2",
+        "SELECT array_agg(volume(t.track, 0.5)) FROM input('f.mkv') f, "
+        "unnest(f.audio) t WHERE t.channels = 2",
         _row_probes(),
     )
     assert _filters(g) == ["volume", "volume"]
@@ -6555,6 +6563,9 @@ def _pair_probes(
     }
 
 
+_GATHERED = "array_agg(a.track), array_agg(b.track)"
+
+
 def _join_query(
     projection: str = "a.track, b.track",
     join: str = "JOIN",
@@ -6588,9 +6599,9 @@ def test_result_row_order_is_the_left_sides_track_order() -> None:
             _track("audio", 1, language="eng", duration=2.0),
         ]
     )
-    g = _lower(_join_query(), probes)
+    g = _lower(_join_query(_GATHERED), probes)
     # `g` stores fra first, but the rows follow `f`: eng, then fra. (Outputs are
-    # column-major -- `a.track`'s array, then `b.track`'s -- so the PAIRING is
+    # column-major -- `a.track`'s gather, then `b.track`'s -- so the PAIRING is
     # element k of one against element k of the other.)
     assert _refs(g) == ["src:f:a:0", "src:f:a:1", "src:g:a:1", "src:g:a:0"]
 
@@ -6604,7 +6615,7 @@ def test_join_multiplicity_is_real_join_semantics() -> None:
             _track("audio", 1, language="eng", channel_layout="5.1", duration=2.0),
         ]
     )
-    g = _lower(_join_query(), probes)
+    g = _lower(_join_query(_GATHERED), probes)
     assert _refs(g) == ["src:f:a:0", "src:f:a:0", "src:g:a:0", "src:g:a:1"]
     # ...and the fix, when that is not what was wanted, is a wider key -- which
     # here matches nothing at all (`f`'s tracks carry no layout), and an empty
@@ -6629,7 +6640,9 @@ def test_a_null_key_matches_nothing() -> None:
 
 
 def test_a_left_join_keeps_unmatched_left_rows() -> None:
-    g = _lower(_join_query(projection="a.track", join="LEFT JOIN"), _pair_probes())
+    g = _lower(
+        _join_query(projection="array_agg(a.track)", join="LEFT JOIN"), _pair_probes()
+    )
     assert _refs(g) == ["src:f:a:0", "src:f:a:1"]
 
 
@@ -6674,7 +6687,7 @@ def test_a_full_join_appends_unmatched_right_rows_in_their_own_order() -> None:
     # row (silence on the right), then the unmatched RIGHT row appended last.
     filled = _lower(
         _join_query(
-            projection="COALESCE(b.track, ffmpeg.anullsrc(duration => 1))",
+            projection="array_agg(COALESCE(b.track, ffmpeg.anullsrc(duration => 1)))",
             join="FULL OUTER JOIN",
         ),
         probes,
@@ -6685,15 +6698,19 @@ def test_a_full_join_appends_unmatched_right_rows_in_their_own_order() -> None:
 
 def test_full_join_with_and_without_the_outer_keyword_are_one_join() -> None:
     probes = _pair_probes()
-    with_kind = _lower(_join_query(projection="a.track", join="FULL OUTER JOIN"), probes)
-    without = _lower(_join_query(projection="a.track", join="FULL JOIN"), probes)
+    with_kind = _lower(
+        _join_query(projection="array_agg(a.track)", join="FULL OUTER JOIN"), probes
+    )
+    without = _lower(
+        _join_query(projection="array_agg(a.track)", join="FULL JOIN"), probes
+    )
     assert _refs(with_kind) == _refs(without) == ["src:f:a:0", "src:f:a:1"]
 
 
 def test_a_comma_between_two_unnests_is_the_cross_join() -> None:
     g = _lower(
-        "SELECT a.track, b.track FROM input('f.mkv') f, input('g.mkv') g, "
-        "unnest(f.audio) a, unnest(g.audio) b",
+        "SELECT array_agg(a.track), array_agg(b.track) FROM input('f.mkv') f, "
+        "input('g.mkv') g, unnest(f.audio) a, unnest(g.audio) b",
         _pair_probes(
             right=[
                 _track("audio", 0, language="eng", duration=2.0),
@@ -6721,7 +6738,7 @@ def test_where_filters_the_joined_rows_not_the_tables() -> None:
 
 
 def test_order_by_re_sorts_the_joined_rows_and_keeps_the_pairing() -> None:
-    g = _lower(_join_query(order="a.language DESC"), _pair_probes(
+    g = _lower(_join_query(_GATHERED, order="a.language DESC"), _pair_probes(
         right=[
             _track("audio", 0, language="eng", duration=2.0),
             _track("audio", 1, language="fra", duration=2.0),
@@ -6735,7 +6752,7 @@ def test_order_by_re_sorts_the_joined_rows_and_keeps_the_pairing() -> None:
 
 def _fill_query(fill: str, projection: str = "COALESCE(b.track, {fill})") -> str:
     return _join_query(
-        projection=projection.format(fill=fill), join="FULL OUTER JOIN"
+        projection=f"array_agg({projection.format(fill=fill)})", join="FULL OUTER JOIN"
     )
 
 
@@ -6771,7 +6788,7 @@ def test_a_fill_with_no_duration_to_inherit_is_a_typed_rejection() -> None:
 def test_a_fill_takes_the_paired_rows_tags_as_its_provenance() -> None:
     g = _lower(
         _join_query(
-            projection="amix(a.track, COALESCE(b.track, ffmpeg.anullsrc()))",
+            projection="array_agg(amix(a.track, COALESCE(b.track, ffmpeg.anullsrc())))",
             join="FULL OUTER JOIN",
         ),
         _pair_probes(),
@@ -6813,7 +6830,7 @@ def test_a_video_fill_inherits_size_rate_and_duration() -> None:
     }
     g = _lower(
         _join_query(
-            projection="COALESCE(b.track, ffmpeg.color())",
+            projection="array_agg(COALESCE(b.track, ffmpeg.color()))",
             join="FULL OUTER JOIN",
             column="video",
         ),
@@ -6842,7 +6859,7 @@ def test_a_caption_gap_fills_with_an_empty_captions_input() -> None:
     }
     g = _lower(
         _join_query(
-            projection="COALESCE(b.track, sqlmpeg.empty_captions())",
+            projection="array_agg(COALESCE(b.track, sqlmpeg.empty_captions()))",
             join="FULL OUTER JOIN",
             column="subtitle",
         ),
@@ -6874,7 +6891,7 @@ def test_the_empty_captions_input_renders_its_format_flag_before_the_i() -> None
     }
     g = _lower(
         _join_query(
-            projection="COALESCE(b.track, sqlmpeg.empty_captions())",
+            projection="array_agg(COALESCE(b.track, sqlmpeg.empty_captions()))",
             join="FULL OUTER JOIN",
             column="subtitle",
         ),
@@ -6926,7 +6943,7 @@ def test_a_joined_track_query_runs_end_to_end(tmp_path: Path) -> None:
     """
     out = tmp_path / "mixed.mka"
     query = (
-        "SELECT amix(a.track, b.track) FROM "
+        "SELECT array_agg(amix(a.track, b.track)) FROM "
         f"input('{(FIXTURES_DIR / 'av2.mp4').as_posix()}') f, "
         f"input('{(FIXTURES_DIR / 'av3.mp4').as_posix()}') g, "
         "unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language"
@@ -6965,8 +6982,18 @@ def test_an_empty_captions_fill_muxes_a_real_track(tmp_path: Path) -> None:
 
 
 def _tag_query(tag: str, projection: str = "t.track", column: str = "audio") -> str:
+    """Tag every row, then gather the rows into one file.
+
+    Two scopes, and the tags need the inner one: rows are tracks inside the
+    CTE body, so the tag column is per stream there, while the outer SELECT
+    aggregates the body's streams into the single file this writes. The tags
+    ride the streams across the boundary, which is what these tests check.
+    """
     return (
-        f"SELECT {projection}, {tag} FROM input('f.mkv') f, unnest(f.{column}) t"
+        "WITH tagged AS ("
+        f"SELECT {projection} AS track, {tag} "
+        f"FROM input('f.mkv') f, unnest(f.{column}) t"
+        ") SELECT array_agg(tagged.track) FROM tagged"
     )
 
 
@@ -6986,7 +7013,7 @@ def test_a_tag_column_adds_a_key_provenance_never_had() -> None:
 
 def test_a_null_tag_clears_the_key_and_leaves_the_rest() -> None:
     g = _lower(
-        _tag_query("NULL AS language", projection="t.track, 'Main' AS title"),
+        _tag_query("NULL AS language, 'Main' AS title"),
         _row_probes(),
     )
     assert [o.metadata for o in g.outputs] == [{"title": "Main"}] * 3
@@ -7109,7 +7136,14 @@ def test_a_joined_row_tags_one_sides_track_from_the_others_column() -> None:
             _track("audio", 1, language="fra", title="French"),
         ],
     )
-    g = _lower(_join_query(projection="a.track, b.title AS title"), probes)
+    g = _lower(
+        "WITH titled AS ("
+        "  SELECT a.track AS track, b.title AS title"
+        "  FROM input('f.mkv') f, input('g.mkv') g,"
+        "       unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language"
+        ") SELECT array_agg(titled.track) FROM titled",
+        probes,
+    )
     assert _refs(g) == ["src:f:a:0", "src:f:a:1"]
     assert [o.metadata for o in g.outputs] == [
         {"language": "eng", "title": "English"},
@@ -7572,7 +7606,7 @@ def _shared_probes() -> dict[str, ProbeResult | None]:
 
 def test_a_tag_column_in_a_cte_body_tags_that_rows_streams() -> None:
     """The bare column splats, each stream carrying the tag its row computed."""
-    g = _lower(_TAGGED_CTE + "SELECT tagged.track FROM tagged", _row_probes())
+    g = _lower(_TAGGED_CTE + "SELECT array_agg(tagged.track) FROM tagged", _row_probes())
     assert [o.metadata for o in g.outputs] == [
         {"language": "eng", "title": "Audio (eng)"},
         {"language": "fra", "title": "Audio (fra)"},
@@ -7582,7 +7616,9 @@ def test_a_tag_column_in_a_cte_body_tags_that_rows_streams() -> None:
 
 
 def test_a_cte_tag_survives_a_subscript_of_the_column() -> None:
-    g = _lower(_TAGGED_CTE + "SELECT tagged.track[2] FROM tagged", _row_probes())
+    g = _lower(
+        _TAGGED_CTE + "SELECT array_agg(tagged.track[2]) FROM tagged", _row_probes()
+    )
     assert [o.metadata for o in g.outputs] == [
         {"language": "fra", "title": "Audio (fra)"}
     ]
@@ -7590,7 +7626,8 @@ def test_a_cte_tag_survives_a_subscript_of_the_column() -> None:
 
 def test_a_cte_tag_survives_a_filter_in_the_outer_query() -> None:
     g = _lower(
-        _TAGGED_CTE + "SELECT volume(tagged.track[1], 0.5) FROM tagged", _row_probes()
+        _TAGGED_CTE + "SELECT array_agg(volume(tagged.track[1], 0.5)) FROM tagged",
+        _row_probes(),
     )
     assert [o.metadata for o in g.outputs] == [
         {"language": "eng", "title": "Audio (eng)"}
@@ -7602,7 +7639,7 @@ def test_a_null_cte_tag_clears_the_key_as_it_does_in_a_sink() -> None:
         "WITH tagged AS ("
         "  SELECT t.track AS track, NULL AS language"
         "  FROM input('f.mkv') f, unnest(f.audio) t"
-        ") SELECT tagged.track FROM tagged",
+        ") SELECT array_agg(tagged.track) FROM tagged",
         _row_probes(),
     )
     assert [o.metadata for o in g.outputs] == [{}, {}, {}]
@@ -7612,15 +7649,18 @@ def test_the_sinks_own_tag_wins_over_the_ctes_on_the_same_key() -> None:
     """Inner then outer is LAYERING, not the disagreement `_record_tag` rejects
     -- that check stays inside one query.
 
-    Three CTE rows crossed with three track rows is a nine-row relation, and
-    the outer tag wins on every one of them.
+    Both sides narrow to one row, which is what keeps the outer tag a
+    PER-STREAM one: an aggregate would tag the container instead.
     """
     g = _lower(
-        _TAGGED_CTE + "SELECT tagged.track, 'Outer' AS title "
-        "FROM tagged, input('f.mkv') g, unnest(g.audio) u",
+        "WITH tagged AS ("
+        "  SELECT t.track AS track, 'Audio (' || t.language || ')' AS title"
+        "  FROM input('f.mkv') f, unnest(f.audio) t WHERE t.index = 1"
+        ") SELECT tagged.track, 'Outer' AS title "
+        "FROM tagged, input('f.mkv') g, unnest(g.audio) u WHERE u.index = 1",
         _shared_probes(),
     )
-    assert [o.metadata.get("title") for o in g.outputs] == ["Outer"] * 9
+    assert [o.metadata.get("title") for o in g.outputs] == ["Outer"]
 
 
 def test_two_sinks_over_one_tagged_view_each_carry_its_tags() -> None:
@@ -7628,8 +7668,8 @@ def test_two_sinks_over_one_tagged_view_each_carry_its_tags() -> None:
         "CREATE VIEW tagged AS"
         "  SELECT t.track AS track, 'Inner' AS title"
         "  FROM input('f.mkv') f, unnest(f.audio) t;"
-        "COPY (SELECT tagged.track FROM tagged) TO 'a.mka';"
-        "COPY (SELECT tagged.track FROM tagged) TO 'b.mka';",
+        "COPY (SELECT array_agg(tagged.track) FROM tagged) TO 'a.mka';"
+        "COPY (SELECT array_agg(tagged.track) FROM tagged) TO 'b.mka';",
         _row_probes(),
     )
     assert [unit.path for unit in g.sinks] == ["a.mka", "b.mka"]
@@ -7672,8 +7712,8 @@ def test_the_two_level_query_tags_the_streams_and_the_container() -> None:
     """Recipe 53's shape: per-stream titles from the WITH, the file's title
     from the outer SELECT, one query."""
     g = _lower(
-        _TAGGED_CTE + "SELECT g.video, tagged.track, 'Director Cut' AS title "
-        "FROM input('f.mkv') g, tagged",
+        _TAGGED_CTE + "SELECT g.video, array_agg(tagged.track), "
+        "'Director Cut' AS title FROM input('f.mkv') g, tagged GROUP BY g.video",
         _shared_probes(),
     )
     assert g.sinks[0].tags == {"title": "Director Cut"}
@@ -7719,12 +7759,13 @@ def test_a_table_query_over_a_tagged_cte_prints_the_same_rows() -> None:
 # a CTE-only FROM has to come from the CTE's own splat array column instead.
 
 
-def _cte_report_query(where: str = "t.language = 'eng'") -> str:
+def _cte_report_query(where: str = "t.language = 'eng'", *, gather: bool = False) -> str:
+    column = "array_agg(aud.track)" if gather else "aud.track"
     return (
         "WITH aud AS ("
         "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
         + (f" WHERE {where}" if where else "")
-        + ") SELECT aud.track FROM aud"
+        + f") SELECT {column} FROM aud"
     )
 
 
@@ -7749,8 +7790,10 @@ def test_csv_cte_array_column_prints_one_row_per_element() -> None:
 
 
 def test_a_media_copy_of_the_report_query_still_maps_both_streams() -> None:
-    """The media path this bug never touched, kept as a regression fence."""
-    g = _lower(_cte_report_query(), {"f": ProbeResult(streams=_LANG_TRACKS)})
+    """The media path this bug never touched, kept as a regression test."""
+    g = _lower(
+        _cte_report_query(gather=True), {"f": ProbeResult(streams=_LANG_TRACKS)}
+    )
     assert [o.ref for o in g.outputs] == ["src:f:a:0", "src:f:a:1"]
 
 
@@ -7933,7 +7976,8 @@ def test_a_cte_beside_an_unnest_relation_maps_the_cross_join() -> None:
     g = _lower(
         "WITH aud AS ("
         "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
-        ") SELECT aud.track, v.track FROM aud, input('g.mkv') g, unnest(g.video) v",
+        ") SELECT array_agg(aud.track), array_agg(v.track) "
+        "FROM aud, input('g.mkv') g, unnest(g.video) v",
         {
             "f": ProbeResult(streams=_LANG_TRACKS),
             "g": ProbeResult(streams=[_track("video", 0), _track("video", 1)]),
@@ -7963,18 +8007,15 @@ def _vid_aud_probes(videos: int = 1) -> dict[str, ProbeResult | None]:
     return {"f": result, "f2": result}
 
 
-def test_an_ungrouped_cross_join_maps_the_repeated_stream() -> None:
-    """One video crossed with two audio rows is a two-row relation, and the
-    ungrouped COPY maps exactly that -- the video TWICE."""
-    g = _lower(
+def test_an_ungrouped_cross_join_is_rejected_against_one_file() -> None:
+    """One video crossed with two audio rows is a two-row relation, and two
+    rows do not fit in one file: the duplication is named, not written."""
+    err = _reject_lower(
         _VID_AUD_CTES + "SELECT vid.track, aud.track FROM vid, aud", _vid_aud_probes()
     )
-    assert [o.ref for o in g.outputs] == [
-        "src:f:v:0",
-        "src:f:v:0",
-        "src:f2:a:0",
-        "src:f2:a:1",
-    ]
+    assert err.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert "this query has 2 rows" in err.message
+    assert "array_agg" in (err.hint or "")
 
 
 def test_a_grouped_cross_join_maps_the_key_once() -> None:
@@ -7992,21 +8033,17 @@ def test_a_grouped_cross_join_maps_the_key_once() -> None:
     ]
 
 
-def test_a_grouped_cross_join_maps_every_group() -> None:
-    """Two videos, two groups: each key's stream followed by its own gather."""
-    g = _lower(
+def test_a_grouped_cross_join_of_two_groups_needs_a_file_each() -> None:
+    """Two videos are two groups, and a group is a file: the same rule the row
+    count follows, counted over groups once the branch aggregates."""
+    err = _reject_lower(
         _VID_AUD_CTES
         + "SELECT vid.track, array_agg(aud.track) FROM vid, aud GROUP BY vid.track",
         _vid_aud_probes(videos=2),
     )
-    assert [o.ref for o in g.outputs] == [
-        "src:f:v:0",
-        "src:f:v:1",
-        "src:f2:a:0",
-        "src:f2:a:1",
-        "src:f2:a:0",
-        "src:f2:a:1",
-    ]
+    assert err.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert "this query has 2 groups" in err.message
+    assert "TO (" in (err.hint or "")
 
 
 def test_a_single_cte_source_still_gathers_its_rows_in_order() -> None:
@@ -8015,7 +8052,7 @@ def test_a_single_cte_source_still_gathers_its_rows_in_order() -> None:
     g = _lower(
         "WITH aud AS ("
         "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
-        ") SELECT aud.track FROM aud",
+        ") SELECT array_agg(aud.track) FROM aud",
         {"f": ProbeResult(streams=_LANG_TRACKS)},
     )
     assert [o.ref for o in g.outputs] == ["src:f:a:0", "src:f:a:1", "src:f:a:2"]
@@ -8147,7 +8184,7 @@ def test_a_computed_filter_argument_is_evaluated_per_row() -> None:
         )
     }
     g = _lower(
-        "SELECT scale(t.track, t.width / 2, -2) "
+        "SELECT array_agg(scale(t.track, t.width / 2, -2)) "
         "FROM input('f.mkv') f, unnest(f.video) t",
         probes,
     )
@@ -8164,7 +8201,7 @@ def test_a_computed_named_argument_is_evaluated_per_row() -> None:
         )
     }
     g = _lower(
-        "SELECT scale(t.track, width => t.width / 4, height => -2) "
+        "SELECT array_agg(scale(t.track, width => t.width / 4, height => -2)) "
         "FROM input('f.mkv') f, unnest(f.video) t",
         probes,
     )
@@ -8182,10 +8219,11 @@ def test_a_computed_argument_still_meets_the_option_table() -> None:
 
 
 # ---------------------------------------------------------------------------
-# array_agg + GROUP BY: the implicit aggregation, spelled out
+# array_agg + GROUP BY: how several rows reach one file
 #
-# The contract is byte-identity, not resemblance: the explicit form reuses the
-# splat machinery, so the sugar and the spelling emit the same argv.
+# Rows are gathered only where the query says to gather them, so each shape is
+# pinned twice over: the ungrouped spelling is rejected, and the aggregate one
+# compiles to the exact command below it.
 # ---------------------------------------------------------------------------
 
 
@@ -8197,43 +8235,94 @@ def _agg_copy(select: str) -> str:
     return f"COPY ({select}) TO 'out.mkv'"
 
 
+# (ungrouped spelling, aggregate spelling, the command the aggregate writes).
+# The ungrouped one is rejected wherever it leaves several rows behind; where a
+# WHERE narrows the relation to one row it is legal, and writes the same file.
 _AGG_SHAPES = [
-    # (sugar, explicit) -- one query written both ways
     (
         "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t",
         "SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t",
+        ["ffmpeg", "-i", "f.mkv",
+         "-map", "0:a:0", "-c:0", "copy", "-metadata:s:0", "language=eng",
+         "-map", "0:a:1", "-c:1", "copy", "-metadata:s:1", "language=fra",
+         "-map", "0:a:2", "-c:2", "copy", "out.mkv"],
     ),
     (
         "SELECT f.video, t.track FROM input('f.mkv') f, unnest(f.audio) t",
         "SELECT f.video, array_agg(t.track) FROM input('f.mkv') f, "
         "unnest(f.audio) t GROUP BY f.video",
-    ),
-    (
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
-        "WHERE t.language = 'fra'",
-        "SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t "
-        "WHERE t.language = 'fra'",
+        ["ffmpeg", "-i", "f.mkv",
+         "-map", "0:v:0", "-c:0", "copy",
+         "-map", "0:a:0", "-c:1", "copy", "-metadata:s:1", "language=eng",
+         "-map", "0:a:1", "-c:2", "copy", "-metadata:s:2", "language=fra",
+         "-map", "0:a:2", "-c:3", "copy", "out.mkv"],
     ),
     (
         "SELECT volume(t.track, 0.5) FROM input('f.mkv') f, unnest(f.audio) t",
         "SELECT array_agg(volume(t.track, 0.5)) FROM input('f.mkv') f, "
         "unnest(f.audio) t",
+        ["ffmpeg", "-i", "f.mkv", "-filter_complex",
+         "[0:a:0]volume=volume=0.5[out0];[0:a:1]volume=volume=0.5[out1];"
+         "[0:a:2]volume=volume=0.5[out2]",
+         "-map", "[out0]", "-metadata:s:0", "language=eng",
+         "-map", "[out1]", "-metadata:s:1", "language=fra",
+         "-map", "[out2]", "out.mkv"],
     ),
     (
         "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
         "ORDER BY t.channels DESC",
         "SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t "
         "ORDER BY t.channels DESC",
+        ["ffmpeg", "-i", "f.mkv",
+         "-map", "0:a:1", "-c:0", "copy", "-metadata:s:0", "language=fra",
+         "-map", "0:a:0", "-c:1", "copy", "-metadata:s:1", "language=eng",
+         "-map", "0:a:2", "-c:2", "copy", "out.mkv"],
     ),
 ]
 
+_NARROWED = (
+    "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+    "WHERE t.language = 'fra'"
+)
+_NARROWED_AGGREGATE = (
+    "SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t "
+    "WHERE t.language = 'fra'"
+)
+_NARROWED_ARGV = [
+    "ffmpeg", "-i", "f.mkv",
+    "-map", "0:a:1", "-c:0", "copy", "-metadata:s:0", "language=fra", "out.mkv",
+]
 
-@pytest.mark.parametrize("sugar,explicit", _AGG_SHAPES, ids=range(len(_AGG_SHAPES)))
-def test_the_explicit_aggregate_compiles_to_the_sugar_byte_for_byte(
-    sugar: str, explicit: str
+
+@pytest.mark.parametrize(
+    "ungrouped,aggregate,argv", _AGG_SHAPES, ids=range(len(_AGG_SHAPES))
+)
+def test_the_ungrouped_shape_is_rejected(
+    ungrouped: str, aggregate: str, argv: list[str]
 ) -> None:
+    err = _reject_lower(_agg_copy(ungrouped), _row_probes())
+    assert err.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert "3 rows" in err.message
+    assert "'out.mkv' is one file" in err.message
+    assert "array_agg" in (err.hint or "")
+    assert "TO (" in (err.hint or "")
+
+
+@pytest.mark.parametrize(
+    "ungrouped,aggregate,argv", _AGG_SHAPES, ids=range(len(_AGG_SHAPES))
+)
+def test_the_aggregate_shape_writes_the_pinned_command(
+    ungrouped: str, aggregate: str, argv: list[str]
+) -> None:
+    assert _agg_argv(_agg_copy(aggregate), _row_probes()) == argv
+
+
+def test_a_where_that_leaves_one_row_needs_no_aggregate() -> None:
+    """The count is the RESOLVED one: one surviving row is one file, written
+    the same way with or without the aggregate."""
     probes = _row_probes()
-    assert _agg_argv(_agg_copy(explicit), probes) == _agg_argv(_agg_copy(sugar), probes)
+    assert _agg_argv(_agg_copy(_NARROWED), probes) == _NARROWED_ARGV
+    assert _agg_argv(_agg_copy(_NARROWED_AGGREGATE), probes) == _NARROWED_ARGV
 
 
 def test_an_aggregate_without_a_group_by_is_one_group() -> None:
@@ -8246,16 +8335,19 @@ def test_an_aggregate_without_a_group_by_is_one_group() -> None:
 
 
 def test_a_grouped_scalar_tags_the_container_not_the_tracks() -> None:
+    """A grouped branch has no per-row scope, so its scalar columns tag the
+    file; ungrouped and single-row, the same column tags the track."""
     probes = _row_probes()
-    sugar = _agg_copy(
-        "SELECT t.track, 'Set' AS album FROM input('f.mkv') f, unnest(f.audio) t"
-    )
-    explicit = _agg_copy(
+    grouped = _agg_copy(
         "SELECT array_agg(t.track), 'Set' AS album FROM input('f.mkv') f, "
         "unnest(f.audio) t GROUP BY f.video"
     )
-    assert _lower(explicit, probes).sinks[0].tags == {"album": "Set"}
-    assert _lower(sugar, probes).sinks[0].tags == {}
+    per_row = _agg_copy(
+        "SELECT t.track, 'Set' AS album FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.index = 1"
+    )
+    assert _lower(grouped, probes).sinks[0].tags == {"album": "Set"}
+    assert _lower(per_row, probes).sinks[0].tags == {}
 
 
 def test_the_group_key_itself_reads_as_a_container_tag() -> None:
@@ -8337,6 +8429,147 @@ def test_grouping_by_a_row_column_needs_a_fan_out_destination() -> None:
     )
     assert "writes one file per group" in err.message
     assert "TO (t.language" in (err.hint or "")
+
+
+def test_a_subscript_works_as_a_group_key() -> None:
+    """``GROUP BY f.video[1]``: an input-level key, so one group, and the
+    keyed column is mapped once ahead of the gather."""
+    g = _lower(
+        "COPY (SELECT f.video[1], array_agg(t.track) FROM input('f.mkv') f, "
+        "unnest(f.audio) t GROUP BY f.video[1]) TO 'out.mkv'",
+        _row_probes(),
+    )
+    assert [o.ref for o in g.outputs] == [
+        "src:f:v:0",
+        "src:f:a:0",
+        "src:f:a:1",
+        "src:f:a:2",
+    ]
+
+
+def test_a_union_all_branch_may_aggregate_its_own_rows() -> None:
+    """One concat segment is one row set, so each branch gathers its own."""
+    probes = _row_probes()
+    probes["g"] = ProbeResult(streams=list(_ROW_TRACKS))
+    g = _lower(
+        "COPY (SELECT f.video[1], array_agg(t.track) FROM input('f.mkv') f, "
+        "unnest(f.audio) t GROUP BY f.video[1] UNION ALL "
+        "SELECT g.video[1], array_agg(u.track) FROM input('g.mkv') g, "
+        "unnest(g.audio) u GROUP BY g.video[1]) TO 'out.mkv'",
+        probes,
+    )
+    assert [node.filter for node in g.nodes.values()] == ["concat"]
+    assert g.nodes["n1"].args == {"n": 2, "v": 1, "a": 3}
+
+
+# ---------------------------------------------------------------------------
+# one row, one file
+# ---------------------------------------------------------------------------
+
+
+def test_a_tag_survives_the_gather_onto_the_output_it_rode_in_on() -> None:
+    """A COALESCE silence fill inside an aggregate still carries the paired
+    row's language tag: the gather moves streams, and a tag rides its own."""
+    probes = _pair_probes()  # f: eng + fra, g: eng only
+    g = _lower(
+        "COPY (SELECT array_agg(amix(a.track, COALESCE(b.track, "
+        "ffmpeg.anullsrc(duration => 1)))) "
+        "FROM input('f.mkv') f, input('g.mkv') g, "
+        "unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b "
+        "ON a.language = b.language) TO 'out.mka'",
+        probes,
+    )
+    args = build_ffmpeg_args(emit(insert_splits(g)))
+    assert args[args.index("-metadata:s:1") + 1] == "language=fra"
+
+
+def test_a_multi_row_view_read_in_from_is_a_row_source() -> None:
+    """A view body follows the CTE rule: several rows in FROM, several rows in
+    the query reading it, and one path cannot hold them."""
+    err = _reject_lower(
+        "CREATE VIEW aud AS SELECT t.track AS track "
+        "FROM input('f.mkv') f, unnest(f.audio) t; "
+        "COPY (SELECT aud.track FROM aud) TO 'out.mka'",
+        _row_probes(),
+    )
+    assert err.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert "this query has 3 rows" in err.message
+    assert "'out.mka' is one file" in err.message
+
+
+def test_the_same_view_gathered_writes_the_file() -> None:
+    g = _lower(
+        "CREATE VIEW aud AS SELECT t.track AS track "
+        "FROM input('f.mkv') f, unnest(f.audio) t; "
+        "COPY (SELECT array_agg(aud.track) FROM aud) TO 'out.mka'",
+        _row_probes(),
+    )
+    assert [o.ref for o in g.outputs] == ["src:f:a:0", "src:f:a:1", "src:f:a:2"]
+
+
+def test_a_bare_select_compiled_to_a_file_is_anchored_on_the_query() -> None:
+    """With ``-o`` there is no TO to point at, so the rejection anchors on the
+    query and says what it says without naming a path."""
+    err = _reject_lower(
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
+    )
+    assert err.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert err.message == "this query has 3 rows, and it writes one file"
+
+
+def test_a_chapters_table_over_one_path_is_rejected_too() -> None:
+    """Chapters are rows like any other -- the rule has no per-source carve-out."""
+    probes: dict[str, ProbeResult | None] = {
+        "f": ProbeResult(
+            streams=[_track("video", 0)],
+            chapters=[
+                ChapterMeta(index=1, start_t=0.0, end_t=1.0, title="Intro"),
+                ChapterMeta(index=2, start_t=1.0, end_t=2.0, title="Outro"),
+            ],
+        )
+    }
+    err = _reject_lower(
+        "COPY (SELECT f.video[1] FROM input('f.mkv') f, chapters(f) c) TO 'out.mkv'",
+        probes,
+    )
+    assert err.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert "this query has 2 rows" in err.message
+
+
+def test_a_row_varying_cte_column_is_rejected_in_a_grouped_branch() -> None:
+    """The rule resolve enforces for a track row, enforced here for the CTE
+    column only lowering can measure: several body rows, one stream each, and
+    neither aggregated nor a key -- so it would read the group's first tuple."""
+    err = _reject_lower(
+        _VID_AUD_CTES + "SELECT vid.track, aud.track, array_agg(aud.track) "
+        "FROM vid, aud GROUP BY vid.track",
+        _vid_aud_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'aud.track' is neither aggregated nor a GROUP BY key" in err.message
+    assert "array_agg" in (err.hint or "")
+
+
+def test_a_single_row_cte_column_stays_group_constant() -> None:
+    """One body row is the same value for every tuple, so it needs no
+    aggregate: the rejection above is about VARYING, not about being a CTE."""
+    g = _lower(
+        _VID_AUD_CTES + "SELECT vid.track, array_agg(aud.track) FROM vid, aud",
+        _vid_aud_probes(),
+    )
+    assert [o.ref for o in g.outputs] == ["src:f:v:0", "src:f2:a:0", "src:f2:a:1"]
+
+
+def test_a_row_varying_cte_column_is_rejected_in_a_grouped_table_query() -> None:
+    """Table mode reads the group's first tuple the same way, so it takes the
+    same rejection."""
+    err = _reject_lower_table(
+        _VID_AUD_CTES + "SELECT vid.track, aud.track, array_agg(aud.track) "
+        "FROM vid, aud GROUP BY vid.track",
+        _vid_aud_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'aud.track' is neither aggregated nor a GROUP BY key" in err.message
 
 
 # ---------------------------------------------------------------------------
@@ -8497,12 +8730,6 @@ def test_the_other_aggregates_keep_their_typed_rejection(name: str) -> None:
 
 _AGG_CONTEXTS = [
     (
-        "a UNION ALL branch",
-        "COPY (SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t "
-        "GROUP BY f.video UNION ALL SELECT g.audio[1] FROM input('g.mkv') g) "
-        "TO 'out.mka'",
-    ),
-    (
         "a CTE body",
         "COPY (WITH c AS (SELECT array_agg(t.track) AS track FROM input('f.mkv') f, "
         "unnest(f.audio) t GROUP BY f.video) SELECT c.track FROM c) TO 'out.mka'",
@@ -8522,7 +8749,7 @@ def test_aggregation_is_a_media_copys_own_select(where: str, sql: str) -> None:
     assert f"GROUP BY is not supported in {where}" in err.message
 
 
-def test_group_by_without_track_rows_keeps_the_streaming_fence() -> None:
+def test_group_by_without_track_rows_still_has_no_streaming_equivalent() -> None:
     err = _reject("COPY (SELECT f.audio[1] FROM input('f.mkv') f GROUP BY f.audio[1]) TO 'o.mka'")
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
     assert err.message == "GROUP BY has no streaming equivalent"

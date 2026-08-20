@@ -1603,9 +1603,11 @@ def test_disposition_tag_column_flags_the_default_track(tmp_path: Path) -> None:
     _require_fixture(_AV2)
     out_path = tmp_path / "flagged.mka"
     query = (
-        "SELECT t.track, "
-        "CASE WHEN t.language = 'eng' THEN 'default' ELSE '0' END AS disposition "
-        f"FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) t"
+        "WITH flagged AS ("
+        "  SELECT t.track AS track, "
+        "  CASE WHEN t.language = 'eng' THEN 'default' ELSE '0' END AS disposition "
+        f"  FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) t"
+        ") SELECT array_agg(flagged.track) FROM flagged"
     )
 
     _compile_and_run(query, out_path)
@@ -1734,8 +1736,8 @@ def test_a_cte_tags_the_streams_while_the_outer_select_tags_the_file(
         "    SELECT a.track AS track, 'Audio (' || a.language || ')' AS title"
         f"    FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) a"
         "  )"
-        "  SELECT g.video, tagged.track, 'Director Cut' AS title"
-        f"  FROM input('{_sql_path(_AV2)}') g, tagged"
+        "  SELECT g.video, array_agg(tagged.track), 'Director Cut' AS title"
+        f"  FROM input('{_sql_path(_AV2)}') g, tagged GROUP BY g.video"
         f") TO '{_sql_path(out_path)}';"
     )
 
