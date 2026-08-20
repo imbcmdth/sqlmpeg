@@ -1,9 +1,13 @@
 """Tests for set-driven output fan-out: ``COPY (...) TO (<expression>)``.
 
 The rule under test: in a media COPY over a compile-time row table, a TO
-EXPRESSION that reads that table's columns compiles to ONE ffmpeg command per
-surviving row, each binding its own row; a constant TO keeps today's semantics
-byte for byte.
+EXPRESSION that reads that table's columns writes one FILE per surviving row,
+each binding its own row; a constant TO keeps today's semantics byte for byte.
+
+Those files ride ONE ffmpeg command as one sink each -- inputs decoded once,
+output stream indices restarting per file -- except in the one shape ffmpeg
+cannot express that way: a fan-out that trims and stream-copies everything it
+maps, which stays a ``&&`` chain of one command per file with input-side seeks.
 
 HERMETIC by default: ``probe_path`` is stubbed with a synthetic
 ``ProbeResult`` (two language-tagged audio rows, two subtitle rows, two
@@ -25,7 +29,7 @@ import pytest
 from sqlmpeg import cli, compiler
 from sqlmpeg.compiler import compile_commands, compile_sql
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import StreamType
+from sqlmpeg.ir import SinkUnit, StreamType
 from sqlmpeg.probe import ChapterMeta, ProbeResult, StreamMeta
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -82,6 +86,15 @@ def _rejects(sql: str) -> SqlmpegError:
     return excinfo.value
 
 
+def _units(sql: str) -> list[SinkUnit]:
+    """Every output FILE the compile writes, in order, across its commands."""
+    return [unit for graph in compile_commands(sql) for unit in graph.sinks]
+
+
+def _paths(sql: str) -> list[str | None]:
+    return [unit.path for unit in _units(sql)]
+
+
 _CHAPTER_SPLIT = (
     f"COPY (SELECT f.video[1], f.audio[1] FROM input('{SRC}') f, chapters(f) c "
     "WHERE f.t BETWEEN c.start_t AND c.end_t) TO ('ch' || c.index::text || '.mkv')"
@@ -124,9 +137,10 @@ def test_a_constant_to_over_a_row_table_gathers_into_one_file() -> None:
     assert [output.ref for output in graphs[0].outputs] == ["src:f:a:0", "src:f:a:1"]
 
 
-def test_a_row_reading_to_fans_out_one_command_per_row() -> None:
+def test_a_row_reading_to_writes_one_file_per_row() -> None:
     graphs = compile_commands(_PER_LANGUAGE)
-    assert [graph.sinks[0].path for graph in graphs] == ["eng.m4a", "fra.m4a"]
+    assert len(graphs) == 1
+    assert [unit.path for unit in graphs[0].sinks] == ["eng.m4a", "fra.m4a"]
 
 
 # ---------------------------------------------------------------------------
@@ -134,22 +148,24 @@ def test_a_row_reading_to_fans_out_one_command_per_row() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_each_command_maps_its_own_row_stream() -> None:
-    graphs = compile_commands(_PER_LANGUAGE)
-    assert [graph.outputs[0].ref for graph in graphs] == ["src:f:a:0", "src:f:a:1"]
+def test_each_file_maps_its_own_row_stream() -> None:
+    assert [unit.outputs[0].ref for unit in _units(_PER_LANGUAGE)] == [
+        "src:f:a:0",
+        "src:f:a:1",
+    ]
 
 
-def test_each_command_carries_its_own_rows_provenance() -> None:
-    graphs = compile_commands(_PER_LANGUAGE)
-    assert [graph.outputs[0].metadata for graph in graphs] == [
+def test_each_file_carries_its_own_rows_provenance() -> None:
+    assert [unit.outputs[0].metadata for unit in _units(_PER_LANGUAGE)] == [
         {"language": "eng"},
         {"language": "fra"},
     ]
 
 
-def test_output_stream_indices_restart_in_every_command() -> None:
-    """Each command is its own file, so ``-c:0``/``-metadata:s:0`` twice."""
+def test_output_stream_indices_restart_in_every_file() -> None:
+    """ffmpeg numbers output streams per file, so ``-c:0`` twice in one command."""
     out = _compile_line(_PER_LANGUAGE)
+    assert " && " not in out
     assert out.count("-c:0 copy") == 2
     assert out.count("-metadata:s:0 language=") == 2
 
@@ -160,28 +176,119 @@ def test_a_row_bounded_where_becomes_a_per_row_seek() -> None:
 
 
 def test_the_path_expression_is_evaluated_per_row() -> None:
+    assert _paths(_CHAPTER_SPLIT) == ["ch1.mkv", "ch2.mkv"]
+
+
+# ---------------------------------------------------------------------------
+# trim windows: output seeks in one command, or the input-seek chain
+# ---------------------------------------------------------------------------
+
+
+def test_a_copy_only_windowed_fan_out_keeps_the_chain() -> None:
+    """ffmpeg writes corrupt files from an output seek plus ``-c copy``, so a
+    fan-out that copies everything it maps stays one command per file."""
     graphs = compile_commands(_CHAPTER_SPLIT)
-    assert [graph.sinks[0].path for graph in graphs] == ["ch1.mkv", "ch2.mkv"]
+    assert len(graphs) == 2
+    assert all(graph.sinks[0].window is None for graph in graphs)
+    line = _compile_line(_CHAPTER_SPLIT)
+    assert line.count(" && ") == 1
+    assert f"-ss 0.0 -to 4.0 -i {SRC}" in line
+    assert line.count("-c:0 copy") == 2
 
 
-def test_a_row_tag_column_tags_only_its_own_command() -> None:
+def test_a_re_encoding_windowed_fan_out_seeks_its_outputs() -> None:
+    sql = _CHAPTER_SPLIT + " WITH (video_codec 'libx264', audio_codec 'aac')"
+    graphs = compile_commands(sql)
+    assert len(graphs) == 1
+    assert [unit.window for unit in graphs[0].sinks] == [(0.0, 4.0), (4.0, 10.0)]
+    assert graphs[0].input_trims == {}
+    line = _compile_line(sql)
+    assert " && " not in line
+    assert f"-i {SRC} -ss 0.0 -to 4.0 -map" in line
+
+
+def test_one_named_codec_drops_the_copy_on_the_untouched_stream() -> None:
+    """The window re-encodes the whole file, so the audio nobody named a codec
+    for takes the container's default encoder rather than ``-c copy``."""
+    sql = _CHAPTER_SPLIT + " WITH (video_codec 'libx264')"
+    line = _compile_line(sql)
+    assert " && " not in line
+    assert "copy" not in line
+    assert line.count("-ss ") == 2
+
+
+def test_a_filtered_stream_is_enough_to_seek_the_outputs() -> None:
+    """No codec named at all: one filtered column re-encodes the file anyway."""
+    sql = (
+        f"COPY (SELECT hflip(f.video[1]), f.audio[1] FROM input('{SRC}') f, "
+        "chapters(f) c WHERE f.t BETWEEN c.start_t AND c.end_t) "
+        "TO ('ch' || c.index::text || '.mkv')"
+    )
+    graphs = compile_commands(sql)
+    assert len(graphs) == 1
+    assert [unit.window for unit in graphs[0].sinks] == [(0.0, 4.0), (4.0, 10.0)]
+    assert "copy" not in _compile_line(sql)
+
+
+def test_an_unwindowed_copy_fan_out_is_still_one_command() -> None:
+    """No window, no reason to chain: stream copies ride the single invocation."""
+    graphs = compile_commands(_PER_LANGUAGE)
+    assert len(graphs) == 1
+    assert all(unit.window is None for unit in graphs[0].sinks)
+    assert "-c:0 copy" in _compile_line(_PER_LANGUAGE)
+
+
+def test_two_windows_in_one_file_send_the_fan_out_back_to_the_chain() -> None:
+    """An output takes one seek, so a row trimming two inputs differently can
+    only be said on the inputs."""
+    sql = (
+        "COPY (SELECT f.video[1], g.audio[1] FROM input('a.mkv') f, "
+        "input('b.mkv') g, chapters(f) c "
+        "WHERE f.t BETWEEN c.start_t AND c.end_t AND g.t BETWEEN 0 AND 2) "
+        "TO ('ch' || c.index::text || '.mkv') WITH (video_codec 'libx264')"
+    )
+    graphs = compile_commands(sql)
+    assert len(graphs) == 2
+    assert [graph.input_trims["f"] for graph in graphs] == [(0.0, 4.0), (4.0, 10.0)]
+    assert all(graph.sinks[0].window is None for graph in graphs)
+
+
+def test_a_filtered_stream_the_files_share_is_split_across_them() -> None:
+    """The CTE's video lowers once for the whole graph, so the sinks share its
+    pad and the split pass hands each one its own."""
+    sql = (
+        "COPY ("
+        "  WITH pic AS (SELECT hflip(g.video[1]) AS frame FROM input('v.mkv') g)"
+        f"  SELECT pic.frame, t.track FROM pic, input('{SRC}') f, unnest(f.audio) t"
+        ") TO (t.language || '.mkv')"
+    )
+    graph = compile_commands(sql)[0]
+    assert [node.filter for node in graph.nodes.values()] == ["hflip", "split"]
+    split = list(graph.nodes.values())[1]
+    assert split.args["n"] == 2
+    assert [unit.outputs[0].ref for unit in graph.sinks] == [
+        f"{split.id}:0",
+        f"{split.id}:1",
+    ]
+
+
+def test_a_row_tag_column_tags_only_its_own_file() -> None:
     sql = (
         f"COPY (SELECT t.track, 'Audio (' || t.language || ')' AS title "
         f"FROM input('{SRC}') f, unnest(f.audio) t) TO (t.language || '.m4a')"
     )
-    graphs = compile_commands(sql)
-    assert [graph.outputs[0].metadata["title"] for graph in graphs] == [
+    assert [unit.outputs[0].metadata["title"] for unit in _units(sql)] == [
         "Audio (eng)",
         "Audio (fra)",
     ]
 
 
-def test_a_tagged_ctes_tags_reach_every_command() -> None:
-    """Each row lowers the whole query for itself, CTE bodies included, so the
-    per-stream tags a CTE sets ride into every command the fan-out writes.
+def test_a_tagged_ctes_tags_reach_every_file() -> None:
+    """The CTE lowers once for the whole graph, so the per-stream tags it sets
+    ride into every file the fan-out writes.
 
     The CTE's rows cross-join with the audio rows, so the captions are
-    gathered per group -- one command per audio track, every caption inside.
+    gathered per group -- one file per audio track, every caption inside.
     """
     sql = (
         "COPY ("
@@ -193,23 +300,22 @@ def test_a_tagged_ctes_tags_reach_every_command() -> None:
         "  unnest(f.audio) t, capt GROUP BY t.track, t.language"
         ") TO (t.language || '.mkv')"
     )
-    graphs = compile_commands(sql)
-    assert [graph.sinks[0].path for graph in graphs] == ["eng.mkv", "fra.mkv"]
-    for graph in graphs:
-        assert [output.metadata.get("title") for output in graph.outputs] == [
+    units = _units(sql)
+    assert [unit.path for unit in units] == ["eng.mkv", "fra.mkv"]
+    for unit in units:
+        assert [output.metadata.get("title") for output in unit.outputs] == [
             None,
             "Subs",
             "Subs",
         ]
 
 
-def test_with_options_apply_to_every_command() -> None:
+def test_with_options_apply_to_every_file() -> None:
     sql = (
         f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
         "TO (t.language || '.m4a') WITH (audio_codec 'aac', audio_bitrate '192k')"
     )
-    graphs = compile_commands(sql)
-    assert [graph.sinks[0].options for graph in graphs] == [
+    assert [unit.options for unit in _units(sql)] == [
         {"audio_codec": "aac", "audio_bitrate": "192k"},
     ] * 2
 
@@ -219,17 +325,15 @@ def test_a_where_row_predicate_still_filters_before_the_fan_out() -> None:
         f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t "
         "WHERE t.language = 'fra') TO (t.language || '.m4a')"
     )
-    graphs = compile_commands(sql)
-    assert [graph.sinks[0].path for graph in graphs] == ["fra.m4a"]
+    assert _paths(sql) == ["fra.m4a"]
 
 
-def test_order_by_reorders_the_commands() -> None:
+def test_order_by_reorders_the_files() -> None:
     sql = (
         f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t "
         "ORDER BY t.language DESC) TO (t.language || '.m4a')"
     )
-    graphs = compile_commands(sql)
-    assert [graph.sinks[0].path for graph in graphs] == ["fra.m4a", "eng.m4a"]
+    assert _paths(sql) == ["fra.m4a", "eng.m4a"]
 
 
 def test_a_cross_product_of_two_row_tables_fans_out_over_every_pair() -> None:
@@ -237,8 +341,7 @@ def test_a_cross_product_of_two_row_tables_fans_out_over_every_pair() -> None:
         f"COPY (SELECT a.track FROM input('{SRC}') f, unnest(f.audio) a, "
         "unnest(f.subtitle) s) TO (a.language || '-' || s.language || '.mka')"
     )
-    graphs = compile_commands(sql)
-    assert [graph.sinks[0].path for graph in graphs] == [
+    assert _paths(sql) == [
         "eng-eng.mka",
         "eng-fra.mka",
         "fra-eng.mka",
@@ -410,8 +513,10 @@ def _compile_line(sql: str, *extra: str) -> str:
     return buffer.getvalue()
 
 
-def test_compile_chains_the_commands_with_and() -> None:
-    assert _compile_line(_PER_LANGUAGE).count(" && ") == 1
+def test_compile_prints_one_command_for_the_whole_fan_out() -> None:
+    line = _compile_line(_PER_LANGUAGE)
+    assert " && " not in line
+    assert line.count("ffmpeg ") == 1
 
 
 def test_dash_o_against_a_fan_out_query_is_a_usage_error(
@@ -423,13 +528,23 @@ def test_dash_o_against_a_fan_out_query_is_a_usage_error(
     assert "-o takes one path, but this script writes 2 files" in captured.err
 
 
-def test_explain_dumps_one_graph_per_command(
+def test_explain_dumps_one_graph_with_a_sink_per_file(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert cli.main(["explain", _PER_LANGUAGE]) == 0
     payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload, dict)
+    assert [sink["path"] for sink in payload["sinks"]] == ["eng.m4a", "fra.m4a"]
+
+
+def test_explain_dumps_a_graph_list_when_the_fan_out_chains(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The copy-and-trim shape is still a sequence, so explain is still a list."""
+    assert cli.main(["explain", _CHAPTER_SPLIT]) == 0
+    payload = json.loads(capsys.readouterr().out)
     assert isinstance(payload, list)
-    assert [graph["sinks"][0]["path"] for graph in payload] == ["eng.m4a", "fra.m4a"]
+    assert [graph["sinks"][0]["path"] for graph in payload] == ["ch1.mkv", "ch2.mkv"]
 
 
 def _probe_with_language(monkeypatch: pytest.MonkeyPatch, language: str | None) -> None:
@@ -477,6 +592,24 @@ def _probe_json(path: Path) -> dict[str, object]:
     return data
 
 
+def _first_frame(path: Path) -> bytes:
+    """The piece's opening video frame as PNG bytes.
+
+    What tells two cuts of one source apart: the fixture's picture is a
+    testsrc2 pattern with a running counter drawn into it.
+    """
+    result = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-i", str(path),
+            "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-",
+        ],
+        capture_output=True,
+        timeout=120,
+        check=True,
+    )
+    return result.stdout
+
+
 def _duration(path: Path) -> float:
     container = _probe_json(path)["format"]
     assert isinstance(container, dict)
@@ -497,12 +630,12 @@ def test_split_by_chapter_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
     _fixtures: None,
 ) -> None:
-    """Recipe 47 executed: two chapter files, each command carrying its own seek.
+    """Recipe 47's stream-copy form executed: two chapter files, one command
+    each, every command carrying its own input seek.
 
-    Recipe 47 stream-COPIES, so ffmpeg snaps ``-ss 1.0`` back to the keyframe
-    before it: ch2.mkv holds the whole 2.023s clip, and only the printed
-    windows show the per-row seek. The re-encoding variant below is the same
-    query with a codec, and cuts where the chapters say -- 1.023s each.
+    It stream-COPIES, so ffmpeg snaps ``-ss 1.0`` back to the keyframe before
+    it: ch2.mkv holds the whole 2.023s clip, and only the printed windows show
+    the per-row seek.
     """
     monkeypatch.undo()  # the synthetic probe: this one reads the real file
     monkeypatch.chdir(tmp_path)
@@ -518,10 +651,29 @@ def test_split_by_chapter_runs(
         assert [stream["codec_type"] for stream in streams] == ["video", "audio"]
     assert _duration(tmp_path / "ch1.mkv") == pytest.approx(1.0, abs=0.25)
 
+
+@pytest.mark.exec
+def test_split_by_chapter_re_encoding_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    _fixtures: None,
+) -> None:
+    """Recipe 47's re-encoding form executed: ONE command, output seeks.
+
+    The source decodes once and each output takes its own window, so the cuts
+    land where the chapters say -- 1.023s each -- and the two pieces really do
+    hold different parts of the picture.
+    """
+    monkeypatch.undo()
+    monkeypatch.chdir(tmp_path)
     options = " WITH (video_codec 'libx264', audio_codec 'aac')"
     assert cli.main(["run", _chapter_split_sql(options), "-y"]) == 0
+    printed = capsys.readouterr().out
+    assert " && " not in printed
+    assert "-ss 0.0 -to 1.0 -map" in printed
+    assert "-ss 1.0 -to 2.0 -map" in printed
     for name in ("ch1.mkv", "ch2.mkv"):
         assert _duration(tmp_path / name) == pytest.approx(1.0, abs=0.25)
+    assert _first_frame(tmp_path / "ch1.mkv") != _first_frame(tmp_path / "ch2.mkv")
 
 
 @pytest.mark.exec
@@ -547,7 +699,7 @@ def test_extract_every_language_runs(
 
 
 # ---------------------------------------------------------------------------
-# the GROUPED fan-out: one command per GROUP, not per row
+# the GROUPED fan-out: one file per GROUP, not per row
 # ---------------------------------------------------------------------------
 
 
@@ -575,16 +727,20 @@ def test_a_group_writes_one_file_holding_all_its_rows(
 ) -> None:
     _two_eng(monkeypatch)
     graphs = compile_commands(_GROUPED)
-    assert [g.sinks[0].path for g in graphs] == ["eng.mka", "fra.mka"]
-    assert [len(g.outputs) for g in graphs] == [2, 1]
+    assert len(graphs) == 1
+    units = graphs[0].sinks
+    assert [unit.path for unit in units] == ["eng.mka", "fra.mka"]
+    assert [len(unit.outputs) for unit in units] == [2, 1]
 
 
 def test_the_group_key_tags_the_groups_container(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _two_eng(monkeypatch)
-    graphs = compile_commands(_GROUPED)
-    assert [g.sinks[0].tags for g in graphs] == [{"title": "eng"}, {"title": "fra"}]
+    assert [unit.tags for unit in _units(_GROUPED)] == [
+        {"title": "eng"},
+        {"title": "fra"},
+    ]
 
 
 def test_groups_come_out_in_first_appearance_order(
@@ -599,7 +755,7 @@ def test_groups_come_out_in_first_appearance_order(
         duration=10.0,
     )
     monkeypatch.setattr(compiler, "probe_path", lambda path: result)
-    assert [g.sinks[0].path for g in compile_commands(_GROUPED)] == ["fra.mka", "eng.mka"]
+    assert _paths(_GROUPED) == ["fra.mka", "eng.mka"]
 
 
 def test_a_multi_key_group_by_partitions_on_the_tuple(
@@ -618,9 +774,9 @@ def test_a_multi_key_group_by_partitions_on_the_tuple(
         f"COPY (SELECT array_agg(t.track) FROM input('{SRC}') f, unnest(f.audio) t "
         "GROUP BY t.language, t.codec) TO (t.language || '-' || t.codec || '.mka')"
     )
-    graphs = compile_commands(sql)
-    assert [g.sinks[0].path for g in graphs] == ["eng-aac.mka", "eng-ac3.mka"]
-    assert [len(g.outputs) for g in graphs] == [2, 1]
+    units = _units(sql)
+    assert [unit.path for unit in units] == ["eng-aac.mka", "eng-ac3.mka"]
+    assert [len(unit.outputs) for unit in units] == [2, 1]
 
 
 def test_two_groups_naming_one_file_are_rejected() -> None:

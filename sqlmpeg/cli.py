@@ -4,7 +4,9 @@ Thin wrapper around the library pipeline (``compile_sql`` -> ``emit`` ->
 ``build_ffmpeg_commands``). See the "CLI" section of sqlmpeg-project.md.
 
 A compile is a SEQUENCE of ffmpeg commands — one for every query but a
-``two_pass`` sink or a ``sqlmpeg.loudnorm2`` graph, either of which is two.
+``two_pass`` sink or a ``sqlmpeg.loudnorm2`` graph (two each), and a
+stream-copied fan-out with trim windows (one per output file, the only
+form ffmpeg cuts copied streams correctly in).
 ``compile`` prints them joined by `` && `` on one line; ``run`` executes them
 in order, stopping at the first nonzero exit and returning it, with
 ``--timeout`` applied per command.
@@ -414,7 +416,8 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         return 1
 
     if args.graph_only:
-        # One line per command; a fan-out query has one graph per row.
+        # One line per command; a compile is a sequence only for two_pass,
+        # loudnorm2 and the copy-and-trim fan-out.
         print("\n".join(e.filter_complex for e in emitted))
         return 0
 
@@ -462,7 +465,7 @@ def _cmd_explain(args: argparse.Namespace) -> int:
         _print_error(err, source=args.query)
         return 1
 
-    # One object for a single command, a JSON ARRAY for a fan-out query's.
+    # One object for a single command, a JSON ARRAY for a sequence's.
     payload: object = graphs[0].to_dict() if len(graphs) == 1 else [
         graph.to_dict() for graph in graphs
     ]

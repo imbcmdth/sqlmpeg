@@ -56,8 +56,9 @@ def _probe_inputs(res: Resolved) -> dict[str, ProbeResult | None]:
 def compile_sql(text: str) -> Graph:
     """Compile SQL `text` into a split-complete IR graph.
 
-    The FIRST command's graph, which is the whole query for everything but a
-    fan-out COPY; :func:`compile_commands` returns every command's.
+    The FIRST command's graph, which is the whole query except for the one
+    fan-out shape that compiles to a command sequence;
+    :func:`compile_commands` returns every command's.
 
     Every input is probed opportunistically (see module docstring). The
     installed ffmpeg's filter set IS the function surface, so what
@@ -73,9 +74,11 @@ def compile_sql(text: str) -> Graph:
 def compile_commands(text: str) -> list[Graph]:
     """Compile SQL `text` into one split-complete IR graph per ffmpeg COMMAND.
 
-    One graph for every query but a fan-out ``COPY ... TO (<expression>)``,
-    which writes one file per surviving row and so compiles to one graph per
-    row. Same probing and registry contract as :func:`compile_sql`.
+    Usually one graph, a fan-out ``COPY ... TO (<expression>)`` included: its
+    files become sink units of a single graph, one ffmpeg command with several
+    outputs. The exception is a fan-out that trims and stream-copies every
+    stream it maps, which stays one graph per file. Same probing and registry
+    contract as :func:`compile_sql`.
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """

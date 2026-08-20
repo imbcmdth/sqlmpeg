@@ -495,9 +495,12 @@ overrides only the path; it never supplies or overrides options.
 ### One file per row
 
 `TO (<expression>)` -- parenthesized, not quoted -- writes ONE file per
-surviving track row when the expression reads that row table's columns, and
-the compile becomes one ffmpeg command per row, `&&`-chained. Each command
-binds its own row: its streams, its tags, its `WHERE` window, its name.
+surviving track row when the expression reads that row table's columns. Each
+file binds its own row: its streams, its tags, its `WHERE` window, its name.
+They all ride ONE ffmpeg command, so the inputs are read once. The exception
+is a fan-out that both trims and stream-copies everything it maps: ffmpeg
+cannot seek an output it copies, so that one becomes one command per file,
+`&&`-chained, each seeking its own input.
 
 ```sql-probed
 COPY (
@@ -510,7 +513,7 @@ COPY (
 The expression is the value grammar (`||`, `CASE`, `::text`, literals) and
 must be text. A `TO` expression reading no row column is just a constant
 path, and a quoted `TO 'path'` is unchanged -- every track still lands in
-that one file. `WITH (...)` applies to every command identically. Rejected:
+that one file. `WITH (...)` applies to every file identically. Rejected:
 a computed segment holding `/`, `\` or `..`; two rows naming one file; zero
 surviving rows; a NULL name; and, in this version, fan-out with `two_pass`,
 `chapters`/`chapters_from`/`metadata_from`, `FORMAT csv`, `UNION ALL`, `-o`,

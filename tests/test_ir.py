@@ -255,6 +255,30 @@ def test_sink_unit_container_tags_round_trip() -> None:
     assert SinkUnit.from_dict(d) == unit
 
 
+def test_sink_unit_window_round_trip() -> None:
+    unit = SinkUnit(
+        outputs=[Output(ref="n2", type="video", name=None, metadata={})],
+        path="ch1.mkv",
+        window=(0.0, 1.5),
+    )
+    d = unit.to_dict()
+    assert d["window"] == [0.0, 1.5]
+    assert SinkUnit.from_dict(d) == unit
+
+
+def test_sink_unit_open_window_round_trips_as_json_null() -> None:
+    unit = SinkUnit(outputs=[], path="tail.mkv", window=(5.0, None))
+    d = unit.to_dict()
+    assert d["window"] == [5.0, None]
+    assert SinkUnit.from_dict(d).window == (5.0, None)
+
+
+def test_a_sink_unit_with_no_window_omits_the_window_key() -> None:
+    unit = SinkUnit(outputs=[], path="out.mkv")
+    assert "window" not in unit.to_dict()
+    assert SinkUnit.from_dict(unit.to_dict()).window is None
+
+
 def test_a_sink_unit_tagging_nothing_omits_the_tags_key() -> None:
     """Same shape the goldens pin: an empty optional field is not serialized."""
     unit = SinkUnit(outputs=[], path="out.mkv")

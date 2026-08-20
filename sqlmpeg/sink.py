@@ -341,6 +341,17 @@ CSV_OPTIONS: dict[str, SinkOptionSpec] = {
 }
 
 
+def copy_suppressed_scopes(options: dict[str, object]) -> set[str]:
+    """Stream scopes for which `options` names an explicit codec.
+
+    A passthrough output in one of these scopes re-encodes, so nothing may
+    force ``-c:<i> copy`` on it. Read straight off the table's ``flag``/
+    ``scope`` fields, and shared by emit (what it renders) and lower (whether
+    a windowed fan-out can keep the stream-copy chain).
+    """
+    return {SINK_OPTIONS[name].scope for name in options if SINK_OPTIONS[name].flag == "-c"}
+
+
 def _unknown_option_hint(name: str, table: dict[str, SinkOptionSpec] = SINK_OPTIONS) -> str:
     matches = difflib.get_close_matches(name, sorted(table), n=1, cutoff=0.6)
     if matches:

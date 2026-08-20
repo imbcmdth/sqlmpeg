@@ -991,9 +991,11 @@ COPY (
 ```
 $ sqlmpeg compile -f query.sql
 ffmpeg -i tests/fixtures/av-chapters.mkv -ss 0.0 -to 1.0 -map 0:v:0 -map 0:a:0 -c:0 \
-  libx264 -crf:0 18 -c:1 aac ch1.mkv -ss 1.0 -to 2.0 -map 0:v:0 -map 0:a:0 -c:0 \
-  libx264 -crf:0 18 -c:1 aac ch2.mkv
+  libx264 -crf:0 18 -c:1 aac ch1.mkv -ss 1.0 -to 2.0 -map 0:v:0 -map 0:a:0 -c:0 libx264 \
+  -crf:0 18 -c:1 aac ch2.mkv
 ```
+
+The chain is the exception, not the rule: it survives only while EVERY stream of every piece is a stream copy. Name one codec, or wrap one column in a filter, and the whole split becomes the single invocation above - the streams you left alone go along with it, taking the container's default encoder instead of `-c copy`.
 
 ## 48. Extract every language to its own file
 
@@ -1006,8 +1008,8 @@ TO (t.language || '.m4a')
 
 ```
 $ sqlmpeg compile -f query.sql
-ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng \
-  eng.m4a -map 0:a:1 -c:0 copy -metadata:s:0 language=fra fra.m4a
+ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng eng.m4a \
+  -map 0:a:1 -c:0 copy -metadata:s:0 language=fra fra.m4a
 ```
 
 ## 49. Normalize loudness properly (two-pass)
@@ -1137,8 +1139,8 @@ COPY (
 ```
 $ sqlmpeg compile -f query.sql
 ffmpeg -i tests/fixtures/av-2eng.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng \
-  -map 0:a:1 -c:1 copy -metadata:s:1 language=eng -metadata title=eng eng.mka -map \
-  0:a:2 -c:0 copy -metadata:s:0 language=fra -metadata title=fra fra.mka
+  -map 0:a:1 -c:1 copy -metadata:s:1 language=eng -metadata title=eng eng.mka -map 0:a:2 \
+  -c:0 copy -metadata:s:0 language=fra -metadata title=fra fra.mka
 ```
 
 ## 56. Preview a grouped shape as a table

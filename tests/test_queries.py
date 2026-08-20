@@ -119,7 +119,7 @@ def _synthetic_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     result = ProbeResult(
         streams=[video, audio, subtitle],
-        # split-chapters.sql fans out over these, one command per chapter.
+        # split-chapters.sql fans out over these, one output file per chapter.
         chapters=[
             ChapterMeta(index=1, start_t=0.0, end_t=30.0, title="Intro"),
             ChapterMeta(index=2, start_t=30.0, end_t=90.0, title="Credits"),

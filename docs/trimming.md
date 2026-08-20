@@ -39,6 +39,14 @@ Rejected:
 
 On a CTE, open windows pass only the bounds they have (`trim=start=3` with no `end=`).
 
+## Fan-out windows: one seek per output file
+
+A fan-out `TO (expression)` whose rows carry a window writes one file per row, and where it can, all of them in one ffmpeg command: each output takes its own `-ss <start> -to <end>` ahead of that output's `-map` list, so the input is read and decoded once no matter how many pieces come out. The cuts are frame-accurate.
+
+Seeking an output re-encodes it. A stream that would have been a plain copy therefore takes whatever codec the sink names, or ffmpeg's default encoder for the container when it names none.
+
+When every mapped stream in every output is a stream copy, that form is unavailable - ffmpeg writes corrupt files from an output seek plus `-c copy`. Such a fan-out compiles to one command per file instead, `&&`-chained, each seeking its own `-i`: fast, nothing decodes, cuts snapping to keyframes. [Recipe 47](examples.md#47-split-a-file-by-its-chapters) shows both forms of one query.
+
 ## Accuracy: decoded vs. stream-copied
 
 - **Decoded** (filtered or re-encoded): frame-accurate - ffmpeg decodes from the previous keyframe and discards up to the requested point.

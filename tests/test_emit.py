@@ -61,10 +61,15 @@ def _sink(
     path: str,
     options: dict[str, object] | None = None,
     tags: dict[str, str | None] | None = None,
+    window: tuple[float | None, float | None] | None = None,
 ) -> SinkUnit:
     """A destination with no outputs yet -- `_graph` fills them in."""
     return SinkUnit(
-        outputs=[], path=path, options=dict(options or {}), tags=dict(tags or {})
+        outputs=[],
+        path=path,
+        options=dict(options or {}),
+        tags=dict(tags or {}),
+        window=window,
     )
 
 
@@ -93,6 +98,7 @@ def _graph(
                 path=sink.path,
                 options=dict(sink.options),
                 tags=dict(sink.tags),
+                window=sink.window,
             )
         ]
     else:
@@ -1872,6 +1878,63 @@ def test_two_aliases_disagreeing_on_one_inputs_window_is_internal_error() -> Non
     )
     err = _assert_internal(g)
     assert "two different trim windows" in err.message
+
+
+# ---------------------------------------------------------------------------
+# output windows: -ss/-to on the output file, ahead of its maps
+# ---------------------------------------------------------------------------
+
+
+def test_a_sink_window_renders_before_that_outputs_maps() -> None:
+    g = _graph([], [_out("src:a:v:0")], sink=_sink("out.mkv", window=(1.0, 2.5)))
+    args = build_ffmpeg_args(emit(g))
+    assert args == [
+        "ffmpeg", "-i", "a.mp4",
+        "-ss", "1.0", "-to", "2.5", "-map", "0:v:0", "out.mkv",
+    ]
+
+
+def test_a_sink_window_drops_the_forced_copy() -> None:
+    """An output seek re-encodes, and `-c copy` under one writes a corrupt
+    file, so the passthrough map takes the default encoder instead."""
+    g = _graph([], [_out("src:a:v:0")], sink=_sink("out.mkv", window=(None, 2.0)))
+    args = build_ffmpeg_args(emit(g))
+    assert "copy" not in args
+    assert args[3:6] == ["-to", "2.0", "-map"]
+
+
+def test_an_open_sink_window_renders_only_the_bound_it_has() -> None:
+    g = _graph([], [_out("src:a:v:0")], sink=_sink("out.mkv", window=(3, None)))
+    args = build_ffmpeg_args(emit(g))
+    assert "-to" not in args
+    assert args[3:5] == ["-ss", "3"]
+
+
+def test_each_output_file_carries_its_own_window() -> None:
+    units = [
+        SinkUnit(outputs=[_out("src:a:v:0")], path="one.mkv", window=(0.0, 1.0)),
+        SinkUnit(
+            outputs=[_out("src:a:a:0", "audio")], path="two.mkv", window=(1.0, 2.0)
+        ),
+    ]
+    g = _graph([], [], sinks=units)
+    args = build_ffmpeg_args(emit(g))
+    assert args == [
+        "ffmpeg", "-i", "a.mp4",
+        "-ss", "0.0", "-to", "1.0", "-map", "0:v:0", "one.mkv",
+        "-ss", "1.0", "-to", "2.0", "-map", "0:a:0", "two.mkv",
+    ]
+
+
+def test_a_windowed_output_still_takes_the_codec_its_options_name() -> None:
+    g = _graph(
+        [],
+        [_out("src:a:v:0")],
+        sink=_sink("out.mkv", {"video_codec": "libx264"}, window=(0.0, 1.0)),
+    )
+    args = build_ffmpeg_args(emit(g))
+    assert args[-3:] == ["-c:0", "libx264", "out.mkv"]
+    assert "copy" not in args
 
 
 # ---------------------------------------------------------------------------

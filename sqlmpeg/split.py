@@ -181,6 +181,7 @@ def insert_splits(g: Graph) -> Graph:
             path=unit.path,
             options=dict(unit.options),
             tags=dict(unit.tags),
+            window=unit.window,
         )
         for unit in g.sinks
     ]

@@ -81,6 +81,12 @@ What lowering does, in order:
     CTE is consumed, and memoized per stream, so every consumer of the same
     stream shares one ``trim``+``setpts`` (video) / ``atrim``+``asetpts``
     (audio) pair. Being a filtergraph trim, it cannot carry captions.
+  - under a fan-out ``TO (<expression>)`` an input alias's window is per-FILE
+    rather than per-``-i``: the rows name different windows over one input, so
+    each lands on its own ``SinkUnit.window`` and emit seeks that OUTPUT. The
+    exception is a fan-out that stream-copies everything it maps, where an
+    output seek would write a corrupt file: that one goes back to one graph
+    (one command) per file, each with its own ``Graph.input_trims``.
 * Each projection lowers bottom-up to one :class:`~sqlmpeg.ir.Output` per
   stream it carries (an array column splats into consecutive Outputs). A call
   type-checks its stream arguments against the filter's pad signature and its
@@ -321,7 +327,12 @@ from sqlmpeg.parser import (
 from sqlmpeg.parser import _ident_name as _fold
 from sqlmpeg.probe import ProbeResult, StreamMeta
 from sqlmpeg.registry import DynamicFilter, FilterOption, Registry, SourceFilter
-from sqlmpeg.sink import CODEC_PARAMS_FLAGS, TWO_PASS_CODECS, validate_csv_option
+from sqlmpeg.sink import (
+    CODEC_PARAMS_FLAGS,
+    TWO_PASS_CODECS,
+    copy_suppressed_scopes,
+    validate_csv_option,
+)
 from sqlmpeg.sink import validate_option as validate_sink_option
 from sqlmpeg.table import ArrayCell, CellValue, StreamCell, TableResult, TableSink
 
@@ -1815,6 +1826,8 @@ class _Lowerer:
         probes: dict[str, ProbeResult | None],
         registry: Registry | None,
         fanout_index: int = 0,
+        *,
+        fanout_sinks: bool = False,
     ) -> None:
         self.res = res
         self.probes = probes
@@ -1840,9 +1853,20 @@ class _Lowerer:
         # sink's TO expression once it is known to reference a row column, and
         # the pinned row / its branch environment once `_pin_fanout_row` runs.
         # `fanout_count` is the relation's surviving row count, i.e. how many
-        # commands the query compiles to; None until a pin happens, which is
-        # what tells `lower_commands` this was not a fan-out query at all.
+        # FILES the query writes; None until a pin happens, which is what tells
+        # `lower_commands` this was not a fan-out query at all.
         self.fanout_index = fanout_index
+        # True -> every fan-out row becomes a SinkUnit of THIS graph (one
+        # command, several output files) and its time window rides that unit
+        # instead of the shared `-i`. False -> `fanout_index` alone binds, one
+        # graph per row, which is the `&&` chain a stream-copy trim needs.
+        self.fanout_sinks = fanout_sinks
+        # The input windows the row being lowered named, alias -> (start, end).
+        # Reset per row; harvested into that row's `SinkUnit.window`.
+        self.fanout_windows: dict[str, tuple[float | None, float | None]] = {}
+        # True once a row named two windows at once: no single output seek
+        # says that, so the fan-out falls back to the chain.
+        self.fanout_window_conflict = False
         self.fanout_expr: exp.Expr | None = None
         # Sticky across sinks, unlike `fanout_expr`: the loudnorm2 fences ask
         # whether ANY COPY of the script fanned out.
@@ -1887,8 +1911,9 @@ class _Lowerer:
             )
             self._harvest_cte_tags(body)
         if self.res.sinks:
-            self.graph.sinks = [self._lower_sink(raw) for raw in self.res.sinks]
-            _check_two_pass_is_single_sink(self.graph.sinks, self.res.sinks)
+            self.graph.sinks = self._lower_sinks()
+            if self.fanout_count is None:
+                _check_two_pass_is_single_sink(self.graph.sinks, self.res.sinks)
         else:
             columns = self._lower_query(self.res.branches, self.res.select, tags="sink")
             self.graph.sinks = [
@@ -1910,12 +1935,25 @@ class _Lowerer:
         that -- a second loudnorm2, a ``two_pass`` sink, a fan-out TO -- is
         closed rather than guessed at. Counted over NODES, so a call
         broadcast across an audio array is caught as the several it is.
+
+        The fan-out rejection comes FIRST: a fan-out mints the call once per
+        file it writes, so the count would otherwise report a multiplicity the
+        query text does not show.
         """
         anchors = [(raw.path_expr, raw.path_node) for raw in self.res.sinks]
         anchor, fallback = anchors[0] if anchors else (self.res.select, self.res.select)
         count = sum(1 for n in self.graph.nodes.values() if n.filter == loudnorm.FILTER)
         if count == 0:
             return
+        if self.fanout_seen:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "sqlmpeg.loudnorm2() and a fan-out TO cannot both be set",
+                anchor,
+                fallback=fallback,
+                hint="a TO expression writes one file per row, each needing its "
+                "own measuring pass; write a quoted TO path",
+            )
         if count > 1:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -1934,17 +1972,31 @@ class _Lowerer:
                     hint="both compile to a command sequence of their own; "
                     "normalize the audio in a separate COPY",
                 )
-        if self.fanout_seen:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                "sqlmpeg.loudnorm2() and a fan-out TO cannot both be set",
-                anchor,
-                fallback=fallback,
-                hint="a TO expression writes one file per row, each needing its "
-                "own measuring pass; write a quoted TO path",
-            )
 
     # -- the COPY sink ----------------------------------
+
+    def _lower_sinks(self) -> list[SinkUnit]:
+        """One :class:`SinkUnit` per COPY — or per fan-out ROW/GROUP.
+
+        A fan-out COPY is alone in its script (the parser sees to that) and
+        writes one file per surviving row, so under `fanout_sinks` it lowers
+        once per row into THIS graph: shared streams are minted once and the
+        split pass fans them out across the units, exactly as it does for a
+        view several COPYs read. The row COUNT is a property of the probed
+        relation, so it comes back from the first pass rather than being known
+        up front.
+        """
+        units: list[SinkUnit] = []
+        for raw in self.res.sinks:
+            units.append(self._lower_sink(raw))
+            count = self.fanout_count
+            if not self.fanout_sinks or count is None:
+                continue
+            for index in range(1, count):
+                self.fanout_index = index
+                units.append(self._lower_sink(raw))
+            self.fanout_index = 0
+        return units
 
     def _lower_sink(self, raw: RawSink) -> SinkUnit:
         """One COPY: its own query lowered, its options validated.
@@ -1980,6 +2032,7 @@ class _Lowerer:
         self.fanout_seen = self.fanout_seen or self.fanout_expr is not None
         self.sink_anchor = raw.path_expr if raw.path_expr is not None else raw.path_node
         self.sink_path = raw.path
+        self.fanout_windows = {}
         columns = self._lower_query(list(raw.branches), raw.query, tags="sink")
         options: dict[str, object] = {}
         option_nodes: dict[str, exp.Expr] = {}
@@ -2033,9 +2086,26 @@ class _Lowerer:
             path=path,
             options=options,
             tags=dict(self.container_tags),
+            window=self._fanout_window(),
         )
 
     # -- the fan-out TO expression ------------------------------------
+
+    def _fanout_window(self) -> tuple[float | None, float | None] | None:
+        """This row's OUTPUT window: the one input window its WHERE named.
+
+        An output seek is a property of the FILE, so every alias the row
+        trimmed has to agree on it. Two disagreeing windows are not a
+        rejection — they are recorded and send the whole fan-out back to one
+        command per row, where each alias seeks its own ``-i`` again.
+        """
+        windows = set(self.fanout_windows.values())
+        if not windows:
+            return None
+        if len(windows) > 1:
+            self.fanout_window_conflict = True
+            return None
+        return windows.pop()
 
     def _check_fanout_options(self, options: dict[str, object], raw: RawSink) -> None:
         """The sink options a fan-out COPY does not take, v1.
@@ -4250,7 +4320,12 @@ class _Lowerer:
                         hint=f"drop seek_end from {alias}'s input(), or drop "
                         f"the WHERE window on '{alias}'",
                     )
-                self.graph.input_trims[alias] = window
+                if self.fanout_sinks and self.fanout_expr is not None:
+                    # A fan-out row's window belongs to the FILE that row
+                    # writes, not to the `-i` every one of them reads.
+                    self.fanout_windows[alias] = window
+                else:
+                    self.graph.input_trims[alias] = window
             else:
                 env.trims[alias] = window
 
@@ -4308,7 +4383,8 @@ class _Lowerer:
         """
         window = env.trims.get(alias)
         if window is None:
-            if value.type in _PASSTHROUGH_ONLY and alias in self.graph.input_trims:
+            trimmed = alias in self.graph.input_trims or alias in self.fanout_windows
+            if value.type in _PASSTHROUGH_ONLY and trimmed:
                 # MEASURED 2026-08-15, not theoretical: ffmpeg does not retime
                 # subtitle/data packets under an input -ss (copy OR transcode;
                 # cue times stay near-original while video rebases to zero), so
@@ -7214,8 +7290,8 @@ def lower(
 ) -> Graph:
     """Lower a resolved query into an IR graph -- its FIRST command's.
 
-    The whole query for everything but a fan-out COPY, which compiles to one
-    graph per row; :func:`lower_commands` returns them all.
+    The whole query except for the one fan-out shape that compiles to a
+    command sequence (see :func:`lower_commands`, which returns them all).
 
     `probes` is keyed by input ALIAS (``compiler.compile_sql`` builds it, one
     ``probe()`` per distinct path); a missing or ``None`` entry means that
@@ -7240,26 +7316,34 @@ def lower_commands(
 ) -> list[Graph]:
     """Lower a resolved query into one IR graph per ffmpeg COMMAND.
 
-    One graph for every query but a fan-out COPY, whose ``TO`` expression reads
-    a track-row column: that one is lowered once per surviving row, each run
-    binding its own row, so each graph carries that row's seek window, streams,
-    tags and destination. The row COUNT is a property of the probed file, so it
-    comes back from the first run rather than being known up front.
+    Usually ONE graph, a fan-out COPY included: ffmpeg takes several output
+    files per invocation, so a ``TO (<expression>)`` lowers each surviving
+    row into a :class:`SinkUnit` of a single graph, sharing one decode of the
+    inputs. The row COUNT is a property of the probed file, so it comes back
+    from the lowering rather than being known up front.
+
+    The exception is a fan-out that TRIMS and stream-copies every stream it
+    maps (:func:`_fanout_keeps_chain`): that one lowers again, one graph per
+    row, and the caller chains the commands.
 
     Same probing/registry contract as :func:`lower`; raises ``SqlmpegError``
     -- and nothing else -- on every rejection.
     """
     try:
-        first = _Lowerer(res, probes, registry)
-        graphs = [first.run()]
-        count = first.fanout_count
-        if count is not None:
-            graphs += [
-                _Lowerer(res, probes, registry, fanout_index=index).run()
-                for index in range(1, count)
-            ]
-            _check_distinct_paths(graphs, res, grouped=first.fanout_grouped)
-        return graphs
+        shared = _Lowerer(res, probes, registry, fanout_sinks=True)
+        graph = shared.run()
+        count = shared.fanout_count
+        if count is None:
+            return [graph]
+        _check_distinct_paths(
+            [unit.path for unit in graph.sinks], res, grouped=shared.fanout_grouped
+        )
+        if not _fanout_keeps_chain(graph, conflict=shared.fanout_window_conflict):
+            return [graph]
+        return [
+            _Lowerer(res, probes, registry, fanout_index=index).run()
+            for index in range(count)
+        ]
     except SqlmpegError:
         raise
     except Exception as err:  # backstop: guardrail #7, no panics on user input
@@ -7272,10 +7356,32 @@ def lower_commands(
         ) from err
 
 
+def _fanout_keeps_chain(graph: Graph, *, conflict: bool) -> bool:
+    """True when this fan-out has to stay one ffmpeg command per file.
+
+    An output-side seek re-encodes, and ffmpeg writes a corrupt file when one
+    meets a stream copy, so a windowed fan-out whose every mapped stream is a
+    copy keeps the ``&&`` chain and seeks its inputs instead. Anything that
+    re-encodes -- a filtered stream, a codec the sink names -- takes the
+    single invocation, and the streams that would have been copies re-encode
+    along with it. `conflict` is the other way back to the chain: one file
+    wanting two different windows, which only an ``-i`` seek can say.
+    """
+    if conflict:
+        return True
+    if all(unit.window is None for unit in graph.sinks):
+        return False
+    return all(
+        is_src(output.ref) and output.type not in copy_suppressed_scopes(unit.options)
+        for unit in graph.sinks
+        for output in unit.outputs
+    )
+
+
 def _check_distinct_paths(
-    graphs: list[Graph], res: Resolved, *, grouped: bool = False
+    paths: list[str | None], res: Resolved, *, grouped: bool = False
 ) -> None:
-    """No two fan-out commands may write the same file.
+    """No two fan-out files may share a destination.
 
     Rows sharing a destination is the typo guard; GROUP BY is how a query ASKS
     for them to share one, so the hint says so. Two distinct GROUPS colliding
@@ -7292,8 +7398,7 @@ def _check_distinct_paths(
     seen: dict[str, int] = {}
     anchor = res.sinks[0].path_expr if res.sinks else None
     fallback = res.sinks[0].path_node if res.sinks else None
-    for index, graph in enumerate(graphs):
-        path = graph.sinks[0].path if graph.sinks else None
+    for index, path in enumerate(paths):
         if path is None:
             continue
         if path in seen:

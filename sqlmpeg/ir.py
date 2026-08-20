@@ -181,7 +181,8 @@ class Output:
 class SinkUnit:
     """One output FILE: its stream list, its destination and its options.
 
-    One unit per ``COPY (query) TO 'path' WITH (options)``, in script order.
+    One unit per ``COPY (query) TO 'path' WITH (options)``, in script order --
+    and one per surviving ROW of a fan-out ``TO (<expression>)``, in row order.
 
     * ``outputs`` is that COPY's top-level SELECT list, in ``-map`` order.
       Output STREAM indices are per-file in ffmpeg, so ``-c:<i>`` and
@@ -194,6 +195,13 @@ class SinkUnit:
     * ``tags`` are the file's CONTAINER tags, key -> value, rendered as
       ``-metadata key=value``. A None value CLEARS the key and still renders
       (``-metadata key=``): ffmpeg copies an input's globals by default.
+    * ``window`` is this FILE's own ``(start, end)`` trim in seconds, rendered
+      as ``-ss``/``-to`` OUTPUT options ahead of the unit's maps. Either bound
+      may be None. It re-encodes every stream it covers, so emit drops the
+      ``-c:<i> copy`` a passthrough map would otherwise carry: output-side
+      seeks and stream copy write corrupt files. Set only by a fan-out whose
+      rows carry a time window; an input-wide window lives in
+      :attr:`Graph.input_trims` instead.
 
     Filtergraph LABELS are graph-scoped, not file-scoped: one
     ``-filter_complex`` serves every unit, so emit keeps ``out<i>`` unique
@@ -204,6 +212,7 @@ class SinkUnit:
     path: str | None = None
     options: dict[str, object] = field(default_factory=dict)
     tags: dict[str, str | None] = field(default_factory=dict)
+    window: tuple[float | None, float | None] | None = None
 
     def to_dict(self) -> dict[str, object]:
         d: dict[str, object] = {
@@ -215,6 +224,8 @@ class SinkUnit:
         # tagging nothing keeps the smaller shape the goldens pin.
         if self.tags:
             d["tags"] = dict(self.tags)
+        if self.window is not None:
+            d["window"] = [self.window[0], self.window[1]]
         return d
 
     @classmethod
@@ -223,10 +234,12 @@ class SinkUnit:
         raw_path = d["path"]
         raw_options = d["options"]
         raw_tags = d.get("tags")
+        raw_window = d.get("window")
         assert isinstance(raw_outputs, list)
         assert raw_path is None or isinstance(raw_path, str)
         assert isinstance(raw_options, dict)
         assert raw_tags is None or isinstance(raw_tags, dict)
+        assert raw_window is None or isinstance(raw_window, list)
         outputs: list[Output] = []
         for raw_output in raw_outputs:
             assert isinstance(raw_output, dict)
@@ -236,8 +249,19 @@ class SinkUnit:
             tags = {
                 str(k): None if v is None else str(v) for k, v in raw_tags.items()
             }
+        window: tuple[float | None, float | None] | None = None
+        if raw_window is not None:
+            start, end = raw_window
+            window = (
+                float(start) if start is not None else None,
+                float(end) if end is not None else None,
+            )
         return cls(
-            outputs=outputs, path=raw_path, options=dict(raw_options), tags=tags
+            outputs=outputs,
+            path=raw_path,
+            options=dict(raw_options),
+            tags=tags,
+            window=window,
         )
 
 
@@ -247,8 +271,8 @@ class Graph:
     sources: dict[str, int]  # alias -> index into input_paths
     nodes: dict[str, Node] = field(default_factory=dict)  # insertion-ordered
     # One unit per output FILE, in script order. Units share this
-    # graph's nodes -- a view read by three COPYs is lowered ONCE and fanned
-    # out by the split pass.
+    # graph's nodes -- a view read by three COPYs, or by three files of one
+    # fan-out, is lowered ONCE and fanned out by the split pass.
     sinks: list[SinkUnit] = field(default_factory=list)
     # alias -> (start, end) seconds. Emit renders "-ss <start> -to
     # <end>" immediately before that alias's -i, trimming every stream type of

@@ -93,6 +93,16 @@ ffmpeg reads to EOF). Both bounds are on the input's own timeline. A seeked
 input can still be stream-copied, and then the cut snaps back to the preceding
 keyframe; a decoded stream is frame-accurate.
 
+Output seeking
+--------------
+``SinkUnit.window`` is the other half: one FILE's own ``(start, end)``,
+rendered as ``-ss``/``-to`` ahead of that output's ``-map`` list rather than
+before an ``-i``. One input can then feed several differently-cut files from a
+single decode, which is what a fan-out over chapters compiles to. Output-side
+seeking re-encodes, so a group carrying a window never renders ``-c:<i> copy``:
+its passthrough streams take whatever codec the sink options name, else
+ffmpeg's default encoder for the container.
+
 Input options
 -------------
 ``Graph.input_options`` maps an alias to its validated ``input('path', name =>
@@ -212,7 +222,13 @@ from .ir import (
     is_src,
     src_parts,
 )
-from .sink import CODEC_PARAMS_FLAGS, PASSLOGFILE_FLAG, SINK_OPTIONS, SinkOptionSpec
+from .sink import (
+    CODEC_PARAMS_FLAGS,
+    PASSLOGFILE_FLAG,
+    SINK_OPTIONS,
+    SinkOptionSpec,
+    copy_suppressed_scopes,
+)
 
 OUTPUT_LABEL_PREFIX = "out"
 """Filtered outputs are labelled ``out0``, ``out1``, ... (without brackets)."""
@@ -279,12 +295,16 @@ class OutputGroup:
     `path` is None only for a bare-SELECT graph, where the caller supplies the
     destination. `options` are the validated ``WITH (...)`` sink options, and
     `tags` that file's container tags (a None value clears its key).
+    `window` is this file's own ``(start, end)`` trim, rendered as ``-ss``/
+    ``-to`` ahead of the maps; it re-encodes, so a group carrying one never
+    renders ``-c:<i> copy``.
     """
 
     maps: list[OutputMap]
     path: str | None = None
     options: dict[str, object] = field(default_factory=dict)
     tags: dict[str, str | None] = field(default_factory=dict)
+    window: tuple[float | None, float | None] | None = None
 
 
 @dataclass
@@ -362,6 +382,7 @@ def _output_group(g: Graph, unit: SinkUnit, labels: dict[str, str]) -> OutputGro
         path=unit.path,
         options=dict(unit.options),
         tags=dict(unit.tags),
+        window=unit.window,
     )
 
 
@@ -530,6 +551,9 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     ``-filter_complex`` is rendered once for the command, omitted when the
     graph is pure passthrough.
 
+    A group's own ``window`` renders ``-ss``/``-to`` FIRST, ahead of its maps,
+    and suppresses every ``-c:<i> copy`` in that group (see "Output seeking").
+
     Per-``-i`` flags come first in a fixed order (see the module docstring's
     "Input options"): `e.input_options` flags (``-loop 1``, ``-framerate 15``)
     FIRST, then `e.input_trims`' ``-ss <start>`` and/or ``-to <end>``, then
@@ -598,11 +622,20 @@ def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> li
         path = out_path if out_path is not None else group.path
         if path is None:
             raise ValueError("no output path given and the query has no sink")
-        copy_suppressed_scopes = _copy_suppressed_scopes(group.options)
+        suppressed = copy_suppressed_scopes(group.options)
+        # This file's own seeks, ahead of its maps: an output-side window
+        # re-encodes everything it covers, which is why no map below forces
+        # `copy` under one.
+        if group.window is not None:
+            start, end = group.window
+            if start is not None:
+                args += ["-ss", _render_number(start)]
+            if end is not None:
+                args += ["-to", _render_number(end)]
         # Output stream indices restart at 0 in every output file.
         for index, mapping in enumerate(group.maps):
             args += ["-map", mapping.target]
-            if mapping.copy and mapping.type not in copy_suppressed_scopes:
+            if mapping.copy and mapping.type not in suppressed and group.window is None:
                 args += [f"-c:{index}", "copy"]
             for key in sorted(mapping.metadata):
                 if key == _DISPOSITION_KEY:
@@ -673,11 +706,6 @@ def _render_container_tags(tags: dict[str, str | None]) -> list[str]:
 
 
 # sink option rendering
-
-
-def _copy_suppressed_scopes(options: dict[str, object]) -> set[str]:
-    """Stream scopes ("video"/"audio") for which a group sets an explicit codec."""
-    return {SINK_OPTIONS[name].scope for name in options if SINK_OPTIONS[name].flag == "-c"}
 
 
 def _render_option_value(spec: SinkOptionSpec, value: object) -> str | None:
