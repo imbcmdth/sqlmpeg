@@ -771,16 +771,16 @@ def test_probe_av_fixture_has_video_and_audio(_fixtures: Path) -> None:
 
 @pytest.mark.exec
 def test_probe_av_eng_fixture_language_and_duration(_fixtures: Path) -> None:
-    """av-eng.mp4: one eng-tagged audio track, ~2s -- both the
+    """av-eng.mp4: one eng-tagged audio track, ~4s -- both the
     per-stream and the container-level duration."""
     result = probe(str(_fixtures / "av-eng.mp4"))
     assert result is not None
-    assert result.duration == pytest.approx(2.0, abs=0.2)
+    assert result.duration == pytest.approx(4.0, abs=0.2)
 
     audio = result.by_type("audio")
     assert len(audio) == 1
     assert audio[0].metadata.get("language") == "eng"
-    assert audio[0].duration == pytest.approx(2.0, abs=0.2)
+    assert audio[0].duration == pytest.approx(4.0, abs=0.2)
     assert audio[0].codec is not None
 
 

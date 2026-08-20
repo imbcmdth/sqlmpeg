@@ -1,5 +1,5 @@
 <p align="center">
-    <img src="sqlmpeg-bg.svg" alt="sqlmpeg" width="300">
+    <img src="https://raw.githubusercontent.com/imbcmdth/sqlmpeg/refs/heads/main/sqlmpeg-bg.svg" alt="sqlmpeg" width="300">
 </p>
 
 **SQL in; ffmpeg out**

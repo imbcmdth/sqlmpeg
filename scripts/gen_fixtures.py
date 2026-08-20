@@ -35,7 +35,7 @@ from pathlib import Path
 
 FIXTURES_DIR = Path(__file__).resolve().parent.parent / "tests" / "fixtures"
 
-_DURATION = 2
+_DURATION = 4
 _SIZE = "320x240"
 _RATE = 15
 
@@ -57,11 +57,14 @@ _AV_CHAPTERS_NAME = "av-chapters.mkv"
 _TAGGED_NAME = "tagged.mp4"
 _AV_2ENG_NAME = "av-2eng.mp4"
 
-# Intro 0-1, Credits 1-2 -- matches cookbook recipe 39's pinned table exactly.
+# Intro 0-1, Chapter 1 1-2, Chapter 2 2-3, Credits 3-4 -- matches cookbook
+# recipe 39's pinned table exactly.
 _CHAPTERS_FFMETADATA = (
     ";FFMETADATA1\n"
     "[CHAPTER]\nTIMEBASE=1/1\nSTART=0\nEND=1\ntitle=Intro\n"
-    "[CHAPTER]\nTIMEBASE=1/1\nSTART=1\nEND=2\ntitle=Credits\n"
+    "[CHAPTER]\nTIMEBASE=1/1\nSTART=1\nEND=2\ntitle=Chapter 1\n"
+    "[CHAPTER]\nTIMEBASE=1/1\nSTART=2\nEND=3\ntitle=Chapter 2\n"
+    "[CHAPTER]\nTIMEBASE=1/1\nSTART=3\nEND=4\ntitle=Credits\n"
 )
 
 _SUBS_VTT = """WEBVTT
@@ -239,7 +242,7 @@ def _generate_avs(subs_path: Path) -> None:
 
 
 def _generate_av_chapters() -> None:
-    """av.mp4 remuxed with two chapters, via ffmpeg's own ffmetadata `data:` URI.
+    """av2.mp4 remuxed with two chapters, via ffmpeg's own ffmetadata `data:` URI.
 
     The chapters(f) read fixture (plan 077): same mechanism the compiler
     itself uses to WRITE chapters, run once by hand to build a file to READ
@@ -251,8 +254,9 @@ def _generate_av_chapters() -> None:
     _run(
         FIXTURES_DIR / _AV_CHAPTERS_NAME,
         [
-            "-i", str(FIXTURES_DIR / _AV_NAME),
+            "-i", str(FIXTURES_DIR / _AV2_NAME),
             "-f", "ffmetadata", "-i", uri,
+            "-map", "0:v:0", "-map", "0:a:0", "-map", "0:a:1",
             "-map_metadata", "1",
             "-map_chapters", "1",
             "-c", "copy",

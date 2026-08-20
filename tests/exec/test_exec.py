@@ -265,10 +265,10 @@ def test_trim_reports_expected_duration(tmp_path: Path) -> None:
 #
 # Measured keyframe layout of the fixture these bounds are chosen for
 # (`ffprobe -select_streams v -show_frames -show_entries frame=key_frame,pts_time`
-# on tests/fixtures/testsrc.mp4): 30 frames at 15 fps over 2.000s, and exactly
+# on tests/fixtures/testsrc.mp4): 60 frames at 15 fps over 4.000s, and exactly
 # ONE keyframe, at pts_time 0.000 -- the GOP is the entire file. A copied
 # 0.5..1.5 cut therefore snaps its start all the way back to t=0; the measured
-# output duration is 1.367s (requested window 1.0s, whole input 2.0s), which is
+# output duration is 1.367s (requested window 1.0s, whole input 4.0s), which is
 # why the copy-path assertion below is a RANGE and not an approx().
 # ---------------------------------------------------------------------------
 
@@ -342,8 +342,8 @@ def test_a_trimmed_passthrough_is_stream_copied_within_keyframe_tolerance(
 def test_tail_only_input_seek_is_frame_accurate_when_the_stream_is_re_encoded(
     tmp_path: Path,
 ) -> None:
-    """`t >= 1` on the 2.000s fixture, decoded path: no upper bound at all --
-    ffmpeg reads to EOF -- so the output is exactly the tail, 2.0 - 1.0 = 1.0s."""
+    """`t >= 1` on the 4.000s fixture, decoded path: no upper bound at all --
+    ffmpeg reads to EOF -- so the output is exactly the tail, 4.0 - 1.0 = 3.0s."""
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "tail-reencoded.mp4"
     query = f"SELECT hflip(a.frame) FROM input('{_sql_path(_TESTSRC)}') a WHERE a.t >= 1"
@@ -645,7 +645,7 @@ def test_profile_level_maxrate_land_in_a_real_encode(tmp_path: Path) -> None:
 
 
 def test_seek_end_produces_a_shorter_file_than_the_source(tmp_path: Path) -> None:
-    """seek_end seeks from EOF: testsrc.mp4 is a known 2.000s, so keeping the
+    """seek_end seeks from EOF: testsrc.mp4 is a known 4.000s, so keeping the
     last second must produce a file shorter than the whole source."""
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "tail.mp4"
@@ -826,8 +826,8 @@ def test_ad_insert_composites_a_delayed_clip_over_the_film(tmp_path: Path) -> No
 
     A 0.33-scale copy of the ad, delayed one second, composited into the
     film's corner, with its audio delayed by the same second and mixed under
-    the film's at half volume. Both fixtures are 2s, so the delayed ad is the
-    longer of the two branches and the output runs to delay + ad = 3s.
+    the film's at half volume. Both fixtures are 4s, so the delayed ad is the
+    longer of the two branches and the output runs to delay + ad = 5s.
     """
     _require_fixture(_AV2)
     _require_fixture(_AV3)
@@ -866,11 +866,11 @@ def test_a_delayed_video_is_transparent_before_and_after_its_clip(
 ) -> None:
     """The semantics the macro promises, measured pixel by pixel.
 
-    The base here is av2+av3 concatenated (4s), so it outlasts the delayed
-    clip (1s + 2s) and there is an "after" to look at. The same base is also
+    The base here is av2+av3 concatenated (8s), so it outlasts the delayed
+    clip (1s + 4s) and there is an "after" to look at. The same base is also
     rendered on its own; the composite must be indistinguishable from it
-    inside the overlay rectangle before t=1 and after t=3, and clearly
-    different in between. The 4s duration is itself the other half of the
+    inside the overlay rectangle before t=1 and after t=5, and clearly
+    different in between. The 8s duration is itself the other half of the
     claim: a transparent canvas that padded FOREVER (tpad stop=-1) would make
     overlay never terminate at all.
     """
@@ -900,7 +900,7 @@ def test_a_delayed_video_is_transparent_before_and_after_its_clip(
         _ffprobe_duration(base_path), abs=0.3
     )
 
-    for moment, expected in ((0.3, "same"), (1.5, "different"), (3.5, "same")):
+    for moment, expected in ((0.3, "same"), (1.5, "different"), (5.5, "same")):
         base_png = tmp_path / f"base-{moment}.png"
         composite_png = tmp_path / f"composite-{moment}.png"
         _extract_frame(base_path, moment, base_png)
@@ -944,7 +944,7 @@ def test_ad_splice_tail_trim_needs_no_between_placeholder(tmp_path: Path) -> Non
     a `BETWEEN x AND 3600`-style placeholder to fake "to the end";
     `g.t >= 1` says it directly, with no upper bound at all.
 
-    Three UNION ALL branches over the 2s av2/av3 fixtures: a 1s head of av2, all
+    Three UNION ALL branches over the 4s av2/av3 fixtures: a 1s head of av2, all
     of av3 as the ad, and a 1s tail of av2 (`g.t >= 1`, BETWEEN-free). Every
     branch feeds the `concat` filter, so every trim is DECODED end to end
     (frame-accurate, not stream-copy-and-snap), and the run is head + ad + tail.
@@ -1004,7 +1004,7 @@ def test_looped_png_title_card_composites_onto_testsrc(tmp_path: Path) -> None:
     before the png's own `-i`; `WHERE p.t <= 2` becomes a `-to 2` input seek
     on that same `-i`, rendered AFTER the options and still before `-i` (the
     order this module's emit.py chose and verified against real ffmpeg).
-    `overlay`'s main input is testsrc.mp4 (the fixture's own 2s duration), so
+    `overlay`'s main input is testsrc.mp4 (the fixture's own 4s duration), so
     the composite runs exactly as long as it does regardless of the png's
     (effectively infinite, looped) length -- loop forces the png through the
     encoder rather than a stream copy, hence the wider tolerance.
@@ -1036,7 +1036,7 @@ def test_looped_png_title_card_composites_onto_testsrc(tmp_path: Path) -> None:
 
     _compile_and_run(query, out_path)
 
-    assert _ffprobe_duration(out_path) == pytest.approx(2.0, abs=0.2)
+    assert _ffprobe_duration(out_path) == pytest.approx(4.0, abs=0.2)
 
 
 # ---------------------------------------------------------------------------
@@ -1154,7 +1154,7 @@ def test_a_sine_tone_is_a_whole_query_with_no_input_file(tmp_path: Path) -> None
 # The claim `enable` makes is about individual FRAMES, so it is checked the way
 # the delay macro's transparency test checks its canvas: render the query, pull one
 # frame from inside the window and one from either side, and diff each against
-# the untouched fixture. The fixture is 2s at 15fps, so 0.2 / 1.0 / 1.8 sit
+# the untouched fixture. The fixture is 4s at 15fps, so 0.2 / 1.0 / 1.8 sit
 # comfortably clear of the 0.5 and 1.5 edges.
 
 # A region well inside the 320x240 frame, so an edge effect cannot decide it.
@@ -1491,7 +1491,7 @@ def test_the_channelsplit_round_trip_mixes_the_channels_back_down(
     streams = _ffprobe_streams(out_path)
     assert [s["codec_type"] for s in streams] == ["audio"]
     assert streams[0]["channels"] == 1
-    assert _ffprobe_duration(out_path) == pytest.approx(2.0, abs=0.2)
+    assert _ffprobe_duration(out_path) == pytest.approx(4.0, abs=0.2)
 
 
 def test_acrossover_writes_one_stream_per_band(tmp_path: Path) -> None:
@@ -1586,7 +1586,12 @@ def test_chapters_from_copies_an_inputs_own_chapters_through(tmp_path: Path) -> 
     _run_sink_query(query, out_path)
 
     chapters = _ffprobe_chapters(out_path)
-    assert [c["tags"]["title"] for c in chapters] == ["Intro", "Credits"]
+    assert [c["tags"]["title"] for c in chapters] == [
+        "Intro",
+        "Chapter 1",
+        "Chapter 2",
+        "Credits",
+    ]
 
 
 # ---------------------------------------------------------------------------

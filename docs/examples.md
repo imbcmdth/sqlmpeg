@@ -645,7 +645,7 @@ An outer join keeps the rows only one side has, and `COALESCE` fills the gap - f
 
 ```pgsql
 COPY (
-  SELECT array_agg(amix(a.track, COALESCE(b.track, ffmpeg.anullsrc(duration => 2))))
+  SELECT array_agg(amix(a.track, COALESCE(b.track, ffmpeg.anullsrc(duration => 4))))
   FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
        unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.language = b.language
 ) TO 'full.mka'
@@ -654,7 +654,7 @@ COPY (
 ```
 $ sqlmpeg compile -f query.sql
 ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex \
-  'anullsrc=duration=2[n1];[0:a:0][1:a:0]amix=inputs=2[out0];'\
+  'anullsrc=duration=4[n1];[0:a:0][1:a:0]amix=inputs=2[out0];'\
 '[0:a:1][n1]amix=inputs=2[out1]' -map '[out0]' -metadata:s:0 language=eng -map '[out1]' \
   -metadata:s:1 language=fra full.mka
 ```
@@ -672,7 +672,7 @@ COPY (
        unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.language = b.language
   GROUP BY f.video[1]
   UNION ALL
-  SELECT g2.video[1], array_agg(COALESCE(b2.track, ffmpeg.anullsrc(duration => 2)))
+  SELECT g2.video[1], array_agg(COALESCE(b2.track, ffmpeg.anullsrc(duration => 4)))
   FROM input('tests/fixtures/av2.mp4') f2, input('tests/fixtures/av-eng.mp4') g2,
        unnest(f2.audio) a2 FULL OUTER JOIN unnest(g2.audio) b2 ON a2.language = b2.language
   GROUP BY g2.video[1]
@@ -682,7 +682,7 @@ COPY (
 ```
 $ sqlmpeg compile -f query.sql
 ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-eng.mp4 -filter_complex \
-  'anullsrc=duration=2[n1];'\
+  'anullsrc=duration=4[n1];'\
 '[0:v:0][0:a:0][0:a:1][1:v:0][1:a:0][n1]concat=n=2:v=1:a=2[out0][out1][out2]' -map \
   '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 \
   language=fra joined.mp4
@@ -899,11 +899,13 @@ FROM input('tests/fixtures/av-chapters.mkv') f, chapters(f) c
 
 ```
 $ sqlmpeg -f query.sql
- index | title   | start_t | end_t
--------+---------+---------+-------
- 1     | Intro   | 0.0     | 1.0
- 2     | Credits | 1.0     | 2.0
-(2 rows)
+ index | title     | start_t | end_t
+-------+-----------+---------+-------
+ 1     | Intro     | 0.0     | 1.0
+ 2     | Chapter 1 | 1.0     | 2.0
+ 3     | Chapter 2 | 2.0     | 3.0
+ 4     | Credits   | 3.0     | 4.0
+(4 rows)
 ```
 
 ## 40. Write chapters
@@ -1031,7 +1033,7 @@ COPY (
 
 ```
 $ sqlmpeg compile -f query.sql
-ffmpeg -to 1.5 -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy \
+ffmpeg -to 3.5 -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy \
   -metadata:s:1 language=eng trimmed.mp4
 ```
 
@@ -1043,34 +1045,47 @@ A `TO` expression over a row table's columns means one output file per row - the
 
 ```pgsql
 COPY (
-  SELECT f.video[1], f.audio[1]
+  SELECT f.video, f.audio
   FROM input('tests/fixtures/av-chapters.mkv') f, chapters(f) c
   WHERE f.t BETWEEN c.start_t AND c.end_t
-) TO ('ch' || c.index::text || '.mkv')
+) TO ('ch-' || c.title || '.mkv')
 ```
 
 ```
 $ sqlmpeg compile -f query.sql
 ffmpeg -ss 0.0 -to 1.0 -i tests/fixtures/av-chapters.mkv -map 0:v:0 -c:0 copy -map 0:a:0 \
-  -c:1 copy ch1.mkv && ffmpeg -ss 1.0 -to 2.0 -i tests/fixtures/av-chapters.mkv -map \
-  0:v:0 -c:0 copy -map 0:a:0 -c:1 copy ch2.mkv
+  -c:1 copy -metadata:s:1 language=eng -map 0:a:1 -c:2 copy -metadata:s:2 language=fra \
+  ch-Intro.mkv && ffmpeg -ss 1.0 -to 2.0 -i tests/fixtures/av-chapters.mkv -map 0:v:0 \
+  -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -map 0:a:1 -c:2 copy \
+  -metadata:s:2 language=fra 'ch-Chapter 1.mkv' && ffmpeg -ss 2.0 -to 3.0 -i \
+  tests/fixtures/av-chapters.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 \
+  language=eng -map 0:a:1 -c:2 copy -metadata:s:2 language=fra 'ch-Chapter 2.mkv' && \
+  ffmpeg -ss 3.0 -to 4.0 -i tests/fixtures/av-chapters.mkv -map 0:v:0 -c:0 copy -map \
+  0:a:0 -c:1 copy -metadata:s:1 language=eng -map 0:a:1 -c:2 copy -metadata:s:2 \
+  language=fra ch-Credits.mkv
 ```
 
 **Re-encode** - frame-accurate cuts, and the whole split is ONE command: the source decodes once no matter how many chapters, with each output taking its own `-ss`/`-to`:
 
 ```pgsql
 COPY (
-  SELECT f.video[1], f.audio[1]
+  SELECT f.video, f.audio
   FROM input('tests/fixtures/av-chapters.mkv') f, chapters(f) c
   WHERE f.t BETWEEN c.start_t AND c.end_t
-) TO ('ch' || c.index::text || '.mkv') WITH (video_codec 'libx264', crf 18, audio_codec 'aac')
+) TO ('ch-' || c.title || '.mkv') WITH (video_codec 'libx264', crf 18, audio_codec 'aac')
 ```
 
 ```
 $ sqlmpeg compile -f query.sql
-ffmpeg -i tests/fixtures/av-chapters.mkv -ss 0.0 -to 1.0 -map 0:v:0 -map 0:a:0 -c:0 \
-  libx264 -crf:0 18 -c:1 aac ch1.mkv -ss 1.0 -to 2.0 -map 0:v:0 -map 0:a:0 -c:0 libx264 \
-  -crf:0 18 -c:1 aac ch2.mkv
+ffmpeg -i tests/fixtures/av-chapters.mkv -ss 0.0 -to 1.0 -map 0:v:0 -map 0:a:0 \
+  -metadata:s:1 language=eng -map 0:a:1 -metadata:s:2 language=fra -c:0 libx264 -crf:0 \
+  18 -c:1 aac -c:2 aac ch-Intro.mkv -ss 1.0 -to 2.0 -map 0:v:0 -map 0:a:0 -metadata:s:1 \
+  language=eng -map 0:a:1 -metadata:s:2 language=fra -c:0 libx264 -crf:0 18 -c:1 aac \
+  -c:2 aac 'ch-Chapter 1.mkv' -ss 2.0 -to 3.0 -map 0:v:0 -map 0:a:0 -metadata:s:1 \
+  language=eng -map 0:a:1 -metadata:s:2 language=fra -c:0 libx264 -crf:0 18 -c:1 aac \
+  -c:2 aac 'ch-Chapter 2.mkv' -ss 3.0 -to 4.0 -map 0:v:0 -map 0:a:0 -metadata:s:1 \
+  language=eng -map 0:a:1 -metadata:s:2 language=fra -c:0 libx264 -crf:0 18 -c:1 aac \
+  -c:2 aac ch-Credits.mkv
 ```
 
 The chain is the exception, not the rule: it survives only while EVERY stream of every piece is a stream copy. Name one codec, or wrap one column in a filter, and the whole split becomes the single invocation above - the streams you left alone go along with it, taking the container's default encoder instead of `-c copy`.
