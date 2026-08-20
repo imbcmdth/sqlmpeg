@@ -257,7 +257,7 @@ def _readme_flagship_sql() -> str:
     how many streams there are, same reason the union-splat example below
     needs one.
     """
-    sql = _readme_block("commentary", exclude="COPY (")
+    sql = _readme_block("TO ('pip.mkv')")
     for shown, fixture in _FLAGSHIP_README_PATHS.items():
         sql = sql.replace(shown, (FIXTURES_DIR / fixture).as_posix())
     return sql
@@ -311,12 +311,45 @@ def test_readme_flagship_emits_a_filtergraph(_fixtures: None) -> None:
     assert [m.copy for m in e.maps] == [False, False, False]
 
 
+def _readme_command_rendering(args: list[str], sink_paths: list[str]) -> str:
+    """The README's display form of a compiled command: one filter chain per
+    line inside the quoted graph, output groups after it wrapped at ~90
+    columns, every continuation line indented two spaces. Newlines and
+    leading spaces inside the graph are legal to BOTH parties: a
+    single-quoted shell argument keeps them, and ffmpeg's graph parser skips
+    them (verified against ffmpeg 9)."""
+    graph_at = args.index("-filter_complex") + 1
+    chains = args[graph_at].split(";")
+    lines = [shlex.join(args[:graph_at]) + " '"]
+    lines += [f"  {chain};" for chain in chains[:-1]]
+    lines.append(f"  {chains[-1]}' \\")
+    groups: list[list[str]] = [[]]
+    for arg in args[graph_at + 1 :]:
+        groups[-1].append(arg)
+        if arg in sink_paths:
+            groups.append([])
+    groups.pop()
+    tail: list[str] = []
+    for group in groups:
+        current = " "
+        for arg in group:
+            piece = shlex.join([arg])
+            if len(current) + 1 + len(piece) > 88 and current.strip():
+                tail.append(current)
+                current = " "
+            current += " " + piece
+        tail.append(current)
+    for k, line in enumerate(tail):
+        lines.append(line + (" \\" if k < len(tail) - 1 else ""))
+    return "\n".join(lines)
+
+
 @pytest.mark.exec
 def test_readme_flagship_command_is_the_real_compilation(_fixtures: None) -> None:
     """The command shown under the headline is what sqlmpeg actually prints for
     that query, with only the fixture paths written back to the shown names."""
-    args = build_ffmpeg_args(emit(compile_sql(_readme_flagship_sql())), "pip.mkv")
-    shown = shlex.join(args)
+    args = build_ffmpeg_args(emit(compile_sql(_readme_flagship_sql())))
+    shown = _readme_command_rendering(args, ["pip.mkv"])
     for name, fixture in _FLAGSHIP_README_PATHS.items():
         shown = shown.replace((FIXTURES_DIR / fixture).as_posix(), name)
     assert shown in _readme_text(), shown
@@ -331,11 +364,10 @@ def _readme_encoding_sql() -> str:
     """The Encoding section's ```sql block: the flagship verbatim inside a
     COPY ... TO ... WITH (...), re-pointed at the real fixtures the same way.
 
-    Needled on 'pip.mkv' (its TO destination), not the more obvious 'COPY (':
-    the Views and multiple outputs section's ladder script also opens with
-    'COPY (', which would make that needle match two blocks.
+    Needled on its WITH options (unique to this block): the PiP demo is also
+    a COPY over 'pip.mkv', and the ladder script also opens with 'COPY ('.
     """
-    sql = _readme_block("pip.mkv")
+    sql = _readme_block("audio_bitrate '192k'")
     for shown, fixture in _FLAGSHIP_README_PATHS.items():
         sql = sql.replace(shown, (FIXTURES_DIR / fixture).as_posix())
     return sql
@@ -355,8 +387,8 @@ def test_readme_encoding_wraps_the_flagship_query_in_a_sink(_fixtures: None) -> 
         "audio_codec": "aac",
         "audio_bitrate": "192k",
     }
-    # The destination is the ONLY difference: same nodes, same outputs.
-    unit["path"] = None
+    # Both sections COPY to 'pip.mkv'; the WITH options are the ONLY
+    # difference -- same nodes, same outputs, same destination.
     unit["options"] = {}
     assert wrapped == plain
 
@@ -370,7 +402,7 @@ def test_readme_encoding_command_is_the_real_compilation(_fixtures: None) -> Non
     precedence `sqlmpeg run query.sql` (no `-o`) would use.
     """
     args = build_ffmpeg_args(emit(compile_sql(_readme_encoding_sql())))
-    shown = shlex.join(args)
+    shown = _readme_command_rendering(args, ["pip.mkv"])
     for name, fixture in _FLAGSHIP_README_PATHS.items():
         shown = shown.replace((FIXTURES_DIR / fixture).as_posix(), name)
     assert shown in _readme_text(), shown
@@ -387,24 +419,27 @@ def test_readme_encoding_command_is_the_real_compilation(_fixtures: None) -> Non
 
 def _readme_ladder_sql() -> str:
     """The ABR-ladder script, verbatim -- 'film.mkv' need not exist."""
-    return _readme_block("CREATE VIEW master")
+    return _readme_block("CREATE VIEW main")
 
 
 def test_readme_ladder_example_compiles() -> None:
     g = compile_sql(_readme_ladder_sql())
     assert [unit.path for unit in g.sinks] == ["720.mp4", "360.mp4", "audio.m4a"]
     filters = [node.filter for node in g.nodes.values()]
-    assert filters.count("scale") == 3  # master's own + one per video COPY
+    assert filters.count("scale") == 3  # main's own + one per video COPY
     assert filters.count("volume") == 1  # built once, split across all 3 COPYs
     assert g.input_paths == ["film.mkv"]  # one -i: decoded once
 
 
 def test_readme_ladder_example_command_is_the_real_compilation() -> None:
     """The command shown under "Views and multiple outputs" is what sqlmpeg
-    actually prints for that script -- no fixture path to substitute back,
-    since the query names no file sqlmpeg can (or needs to) read."""
-    args = build_ffmpeg_args(emit(compile_sql(_readme_ladder_sql())), None)
-    assert shlex.join(args) in _readme_text()
+    actually prints for that script, in the README's one-filter-per-line
+    display form -- no fixture path to substitute back, since the query
+    names no file sqlmpeg can (or needs to) read."""
+    g = compile_sql(_readme_ladder_sql())
+    args = build_ffmpeg_args(emit(g), None)
+    rendering = _readme_command_rendering(args, [unit.path for unit in g.sinks])
+    assert rendering in _readme_text()
 
 
 def test_readme_flagship_scale_factor_is_not_a_decimal() -> None:

@@ -1,23 +1,41 @@
 # sqlmpeg
 
-SQL in, ffmpeg command out. You write a `SELECT` statement, sqlmpeg compiles it into a `-filter_complex` invocation, and ffmpeg does the actual pixel-pushing. This tool never decodes a single frame: it's a compiler, and ffmpeg is the executor.
+**SQL in; ffmpeg out**
 
-Why does this exist? The ffmpeg engine is a marvel. The filtergraph syntax is the hard part: hand-labeled pads that must each be consumed exactly once, `split` nodes you have to count yourself, and quoting rules deep enough that the official docs include a worked escaping example. SQL, meanwhile, has been describing dataflow DAGs for fifty years, and it's the language every developer (and every LLM) already speaks. This project connects the two.
+You write a `SELECT` statement, sqlmpeg compiles it into a `-filter_complex` invocation, and ffmpeg does the actual pixel-pushing. This tool never decodes a single frame: it's a compiler, and ffmpeg is the executor.
+
+## Why does this exist?
+
+Look, ffmpeg is a marvel - one that I've used for over a decade - but I still need to lookup the syntax *every single time* I want to do something non-trivial. And AI barely helps - it often just gives you the same wrong answer from Reddit that you could have Googled yourself.
+
+ SQL, meanwhile, has been describing dataflow DAGs for fifty years, and it's the language every developer (and every LLM) already speaks.
+
+ This project connects the two so you can bring your preexisting knowledge and create **declarative**, **composable**, and **generalizable** ffmpeg formulae.
 
 ## Install
+
+Python 3.10+.
 
 ```bash
 pip install sqlmpeg
 ```
 
-Or run it without installing anything: `uvx sqlmpeg` / `pipx run sqlmpeg`. Python 3.10+. ffmpeg and ffprobe are required and handled for you: a system install on `PATH` always wins, and on a machine without one, the bundled provisioner (`static-ffmpeg`) fetches both binaries on first use. Every filter call resolves against what your actual ffmpeg ships, and probing your files is what powers `SELECT *`, bare-array broadcasting, and the track-row columns.
+Or run it without installing anything:
+```bash
+uvx sqlmpeg
+```
+
+`ffmpeg` and `ffprobe` are required and, optionally, handled for you. A preexisting ffmpeg install on `PATH` always wins. On a machine without one, the bundled provisioner (`static-ffmpeg`) fetches both binaries on first use.
 
 ## Ask before you act
 
-`run` is the default subcommand, so a query is the whole invocation - and a query with no `COPY ... TO` is a **metadata query**: the answer is probed metadata, fully known the moment compilation ends, so sqlmpeg prints it as a table and never runs ffmpeg at all. This works on anything ffprobe can read, remote manifests included:
+`run` is the default subcommand, so a query is the whole invocation - and a query with no `COPY ... TO` is a **metadata query**: the answer is probed metadata, fully known the moment compilation ends, so sqlmpeg prints it as a table and never runs `ffmpeg` at all. This works on anything `ffprobe` can read, remote manifests included:
 
-```
-$ sqlmpeg "SELECT t.index, t.language, t.codec FROM input(:'src') f, unnest(f.audio) t WHERE t.codec = 'aac'" -v src=https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd
+```bash
+$ sqlmpeg "SELECT t.index, t.language, t.codec \
+FROM input(:'src') f, unnest(f.audio) t \
+WHERE t.codec = 'aac'" \
+-v src=https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd
  index | language | codec
 -------+----------+-------
  1     | es       | aac
@@ -30,8 +48,13 @@ $ sqlmpeg "SELECT t.index, t.language, t.codec FROM input(:'src') f, unnest(f.au
 
 `COPY ... TO STDOUT WITH (format 'csv')` is the scriptable spelling of the same thing - stock Postgres COPY, `header true` optional, or `TO 'tracks.csv'` to write a file:
 
-```
-$ sqlmpeg "COPY (SELECT t.language, t.codec FROM input(:'src') f, unnest(f.audio) t WHERE t.codec = 'aac') TO STDOUT WITH (format 'csv', header true)" -v src=https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd
+```bash
+$ sqlmpeg "COPY ( \
+  SELECT t.language, t.codec \
+  FROM input(:'src') f, unnest(f.audio) t \
+  WHERE t.codec = 'aac' \
+)TO STDOUT WITH (format 'csv', header true)" \
+-v src=https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd
 language,codec
 es,aac
 de,aac
@@ -40,13 +63,14 @@ fr,aac
 it,aac
 ```
 
-Media only moves when you ask for a file: a `COPY ... TO 'out.mkv'` inside the query, or `-o out.mkv` on the CLI (which is the same thing, spelled as a flag). Everything below is that second kind of query.
+Media only moves when you ask for a file: using the same `COPY ... TO 'out.mkv'` inside the query.
 
 ## PiP demo
 
 Imagine you wanted to shrink `commentary.mkv` into the corner of `film.mkv`, and duck the commentary under the main mix. And both files carry two audio tracks - an English and a French language.
 
 ```sql
+COPY(
 WITH pip AS (
   SELECT scale(c.frame, 'iw/4', -2) AS frame, c.audio AS sound
   FROM input('commentary.mkv') c
@@ -54,14 +78,25 @@ WITH pip AS (
 SELECT overlay(f.frame, pip.frame, 20, 20),
        amix(volume(f.audio, 0.65), volume(pip.sound, 0.35))
 FROM input('film.mkv') f, pip
+) TO ('pip.mkv')
 ```
 
-```
-$ sqlmpeg compile -f query.sql -o pip.mkv
-ffmpeg -i commentary.mkv -i film.mkv -filter_complex '[0:v:0]scale=width=iw/4:height=-2[n1];[1:v:0][n1]overlay=x=20:y=20[out0];[1:a:0]volume=volume=0.65[n3];[1:a:1]volume=volume=0.65[n4];[0:a:0]volume=volume=0.35[n5];[0:a:1]volume=volume=0.35[n6];[n3][n5]amix=inputs=2[out1];[n4][n6]amix=inputs=2[out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra pip.mkv
+```bash
+$ sqlmpeg compile -f query.sql
+ffmpeg -i commentary.mkv -i film.mkv -filter_complex '
+  [0:v:0]scale=width=iw/4:height=-2[n1];
+  [1:v:0][n1]overlay=x=20:y=20[out0];
+  [1:a:0]volume=volume=0.65[n3];
+  [1:a:1]volume=volume=0.65[n4];
+  [0:a:0]volume=volume=0.35[n5];
+  [0:a:1]volume=volume=0.35[n6];
+  [n3][n5]amix=inputs=2[out1];
+  [n4][n6]amix=inputs=2[out2]' \
+  -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 \
+  language=fra pip.mkv
 ```
 
-Check out all the work you didn't need to do! No pad labels. No split bookkeeping. You never even said how many audio tracks there were: `c.audio` is the whole array, `volume` broadcasts over it (one node per language), and `amix` zips the two arrays elementwise, English with English, French with French. Each mixed track keeps its language tag, because both parents agreed on it. (`compile` shows the command; drop it - `sqlmpeg -f query.sql -o pip.mkv` - and the default `run` executes it instead.)
+Check out all that work you didn't need to do! No pad labels or bookkeeping. You never even said how many audio tracks there were: `c.audio` is the whole array, `volume` broadcasts over it (one node per language), and `amix` zips the two arrays elementwise, English with English, French with French. Each mixed track keeps its language tag, because both parents agreed. (`compile` shows the command; drop it - `sqlmpeg -f query.sql` - and the default `run` executes it instead.)
 
 ## Encoding
 
@@ -81,49 +116,66 @@ COPY (
 )
 ```
 
-```
+```bash
 $ sqlmpeg compile -f query.sql
-ffmpeg -i commentary.mkv -i film.mkv -filter_complex '[0:v:0]scale=width=iw/4:height=-2[n1];[1:v:0][n1]overlay=x=20:y=20[out0];[1:a:0]volume=volume=0.65[n3];[1:a:1]volume=volume=0.65[n4];[0:a:0]volume=volume=0.35[n5];[0:a:1]volume=volume=0.35[n6];[n3][n5]amix=inputs=2[out1];[n4][n6]amix=inputs=2[out2]' -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 language=fra -c:0 libx264 -crf:0 20 -c:1 aac -c:2 aac -b:1 192k -b:2 192k pip.mkv
+ffmpeg -i commentary.mkv -i film.mkv -filter_complex '
+  [0:v:0]scale=width=iw/4:height=-2[n1];
+  [1:v:0][n1]overlay=x=20:y=20[out0];
+  [1:a:0]volume=volume=0.65[n3];
+  [1:a:1]volume=volume=0.65[n4];
+  [0:a:0]volume=volume=0.35[n5];
+  [0:a:1]volume=volume=0.35[n6];
+  [n3][n5]amix=inputs=2[out1];
+  [n4][n6]amix=inputs=2[out2]' \
+  -map '[out0]' -map '[out1]' -metadata:s:1 language=eng -map '[out2]' -metadata:s:2 \
+  language=fra -c:0 libx264 -crf:0 20 -c:1 aac -c:2 aac -b:1 192k -b:2 192k pip.mkv
 ```
-
-An explicit `video_codec` or `audio_codec` re-encodes every output of that type, including one that would otherwise stream-copy. That's deliberate: if you asked for a codec, you get that codec, every time. `-o` on the CLI still works and overrides only the path - same encode, different destination.
 
 ## Views and multiple outputs
 
 A `CREATE VIEW name AS <query>;` followed by one or more `COPY (...) TO '<path>' WITH (...);` is a script - the ABR-ladder shape, one decode feeding several encodes. It still compiles to ONE ffmpeg invocation, one output group per COPY:
 
 ```sql
-CREATE VIEW master AS
+CREATE VIEW main AS
   SELECT scale(f.video[1], 1920, -2) AS v, volume(f.audio[1], 0.9) AS a
   FROM input('film.mkv') f;
 
-COPY (SELECT scale(m.v, 1280, -2) AS v, m.a FROM master m)
-TO '720.mp4' WITH (video_codec 'libx264', crf 21, audio_codec 'aac');
+COPY (SELECT scale(m.v, 1280, -2) AS v, m.a FROM main m) TO '720.mp4'
+WITH (video_codec 'libx264', crf 21, audio_codec 'aac');
 
-COPY (SELECT scale(m.v, 640, -2) AS v, m.a FROM master m)
-TO '360.mp4' WITH (video_codec 'libx264', crf 26, audio_codec 'aac');
+COPY (SELECT scale(m.v, 640, -2) AS v, m.a FROM main m) TO '360.mp4'
+WITH (video_codec 'libx264', crf 26, audio_codec 'aac');
 
-COPY (SELECT m.a FROM master m)
-TO 'audio.m4a' WITH (audio_codec 'aac', audio_bitrate '128k')
+COPY (SELECT m.a FROM main m) TO 'audio.m4a'
+WITH (audio_codec 'aac', audio_bitrate '128k')
 ```
 
-```
+```bash
 $ sqlmpeg compile -f query.sql
-ffmpeg -i film.mkv -filter_complex '[0:v:0]scale=width=1920:height=-2[n1];[0:a:0]volume=volume=0.9[n2];[n1]split=2[n1_split0][n1_split1];[n1_split0]scale=width=1280:height=-2[out0];[n1_split1]scale=width=640:height=-2[out2];[n2]asplit=3[out1][out3][out4]' -map '[out0]' -map '[out1]' -c:0 libx264 -crf:0 21 -c:1 aac 720.mp4 -map '[out2]' -map '[out3]' -c:0 libx264 -crf:0 26 -c:1 aac 360.mp4 -map '[out4]' -c:0 aac -b:0 128k audio.m4a
+ffmpeg -i film.mkv -filter_complex '
+  [0:v:0]scale=width=1920:height=-2[n1];
+  [0:a:0]volume=volume=0.9[n2];
+  [n1]split=2[n1_split0][n1_split1];
+  [n1_split0]scale=width=1280:height=-2[out0];
+  [n1_split1]scale=width=640:height=-2[out2];
+  [n2]asplit=3[out1][out3][out4]' \
+  -map '[out0]' -map '[out1]' -c:0 libx264 -crf:0 21 -c:1 aac 720.mp4 \
+  -map '[out2]' -map '[out3]' -c:0 libx264 -crf:0 26 -c:1 aac 360.mp4 \
+  -map '[out4]' -c:0 aac -b:0 128k audio.m4a
 ```
 
-A view is to statements what a CTE is to branches: `master` decodes and filters `film.mkv` exactly once - `scale` and `volume` each appear a single time in the graph above - and the split pass hands out however many pads its readers need (`split=2` for the two video consumers, `asplit=3` for the three audio ones). Alias it in `FROM` (`FROM master m`) exactly like a CTE; view, CTE and alias names share one flat, script-wide namespace, and a view that nothing ever reads is a typo, rejected outright. `-o` on the CLI only makes sense with one destination - against a script with more than one COPY it's a usage error naming the sinks it found, so give each COPY its own path instead.
+A view is to statements what a CTE is to branches: `main` decodes and filters `film.mkv` exactly once - `scale` and `volume` each appear a single time in the graph above - and the split pass hands out however many pads its readers need (`split=2` for the two video consumers, `asplit=3` for the three audio ones).
 
 There's much more - watermarks, GIFs, subtitle muxing, multiband compression, generated test media - and it all lives in the **[cookbook](docs/examples.md)**: nearly sixty real tasks, simple to complex, every shown output rerun and byte-checked by the test suite - and most of them parameterized with `-v` variables, so they run against your files as-is.
 
 ## CLI reference
 
-`run` is the default subcommand: any invocation that doesn't start with a subcommand name is `run`'s, so `sqlmpeg "SELECT ..."` and `sqlmpeg -f query.sql` just work. All four query commands take the SQL as text right on the command line, or from a file with `-f query.sql` (`-f -` reads stdin). Exactly one of the two. All four also take `-v name=value` (repeatable - psql's flag, psql's syntax): `:'name'` in the query becomes the value as an escaped string literal, bare `:name` becomes it raw, and an undefined variable is a compile-time error. A query file plus `-v` is a reusable program; [queries/](queries/) collects ready-made ones. `sqlmpeg --version` (or `-V`, psql's spelling) prints the tool version.
+`run` is the default subcommand: any invocation that doesn't start with a subcommand name is `run`'s, so `sqlmpeg "SELECT ..."` and `sqlmpeg -f query.sql` just work. All four query commands take the SQL as text right on the command line, or from a file with `-f query.sql` (`-f -` reads stdin). Exactly one of the two. All four also take `-v name=value` (repeatable - psql's flag, psql's syntax): `:'name'` in the query becomes the value as an escaped string literal, bare `:name` becomes it raw, and an undefined variable is a compile-time error. A query file plus `-v` is a reusable program; [queries/](queries/) collects ready-made ones.
 
 | command | what it does | flags |
 |---|---|---|
-| `run` | **the default** (`sqlmpeg "SELECT ..."` is enough): a query with a media destination compiles and executes ffmpeg; one without prints its result set as a table, psql-style, executing nothing | `-o PATH` (media output; makes any query a media query) · `--timeout SECS` (default 600) · `-y` (overwrite) |
-| `compile` | print the full ffmpeg command | `--graph-only` (just the filtergraph string) · `-o PATH` (output path; default is the query's `COPY` sink path, else `out.mp4`) |
+| `run` | **the default** (`sqlmpeg "SELECT ..."` is enough): a query with a media destination compiles and executes ffmpeg; one without prints its result set as a table, psql-style, executing nothing | `--timeout SECS` (default 600) · `-y` (overwrite) |
+| `compile` | print the full ffmpeg command | `--graph-only` (just the filtergraph string) |
 | `explain` | dump the compiled IR graph as JSON | |
 | `validate` | exit 0 if the query compiles, else a line-anchored error | `--json` (machine-readable error object on stdout) |
 | `prompt` | print the LLM system prompt | |
@@ -145,21 +197,19 @@ There's much more - watermarks, GIFs, subtitle muxing, multiband compression, ge
 
 sqlmpeg ships the system prompt. Bring whatever model you like.
 
-```
+```bash
 $ sqlmpeg prompt > system.txt      # the dialect, the calling convention, your filters
 ```
 
 Pipe that in as the system prompt, ask for the edit in English, and put the reply through the validator:
 
-```
+```bash
 $ sqlmpeg validate --json -f query.sql
 {"line": 1, "col": 8, "code": "UDF_ARG_TYPE", "message": "...", "hint": "..."}
 ```
 
-Exit 0 with no output means it compiles. On exit 1, hand the JSON back to the model and ask for a repair; the prompt carries per-code repair guidance, so the loop converges in a round or two. Then `sqlmpeg -f query.sql -o out.mp4`.
-
-The prompt's filter reference is rendered from the same registry the compiler resolves against - your installed ffmpeg - so it cannot drift, and the model works with your actual machine rather than a platonic ideal of one. A rendered copy of the base prompt lives in [docs/system-prompt.md](docs/system-prompt.md).
+The prompt's filter reference is rendered from the same registry the compiler resolves against - your installed ffmpeg - so it cannot drift, and the model works with your actual machine rather than a platonic ideal of one.
 
 ---
 
-Docs: [cookbook](docs/examples.md) · [filters](docs/filters.md) · [row shapes](docs/rows.md) · [trimming](docs/trimming.md) · [error contract](docs/errors.md) · [known gaps](docs/known_gaps.md) · [project spec](sqlmpeg-project.md)
+More docs: [cookbook](docs/examples.md) · [filters](docs/filters.md) · [row shapes](docs/rows.md) · [trimming](docs/trimming.md) · [error contract](docs/errors.md) · [known gaps](docs/known_gaps.md)
