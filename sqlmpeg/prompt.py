@@ -19,14 +19,11 @@ still requires that to degrade to a typed note rather than crash (see
 
 Two properties the committed doc must keep:
 
-* **Deterministic and pure.** No clock, no environment, no dependence on
-  whatever ffmpeg (if any) happens to be on the machine that regenerates it.
-  ``scripts/gen_prompt.py`` renders from the committed, version-pinned
-  ``tests/data/reference_registry.json`` (:func:`sqlmpeg.registry.load_reference`)
-  rather than the live registry ``sqlmpeg prompt`` uses, so
-  ``docs/system-prompt.md`` is the same string on every machine and every
-  CI run regardless of what ffmpeg it has -- and a test asserts the
-  committed copy is fresh.
+* **Deterministic and pure.** No clock, no environment: the same registry
+  in always renders the same string out. The test suite renders from the
+  committed, version-pinned ``tests/data/reference_registry.json``
+  (:func:`sqlmpeg.registry.load_reference`) rather than the live registry
+  ``sqlmpeg prompt`` uses, so its assertions hold on every machine.
 * **Generated from the real surface.** The repair guidance is keyed by
   :class:`sqlmpeg.errors.ErrorCode`, the sink/input option tables are
   rendered from :data:`sqlmpeg.sink.SINK_OPTIONS` /
@@ -356,10 +353,6 @@ _DIALECT_TAIL = """\
 - A single bare `SELECT`, or a single `COPY`, behaves exactly as it always
   has -- nothing above applies until the query text has more than one
   statement.
-- `-o` on the CLI names ONE path, so it is legal only when the query has
-  exactly one sink (a bare `SELECT` with no `COPY`, or a script with exactly
-  one `COPY`); against more than one sink it is a usage error naming the
-  sinks the script found.
 
 ### Time selection
 - The supported predicates are `WHERE <alias>.t BETWEEN <start> AND <end>`,
@@ -544,11 +537,11 @@ def _dialect_section() -> str:
 _OUTPUT_HEADER = """\
 ## Output
 
-By default a query has no destination: `sqlmpeg compile` writes to `-o` if
-given, else a placeholder `out.mp4`; `sqlmpeg run` writes to `-o` if given,
-else refuses with an error unless the query names its own destination. To
-put the destination and the encoding in the query itself, wrap it in
-`COPY (<query>) TO '<path>' WITH (<options>)`:
+The query names its own destination: wrap it in
+`COPY (<query>) TO '<path>' WITH (<options>)`. A query with no media `COPY`
+-- a bare `SELECT`, or one whose every `COPY` is `FORMAT csv` -- is a table
+query: `sqlmpeg run` prints its result set, and `sqlmpeg compile` refuses it
+(there is no ffmpeg command to show).
 
 ```sql
 COPY (
@@ -565,8 +558,7 @@ applies. `<path>` is a single-quoted string literal, on its own `TO` line.
 single-quoted string for a `str` option (`video_codec 'libx264'`), a bare
 integer literal for an `int` option (`crf 20`), or `true`/`false` for a
 `bool` option (`faststart true`) -- a bare word with no quotes
-(`preset slow`) or a computed value are both rejected. `-o` on the CLI
-overrides only the path; it never supplies or overrides options.
+(`preset slow`) or a computed value are both rejected.
 
 ### One file per row
 
@@ -592,8 +584,8 @@ path, and a quoted `TO 'path'` is unchanged -- every track still lands in
 that one file. `WITH (...)` applies to every file identically. Rejected:
 a computed segment holding `/`, `\\` or `..`; two rows naming one file; zero
 surviving rows; a NULL name; and, in this version, fan-out with `two_pass`,
-`chapters`/`chapters_from`/`metadata_from`, `FORMAT csv`, `UNION ALL`, `-o`,
-or another `COPY` in the same script.
+`chapters`/`chapters_from`/`metadata_from`, `FORMAT csv`, `UNION ALL`, or
+another `COPY` in the same script.
 
 ### Options
 
@@ -1084,11 +1076,10 @@ def build_system_prompt(registry: Registry) -> str:
     provisioner, so there is always a real registry to pass) and is the only
     thing that can vary the output -- everything else here is pure, with no
     I/O, clock, or environment of its own. `sqlmpeg prompt` passes the live
-    registry (`registry.load()`), machine-dependent by nature; the committed
-    `docs/system-prompt.md` is rendered by `scripts/gen_prompt.py` from the
-    committed reference snapshot (`registry.load_reference(...)`) instead, so
-    it stays byte-identical across machines and CI runs regardless of what
-    ffmpeg (if any) generated it. `registry.available()` being False (a
+    registry (`registry.load()`), machine-dependent by nature; the test
+    suite passes the committed reference snapshot
+    (`registry.load_reference(...)`) instead, so its assertions hold on
+    every machine. `registry.available()` being False (a
     failed provisioner, guardrail #7) degrades the Functions section to one
     explanatory note rather than crashing; that is the only other thing that
     can vary given two different registries.
