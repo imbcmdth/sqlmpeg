@@ -959,7 +959,9 @@ ffmpeg -to 1.5 -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 co
 
 ## 47. Split a file by its chapters
 
-A `TO` expression over a row table's columns means one ffmpeg command per row - the chapters drive the seeks and the filenames, chained with `&&`:
+A `TO` expression over a row table's columns means one output file per row - the chapters drive the seeks and the filenames. Two ways to cut, and the trade matters:
+
+**Stream copy** - fastest, nothing decodes, but each cut snaps back to the previous keyframe, so pieces can start early. Copied trims need one ffmpeg command per piece, chained with `&&`:
 
 ```pgsql
 COPY (
@@ -976,6 +978,23 @@ ffmpeg -ss 0.0 -to 1.0 -i tests/fixtures/av-chapters.mkv -map 0:v:0 -c:0 copy -m
   0:v:0 -c:0 copy -map 0:a:0 -c:1 copy ch2.mkv
 ```
 
+**Re-encode** - frame-accurate cuts, and the whole split is ONE command: the source decodes once no matter how many chapters, with each output taking its own `-ss`/`-to`:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1]
+  FROM input('tests/fixtures/av-chapters.mkv') f, chapters(f) c
+  WHERE f.t BETWEEN c.start_t AND c.end_t
+) TO ('ch' || c.index::text || '.mkv') WITH (video_codec 'libx264', crf 18, audio_codec 'aac')
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av-chapters.mkv -ss 0.0 -to 1.0 -map 0:v:0 -map 0:a:0 -c:0 \
+  libx264 -crf:0 18 -c:1 aac ch1.mkv -ss 1.0 -to 2.0 -map 0:v:0 -map 0:a:0 -c:0 \
+  libx264 -crf:0 18 -c:1 aac ch2.mkv
+```
+
 ## 48. Extract every language to its own file
 
 The same rule over track rows: each row's stream goes to a filename built from its own metadata:
@@ -987,9 +1006,8 @@ TO (t.language || '.m4a')
 
 ```
 $ sqlmpeg compile -f query.sql
-ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng eng.m4a \
-  && ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:1 -c:0 copy -metadata:s:0 language=fra \
-  fra.m4a
+ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng \
+  eng.m4a -map 0:a:1 -c:0 copy -metadata:s:0 language=fra fra.m4a
 ```
 
 ## 49. Normalize loudness properly (two-pass)
@@ -1119,9 +1137,8 @@ COPY (
 ```
 $ sqlmpeg compile -f query.sql
 ffmpeg -i tests/fixtures/av-2eng.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng \
-  -map 0:a:1 -c:1 copy -metadata:s:1 language=eng -metadata title=eng eng.mka && ffmpeg \
-  -i tests/fixtures/av-2eng.mp4 -map 0:a:2 -c:0 copy -metadata:s:0 language=fra \
-  -metadata title=fra fra.mka
+  -map 0:a:1 -c:1 copy -metadata:s:1 language=eng -metadata title=eng eng.mka -map \
+  0:a:2 -c:0 copy -metadata:s:0 language=fra -metadata title=fra fra.mka
 ```
 
 ## 56. Preview a grouped shape as a table
