@@ -13,14 +13,18 @@ one SinkUnit per row/group — the ABR/view IR shape, repurposed.
 - A fan-out (`TO (expression)`, grouped or not) over rows that share
   the same inputs compiles to ONE command with one output file per
   row/group: per-output maps, codecs, tags, container tags, path.
-- Trim windows (WHERE f.t BETWEEN c.start_t AND c.end_t and friends):
-  - Every mapped stream RE-ENCODES → the window rides as OUTPUT
-    options per output file (`-ss X -to Y` before that output's
-    maps). VERIFIED on ffmpeg 9: frame-accurate, timestamps rebased,
-    the input decoded ONCE for all outputs.
-  - Any mapped stream is a stream COPY → keep today's `&&` chain with
-    input-side seeks. VERIFIED: output-side seeks with `-c copy`
-    produce corrupt, unreadable files — this is ffmpeg, not us.
+- Trim windows (WHERE f.t BETWEEN c.start_t AND c.end_t and friends).
+  Maintainer ruling: copy is the exception, not the trigger.
+  - EVERY mapped stream in every output is a stream copy → keep
+    today's `&&` chain with input-side seeks (the only correct form:
+    VERIFIED, output-side seeks with `-c copy` write corrupt files).
+  - ANYTHING re-encodes → the WHOLE fan-out is one invocation with
+    output-side `-ss X -to Y` per output (VERIFIED: frame-accurate,
+    timestamps rebased, input decoded once), and streams that would
+    have been copies drop the forced `-c copy`: they take the sink's
+    named codec when one applies, else ffmpeg's default encoder —
+    exactly what already happens to a filtered stream. Documented in
+    the recipe.
 - `run` executes whatever the compile produced (one command, or the
   copy-trim chain) — no behavior change beyond fewer processes.
 - two_pass and loudnorm2 fan-out combinations stay rejected as today.
