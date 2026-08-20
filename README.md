@@ -170,6 +170,10 @@ There's much more - watermarks, GIFs, subtitle muxing, multiband compression, ge
 
 ## CLI reference
 
+```
+sqlmpeg <command> [-h] [-f FILE] [-v NAME=VALUE] [--timeout TIMEOUT] [-y] [query]
+```
+
 `run` is the default subcommand: any invocation that doesn't start with a subcommand name is `run`'s, so `sqlmpeg "SELECT ..."` and `sqlmpeg -f query.sql` just work. All four query commands take the SQL as text right on the command line, or from a file with `-f query.sql` (`-f -` reads stdin). Exactly one of the two. All four also take `-v name=value` (repeatable - psql's flag, psql's syntax): `:'name'` in the query becomes the value as an escaped string literal, bare `:name` becomes it raw, and an undefined variable is a compile-time error. A query file plus `-v` is a reusable program; [queries/](queries/) collects ready-made ones.
 
 | command | what it does | flags |
