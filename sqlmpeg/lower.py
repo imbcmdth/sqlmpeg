@@ -1879,7 +1879,7 @@ class _Lowerer:
         self.fanout_grouped = False
         # The COPY whose query is lowering: the node its row-count rejection
         # anchors on, and the path it names. Both None for a bare SELECT,
-        # whose destination is the `-o` the command line supplies.
+        # which names no destination at all.
         self.sink_anchor: exp.Expr | None = None
         self.sink_path: str | None = None
         # True for the whole duration of `run_table()`; `run()` never sets it.

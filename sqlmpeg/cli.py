@@ -19,23 +19,22 @@ substitutes the numbers straight into the second command's argv.
 
 Subcommands:
 
-* ``compile SQL [-f FILE] [--graph-only] [-o OUT]`` -- print the full ffmpeg
-  command (POSIX-quoted via ``shlex.join`` even on Windows: it is
-  documentation output, not something to paste into cmd.exe), or just the
-  ``-filter_complex`` string with ``--graph-only``. Output path:
-  ``-o`` if given, else the query's ``COPY ... TO`` sink paths, else the
-  ``out.mp4`` placeholder. A multi-COPY script compiles to ONE
-  ffmpeg command with one output file per COPY, so ``-o`` -- one path -- is a
-  usage error (exit 2) against it, naming the paths the script found.
+* ``compile SQL [-f FILE] [--graph-only]`` -- print the full ffmpeg command
+  (POSIX-quoted via ``shlex.join`` even on Windows: it is documentation
+  output, not something to paste into cmd.exe), or just the
+  ``-filter_complex`` string with ``--graph-only``. The query names its own
+  destination with ``COPY ... TO``; a query with no media ``COPY`` -- a bare
+  SELECT, or one whose every ``COPY`` is ``FORMAT csv`` -- has nothing to
+  compile and is refused (run it instead).
 * ``explain SQL [-f FILE]`` -- dump the IR graph as JSON, sinks included.
 * ``validate SQL [-f FILE] [--json]`` -- exit 0 silent on success; on error,
   exit 1 with a one-line human message or ``err.to_dict()`` JSON.
-* ``run SQL [-f FILE] [-o OUT] [--timeout SECS] [-y]`` -- compile and execute
-  ffmpeg as a subprocess (guardrail #6: argv list, no shell, timeout
-  enforced, stderr surfaced on failure). Output path: ``-o``, else the
-  query's sink paths, else a usage error (exit 2) -- unlike ``compile``,
-  ``run`` never falls back to a placeholder. ``-o`` against a multi-COPY
-  script is the same usage error ``compile`` gives.
+* ``run SQL [-f FILE] [--timeout SECS] [-y]`` -- compile and execute ffmpeg
+  as a subprocess (guardrail #6: argv list, no shell, timeout enforced,
+  stderr surfaced on failure). A query with no media ``COPY`` prints its
+  result set as a table (or CSV, for ``COPY ... WITH (FORMAT csv)``);
+  otherwise it runs the compiled ffmpeg command(s) against the ``COPY``'s
+  own destination paths.
 * ``prompt`` -- print the LLM system prompt to stdout. Takes no arguments and
   touches no files, but calls ``registry.load()`` to render the filter
   reference from this machine's ``ffmpeg -filters``/``-help`` output.
@@ -84,7 +83,6 @@ from .vars import substitute
 
 __all__ = ["main"]
 
-_DEFAULT_OUT = "out.mp4"
 _DEFAULT_TIMEOUT = 600
 
 # `compile` prints a command SEQUENCE as one line: shell chaining, so the
@@ -159,14 +157,6 @@ def _build_parser() -> argparse.ArgumentParser:
     compile_p.add_argument(
         "--graph-only", action="store_true", help="print only the filter_complex string"
     )
-    compile_p.add_argument(
-        "-o",
-        "--output",
-        default=None,
-        # Works but unadvertised: COPY ... TO with -v variables is the
-        # preferred spelling, and -o may be removed.
-        help=argparse.SUPPRESS,
-    )
     explain_p = subparsers.add_parser("explain", help="dump the compiled IR graph as JSON")
     _add_query_arguments(explain_p)
     validate_p = subparsers.add_parser("validate", help="check that a query compiles")
@@ -182,13 +172,6 @@ def _build_parser() -> argparse.ArgumentParser:
         description=f"sqlmpeg {_version()} - compile and execute ffmpeg (the default subcommand)",
     )
     _add_query_arguments(run_p)
-    run_p.add_argument(
-        "-o",
-        "--output",
-        default=None,
-        # Works but unadvertised, same as compile's.
-        help=argparse.SUPPRESS,
-    )
     run_p.add_argument(
         "--timeout", type=float, default=_DEFAULT_TIMEOUT, help="ffmpeg timeout in seconds"
     )
@@ -318,32 +301,13 @@ def _sinks(graphs: list[Graph]) -> list[SinkUnit]:
     return [unit for graph in graphs for unit in graph.sinks]
 
 
-def _reject_output_override(cli_output: str | None, graphs: list[Graph]) -> str | None:
-    """``-o`` names ONE file, so it is illegal against a multi-file compile.
-
-    Each COPY -- and each row of a fan-out COPY -- carries its own destination,
-    and one ``-o`` would silently write them all over the same file. Returns
-    the stderr message (usage error, exit 2), or None.
-    """
-    units = _sinks(graphs)
-    if cli_output is None or len(units) <= 1:
-        return None
-    paths = ", ".join(repr(unit.path) for unit in units)
-    return (
-        f"error: -o takes one path, but this script writes {len(units)} "
-        f"files ({paths}); drop -o and let the query write its own"
-    )
-
-
 def _needs_out_path(graphs: list[Graph]) -> bool:
     """True if some sink names no destination — i.e. the bare-SELECT case."""
     return any(unit.path is None for unit in _sinks(graphs))
 
 
-def _output_paths(out_path: str | None, graphs: list[Graph]) -> list[str]:
+def _output_paths(graphs: list[Graph]) -> list[str]:
     """Every file this command will write, for the directory-existence check."""
-    if out_path is not None:
-        return [out_path]
     return [unit.path for unit in _sinks(graphs) if unit.path is not None]
 
 
@@ -365,13 +329,10 @@ def _is_table_capable_query(text: str) -> bool:
 
 _TABLE_USAGE_HINT = (
     "error: compile has nothing to show: this query has no media destination "
-    "(no COPY, no -o); run it instead -- `sqlmpeg run ...` prints its result "
-    "set as a table"
+    "(no COPY, or every COPY is FORMAT csv); run it instead -- `sqlmpeg run ...` "
+    "prints its result set as a table"
 )
-_CSV_DASH_O_ERROR = (
-    "error: -o does not apply to a COPY ... WITH (FORMAT csv) query; drop -o "
-    "and let the COPY write its own destination"
-)
+_NO_OUTPUT_PATH_ERROR = "error: no output path given: use COPY ... TO in the query"
 
 
 def _print_table_sinks(sinks: list[TableSink]) -> int:
@@ -406,13 +367,9 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         # fallback -- tried only after compilation failed, and only for a
         # query that could BE one. If the fallback fails too, the original
         # error surfaces; it is usually more informative.
-        # `-o` takes the fallback away: it NAMES a media destination, so the
-        # hint below ("no COPY, no -o") would be false and the real rejection
-        # -- which is usually about the file this was meant to write -- is
-        # what the reader needs.
         # `text` is None only when `err` came from `-v` substitution, which
         # cannot be table-capable either, so it is guarded out of `classify`.
-        if text is not None and args.output is None and _is_table_capable_query(text):
+        if text is not None and _is_table_capable_query(text):
             print(_TABLE_USAGE_HINT, file=sys.stderr)
             return 2
         _print_error(err, source=args.query)
@@ -424,21 +381,17 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         print("\n".join(e.filter_complex for e in emitted))
         return 0
 
-    override_error = _reject_output_override(args.output, graphs)
-    if override_error is not None:
-        print(override_error, file=sys.stderr)
+    # A bare SELECT compiles fine here (the streaming lowerer allows it), but
+    # it has no COPY ... TO destination -- compile never invents one, so it
+    # is the same refusal as the except branch above.
+    if _needs_out_path(graphs):
+        print(_TABLE_USAGE_HINT, file=sys.stderr)
         return 2
-
-    # `-o`, else each COPY's own path (build_ffmpeg_args reads them off the
-    # groups), with the placeholder standing in for a bare SELECT.
-    out_path = args.output
-    if out_path is None and _needs_out_path(graphs):
-        out_path = _DEFAULT_OUT
-    print(_CHAIN.join(_shell_commands(emitted, out_path)))
+    print(_CHAIN.join(_shell_commands(emitted)))
     return 0
 
 
-def _shell_commands(emitted: list[Emitted], out_path: str | None) -> list[str]:
+def _shell_commands(emitted: list[Emitted]) -> list[str]:
     """Every command of the compile as a shell-ready line, in order.
 
     ``shlex.join`` for all but a ``loudnorm2`` compile: there the measuring
@@ -448,7 +401,7 @@ def _shell_commands(emitted: list[Emitted], out_path: str | None) -> list[str]:
     """
     lines: list[str] = []
     for e in emitted:
-        commands = build_ffmpeg_commands(e, out_path)
+        commands = build_ffmpeg_commands(e)
         if not e.measure_filter_complex:
             lines += [shlex.join(command) for command in commands]
             continue
@@ -505,19 +458,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         text, code = _resolve_query(args)
         if text is None:
             return code
-        is_table_capable, has_copy = classify(text)
+        is_table_capable, _has_copy = classify(text)
     except SqlmpegError as err:
         _print_error(err, source=args.query)
         return 1
 
-    if is_table_capable and has_copy and args.output is not None:
-        print(_CSV_DASH_O_ERROR, file=sys.stderr)
-        return 2
-
-    # A csv COPY, or a bare SELECT with no `-o`: the table/csv path, which
-    # needs no ffmpeg. `-o` against a bare SELECT falls through to the
-    # media path below -- `-o` IS an implicit media COPY.
-    if is_table_capable and (has_copy or args.output is None):
+    # No media COPY -- a bare SELECT, or every COPY is FORMAT csv -- IS a
+    # table query, always: the table/csv path, which needs no ffmpeg.
+    if is_table_capable:
         try:
             sinks = compile_table_sql(text)
         except SqlmpegError as err:
@@ -532,20 +480,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         _print_error(err, source=args.query)
         return 1
 
-    override_error = _reject_output_override(args.output, graphs)
-    if override_error is not None:
-        print(override_error, file=sys.stderr)
+    # A media COPY names its own destination, so this fires only for the rare
+    # script that mixes a media COPY with a `COPY ... TO STDOUT WITH (FORMAT
+    # csv)` sink -- STDOUT has no file path for a media run.
+    if _needs_out_path(graphs):
+        print(_NO_OUTPUT_PATH_ERROR, file=sys.stderr)
         return 2
 
-    out_path = args.output
-    if out_path is None and _needs_out_path(graphs):
-        print(
-            "error: no output path given: pass -o, or use COPY ... TO in the query",
-            file=sys.stderr,
-        )
-        return 2
-
-    for path in _output_paths(out_path, graphs):
+    for path in _output_paths(graphs):
         dir_error = _check_output_dir(path)
         if dir_error is not None:
             print(dir_error, file=sys.stderr)
@@ -565,7 +507,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # `eval "$(...)"` the printed line shows is only for a pasted command.
     measured: dict[str, str] = {}
     for e in emitted:
-        commands = build_ffmpeg_commands(e, out_path)
+        commands = build_ffmpeg_commands(e)
         measures = bool(e.measure_filter_complex)
         for index, command in enumerate(commands):
             capture = measures and index == 0

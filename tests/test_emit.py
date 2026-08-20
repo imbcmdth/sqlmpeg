@@ -2346,7 +2346,7 @@ def test_pass_one_renumbers_stream_indices_over_its_own_maps() -> None:
 
 
 def test_passlogfile_follows_the_out_path_override() -> None:
-    """`-o` renames the destination, so the stats file moves with it."""
+    """`out_path` renames the destination, so the stats file moves with it."""
     g = _graph([], [_out("src:a:v:0")], sink=_two_pass_sink())
     for command in build_ffmpeg_commands(emit(g), "elsewhere/final.mkv"):
         assert command[command.index("-passlogfile") + 1] == "elsewhere/final.mkv"

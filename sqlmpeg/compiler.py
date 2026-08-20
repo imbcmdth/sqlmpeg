@@ -112,10 +112,9 @@ def classify(text: str) -> tuple[bool, bool]:
 
     Cheap and static: parse + resolve only, no probing. ``is_table_capable``
     is True when `text` has no media destination -- a bare SELECT, or every
-    COPY a ``FORMAT csv`` one. ``-o`` is CLI-only and never reaches here, so a
-    bare SELECT is always table-capable by this check alone; the CLI decides
-    from its own ``-o`` whether to use :func:`compile_table_sql` or fall back
-    to :func:`compile_sql`.
+    COPY a ``FORMAT csv`` one. A bare SELECT is always table-capable by this
+    check alone; the CLI decides from it whether to use
+    :func:`compile_table_sql` or fall back to :func:`compile_sql`.
 
     Raises ``SqlmpegError`` on a query that does not even resolve.
     """

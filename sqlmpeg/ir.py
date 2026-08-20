@@ -188,8 +188,10 @@ class SinkUnit:
       Output STREAM indices are per-file in ffmpeg, so ``-c:<i>`` and
       ``-metadata:s:<i>`` are indexed within this list, not across the
       command (emit's ``OutputGroup``).
-    * ``path`` is None only for the bare-SELECT case, where the caller (the
-      CLI's ``-o``, or a placeholder) supplies one; ``options`` is empty then.
+    * ``path`` is None for the bare-SELECT case (no COPY at all; ``options``
+      is empty then), and for a ``COPY ... TO STDOUT WITH (FORMAT csv)`` sink
+      that ends up in a media graph alongside a real COPY. Neither CLI
+      subcommand invents a destination for it.
     * ``options`` is insertion-ordered with values already validated against
       `sqlmpeg.sink.SINK_OPTIONS` by lower.
     * ``tags`` are the file's CONTAINER tags, key -> value, rendered as

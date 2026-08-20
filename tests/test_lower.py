@@ -398,8 +398,8 @@ def test_readme_encoding_command_is_the_real_compilation(_fixtures: None) -> Non
     """The command shown under Encoding is what sqlmpeg actually prints for
     that query, with only the fixture paths written back to the shown names.
 
-    No `-o` override: the sink's own `TO 'pip.mkv'` supplies the path, same
-    precedence `sqlmpeg run query.sql` (no `-o`) would use.
+    No override: the sink's own `TO 'pip.mkv'` supplies the path, same as
+    `sqlmpeg run query.sql` would use.
     """
     args = build_ffmpeg_args(emit(compile_sql(_readme_encoding_sql())))
     shown = _readme_command_rendering(args, ["pip.mkv"])
@@ -8543,8 +8543,9 @@ def test_the_same_view_gathered_writes_the_file() -> None:
 
 
 def test_a_bare_select_compiled_to_a_file_is_anchored_on_the_query() -> None:
-    """With ``-o`` there is no TO to point at, so the rejection anchors on the
-    query and says what it says without naming a path."""
+    """A bare SELECT lowered as media has no TO to point at, so the
+    rejection anchors on the query and says what it says without naming a
+    path."""
     err = _reject_lower(
         "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
     )

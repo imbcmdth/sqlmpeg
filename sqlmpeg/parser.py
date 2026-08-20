@@ -1796,10 +1796,11 @@ class _Resolver:
                     hint=_SCRIPT_HINT,
                 )
             # A bare SELECT has no media destination, so it is always at least
-            # table-capable: metadata columns are legal SELECT outputs here
-            # whatever `-o` the CLI eventually supplies. This never weakens a
-            # MEDIA query -- the streaming lowerer independently enforces
-            # "streams are the only output" (`sqlmpeg.lower._row_value`).
+            # table-capable: metadata columns are legal SELECT outputs here,
+            # even if the CLI goes on to compile it as a media command. This
+            # never weakens a MEDIA query -- the streaming lowerer
+            # independently enforces "streams are the only output"
+            # (`sqlmpeg.lower._row_value`).
             select, branches = self._resolve_query(statement, table_mode=True)
 
         if select is None:

@@ -537,8 +537,8 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
     ``ValueError``. `out_path` OVERRIDES, so it is legal only for a
     single-group `e` — overriding several files with one path would write them
     on top of each other — and a multi-group `e` with `out_path` set raises.
-    A CLI/programmer contract, not something user SQL can trigger: the CLI
-    rejects ``-o`` against a multi-sink script (exit 2) before calling this.
+    A library/programmer contract, not something user SQL can trigger: the
+    CLI never passes `out_path` at all, so every sink writes its own path.
 
     The SELECT list is authoritative: exactly one ``-map`` per
     :class:`OutputMap`, in order, with ``-c:<i> copy`` for passthrough streams

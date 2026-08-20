@@ -519,13 +519,15 @@ def test_compile_prints_one_command_for_the_whole_fan_out() -> None:
     assert line.count("ffmpeg ") == 1
 
 
-def test_dash_o_against_a_fan_out_query_is_a_usage_error(
+def test_dash_o_against_a_fan_out_query_is_an_unrecognized_argument(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    code = cli.main(["compile", _PER_LANGUAGE, "-o", "one.m4a"])
-    captured = capsys.readouterr()
-    assert code == 2
-    assert "-o takes one path, but this script writes 2 files" in captured.err
+    """A fan-out TO writes several files from its own row-computed paths;
+    -o is gone entirely now, so it fails as argparse's ordinary unrecognized
+    -argument error rather than a bespoke one-path-vs-several-files message."""
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["compile", _PER_LANGUAGE, "-o", "one.m4a"])
+    assert exc_info.value.code == 2
 
 
 def test_explain_dumps_one_graph_with_a_sink_per_file(

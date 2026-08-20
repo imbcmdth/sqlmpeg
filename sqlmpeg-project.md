@@ -5,16 +5,18 @@
 A standalone CLI that compiles SQL into an ffmpeg `-filter_complex` invocation. Write a `SELECT` statement; get a runnable ffmpeg command. FFmpeg is the executor — this tool never touches pixels.
 
 ```sql
-WITH pip AS (
-  SELECT scale(crop(b.frame, 1200, 50, 600, 200), 0.5) AS frame
-  FROM input('game.mp4') b
-)
-SELECT overlay(a.frame, pip.frame, 20, 20)
-FROM input('game.mp4') a, pip
+COPY (
+  WITH pip AS (
+    SELECT scale(crop(b.frame, 1200, 50, 600, 200), 0.5) AS frame
+    FROM input('game.mp4') b
+  )
+  SELECT overlay(a.frame, pip.frame, 20, 20)
+  FROM input('game.mp4') a, pip
+) TO 'out.mp4'
 ```
 
 ```
-$ sqlmpeg run query.sql -o out.mp4
+$ sqlmpeg run query.sql
 ffmpeg -i game.mp4 -i game.mp4 -filter_complex \
   "[1:v]crop=600:200:1200:50,scale=iw*0.5:-2[pip]; \
    [0:v][pip]overlay=20:20[out]" -map "[out]" out.mp4
@@ -106,7 +108,7 @@ class Graph:
 ```
 sqlmpeg compile query.sql            # print full ffmpeg command
 sqlmpeg compile query.sql --graph-only
-sqlmpeg run query.sql -o out.mp4     # compile + exec ffmpeg
+sqlmpeg run query.sql                # compile + exec ffmpeg (query names its own TO)
 sqlmpeg explain query.sql            # dump IR as JSON (debug/tests)
 sqlmpeg validate query.sql           # errors only, exit code; JSON with --json
 ```

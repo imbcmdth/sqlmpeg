@@ -571,10 +571,9 @@ def test_copy_sink_codec_options_land_in_the_real_encode(tmp_path: Path) -> None
 
     The query concatenates av2 and av3 (splatting each file's whole audio
     array, same as the README headline) and asks for libx264/aac re-encodes
-    at explicit bitrates; the sink's own TO path (not `-o`) is what
-    `build_ffmpeg_args` resolves, and ffprobe on the real output confirms the
-    video and both audio streams were actually re-encoded to the requested
-    codecs.
+    at explicit bitrates; the sink's own TO path is what `build_ffmpeg_args`
+    resolves, and ffprobe on the real output confirms the video and both
+    audio streams were actually re-encoded to the requested codecs.
     """
     _require_fixture(_AV2)
     _require_fixture(_AV3)
@@ -591,7 +590,7 @@ def test_copy_sink_codec_options_land_in_the_real_encode(tmp_path: Path) -> None
 
     graph = compile_sql(query)
     emitted = emit(graph)
-    args = build_ffmpeg_args(emitted)  # no -o override: the sink's own path is used
+    args = build_ffmpeg_args(emitted)  # no override: the sink's own path is used
     args.insert(1, "-y")
     result = subprocess.run(args, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT)
     assert result.returncode == 0, result.stderr
@@ -668,7 +667,7 @@ def test_seek_end_produces_a_shorter_file_than_the_source(tmp_path: Path) -> Non
 
 
 def _run_sink_query(query: str, out_path: Path) -> None:
-    """Compile a COPY query and run it at ITS OWN sink path (no -o override)."""
+    """Compile a COPY query and run it at ITS OWN sink path (no override)."""
     emitted = emit(compile_sql(query))
     args = build_ffmpeg_args(emitted)
     args.insert(1, "-y")
