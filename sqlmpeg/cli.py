@@ -163,7 +163,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "-o",
         "--output",
         default=None,
-        help="output path (default: the query's sink path, else out.mp4)",
+        # Works but unadvertised: COPY ... TO with -v variables is the
+        # preferred spelling, and -o may be removed.
+        help=argparse.SUPPRESS,
     )
     explain_p = subparsers.add_parser("explain", help="dump the compiled IR graph as JSON")
     _add_query_arguments(explain_p)
@@ -184,7 +186,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "-o",
         "--output",
         default=None,
-        help="output file path (default: the query's sink path)",
+        # Works but unadvertised, same as compile's.
+        help=argparse.SUPPRESS,
     )
     run_p.add_argument(
         "--timeout", type=float, default=_DEFAULT_TIMEOUT, help="ffmpeg timeout in seconds"
