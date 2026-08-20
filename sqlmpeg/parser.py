@@ -1088,7 +1088,7 @@ class Resolved:
     """Named query binding -> its query, in DEFINITION order.
 
     Both kinds of binding live here, because a view IS a CTE to everything
-    downstream (RFC-006): a script's ``CREATE VIEW``s, the CTEs of their
+    downstream: a script's ``CREATE VIEW``s, the CTEs of their
     bodies, and the CTEs of each COPY's own ``WITH``, in the order they were
     written. Lower walks this dict once and binds each entry by name, which is
     why the order matters and why views need no machinery of their own.
@@ -1100,9 +1100,8 @@ class Resolved:
     sinks: list[RawSink] = field(default_factory=list)
     """One entry per ``COPY``, in script order; EMPTY for a bare SELECT.
 
-    RFC-006 replaced the single ``sink`` field with this list. Resolve accepts
-    any number and lower turns each into one ``ir.SinkUnit`` -- one output
-    FILE of the single ffmpeg command the script compiles to (plan 046).
+    Resolve accepts any number and lower turns each into one ``ir.SinkUnit``
+    -- one output FILE of the single ffmpeg command the script compiles to.
     """
 
     views: dict[str, QueryExpr] = field(default_factory=dict)
@@ -1113,17 +1112,17 @@ class Resolved:
     """
 
     input_options: dict[str, tuple[RawInputOption, ...]] = field(default_factory=dict)
-    """Input alias -> its trailing named options (RFC-005). Only aliases that
+    """Input alias -> its trailing named options. Only aliases that
     wrote at least one option get an entry -- absent means none."""
 
     source_filters: dict[str, RawSource] = field(default_factory=dict)
     """``FROM ffmpeg.<source>(...) alias`` records, keyed by alias, in FROM
-    order across the whole query (RFC-005 §1). Disjoint from ``sources``: a
+    order across the whole query. Disjoint from ``sources``: a
     generated source has no ``-i`` and therefore no input index."""
 
     track_rows: dict[str, RawTrackRows] = field(default_factory=dict)
     """``unnest(<input>.<type>) alias`` records, keyed by ROW alias, in FROM
-    order across the whole script (RFC-009). Disjoint from every other name
+    order across the whole script. Disjoint from every other name
     table: a row alias takes no ``-i`` of its own — its streams belong to the
     input alias named in ``RawTrackRows.source`` — and shares the one flat
     namespace views, CTEs and aliases live in. ``chapters(<input>) c`` also
@@ -1254,13 +1253,20 @@ def from_items(select: exp.Select) -> list[exp.Expr]:
     return [item for item, _ in from_entries(select)]
 
 
-def _has_unnest(select: exp.Select) -> bool:
-    """True if this branch's FROM clause holds a row table: ``unnest(...)``
-    or its sibling ``chapters(...)`` -- either admits the ORDER BY carve-out."""
-    return any(
-        isinstance(item, exp.Unnest) or _is_chapters_call(item)
-        for item in from_items(select)
-    )
+def _has_row_source(select: exp.Select, visible: set[str]) -> bool:
+    """True if this branch's FROM clause holds rows: ``unnest(...)``, its
+    sibling ``chapters(...)``, or a reference to a CTE or view -- each of
+    which contributes rows to group over, and admits the ORDER BY carve-out."""
+    for item in from_items(select):
+        if isinstance(item, exp.Unnest) or _is_chapters_call(item):
+            return True
+        if (
+            isinstance(item, exp.Table)
+            and isinstance(item.this, exp.Identifier)
+            and _ident_name(item.this) in visible
+        ):
+            return True
+    return False
 
 
 def _projection_expr(projection: exp.Expr) -> exp.Expr:
@@ -2243,14 +2249,14 @@ class _Resolver:
         path_expr: exp.Expr | None = None,
         no_aggregate: str | None = None,
     ) -> None:
-        # `ORDER BY` and `GROUP BY` are admitted for TRACK-ROW queries and
+        # `ORDER BY` and `GROUP BY` are admitted for ROW-SOURCE queries and
         # nowhere else. The carve-out is decided from the FROM clause alone,
-        # before any of it is validated, so a branch with no `unnest` keeps the
-        # NO_STREAMING_EQUIVALENT fence byte for byte.
-        unnest = _has_unnest(select)
-        if unnest:
+        # before any of it is validated, so a branch with no rows keeps the
+        # NO_STREAMING_EQUIVALENT rejection byte for byte.
+        rows = _has_row_source(select, visible)
+        if rows:
             self._check_aggregate_context(select, no_aggregate)
-        allowed = _SELECT_ALLOWED | {"order", "group"} if unnest else _SELECT_ALLOWED
+        allowed = _SELECT_ALLOWED | {"order", "group"} if rows else _SELECT_ALLOWED
         _check_query_args(select, allowed, "SELECT")
 
         # The SELECT list IS the output stream list, so any number of
@@ -2260,7 +2266,7 @@ class _Resolver:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL, "SELECT has no output column", fallback=select
             )
-        aggregating = unnest and no_aggregate is None
+        aggregating = rows and no_aggregate is None
         for projection in projections:
             # A star projection carries nothing but the star and its qualifier,
             # so there is no expression to check inside it -- and running the
@@ -2294,7 +2300,7 @@ class _Resolver:
         """Aggregation belongs to a query's own top-level SELECT, never a
         UNION ALL branch or a CTE body.
 
-        Fires only for a branch that HAS track rows: without them the generic
+        Fires only for a branch that HAS rows: without them the generic
         ``GROUP BY has no streaming equivalent`` / ``aggregate function ...``
         fences already say the right thing.
         """
@@ -4404,11 +4410,12 @@ class _Resolver:
     ) -> None:
         """Every sort key is a track-row metadata column, and nothing else.
 
-        Reaching here at all means the branch has an ``unnest``
-        (:func:`_has_unnest` gates the arg whitelist), so this is the second
-        half of the carve-out: the fence bends for ROW columns, not for the
-        query that happens to contain them. Sorting frames, or a time column,
-        is still NO_STREAMING_EQUIVALENT.
+        Reaching here at all means the branch has a row source
+        (:func:`_has_row_source` decides the arg whitelist), so this is the
+        second half of the carve-out: the carve-out is for track-row METADATA
+        columns, not for the query that happens to contain them. Sorting
+        frames, a CTE's streams, or a time column is still
+        NO_STREAMING_EQUIVALENT.
         """
         _check_query_args(order, frozenset({"expressions"}), "ORDER BY")
         expressions = order.expressions

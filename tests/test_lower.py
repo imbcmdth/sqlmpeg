@@ -7610,13 +7610,17 @@ def test_a_null_cte_tag_clears_the_key_as_it_does_in_a_sink() -> None:
 
 def test_the_sinks_own_tag_wins_over_the_ctes_on_the_same_key() -> None:
     """Inner then outer is LAYERING, not the disagreement `_record_tag` rejects
-    -- that check stays inside one query."""
+    -- that check stays inside one query.
+
+    Three CTE rows crossed with three track rows is a nine-row relation, and
+    the outer tag wins on every one of them.
+    """
     g = _lower(
         _TAGGED_CTE + "SELECT tagged.track, 'Outer' AS title "
         "FROM tagged, input('f.mkv') g, unnest(g.audio) u",
         _shared_probes(),
     )
-    assert [o.metadata.get("title") for o in g.outputs] == ["Outer"] * 3
+    assert [o.metadata.get("title") for o in g.outputs] == ["Outer"] * 9
 
 
 def test_two_sinks_over_one_tagged_view_each_carry_its_tags() -> None:
@@ -7772,16 +7776,17 @@ def test_a_cte_column_broadcasts_an_input_scalar_beside_it() -> None:
     ]
 
 
-def test_a_subscripted_cte_column_stays_one_broadcast_cell() -> None:
-    """`aud.track[1]`-style: the CTE stored an array, but a subscript already
-    picked one element, so it stays a single row like any other subscript."""
+def test_a_subscripted_cte_column_broadcasts_over_the_ctes_rows() -> None:
+    """`aud.track[1]`-style: the subscript picked one element, so the value is
+    the same in every row -- but `FROM aud` still has as many rows as the body
+    produced, and each of them prints it."""
     query = (
         "WITH aud AS ("
         "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
         ") SELECT aud.track[1] FROM aud"
     )
     sinks = lower_table(resolve(parse(query)), {"f": ProbeResult(streams=_LANG_TRACKS)})
-    assert sinks[0].result.rows == [[StreamCell(type="audio", spec="0:a:0")]]
+    assert sinks[0].result.rows == [[StreamCell(type="audio", spec="0:a:0")]] * 3
 
 
 def test_two_columns_from_the_same_cte_stay_aligned() -> None:
@@ -7808,7 +7813,9 @@ def _reject_lower_table(sql: str, probes: dict[str, ProbeResult | None]) -> Sqlm
     return _anchored(excinfo.value)
 
 
-def test_two_ctes_with_disagreeing_row_counts_are_rejected() -> None:
+def test_two_ctes_cross_join_with_real_multiplicity() -> None:
+    """A comma between two CTEs is a cross join: three audio rows beside two
+    video rows print six, each value repeated as often as it occurs."""
     query = (
         "WITH a1 AS ("
         "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
@@ -7816,38 +7823,214 @@ def test_two_ctes_with_disagreeing_row_counts_are_rejected() -> None:
         "  SELECT v.track AS track FROM input('g.mkv') g, unnest(g.video) v"
         ") SELECT a1.track, a2.track FROM a1, a2"
     )
-    err = _reject_lower_table(
-        query,
+    sinks = lower_table(
+        resolve(parse(query)),
         {
             "f": ProbeResult(streams=_LANG_TRACKS),
             "g": ProbeResult(streams=[_track("video", 0), _track("video", 1)]),
         },
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "a1.track" in err.message and "a2.track" in err.message
-    assert "3" in err.message and "2" in err.message
-    assert "separate queries" in (err.hint or "")
+    assert sinks[0].result.rows == [
+        [StreamCell(type="audio", spec=f"0:a:{a}"), StreamCell(type="video", spec=f"1:v:{v}")]
+        for a in range(3)
+        for v in range(2)
+    ]
 
 
-def test_a_cte_array_column_beside_an_unnest_relation_is_rejected() -> None:
-    """Even when the counts happen to agree, a CTE's own row set and a fresh
-    `unnest` relation are two independent things with no natural join, so
-    the simplest safe choice rejects the combination outright."""
+def test_one_cte_row_crossed_with_two_repeats_the_single_value() -> None:
+    """The 1 x 2 shape the table has to print honestly: two rows, the video
+    visible in both."""
+    query = (
+        "WITH vid AS ("
+        "  SELECT v.track AS track FROM input('f.mkv') f, unnest(f.video) v"
+        "), aud AS ("
+        "  SELECT t.track AS track FROM input('f.mkv') f2, unnest(f2.audio) t"
+        ") SELECT vid.track, aud.track FROM vid, aud"
+    )
+    probes = ProbeResult(streams=[_track("video", 0), *_LANG_TRACKS[:2]])
+    sinks = lower_table(resolve(parse(query)), {"f": probes, "f2": probes})
+    assert sinks[0].result.rows == [
+        [StreamCell(type="video", spec="0:v:0"), StreamCell(type="audio", spec="0:a:0")],
+        [StreamCell(type="video", spec="0:v:0"), StreamCell(type="audio", spec="0:a:1")],
+    ]
+
+
+def test_a_grouped_cross_join_prints_one_row_with_an_array_cell() -> None:
+    """Recipe 57's table form: group by the video, gather the audio."""
+    query = (
+        "WITH vid AS ("
+        "  SELECT v.track AS track FROM input('f.mkv') f, unnest(f.video) v"
+        "), aud AS ("
+        "  SELECT t.track AS track FROM input('f.mkv') f2, unnest(f2.audio) t"
+        ") SELECT vid.track, array_agg(aud.track) FROM vid, aud GROUP BY vid.track"
+    )
+    probes = ProbeResult(streams=[_track("video", 0), *_LANG_TRACKS[:2]])
+    sinks = lower_table(resolve(parse(query)), {"f": probes, "f2": probes})
+    assert sinks[0].result.rows == [
+        [
+            StreamCell(type="video", spec="0:v:0"),
+            ArrayCell(
+                elements=(
+                    StreamCell(type="audio", spec="0:a:0"),
+                    StreamCell(type="audio", spec="0:a:1"),
+                )
+            ),
+        ]
+    ]
+
+
+def test_a_grouped_cross_join_prints_one_row_per_key() -> None:
+    """Two videos crossed with two audio rows: one printed row per video, each
+    gathering the whole audio set."""
+    query = (
+        "WITH vid AS ("
+        "  SELECT v.track AS track FROM input('f.mkv') f, unnest(f.video) v"
+        "), aud AS ("
+        "  SELECT t.track AS track FROM input('f.mkv') f2, unnest(f2.audio) t"
+        ") SELECT vid.track, array_agg(aud.track) FROM vid, aud GROUP BY vid.track"
+    )
+    probes = ProbeResult(
+        streams=[_track("video", 0), _track("video", 1), *_LANG_TRACKS[:2]]
+    )
+    sinks = lower_table(resolve(parse(query)), {"f": probes, "f2": probes})
+    gathered = ArrayCell(
+        elements=(
+            StreamCell(type="audio", spec="0:a:0"),
+            StreamCell(type="audio", spec="0:a:1"),
+        )
+    )
+    assert sinks[0].result.rows == [
+        [StreamCell(type="video", spec="0:v:0"), gathered],
+        [StreamCell(type="video", spec="0:v:1"), gathered],
+    ]
+
+
+def test_a_cte_beside_an_unnest_relation_is_a_cross_join() -> None:
+    """Two independent row sets used to be rejected outright; the comma
+    between them is an ordinary cross join, so the table prints all six."""
     query = (
         "WITH aud AS ("
         "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
         ") SELECT aud.track, v.track FROM aud, input('g.mkv') g, unnest(g.video) v"
     )
-    err = _reject_lower_table(
-        query,
+    sinks = lower_table(
+        resolve(parse(query)),
         {
             "f": ProbeResult(streams=_LANG_TRACKS),
-            "g": ProbeResult(streams=[_track("video", 0), _track("video", 1), _track("video", 2)]),
+            "g": ProbeResult(streams=[_track("video", 0), _track("video", 1)]),
         },
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "aud.track" in err.message
-    assert "separate queries" in (err.hint or "")
+    assert sinks[0].result.rows == [
+        [StreamCell(type="audio", spec=f"0:a:{a}"), StreamCell(type="video", spec=f"1:v:{v}")]
+        for a in range(3)
+        for v in range(2)
+    ]
+
+
+def test_a_cte_beside_an_unnest_relation_maps_the_cross_join() -> None:
+    """The same shape as a media query: every pair of the cross join is an
+    output, in relation order."""
+    g = _lower(
+        "WITH aud AS ("
+        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        ") SELECT aud.track, v.track FROM aud, input('g.mkv') g, unnest(g.video) v",
+        {
+            "f": ProbeResult(streams=_LANG_TRACKS),
+            "g": ProbeResult(streams=[_track("video", 0), _track("video", 1)]),
+        },
+    )
+    assert [o.ref for o in g.outputs] == [
+        "src:f:a:0", "src:f:a:0", "src:f:a:1",
+        "src:f:a:1", "src:f:a:2", "src:f:a:2",
+        "src:g:v:0", "src:g:v:1", "src:g:v:0",
+        "src:g:v:1", "src:g:v:0", "src:g:v:1",
+    ]
+
+
+_VID_AUD_CTES = (
+    "WITH vid AS ("
+    "  SELECT v.track AS track FROM input('f.mkv') f, unnest(f.video) v"
+    "), aud AS ("
+    "  SELECT t.track AS track FROM input('f.mkv') f2, unnest(f2.audio) t"
+    ") "
+)
+
+
+def _vid_aud_probes(videos: int = 1) -> dict[str, ProbeResult | None]:
+    result = ProbeResult(
+        streams=[_track("video", k) for k in range(videos)] + list(_LANG_TRACKS[:2])
+    )
+    return {"f": result, "f2": result}
+
+
+def test_an_ungrouped_cross_join_maps_the_repeated_stream() -> None:
+    """One video crossed with two audio rows is a two-row relation, and the
+    ungrouped COPY maps exactly that -- the video TWICE."""
+    g = _lower(
+        _VID_AUD_CTES + "SELECT vid.track, aud.track FROM vid, aud", _vid_aud_probes()
+    )
+    assert [o.ref for o in g.outputs] == [
+        "src:f:v:0",
+        "src:f:v:0",
+        "src:f2:a:0",
+        "src:f2:a:1",
+    ]
+
+
+def test_a_grouped_cross_join_maps_the_key_once() -> None:
+    """Recipe 57's media form: GROUP BY the video and gather the audio, and
+    the video is mapped once with both audio tracks after it."""
+    g = _lower(
+        _VID_AUD_CTES
+        + "SELECT vid.track, array_agg(aud.track) FROM vid, aud GROUP BY vid.track",
+        _vid_aud_probes(),
+    )
+    assert [o.ref for o in g.outputs] == [
+        "src:f:v:0",
+        "src:f2:a:0",
+        "src:f2:a:1",
+    ]
+
+
+def test_a_grouped_cross_join_maps_every_group() -> None:
+    """Two videos, two groups: each key's stream followed by its own gather."""
+    g = _lower(
+        _VID_AUD_CTES
+        + "SELECT vid.track, array_agg(aud.track) FROM vid, aud GROUP BY vid.track",
+        _vid_aud_probes(videos=2),
+    )
+    assert [o.ref for o in g.outputs] == [
+        "src:f:v:0",
+        "src:f:v:1",
+        "src:f2:a:0",
+        "src:f2:a:1",
+        "src:f2:a:0",
+        "src:f2:a:1",
+    ]
+
+
+def test_a_single_cte_source_still_gathers_its_rows_in_order() -> None:
+    """The one-source shape is untouched: `FROM aud` is three rows, and an
+    ungrouped COPY maps them in row order, as it always did."""
+    g = _lower(
+        "WITH aud AS ("
+        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        ") SELECT aud.track FROM aud",
+        {"f": ProbeResult(streams=_LANG_TRACKS)},
+    )
+    assert [o.ref for o in g.outputs] == ["src:f:a:0", "src:f:a:1", "src:f:a:2"]
+
+
+def test_order_by_a_cte_column_has_no_streaming_equivalent() -> None:
+    """A CTE's columns are streams, and streams have no order to sort by, so
+    ORDER BY over a CTE source is rejected rather than silently ignored."""
+    err = _reject(
+        "WITH aud AS ("
+        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        ") SELECT aud.track FROM aud ORDER BY aud.track"
+    )
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+    assert "ORDER BY" in err.message
 
 
 # ---------------------------------------------------------------------------

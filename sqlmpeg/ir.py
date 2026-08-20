@@ -44,7 +44,7 @@ uphold and split/emit check.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 StreamType = Literal["video", "audio", "subtitle", "data"]
@@ -344,3 +344,60 @@ class Graph:
             input_trims=input_trims,
             input_options=input_options,
         )
+
+
+_MergeKey = tuple[str, tuple[tuple[str, object], ...]]
+
+
+def _merge_key(g: Graph, index: int, aliases: list[str], trimmed: set[str]) -> _MergeKey | None:
+    """This input slot's dedup key, or None if it can never merge.
+
+    None for any slot carrying a trimmed alias -- a trim is a property of that
+    alias's own ``-i``, so two windows are never folded together
+    even when equal. Otherwise the key is the path plus the resolved options
+    every alias on this slot set, sorted by name: two slots merge only when
+    both match exactly.
+    """
+    if any(alias in trimmed for alias in aliases):
+        return None
+    options: dict[str, object] = {}
+    for alias in aliases:
+        options.update(g.input_options.get(alias, {}))
+    return (g.input_paths[index], tuple(sorted(options.items())))
+
+
+def dedup_inputs(g: Graph) -> Graph:
+    """Fold untrimmed same-path same-options aliases onto one ``-i``.
+
+    Aliases keep their names; only ``Graph.sources`` (alias -> input index)
+    and ``Graph.input_paths`` are rewritten, in first-occurrence order, so
+    labels/chains/fanout need no change -- they already resolve a source ref's
+    input index through ``g.sources`` at render time. Returns `g` itself when
+    nothing merges. Callers run it once every input option and trim window is
+    known -- which is what the "no trim window" test needs.
+    """
+    aliases_by_index: dict[int, list[str]] = {}
+    for alias, index in g.sources.items():
+        aliases_by_index.setdefault(index, []).append(alias)
+
+    trimmed = set(g.input_trims.keys())
+
+    key_to_new_index: dict[_MergeKey, int] = {}
+    old_to_new_index: dict[int, int] = {}
+    new_input_paths: list[str] = []
+    for index, path in enumerate(g.input_paths):
+        key = _merge_key(g, index, aliases_by_index.get(index, []), trimmed)
+        if key is not None and key in key_to_new_index:
+            old_to_new_index[index] = key_to_new_index[key]
+            continue
+        new_index = len(new_input_paths)
+        new_input_paths.append(path)
+        old_to_new_index[index] = new_index
+        if key is not None:
+            key_to_new_index[key] = new_index
+
+    if len(new_input_paths) == len(g.input_paths):
+        return g
+
+    new_sources = {alias: old_to_new_index[index] for alias, index in g.sources.items()}
+    return replace(g, input_paths=new_input_paths, sources=new_sources)

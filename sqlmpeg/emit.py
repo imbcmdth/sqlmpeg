@@ -149,7 +149,7 @@ Input dedup
 -----------
 Two ``INPUT`` aliases over the SAME path, with the SAME (validated,
 normalized) ``input_options`` and NO ``input_trims`` window on either, share a
-single ``-i``: :func:`_dedup_inputs` runs first in :func:`emit` and folds such
+single ``-i``: :func:`~sqlmpeg.ir.dedup_inputs` runs first in :func:`emit` and folds such
 aliases' ``Graph.sources`` entries onto one ``input_paths`` slot (first
 occurrence wins the position). A trimmed alias is NEVER merged, even against
 an identical window -- the concat splice (two aliases, two DIFFERENT windows,
@@ -201,7 +201,17 @@ from dataclasses import dataclass, field, replace
 from . import loudnorm
 from .errors import ErrorCode, SqlmpegError
 from .inputs import InputOptionSpec, option_spec
-from .ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType, is_src, src_parts
+from .ir import (
+    FrameRef,
+    Graph,
+    Node,
+    Output,
+    SinkUnit,
+    StreamType,
+    dedup_inputs,
+    is_src,
+    src_parts,
+)
 from .sink import CODEC_PARAMS_FLAGS, PASSLOGFILE_FLAG, SINK_OPTIONS, SinkOptionSpec
 
 OUTPUT_LABEL_PREFIX = "out"
@@ -307,63 +317,6 @@ class Emitted:
         return [mapping for group in self.groups for mapping in group.maps]
 
 
-_MergeKey = tuple[str, tuple[tuple[str, object], ...]]
-
-
-def _merge_key(g: Graph, index: int, aliases: list[str], trimmed: set[str]) -> _MergeKey | None:
-    """This input slot's dedup key, or None if it can never merge.
-
-    None for any slot carrying a trimmed alias -- a trim is a property of that
-    alias's own ``-i``, so two windows are never folded together
-    even when equal. Otherwise the key is the path plus the resolved options
-    every alias on this slot set, sorted by name: two slots merge only when
-    both match exactly.
-    """
-    if any(alias in trimmed for alias in aliases):
-        return None
-    options: dict[str, object] = {}
-    for alias in aliases:
-        options.update(g.input_options.get(alias, {}))
-    return (g.input_paths[index], tuple(sorted(options.items())))
-
-
-def _dedup_inputs(g: Graph) -> Graph:
-    """Fold untrimmed same-path same-options aliases onto one ``-i``.
-
-    Aliases keep their names; only ``Graph.sources`` (alias -> input index)
-    and ``Graph.input_paths`` are rewritten, in first-occurrence order, so
-    labels/chains/fanout need no change -- they already resolve a source ref's
-    input index through ``g.sources`` at render time. Returns `g` itself when
-    nothing merges. See the module docstring for why it runs here, not in
-    `sqlmpeg.lower`.
-    """
-    aliases_by_index: dict[int, list[str]] = {}
-    for alias, index in g.sources.items():
-        aliases_by_index.setdefault(index, []).append(alias)
-
-    trimmed = set(g.input_trims.keys())
-
-    key_to_new_index: dict[_MergeKey, int] = {}
-    old_to_new_index: dict[int, int] = {}
-    new_input_paths: list[str] = []
-    for index, path in enumerate(g.input_paths):
-        key = _merge_key(g, index, aliases_by_index.get(index, []), trimmed)
-        if key is not None and key in key_to_new_index:
-            old_to_new_index[index] = key_to_new_index[key]
-            continue
-        new_index = len(new_input_paths)
-        new_input_paths.append(path)
-        old_to_new_index[index] = new_index
-        if key is not None:
-            key_to_new_index[key] = new_index
-
-    if len(new_input_paths) == len(g.input_paths):
-        return g
-
-    new_sources = {alias: old_to_new_index[index] for alias, index in g.sources.items()}
-    return replace(g, input_paths=new_input_paths, sources=new_sources)
-
-
 def emit(g: Graph) -> Emitted:
     """Render `g` as an ffmpeg filtergraph plus its output map list.
 
@@ -374,10 +327,10 @@ def emit(g: Graph) -> Emitted:
     feeding both a node and an output, or two outputs naming one pad, is a
     split-pass bug.
 
-    Runs :func:`_dedup_inputs` first, before anything below reads
+    Runs :func:`~sqlmpeg.ir.dedup_inputs` first, before anything below reads
     ``g.sources``/``g.input_paths``.
     """
-    g = _dedup_inputs(g)
+    g = dedup_inputs(g)
     _verify_topological(g)
 
     nodes = list(g.nodes.values())

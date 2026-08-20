@@ -268,7 +268,7 @@ from __future__ import annotations
 
 import base64
 import difflib
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
@@ -277,7 +277,17 @@ from sqlglot import exp
 from sqlmpeg import binaries, loudnorm
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import validate_option as validate_input_option
-from sqlmpeg.ir import FrameRef, Graph, Node, Output, SinkUnit, StreamType, is_src, src_parts
+from sqlmpeg.ir import (
+    FrameRef,
+    Graph,
+    Node,
+    Output,
+    SinkUnit,
+    StreamType,
+    dedup_inputs,
+    is_src,
+    src_parts,
+)
 from sqlmpeg.macros import INPUT_MACROS, MACROS, InputMacro, Macro, macro_names
 from sqlmpeg.parser import (
     _ARITHMETIC,
@@ -1387,10 +1397,19 @@ class _InputBinding:
 
 @dataclass(frozen=True)
 class _CteBinding:
-    """``FROM <cte>`` — exposes the columns the CTE's SELECT list named."""
+    """``FROM <cte>`` — a TABLE of the rows its body produced.
+
+    `columns` is what the body's SELECT list named, each column holding every
+    stream it carries. `rows` is the body's ROW count, which a splat array
+    column carries one element per; `relation` is the branch's joined row set,
+    so a column of that width reads back one element per result row and a
+    cross join with a second source repeats it honestly.
+    """
 
     name: str
     columns: tuple[_Column, ...]
+    rows: int = 1
+    relation: _RowRelation | None = None
 
 
 @dataclass
@@ -1455,13 +1474,31 @@ class _TrackRow:
     columns: dict[str, RowValue]
 
 
+@dataclass(frozen=True)
+class _CteRow:
+    """One row of a CTE source: which row of the body's row set it is.
+
+    A CTE row has no metadata columns of its own — the body named what it
+    named, and those columns are streams — so the position is all a result
+    tuple needs to read the row's value back out of each column's array.
+    """
+
+    position: int
+
+
+# What one result row holds per FROM alias: a track (or a gap, where an outer
+# join found no counterpart) for a row table, a position for a CTE source.
+_RowTuple = dict[str, "_TrackRow | _CteRow | None"]
+
+
 @dataclass
 class _RowRelation:
-    """One branch's joined row set: every unnest table, aligned.
+    """One branch's joined row set: every row source, aligned.
 
     `tuples` is the relation itself — one dict per result ROW, mapping each row
-    alias to that row's track, or to ``None`` where an outer join left a gap.
-    All of a branch's row tables share this one object, which is what keeps
+    alias to that row's track, or to ``None`` where an outer join left a gap,
+    and each CTE alias to the body row it took. All of a branch's row sources
+    share this one object, which is what keeps
     ``a.track`` and ``b.track`` aligned: element `i` of each is the pair the
     join made, so the existing zip/broadcast machinery wires the right streams
     together without learning that joins exist.
@@ -1473,7 +1510,7 @@ class _RowRelation:
     """
 
     aliases: list[str] = field(default_factory=list)
-    tuples: list[dict[str, _TrackRow | None]] = field(default_factory=list)
+    tuples: list[_RowTuple] = field(default_factory=list)
     keys: dict[str, list[str]] = field(default_factory=dict)
 
 
@@ -1503,7 +1540,7 @@ class _RowBinding:
 
     @property
     def rows(self) -> tuple[_TrackRow | None, ...]:
-        return tuple(row.get(self.alias) for row in self.relation.tuples)
+        return tuple(_track_of(row, self.alias) for row in self.relation.tuples)
 
 
 _Binding = _InputBinding | _CteBinding | _SourceBinding | _RowBinding
@@ -1520,6 +1557,27 @@ _TagScope = Literal["sink", "rows"]
 # The reserved per-stream key emit renders as `-disposition:<i>`. A container
 # has no disposition, so it is not a container tag key.
 _DISPOSITION_TAG = "disposition"
+
+
+def _track_of(row: _RowTuple, alias: str) -> _TrackRow | None:
+    """One result row's track for a row alias; None for a gap or a CTE row."""
+    entry = row.get(alias)
+    return entry if isinstance(entry, _TrackRow) else None
+
+
+def _cte_row_count(columns: Iterable[_Column]) -> int:
+    """How many rows a CTE body produced: the width of its row-set columns.
+
+    A splat array column carries one stream per body row, so its length IS the
+    body's row count; a body with none (a single input row, a UNION ALL's
+    concat, a broadcast array) is one row.
+    """
+    widths = [
+        len(column.value.streams)
+        for column in columns
+        if column.splat and column.value.is_array
+    ]
+    return max(widths) if widths else 1
 
 
 def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
@@ -1775,7 +1833,7 @@ class _Lowerer:
         # Sticky across sinks, unlike `fanout_expr`: the loudnorm2 fences ask
         # whether ANY COPY of the script fanned out.
         self.fanout_seen = False
-        self.fanout_row: dict[str, _TrackRow | None] = {}
+        self.fanout_row: _RowTuple = {}
         self.fanout_env: _Env | None = None
         self.fanout_count: int | None = None
         # True when the pin partitioned by a GROUP BY key rather than by row,
@@ -2278,11 +2336,7 @@ class _Lowerer:
     def _lower_branch(self, select: exp.Select, *, tags: _TagScope) -> list[_Column]:
         env = self._scope(select)
         env.grouped = is_grouped(select)
-        env.group_keys = tuple(
-            key
-            for key in group_keys(select)
-            if references_row_alias(key, set(self.res.track_rows))
-        )
+        env.group_keys = _partition_keys(select, env)
         # One WHERE clause, three languages. A conjunct over track-row columns
         # is decided HERE and never reaches ffmpeg; a subscript metadata
         # conjunct is a compile-time ASSERTION (nothing to filter -- the SELECT
@@ -2323,7 +2377,7 @@ class _Lowerer:
             # no per-row scope: its scalars are group-constants, so they tag
             # the group's container.
             if _is_tag_column(projection, env):
-                if env.relation is not None and not env.grouped:
+                if _has_track_rows(env) and not env.grouped:
                     self._collect_tag(projection, env, select)
                 elif tags == "sink":
                     self._collect_container_tag(projection, env, select)
@@ -2342,7 +2396,7 @@ class _Lowerer:
             columns.append(
                 _Column(
                     name=_projection_name(projection),
-                    value=self._lower_expr(projection, env, select),
+                    value=self._branch_value(projection, env, select),
                     splat=self._is_splat_projection(projection, env),
                 )
             )
@@ -2356,6 +2410,44 @@ class _Lowerer:
                 "tracks too, e.g. SELECT t.track, ... AS title",
             )
         return columns
+
+    def _branch_value(
+        self, projection: exp.Expr, env: _Env, select: exp.Select
+    ) -> _Value:
+        """One SELECT column's streams, group by group where that matters.
+
+        A branch whose GROUP BY partitions the relation gathers each group in
+        turn: an aggregate sees its whole group, every other column the
+        group's first tuple -- which is what makes ``SELECT vid.track,
+        array_agg(aud.track) ... GROUP BY vid.track`` map the video once and
+        every audio of its group after it. The same split holds under a
+        fan-out ``TO``, where the pin already cut the relation to one group.
+        Without a partitioning key the column lowers over the relation as it
+        stands, which is every ungrouped query.
+        """
+        if not env.group_keys:
+            return self._lower_expr(projection, env, select)
+        relation = env.relation
+        if relation is None:  # defensive: a partitioning key implies a relation
+            return self._lower_expr(projection, env, select)
+        groups = self._grouped_partitions(env, select)
+        if not groups:
+            # No row survived: lower the column as it stands, which is where
+            # the empty-row-set rejection lives.
+            return self._lower_expr(projection, env, select)
+        aggregate = isinstance(_unwrap(projection), exp.ArrayAgg)
+        original = relation.tuples
+        gathered: list[_Stream] = []
+        stream_type: StreamType = "video"  # every pass overwrites it
+        try:
+            for group in groups:
+                relation.tuples = list(group) if aggregate else group[:1]
+                value = self._lower_expr(projection, env, select)
+                gathered += value.streams
+                stream_type = value.type
+        finally:
+            relation.tuples = original
+        return _array(stream_type, gathered)
 
     def _is_splat_projection(self, projection: exp.Expr, env: _Env) -> bool:
         """True when this stream column's array value (if it turns out to be
@@ -2491,7 +2583,9 @@ class _Lowerer:
             value = self._eval_value(value_node, env, row, select)
             text = None if value is None else _tag_text(value)
             for track in row.values():
-                if track is not None:
+                # A CTE row carries no track of its own: its streams were
+                # tagged by the body that named them.
+                if isinstance(track, _TrackRow):
                     self._record_tag(track.stream.source, key, text, projection, select)
 
     def _record_tag(
@@ -2651,7 +2745,9 @@ class _Lowerer:
                 ),
             )
             for column in binding.columns
-            for stream in column.value.streams
+            for stream in self._cte_column_value(
+                binding, column, anchor, select
+            ).streams
         ]
 
     # -- FROM -------------------------------------------------------------
@@ -2748,12 +2844,12 @@ class _Lowerer:
         self,
         relation: _RowRelation,
         alias: str,
-        rows: list[_TrackRow],
+        rows: Sequence[_TrackRow | _CteRow],
         join: RawRowJoin | None,
         env: _Env,
         select: exp.Select,
     ) -> None:
-        """Fold one freshly bound row table into the branch's relation.
+        """Fold one freshly bound row source into the branch's relation.
 
         Ordinary SQL join semantics, evaluated here because every column is
         probed metadata ("the joins never reach ffmpeg"):
@@ -2781,12 +2877,12 @@ class _Lowerer:
                     if name not in relation.keys.setdefault(key_alias, []):
                         relation.keys[key_alias].append(name)
 
-        combined: list[dict[str, _TrackRow | None]] = []
+        combined: list[_RowTuple] = []
         matched: set[int] = set()
         for left in relation.tuples:
             paired = False
             for position, row in enumerate(rows):
-                candidate: dict[str, _TrackRow | None] = {**left, alias: row}
+                candidate: _RowTuple = {**left, alias: row}
                 if kind != "cross" and (
                     join is None
                     or join.on is None
@@ -2799,7 +2895,7 @@ class _Lowerer:
             if not paired and kind in ("left", "full"):
                 combined.append({**left, alias: None})
         if kind == "full":
-            empty: dict[str, _TrackRow | None] = {name: None for name in relation.aliases}
+            empty: _RowTuple = {name: None for name in relation.aliases}
             combined += [
                 {**empty, alias: row}
                 for position, row in enumerate(rows)
@@ -2930,13 +3026,39 @@ class _Lowerer:
             local = name
             if isinstance(alias_node, exp.TableAlias) and alias_node.this is not None:
                 local = _fold(alias_node.this)
-            env.bindings[local] = _CteBinding(name=local, columns=columns)
+            self._add_cte_rows(local, columns, env, select)
             return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             "only input('path') and CTE names are allowed in FROM",
             table,
             fallback=select,
+        )
+
+    def _add_cte_rows(
+        self, local: str, columns: tuple[_Column, ...], env: _Env, select: exp.Select
+    ) -> None:
+        """Bind one CTE reference: its body's rows join the branch's relation.
+
+        One body row is one outer row, so a comma between two CTEs (or between
+        a CTE and an unnest table) is the ordinary cross join
+        :meth:`_join_rows` already builds, multiplicity and all. A single-row
+        body is a shape no-op, which is what keeps the one-input CTE shapes
+        compiling exactly as they did.
+        """
+        if env.relation is None:
+            env.relation = _RowRelation()
+        rows = _cte_row_count(columns)
+        env.bindings[local] = _CteBinding(
+            name=local, columns=columns, rows=rows, relation=env.relation
+        )
+        self._join_rows(
+            env.relation,
+            local,
+            [_CteRow(position=position) for position in range(rows)],
+            None,
+            env,
+            select,
         )
 
     def _known_hint(self) -> str:
@@ -3234,7 +3356,7 @@ class _Lowerer:
 
     def _fanout_groups(
         self, env: _Env, select: exp.Select
-    ) -> list[list[dict[str, _TrackRow | None]]]:
+    ) -> list[list[_RowTuple]]:
         """The relation's tuples partitioned into the files they write.
 
         One group per distinct GROUP BY key, in FIRST-APPEARANCE order (the
@@ -3246,13 +3368,56 @@ class _Lowerer:
         tuples = relation.tuples if relation is not None else []
         if not env.group_keys:
             return [[row] for row in tuples]
-        groups: dict[tuple[RowValue, ...], list[dict[str, _TrackRow | None]]] = {}
+        groups: dict[tuple[RowValue, ...], list[_RowTuple]] = {}
         for row in tuples:
-            key = tuple(
-                self._eval_value(node, env, row, select) for node in env.group_keys
-            )
+            key = tuple(self._key_value(node, env, row, select) for node in env.group_keys)
             groups.setdefault(key, []).append(row)
         return list(groups.values())
+
+    def _key_value(
+        self, node: exp.Expr, env: _Env, row: _RowTuple, select: exp.Select
+    ) -> RowValue:
+        """One GROUP BY key, read out of one result tuple.
+
+        A stream column -- a CTE's, or a row table's ``track`` -- has no
+        metadata value to compare, so what identifies the group is the stream
+        itself: its ref, which two tuples share exactly when they carry the
+        same stream.
+        """
+        stream = self._key_stream(node, env, row)
+        if stream is not None:
+            return stream.ref
+        return self._eval_value(node, env, row, select)
+
+    def _key_stream(self, node: exp.Expr, env: _Env, row: _RowTuple) -> _Stream | None:
+        """The stream a GROUP BY key names in this tuple, else None."""
+        column_node = _unwrap(node)
+        if not isinstance(column_node, exp.Column):
+            return None
+        table_node = column_node.args.get("table")
+        if table_node is None:
+            return None
+        binding = env.bindings.get(_fold(table_node))
+        name = _fold(column_node.this)
+        if isinstance(binding, _RowBinding):
+            if name != ROW_STREAM_COLUMN:
+                return None
+            track = _track_of(row, binding.alias)
+            return track.stream if track is not None else None
+        if not isinstance(binding, _CteBinding):
+            return None
+        column = self._cte_column(binding, name)
+        if column is None or not column.value.streams:
+            return None
+        entry = row.get(binding.name)
+        if (
+            isinstance(entry, _CteRow)
+            and column.splat
+            and len(column.value.streams) == binding.rows
+        ):
+            return column.value.streams[entry.position]
+        # A broadcast column is one unit: every tuple reads the same stream.
+        return column.value.streams[0]
 
     def _row_binding_of(
         self, node: exp.Expr, env: _Env, select: exp.Select
@@ -3278,7 +3443,7 @@ class _Lowerer:
         self,
         node: exp.Expr,
         env: _Env,
-        rows: dict[str, _TrackRow | None],
+        rows: _RowTuple,
         select: exp.Select,
     ) -> bool | None:
         """One predicate against one result row: TRUE, FALSE, UNKNOWN (``None``).
@@ -3342,7 +3507,7 @@ class _Lowerer:
         self,
         node: exp.Expr | None,
         env: _Env,
-        rows: dict[str, _TrackRow | None],
+        rows: _RowTuple,
         select: exp.Select,
     ) -> RowValue:
         """One ``<row alias>.<column>`` reference, read out of this result row.
@@ -3389,14 +3554,14 @@ class _Lowerer:
                 hint=f"{binding.column} track rows expose "
                 f"{', '.join(sorted(ROW_SCHEMAS[binding.column]))}",
             )
-        row = rows.get(binding.alias)
+        row = _track_of(rows, binding.alias)
         return None if row is None else row.columns.get(name)
 
     def _eval_value(
         self,
         node: exp.Expr | None,
         env: _Env,
-        rows: dict[str, _TrackRow | None],
+        rows: _RowTuple,
         select: exp.Select,
     ) -> RowValue:
         """One compile-time value over a result row.
@@ -3429,7 +3594,7 @@ class _Lowerer:
         self,
         node: exp.Expr,
         env: _Env,
-        rows: dict[str, _TrackRow | None],
+        rows: _RowTuple,
         select: exp.Select,
     ) -> RowValue:
         """``+ - * /`` with Postgres' own typing, at compile time.
@@ -3469,7 +3634,7 @@ class _Lowerer:
         operator: str,
         anchor: exp.Expr,
         env: _Env,
-        rows: dict[str, _TrackRow | None],
+        rows: _RowTuple,
         select: exp.Select,
     ) -> int | float | None:
         """One arithmetic operand's value; text is a typed rejection."""
@@ -3487,7 +3652,7 @@ class _Lowerer:
         self,
         node: exp.Cast,
         env: _Env,
-        rows: dict[str, _TrackRow | None],
+        rows: _RowTuple,
         select: exp.Select,
     ) -> RowValue:
         """``x::text``: the number spelled out, NULL left NULL.
@@ -3503,7 +3668,7 @@ class _Lowerer:
         self,
         node: exp.Case,
         env: _Env,
-        rows: dict[str, _TrackRow | None],
+        rows: _RowTuple,
         select: exp.Select,
     ) -> RowValue:
         """CASE, searched and simple: the first TRUE branch, else ELSE, else NULL.
@@ -3545,7 +3710,7 @@ class _Lowerer:
         self,
         node: exp.DPipe,
         env: _Env,
-        rows: dict[str, _TrackRow | None],
+        rows: _RowTuple,
         select: exp.Select,
     ) -> RowValue:
         """``a || b``: NULL when either side is NULL, else the two texts joined."""
@@ -3819,11 +3984,11 @@ class _Lowerer:
             relation = binding.relation
 
             def value_of(
-                row: dict[str, _TrackRow | None],
+                row: _RowTuple,
                 alias: str = binding.alias,
                 name: str = name,
             ) -> RowValue:
-                track = row.get(alias)
+                track = _track_of(row, alias)
                 return None if track is None else track.columns.get(name)
 
             nulls = [row for row in relation.tuples if value_of(row) is None]
@@ -4380,7 +4545,7 @@ class _Lowerer:
     def _paired_row(
         self,
         relation: _RowRelation,
-        row: dict[str, _TrackRow | None],
+        row: _RowTuple,
         alias: str,
     ) -> tuple[str | None, _TrackRow | None]:
         """The counterpart of a gap: the first row table that DID match here.
@@ -4393,7 +4558,7 @@ class _Lowerer:
         for other in relation.aliases:
             if other == alias:
                 continue
-            track = row.get(other)
+            track = _track_of(row, other)
             if track is not None:
                 return other, track
         return None, None
@@ -4424,7 +4589,7 @@ class _Lowerer:
             )
         streams: list[_Stream] = []
         for row in relation.tuples:
-            track = row.get(binding.alias)
+            track = _track_of(row, binding.alias)
             if track is not None:
                 # The real track goes through `_access` exactly as a bare
                 # `<alias>.track` would, so the input's WHERE window (and the
@@ -4944,9 +5109,11 @@ class _Lowerer:
                 fallback=select,
                 hint=self._cte_columns_hint(binding),
             )
-        value = column.value
         if index is None:
-            return value
+            return self._cte_column_value(binding, column, anchor, select)
+        # A subscript names one element of the BODY's array, whatever the
+        # branch's relation did with the rows around it.
+        value = column.value
         if not value.is_array:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -4968,6 +5135,44 @@ class _Lowerer:
                 hint=_SUBSCRIPT_HINT,
             )
         return _scalar(value.streams[index - 1])
+
+    def _cte_column_value(
+        self,
+        binding: _CteBinding,
+        column: _Column,
+        anchor: exp.Expr,
+        select: exp.Select,
+    ) -> _Value:
+        """One CTE column as this branch's relation reads it.
+
+        A row-set column carries one stream per body row, so the value is that
+        column re-read through the result tuples: a cross join repeats the
+        stream once per partner row, and a filtered relation drops the rows it
+        dropped. Everything else -- a scalar, an ``array_agg``, a bare input
+        array re-exposed -- is one unit that broadcasts, exactly as before.
+        """
+        relation = binding.relation
+        if (
+            relation is None
+            or not (column.splat and column.value.is_array)
+            or len(column.value.streams) != binding.rows
+        ):
+            return column.value
+        streams = [
+            column.value.streams[row.position]
+            for row in (tuple_.get(binding.name) for tuple_ in relation.tuples)
+            if isinstance(row, _CteRow)
+        ]
+        if not streams:
+            raise _error(
+                ErrorCode.STREAM_NOT_FOUND,
+                f"'{binding.name}.{column.name}' selects nothing: no row of "
+                f"'{binding.name}' survived",
+                anchor,
+                fallback=select,
+                hint="an empty row set would select no streams; widen the WHERE",
+            )
+        return _array(column.value.type, streams)
 
     def _cte_column(self, binding: _CteBinding, name: str) -> _Column | None:
         for column in binding.columns:
@@ -5732,7 +5937,7 @@ class _Lowerer:
         self,
         node: exp.Expr,
         env: _Env,
-        row: dict[str, _TrackRow | None],
+        row: _RowTuple,
         select: exp.Select,
     ) -> exp.Expr:
         """One option argument as `row` makes it; anything else, untouched."""
@@ -6128,7 +6333,7 @@ class _Lowerer:
             result = self._lower_table_query(self.res.branches, self.res.select)
             sinks.append(TableSink(result=result, path=None, csv=False, header=False))
         self.graph.input_options = self._lower_input_options()
-        return sinks
+        return self._render_specs(sinks)
 
     def _lower_table_sink(self, raw: RawSink) -> TableSink:
         """One csv COPY: its query lowered, ``FORMAT``/``HEADER`` validated.
@@ -6163,22 +6368,16 @@ class _Lowerer:
     def _lower_table_branch(self, select: exp.Select) -> TableResult:
         """One table/csv branch: row cardinality, then every column, per row.
 
-        Cardinality is the branch's shared row relation -- every row alias's
-        column stays aligned to it, joins included; a CTE-ONLY FROM has no
-        relation, so it comes from whichever splat CTE array column the
-        SELECT list reads instead (see :meth:`_table_cardinality`); a branch
-        with neither is 1 (a plain metadata/stream SELECT has exactly one
-        row, the same way a bare scalar broadcasts). A GROUPED branch (a
+        Cardinality is the branch's shared row relation -- every row source
+        stays aligned to it, joins and CTE references included -- and 1 for a
+        branch with no rows at all (a plain metadata/stream SELECT has exactly
+        one row, the same way a bare scalar broadcasts). A GROUPED branch (a
         GROUP BY, an ``array_agg``, or both) prints one row per group instead
         -- see :meth:`_lower_grouped_table_branch`.
         """
         env = self._scope(select)
         env.grouped = is_grouped(select)
-        env.group_keys = tuple(
-            key
-            for key in group_keys(select)
-            if references_row_alias(key, set(self.res.track_rows))
-        )
+        env.group_keys = _partition_keys(select, env)
         time_conjuncts, row_conjuncts, assertion_conjuncts = self._split_where(select, env)
         self._collect_trims(select, env, time_conjuncts)
         self._filter_rows(row_conjuncts, env, select)
@@ -6205,84 +6404,13 @@ class _Lowerer:
         if env.grouped:
             return self._lower_grouped_table_branch(select, env, projections, names)
 
-        cardinality = self._table_cardinality(projections, env, select)
+        cardinality = len(env.relation.tuples) if env.relation is not None else 1
         per_column = [
             self._table_projection(projection, env, select, cardinality)
             for projection in projections
         ]
         rows = [[per_column[c][r] for c in range(len(names))] for r in range(cardinality)]
         return TableResult(columns=names, rows=rows)
-
-    def _table_cardinality(
-        self, projections: list[exp.Expr], env: _Env, select: exp.Select
-    ) -> int:
-        """The branch's row count, from its row relation or its CTE columns.
-
-        ``FROM aud`` has no relation at all: cardinality has to come from the
-        row set a splat CTE array column carries. Same-CTE columns share one
-        body and so agree by construction -- one entry is kept per alias --
-        but two DIFFERENT array-valued sources (two CTEs, or a CTE beside an
-        unnest relation) have no natural join between them, so disagreeing OR
-        NOT, mixing them is rejected rather than guessed at.
-        """
-        widths = self._cte_row_widths(projections, env)
-        if env.relation is not None:
-            if widths:
-                anchor, label, _ = widths[0]
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"'{label}' is a CTE array column and this table query "
-                    "also unnests its own row table: there is no way to "
-                    "align the two independent row sets",
-                    anchor,
-                    fallback=select,
-                    hint="select them in separate queries",
-                )
-            return len(env.relation.tuples)
-        if not widths:
-            return 1
-        first_anchor, first_label, first_width = widths[0]
-        for anchor, label, width in widths[1:]:
-            if width != first_width:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"'{first_label}' has {_stream_count(first_width)} but "
-                    f"'{label}' has {_stream_count(width)}: a table query "
-                    "needs a single row count",
-                    anchor,
-                    fallback=select,
-                    hint="select them in separate queries",
-                )
-        return first_width
-
-    def _cte_row_widths(
-        self, projections: list[exp.Expr], env: _Env
-    ) -> list[tuple[exp.Expr, str, int]]:
-        """``(anchor, "<cte>.<name>", row count)`` per splat CTE array column
-        the SELECT list bare-references, one entry per DISTINCT CTE alias.
-        """
-        widths: list[tuple[exp.Expr, str, int]] = []
-        seen: set[str] = set()
-        for projection in projections:
-            expr = _unwrap(projection)
-            if not isinstance(expr, exp.Column):
-                continue
-            table_node = expr.args.get("table")
-            if table_node is None:
-                continue
-            alias = _fold(table_node)
-            if alias in seen:
-                continue
-            binding = env.bindings.get(alias)
-            if not isinstance(binding, _CteBinding):
-                continue
-            name = _fold(expr.this)
-            column = self._cte_column(binding, name)
-            if column is None or not column.splat or not column.value.is_array:
-                continue
-            seen.add(alias)
-            widths.append((projection, f"{alias}.{name}", len(column.value.streams)))
-        return widths
 
     def _lower_grouped_table_branch(
         self,
@@ -6291,7 +6419,7 @@ class _Lowerer:
         projections: list[exp.Expr],
         names: list[str],
     ) -> TableResult:
-        """One printed row per GROUP BY group -- 085's partition, no fan-out sink.
+        """One printed row per GROUP BY group; no fan-out sink involved.
 
         Reuses the exact per-row machinery: for each group, the relation's
         tuples are pinned to that group (the array_agg column sees every tuple,
@@ -6301,7 +6429,7 @@ class _Lowerer:
         and every projection lowers as one ordinary, single-row column.
         """
         relation = env.relation
-        assert relation is not None  # is_grouped implies unnest; resolve enforced it
+        assert relation is not None  # is_grouped implies rows; resolve enforced it
         groups = self._grouped_partitions(env, select)
         original = relation.tuples
         rows: list[list[CellValue]] = []
@@ -6319,7 +6447,7 @@ class _Lowerer:
 
     def _grouped_partitions(
         self, env: _Env, select: exp.Select
-    ) -> list[list[dict[str, _TrackRow | None]]]:
+    ) -> list[list[_RowTuple]]:
         """The relation's tuples partitioned into the groups a table query
         prints, one row each.
 
@@ -6333,9 +6461,9 @@ class _Lowerer:
         tuples = relation.tuples if relation is not None else []
         if not env.group_keys:
             return [list(tuples)]
-        groups: dict[tuple[RowValue, ...], list[dict[str, _TrackRow | None]]] = {}
+        groups: dict[tuple[RowValue, ...], list[_RowTuple]] = {}
         for row in tuples:
-            key = tuple(self._eval_value(node, env, row, select) for node in env.group_keys)
+            key = tuple(self._key_value(node, env, row, select) for node in env.group_keys)
             groups.setdefault(key, []).append(row)
         return list(groups.values())
 
@@ -6428,9 +6556,39 @@ class _Lowerer:
         return [cell] * cardinality
 
     def _stream_to_cell(self, stream: _Stream) -> CellValue:
+        """One stream as a cell, carrying its REF until `_render_specs` runs."""
         if stream.ref == _NULL_STREAM_REF:
             return None
-        return StreamCell(type=stream.type, spec=self._stream_spec(stream.ref))
+        return StreamCell(type=stream.type, spec=stream.ref)
+
+    def _render_specs(self, sinks: list[TableSink]) -> list[TableSink]:
+        """Turn every cell's stream ref into the spec the command will name.
+
+        Which ``-i`` an alias reads is settled only once every input option
+        and trim window is known, and two aliases over one untrimmed path
+        share a slot. A table previews the command, so it names the same
+        input: the refs wait here for the final input list.
+        """
+        self.graph = dedup_inputs(self.graph)
+        return [
+            replace(
+                sink,
+                result=TableResult(
+                    columns=sink.result.columns,
+                    rows=[[self._render_cell(cell) for cell in row] for row in sink.result.rows],
+                ),
+            )
+            for sink in sinks
+        ]
+
+    def _render_cell(self, cell: CellValue) -> CellValue:
+        if isinstance(cell, StreamCell):
+            return StreamCell(type=cell.type, spec=self._stream_spec(cell.spec))
+        if isinstance(cell, ArrayCell):
+            return ArrayCell(
+                elements=tuple(self._render_cell(element) for element in cell.elements)
+            )
+        return cell
 
     def _stream_spec(self, ref: FrameRef) -> str:
         """The ffmpeg stream spec (``"0:a:0"``) for a source ref, else the
@@ -6534,7 +6692,34 @@ def _tag_text(value: str | int | float) -> str:
     return value if isinstance(value, str) else str(value)
 
 
-def _group_row(env: _Env) -> dict[str, _TrackRow | None]:
+def _partition_keys(select: exp.Select, env: _Env) -> tuple[exp.Expr, ...]:
+    """The GROUP BY keys that actually partition the branch's relation.
+
+    A key reading a row source -- a track row, a chapter row, a CTE row --
+    varies from tuple to tuple. An input-level or constant key has the same
+    value everywhere and leaves one group.
+    """
+    return tuple(key for key in group_keys(select) if _reads_row_source(key, env))
+
+
+def _reads_row_source(node: exp.Expr, env: _Env) -> bool:
+    for sub in node.walk():
+        if not isinstance(sub, exp.Column):
+            continue
+        table_node = sub.args.get("table")
+        if table_node is None:
+            continue
+        if isinstance(env.bindings.get(_fold(table_node)), _RowBinding | _CteBinding):
+            return True
+    return False
+
+
+def _has_track_rows(env: _Env) -> bool:
+    """True when the branch has track (or chapter) rows to tag per stream."""
+    return any(isinstance(binding, _RowBinding) for binding in env.bindings.values())
+
+
+def _group_row(env: _Env) -> _RowTuple:
     """The tuple a grouped branch's group-constant values read, else no row."""
     if not env.grouped or env.relation is None or not env.relation.tuples:
         return {}

@@ -176,14 +176,19 @@ def test_a_row_tag_column_tags_only_its_own_command() -> None:
 
 def test_a_tagged_ctes_tags_reach_every_command() -> None:
     """Each row lowers the whole query for itself, CTE bodies included, so the
-    per-stream tags a CTE sets ride into every command the fan-out writes."""
+    per-stream tags a CTE sets ride into every command the fan-out writes.
+
+    The CTE's rows cross-join with the audio rows, so the captions are
+    gathered per group -- one command per audio track, every caption inside.
+    """
     sql = (
         "COPY ("
         "  WITH capt AS ("
         "    SELECT s.track AS track, 'Subs' AS title"
         f"    FROM input('{SRC}') g, unnest(g.subtitle) s"
         "  )"
-        f"  SELECT t.track, capt.track FROM input('{SRC}') f, unnest(f.audio) t, capt"
+        f"  SELECT t.track, array_agg(capt.track) FROM input('{SRC}') f, "
+        "  unnest(f.audio) t, capt GROUP BY t.track, t.language"
         ") TO (t.language || '.mkv')"
     )
     graphs = compile_commands(sql)
