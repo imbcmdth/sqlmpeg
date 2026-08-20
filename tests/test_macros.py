@@ -394,7 +394,7 @@ def test_build_ffmpeg_args_refuses_a_loudnorm2_emitted() -> None:
         build_ffmpeg_args(emit(_lower(_LOUDNORM2)), "out.m4a")
 
 
-# the v1 fences
+# the v1 limits
 
 
 def test_two_loudnorm2_calls_are_rejected() -> None:

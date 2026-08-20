@@ -643,7 +643,7 @@ def test_a_repeated_scalar_is_fanned_out_by_the_split_pass() -> None:
 def test_an_in_registry_acrossfade_wins_over_the_n_input_table() -> None:
     """acrossfade is AA->A on the snapshot's ffmpeg (pre-9) and variadic
     N->A on ffmpeg 9. The N_INPUT entry must NOT shadow a registry that has
-    the filter in-fence: on old builds it is an ordinary two-input call, no
+    the filter in-scope: on old builds it is an ordinary two-input call, no
     `inputs` option written (older acrossfade has no such option)."""
     g = _lower(
         "SELECT acrossfade(a.audio[1], b.audio[1], duration => 1) "
@@ -657,7 +657,7 @@ def test_an_in_registry_acrossfade_wins_over_the_n_input_table() -> None:
 
 @pytest.mark.exec
 def test_a_variadic_acrossfade_omits_the_defaulted_count_and_writes_a_real_one() -> None:
-    """On a build where acrossfade is variadic (ffmpeg 9+: fenced N->A with
+    """On a build where acrossfade is variadic (ffmpeg 9+: excluded N->A with
     an `inputs` option), the N_INPUT rescue kicks in -- and emits `inputs`
     only beyond the default of 2, so the two-stream command stays valid on
     every ffmpeg (cookbook recipe 13's pin is version-stable)."""
@@ -665,7 +665,7 @@ def test_a_variadic_acrossfade_omits_the_defaulted_count_and_writes_a_real_one()
     if live.get("acrossfade") is not None:
         pytest.skip(
             "this ffmpeg's acrossfade is a fixed two-input filter; the "
-            "variadic N_INPUT path only exists on builds that fence it"
+            "variadic N_INPUT path only exists on builds that exclude it"
         )
     two = compile_sql(
         "SELECT acrossfade(a.audio[1], a.audio[2], duration => 1) "
@@ -2841,8 +2841,8 @@ xfade AVOptions:
 
 """,
     # -- array-returning filters. All three are `->N` and
-    # so are FENCED out of the registry's tables; their option blocks are
-    # still reachable through `Registry.fenced_options`, which is what makes
+    # so are EXCLUDED from the registry's tables; their option blocks are
+    # still reachable through `Registry.excluded_options`, which is what makes
     # them callable through the namespace. Real ffmpeg 7.1 captures.
     "channelsplit": """\
 channelsplit AVOptions:
@@ -3129,7 +3129,7 @@ def test_two_pad_dynamic_filter_lowers_both_inputs(_registry: Registry) -> None:
 
 
 def test_excluded_filters_are_not_callable(_registry: Registry) -> None:
-    """The v1 scope fence lives in the registry: dynamic pads (acrossover),
+    """The v1 scope check lives in the registry: dynamic pads (acrossover),
     multiple outputs (feedback) and sources (testsrc) are all in the fixture's
     -filters output but excluded, so lowering never sees them at all.
 
@@ -3529,7 +3529,7 @@ def test_did_you_mean_over_the_registry(_registry: Registry) -> None:
 
 def test_did_you_mean_can_suggest_an_n_input_filter(_registry: Registry) -> None:
     """The N_INPUT names are callable, so they are candidates for the hint even
-    though the registry's own tables fence them out."""
+    though the registry's own tables exclude them."""
     err = _reject_dyn("SELECT amixx(a.audio[1], a.audio[2]) FROM input('x.mp4') a", _registry)
     assert err.hint is not None and "amix()" in err.hint
 
@@ -3896,11 +3896,11 @@ def test_a_namespaced_did_you_mean_stays_in_the_namespace(
     assert err.hint is not None and "not one of them" in err.hint
 
 
-def test_the_scope_fence_applies_to_the_namespace_too(_registry: Registry) -> None:
+def test_the_scope_check_applies_to_the_namespace_too(_registry: Registry) -> None:
     """Three `->N` names are re-admitted through this namespace (array-
     RETURNING), and a handful of `N->1` names through N_INPUT (amix, amerge,
     ...); multi-output, source and `split`-shaped (`N` on the OUTPUT side,
-    admitted by neither table) names stay fenced."""
+    admitted by neither table) names stay excluded."""
     for sql in (
         "SELECT ffmpeg.feedback(a.frame, a.frame) FROM input('x.mp4') a",
         "SELECT ffmpeg.testsrc(a.frame) FROM input('x.mp4') a",
@@ -3979,11 +3979,11 @@ def test_an_unrelated_qualified_call_is_still_rejected() -> None:
 # array-RETURNING filters
 # ---------------------------------------------------------------------------
 #
-# `channelsplit`, `acrossover` and `extractplanes` are `->N` filters, fenced
-# out of the registry's tables, re-admitted through the `ffmpeg.` namespace by
+# `channelsplit`, `acrossover` and `extractplanes` are `->N` filters, excluded
+# from the registry's tables, re-admitted through the `ffmpeg.` namespace by
 # `lower.ARRAY_RETURNING` -- one node with N output pads, returned as an
 # N-element ARRAY. The fixture registry has all three `-help` blocks (and
-# `amerge`, which has none, so it stays fenced).
+# `amerge`, which has none, so it stays excluded).
 
 
 def test_channelsplit_defaults_to_the_stereo_layouts_two_pads(_registry: Registry) -> None:
@@ -4385,7 +4385,7 @@ def test_enable_compiles_offline(_offline: Registry) -> None:
     assert g.nodes["n1"].args == {"sigma": 5, "enable": "between(t,2,5)"}
 
 
-def test_enable_is_still_gated_on_the_timeline_flag_offline(_offline: Registry) -> None:
+def test_enable_still_requires_the_timeline_flag_offline(_offline: Registry) -> None:
     """scale is not T-flagged, and the snapshot carries that flag verbatim."""
     with pytest.raises(SqlmpegError) as excinfo:
         lower(
@@ -4443,7 +4443,7 @@ def test_positional_options_bind_offline_exactly_as_they_do_live(
 # ---------------------------------------------------------------------------
 #
 # The mirror of the array-RETURNING trio: `N->1` filters whose INPUT pad count
-# is fixed by their `inputs` option, so the v1 pad fence excludes them from the
+# is fixed by their `inputs` option, so the v1 pad scope check excludes them from the
 # registry's tables even though the count is statically knowable. Reachable
 # under BOTH spellings -- no Postgres grammar claims these three names.
 
@@ -4615,7 +4615,7 @@ def test_an_n_input_node_is_split_like_any_other(_registry: Registry) -> None:
 #
 # Same rescue mechanism as amix/hstack/vstack, added second wave. amerge and
 # join count via `inputs`; interleave/ainterleave count via `nb_inputs` --
-# VERIFIED against a real ffmpeg 9.0.1 (`Registry.fenced_options`): `n` is
+# VERIFIED against a real ffmpeg 9.0.1 (`Registry.excluded_options`): `n` is
 # `nb_inputs`'s adjacent alias, so the registry's dedup rule keeps the longer
 # name, and `nb_inputs` is what a positional binds too.
 
@@ -4724,8 +4724,8 @@ def test_amerge_join_interleave_ainterleave_reachable_through_the_namespace(
 #
 # Offline, against the same fixture registry: the fixture's `-filters` block
 # carries `testsrc` (|->V), `anullsrc`/`sine` (|->A), plus `avsynctest`
-# (|->AV) and `movie` (|->N), which the v1 scope fence excludes -- so the
-# fenced half is exercised without an ffmpeg on the machine either.
+# (|->AV) and `movie` (|->N), which the v1 scope check excludes -- so the
+# excluded half is exercised without an ffmpeg on the machine either.
 
 
 def test_a_source_lowers_to_a_zero_input_node(_registry: Registry) -> None:
@@ -4893,11 +4893,11 @@ def test_an_unknown_source_suggests_a_real_one(_registry: Registry) -> None:
     assert err.hint == "did you mean ffmpeg.testsrc()?"
 
 
-def test_a_fenced_source_gets_the_fence_message(_registry: Registry) -> None:
+def test_an_excluded_source_gets_the_exclusion_message(_registry: Registry) -> None:
     """`avsynctest` (|->AV) and `movie` (|->N) are in the fixture's -filters
-    output and excluded by the v1 scope fence, so the registry never retained
+    output and excluded by the v1 scope check, so the registry never retained
     them -- they are indistinguishable from a typo here and land on the same
-    rejection, whose hint states the fence."""
+    rejection, whose hint states the exclusion."""
     for name in ("avsynctest", "movie", "amovie"):
         err = _reject_dyn(f"SELECT t.frame FROM ffmpeg.{name}() t", _registry)
         assert err.code is ErrorCode.UNKNOWN_FUNCTION, name
@@ -4912,7 +4912,7 @@ def test_a_sink_is_not_a_source_either(_registry: Registry) -> None:
 
 
 def test_a_regular_filter_in_from_says_it_takes_inputs(_registry: Registry) -> None:
-    """The one fenced case that IS positively identifiable: the name is a
+    """The one excluded case that IS positively identifiable: the name is a
     real filter of this ffmpeg, it just has input pads."""
     err = _reject_dyn("SELECT t.frame FROM ffmpeg.gblur(sigma => 2) t", _registry)
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -5454,7 +5454,7 @@ def test_a_positionally_compiled_call_runs(_av_fixture: str, tmp_path: Path) -> 
 
 @pytest.mark.exec
 def test_an_n_input_call_runs(_av_fixture: str, tmp_path: Path) -> None:
-    """amix is fenced out of the registry's tables; N_INPUT is what makes it
+    """amix is excluded from the registry's tables; N_INPUT is what makes it
     callable, and the command it builds is one ffmpeg accepts."""
     out = tmp_path / "amix.mp4"
     query = (
@@ -5484,7 +5484,7 @@ def test_the_snapshot_agrees_with_the_installed_ffmpeg_on_option_order(
 #
 # Which filter names Postgres parses specially is a property of sqlglot's
 # grammar crossed with this ffmpeg's filter list, so it is MEASURED rather
-# than reasoned about: parse `<name>(...)` for every in-fence filter, in
+# than reasoned about: parse `<name>(...)` for every in-scope filter, in
 # several argument shapes (a collision can depend on the arity -- `overlay(a)`
 # is a PARSE_ERROR while `overlay(a, b, 1, 2)` is the builtin), and collect
 # every name that does not arrive as an ordinary anonymous call.
@@ -5501,7 +5501,7 @@ _CENSUS_ARG_FORMS = (
     "a.frame, x => 1",
 )
 
-# Measured against ffmpeg 7.1 (464 in-fence filters) and sqlglot 30.17.
+# Measured against ffmpeg 7.1 (464 in-scope filters) and sqlglot 30.17.
 _KNOWN_COLLISIONS = frozenset(
     {
         "copy",
@@ -5572,7 +5572,7 @@ def test_the_namespace_never_collides_with_the_grammar() -> None:
 def test_every_collided_filter_compiles_through_the_namespace(
     _av_fixture: str, _av2_fixture: str
 ) -> None:
-    """The point of the whole feature: no in-fence filter is unreachable.
+    """The point of the whole feature: no in-scope filter is unreachable.
 
     Each collided name is called with exactly its own input pads (from the
     real pad signature), one distinct alias per pad so nothing needs a split,
@@ -6174,7 +6174,7 @@ def test_a_time_window_still_reaches_the_input_of_a_row_query() -> None:
 
 
 def test_a_seeked_caption_row_is_still_rejected() -> None:
-    # The caption-seek fence keys off the INPUT alias, and a row table's
+    # The caption-seek rejection keys off the INPUT alias, and a row table's
     # streams belong to that input -- so the rejection survives the indirection.
     probes = _row_probes(_track("subtitle", 0, language="eng"))
     err = _reject_lower(

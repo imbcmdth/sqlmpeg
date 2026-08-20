@@ -34,7 +34,7 @@ from a full scan of `ffmpeg version 7.1-full_build-www.gyan.dev` (captured
     letters parse verbatim per character regardless. Multi-output (`VV->VV`:
     `feedback`, `scale2ref`), dynamic pad count `N` (`split`: `V->N`,
     `concat`: `N->N`) and source/sink `|` (`testsrc`: `|->V`, `anullsink`:
-    `A->|`) are excluded by the pad scope fence. Every zero-input filter
+    `A->|`) are excluded by the pad scope check. Every zero-input filter
     observed uses `|` as its input character, never an empty string -- the
     "zero inputs" exclusion is defensive, not something seen in practice.
   - The `-help filter=X` AVOptions header does NOT always read
@@ -177,7 +177,7 @@ class SourceFilter:
     """A zero-input (`|->V` / `|->A`) filter -- the `ffmpeg.<source>()` call.
 
     Multi-output (`|->AV`), dynamic-count (`|->N`) and all sinks (`->|`) are
-    excluded by the pad scope fence and never produce a SourceFilter. Options
+    excluded by the pad scope check and never produce a SourceFilter. Options
     load lazily via the same `Registry.options()` path as regular filters.
     """
 
@@ -248,7 +248,7 @@ def _parse_filters_list(
                 continue
             sources[name] = SourceFilter(name=name, output=stream, doc=doc_text)
             continue
-        # Scope fence: exclude dynamic pad count (N), sink (output '|'),
+        # Scope check: exclude dynamic pad count (N), sink (output '|'),
         # multi-output, and (defensively) zero-input specs.
         if not inp or "N" in spec or "|" in spec or len(outp) != 1:
             continue
@@ -648,9 +648,9 @@ class Registry:
 
     `-filters` is parsed at most once per process, on first call to any of
     `available()`, `get()`, `names()`, `get_source()`, `source_names()`,
-    `options()` or `fenced_options()`. Per-filter `-help filter=X` is parsed
+    `options()` or `excluded_options()`. Per-filter `-help filter=X` is parsed
     at most once per filter (regular OR source), on first call to
-    `options(name)` / `fenced_options(name)` for that filter -- never for all
+    `options(name)` / `excluded_options(name)` for that filter -- never for all
     filters upfront. NEVER raises.
 
     `source` marks where the data came from: `"live"` (default, via `load()`
@@ -721,7 +721,7 @@ class Registry:
         return list(self._filters)
 
     def get(self, name: str) -> DynamicFilter | None:
-        """None if `name` is unknown to this ffmpeg OR excluded by the pad fence.
+        """None if `name` is unknown to this ffmpeg OR excluded by the pad scope check.
 
         Also None for a known SOURCE name: a source is not a column function,
         use `get_source()`.
@@ -759,10 +759,10 @@ class Registry:
             _write_disk_cache(self._version_line, self._filters, self._sources, self._options)
         return opts
 
-    def fenced_options(self, name: str) -> dict[str, FilterOption] | None:
-        """`-help filter=<name>` options for a name the v1 pad fence EXCLUDED.
+    def excluded_options(self, name: str) -> dict[str, FilterOption] | None:
+        """`-help filter=<name>` options for a name the v1 pad scope check EXCLUDED.
 
-        `options()` answers only for names that SURVIVED the fence, i.e. the
+        `options()` answers only for names that SURVIVED that check, i.e. the
         keys of `_filters`/`_sources`; an excluded name reads as unknown
         there. The array-RETURNING filters (`channelsplit`, `acrossover`,
         `extractplanes` -- all `->N`) are excluded from those tables yet
@@ -830,8 +830,8 @@ def load_reference(path: str | Path) -> Registry:
     The payload is the parsed `-filters`/`-help` data
     `scripts/gen_snapshot.py` captured from a real ffmpeg, wrapped with
     `snapshot_of` (that ffmpeg's `-version` first line) and `generated` (the
-    `--stamp` it ran with). Every in-fence filter's and source's options, plus
-    the array-returning trio's `fenced_options()`, are already in it -- so
+    `--stamp` it ran with). Every in-scope filter's and source's options, plus
+    the array-returning trio's `excluded_options()`, are already in it -- so
     `_ensure_loaded()` never runs (`_loaded` is True up front) and the
     returned instance spawns NO subprocess, on any platform, with or without
     ffmpeg on PATH.

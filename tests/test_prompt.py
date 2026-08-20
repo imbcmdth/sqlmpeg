@@ -2,7 +2,7 @@
 
 The load-bearing one is :func:`test_every_sql_example_compiles`: the prompt is
 a contract with a model, so every query it shows off must actually compile.
-The marker convention is a fenced ``sql`` block -- prompt.py only ever puts
+The marker convention is a ``sql``-tagged code block -- prompt.py only ever puts
 complete, accepted queries inside one.
 
 Content-keyed rather than full-text pinned: these assert the prompt SAYS the
@@ -40,19 +40,19 @@ DOC_PATH = ROOT / "docs" / "system-prompt.md"
 GEN_SCRIPT = ROOT / "scripts" / "gen_prompt.py"
 SNAPSHOT_PATH = ROOT / "tests" / "data" / "reference_registry.json"
 
-_SQL_FENCE_RE = re.compile(r"```sql\n(.*?)\n```", re.DOTALL)
-_SQL_PROBED_FENCE_RE = re.compile(r"```sql-probed\n(.*?)\n```", re.DOTALL)
+_SQL_BLOCK_RE = re.compile(r"```sql\n(.*?)\n```", re.DOTALL)
+_SQL_PROBED_BLOCK_RE = re.compile(r"```sql-probed\n(.*?)\n```", re.DOTALL)
 
 _REFERENCE_REGISTRY = load_reference(SNAPSHOT_PATH)
 PROMPT = build_system_prompt(_REFERENCE_REGISTRY)
 
 
 def _sql_examples(text: str) -> list[str]:
-    return _SQL_FENCE_RE.findall(text)
+    return _SQL_BLOCK_RE.findall(text)
 
 
 def _probed_sql_examples(text: str) -> list[str]:
-    return _SQL_PROBED_FENCE_RE.findall(text)
+    return _SQL_PROBED_BLOCK_RE.findall(text)
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +109,9 @@ def test_macros_are_documented_as_positional_only() -> None:
     assert "UNSUPPORTED_SQL" in PROMPT
 
 
-def test_loudnorm2_signature_and_fences_are_documented() -> None:
+def test_loudnorm2_signature_and_limits_are_documented() -> None:
     """The one macro with named options, and the one whose presence changes
-    the shape of the compile -- so the prompt has to carry its fences too."""
+    the shape of the compile -- so the prompt has to carry its limits too."""
     assert "sqlmpeg.loudnorm2(stream, I => ..., TP => ..., LRA => ...)" in PROMPT
     assert "one `loudnorm2` per query" in PROMPT
     assert "two chained ffmpeg commands" in PROMPT
@@ -215,7 +215,7 @@ def test_track_row_fills_documented() -> None:
     assert "Nothing generates a `data` track" in PROMPT
 
 
-def test_track_row_examples_are_present_but_gated() -> None:
+def test_track_row_examples_are_present_but_not_compiled() -> None:
     """unnest needs a probeable input to size its rows (same rule as a bare
     array), so the worked track-row examples cannot be proven to compile
     without a real file -- they are ```sql-probed, same convention as the
@@ -346,7 +346,7 @@ def test_functions_section_with_a_live_registry_lists_gblur() -> None:
 
 
 def test_cli_prompt_loads_the_registry(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unlike the old --dynamic-gated CLI, `sqlmpeg prompt` always renders the
+    """Unlike the old --dynamic-guarded CLI, `sqlmpeg prompt` always renders the
     Functions section from the live registry now -- so it always loads one."""
     called = False
 

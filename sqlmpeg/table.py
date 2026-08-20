@@ -104,7 +104,7 @@ def render_table(result: TableResult) -> str:
     """The psql-style ASCII table for `result`, newline-joined, no trailing "\\n".
 
     Callers ``print()`` it, which supplies the final newline the pinned
-    recipes' fences show.
+    recipes' code blocks show.
     """
     headers = result.columns
     text_rows = [[_cell_text(cell) for cell in row] for row in result.rows]

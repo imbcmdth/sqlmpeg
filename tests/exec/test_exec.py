@@ -1430,8 +1430,8 @@ def test_two_sinks_may_stream_copy_the_same_audio_track(tmp_path: Path) -> None:
 # array-RETURNING filters, against real ffmpeg
 # ---------------------------------------------------------------------------
 #
-# `ffmpeg.channelsplit(...)` and friends are `->N` filters the registry fences
-# out; lowering re-admits them from its own table and returns an ARRAY, so the
+# `ffmpeg.channelsplit(...)` and friends are `->N` filters the registry
+# excludes; lowering re-admits them from its own table and returns an ARRAY, so the
 # result splats, subscripts and broadcasts. These run the real thing: the pad
 # count the table computed has to be exactly the pad count ffmpeg builds, or
 # the graph does not link at all ("More output link labels specified for
@@ -1618,7 +1618,7 @@ def test_disposition_tag_column_flags_the_default_track(tmp_path: Path) -> None:
 
 
 def test_amerge_runs_and_produces_one_multichannel_stream(tmp_path: Path) -> None:
-    """`amerge` is fenced out of the registry's tables; N_INPUT is what makes
+    """`amerge` is excluded from the registry's tables; N_INPUT is what makes
     it callable at all (mirrors the amix exec test), and running it for real
     proves the two mono tracks actually landed in one merged stream."""
     _require_fixture(_AV2)

@@ -93,7 +93,7 @@ _CHAIN = " && "
 
 # `run` is the DEFAULT subcommand, unconditionally: any argv whose
 # first token is not one of these six names IS run's argv, flags included
-# (`sqlmpeg -f q.sql`). No plausibility gating -- a mistyped subcommand falls
+# (`sqlmpeg -f q.sql`). No plausibility checking -- a mistyped subcommand falls
 # through to run's SQL parser and dies as a line-anchored PARSE_ERROR, a
 # better diagnostic than a usage line. Consequence: `sqlmpeg -h` shows run's
 # help, not the top-level one.

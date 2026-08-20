@@ -172,9 +172,9 @@ def test_round_trip_matches_live_registry_spot_check(pinned_ffmpeg: None) -> Non
         assert r.timeline == expected
         assert v.timeline == expected
 
-    # fenced array-returning trio.
+    # excluded array-returning trio.
     for name in ("channelsplit", "acrossover", "extractplanes"):
-        assert ref.fenced_options(name) == live.fenced_options(name)
+        assert ref.excluded_options(name) == live.excluded_options(name)
         assert ref.get(name) is None  # still excluded from the filters table
         assert live.get(name) is None
 
@@ -212,13 +212,13 @@ def test_snapshot_preserves_ffmpeg_option_order() -> None:
         assert list(options)[: len(head)] == head, name
 
 
-def test_snapshot_carries_the_fenced_tables_lowering_needs() -> None:
-    """Both fence-escape tables are in the payload, or they are uncallable offline."""
+def test_snapshot_carries_the_excluded_tables_lowering_needs() -> None:
+    """Both re-admission tables are in the payload, or they are uncallable offline."""
     ref = load_reference(_SNAPSHOT_PATH)
     for name in ("channelsplit", "acrossover", "extractplanes"):
-        assert ref.fenced_options(name), name
+        assert ref.excluded_options(name), name
     for name in ("amix", "hstack", "vstack"):
-        options = ref.fenced_options(name)
+        options = ref.excluded_options(name)
         assert options is not None and "inputs" in options, name
         assert options["inputs"].default == "2", name
 
@@ -271,7 +271,7 @@ def test_load_reference_never_spawns_a_subprocess_with_no_ffmpeg(
     assert ref.options("gblur") is not None
     assert ref.get_source("testsrc") is not None
     assert ref.options("testsrc") is not None
-    assert ref.fenced_options("channelsplit") is not None
+    assert ref.excluded_options("channelsplit") is not None
     assert len(ref.names()) > 300
     assert len(ref.source_names()) > 20
 

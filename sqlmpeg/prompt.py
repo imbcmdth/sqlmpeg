@@ -33,15 +33,15 @@ Two properties the committed doc must keep:
   :data:`sqlmpeg.inputs.INPUT_OPTIONS`, so a new code or option cannot
   silently go undocumented.
 
-Marker convention (relied on by ``tests/test_prompt.py``): every fenced
-```sql block in the prompt is one complete query that ``compile_sql`` accepts
+Marker convention (relied on by ``tests/test_prompt.py``): every ```sql code
+block in the prompt is one complete query that ``compile_sql`` accepts
 standalone, with no input file required to exist. Rejected SQL is only ever
 shown inline, in single backticks, so that the extract-and-compile test can
-treat every fence as a promise. An example whose query needs a real, readable
-file to compile (a bare-array broadcast, or an `unnest(...)` track-row table
--- either needs the file's actual stream data, not just its shape) is fenced
-```sql-probed instead -- a distinct tag the extractor deliberately does not
-match, so it is exempt from that promise.
+treat every code block as a promise. An example whose query needs a real,
+readable file to compile (a bare-array broadcast, or an `unnest(...)`
+track-row table -- either needs the file's actual stream data, not just its
+shape) is tagged ```sql-probed instead -- a distinct tag the extractor
+deliberately does not match, so it is exempt from that promise.
 
 The prompt is ASCII-only: it is printed by ``sqlmpeg prompt`` and piped around
 on consoles whose encoding is not UTF-8.
@@ -65,7 +65,7 @@ You translate natural-language video-edit requests into sqlmpeg SQL. sqlmpeg
 compiles that SQL into an ffmpeg `-filter_complex` command; a query is correct
 only if it compiles, so stay strictly inside the dialect below.
 
-Output only the query text. No prose, no explanation, no markdown fences,
+Output only the query text. No prose, no explanation, no markdown code blocks,
 unless you are explicitly asked for them. If the request needs something the
 dialect cannot express, output a single line starting with
 `-- cannot express: ` and name the missing capability instead of guessing."""
@@ -477,7 +477,7 @@ ffmpeg itself (except the four `sqlmpeg.*` macros, which are sqlmpeg's own).
      number: `sqlmpeg.loudnorm2(f.audio[1], I => -16, TP => -1.5, LRA => 11)`.
      AUDIO ONLY. It changes the SHAPE of the compile -- one query becomes
      two chained ffmpeg commands with a measuring pass in front -- which is
-     why the v1 fences are: one `loudnorm2` per query, never together with a
+     why the v1 limits are: one `loudnorm2` per query, never together with a
      `two_pass` sink, never inside a fan-out `TO (<expression>)`, and never
      in a table/CSV query. Each is `UNSUPPORTED_SQL`. Use the bare
      `loudnorm(...)` filter instead when one pass is genuinely enough (a
@@ -809,9 +809,9 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
 )
 
 # Examples that broadcast a bare array need a real, readable file to know how
-# many streams to expand over. tests/test_prompt.py compiles every ```sql fence
-# as a promise it succeeds standalone, so these are fenced ```sql-probed: a
-# distinct tag the extractor does not match.
+# many streams to expand over. tests/test_prompt.py compiles every ```sql code
+# block as a promise it succeeds standalone, so these are tagged ```sql-probed:
+# a distinct tag the extractor does not match.
 _PROBED_EXAMPLES: tuple[tuple[str, str], ...] = (
     (
         "Add echo/reverb to every audio track in film.mkv, whatever language "

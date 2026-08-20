@@ -169,18 +169,18 @@ compiles therefore depends on what that ffmpeg reports, and an empty registry
   everywhere else. The node it builds carries the FILTER's name, so nothing
   downstream knows the namespace exists.
 * Three ``->N`` filters are callable through that namespace despite the pad
-  fence, because their output COUNT is fixed by an option: ``channelsplit``,
+  scope check, because their output COUNT is fixed by an option: ``channelsplit``,
   ``acrossover`` and ``extractplanes`` (:data:`ARRAY_RETURNING`). Each lowers
   to ONE node with N output pads and RETURNS an array, so its result splats
   into a SELECT list, subscripts out of a CTE column and broadcasts
   elementwise like any other array. The table is
   consulted before the registry's verdict, since the registry has no entry to
-  give; every other fenced name keeps its ``UNKNOWN_FUNCTION``.
+  give; every other excluded name keeps its ``UNKNOWN_FUNCTION``.
 * Several ``N->1`` filters are re-admitted the mirror way (:data:`N_INPUT`):
   ``amix``, ``hstack``, ``vstack``, ``amerge``, ``join``, ``interleave`` and
   ``ainterleave`` take a variable number of INPUT pads fixed by one option
   (``inputs`` for most, ``nb_inputs`` for interleave/ainterleave), so the pad
-  fence excludes them too, yet the count is statically knowable the moment
+  scope check excludes them too, yet the count is statically knowable the moment
   that option is read. Their leading stream arguments ARE the input pads and
   the count option must agree with how many were supplied (``UDF_ARG_TYPE``
   naming both numbers when it does not). Unlike the array trio these are
@@ -458,14 +458,14 @@ _MAX_LISTED = 12
 #
 # Three ffmpeg filters take ONE input pad and produce a number of output pads
 # fixed statically by one of their options. Their `-filters` spec is `A->N` /
-# `V->N`, so the pad fence excludes all three and `Registry.get` says None.
+# `V->N`, so the pad scope check excludes all three and `Registry.get` says None.
 # This table re-admits exactly those three. It lives here, not in the registry,
 # because the count rule is a property of the OPTION SEMANTICS, which nothing
 # ffmpeg prints exposes: the registry keeps saying `A->N`, lowering keeps the
 # arithmetic.
 #
 # Re-admitted through the `ffmpeg.<filter>(...)` namespace ONLY. A bare
-# `channelsplit(...)` stays UNKNOWN_FUNCTION like every other fenced name.
+# `channelsplit(...)` stays UNKNOWN_FUNCTION like every other excluded name.
 #
 # The result is an ARRAY value: `Node(outputs=[element]*N)` plus one `_Stream`
 # per pad, `is_array=True` even when N == 1 (a one-element array still splats,
@@ -675,7 +675,7 @@ _ARRAY_INPUT_HINT = (
 #
 # Several ffmpeg filters take a number of INPUT pads fixed statically by one
 # of their options and produce exactly one output pad. Their `-filters` spec
-# is `N->A` / `N->V`, so the pad fence excludes them all -- yet the count is
+# is `N->A` / `N->V`, so the pad scope check excludes them all -- yet the count is
 # knowable the moment the option is read, the same argument that re-admits the
 # array-returning trio.
 #
@@ -728,7 +728,7 @@ N_INPUT: dict[str, _NInputFilter] = {
         name="join", stream="audio", output="audio", option="inputs", fallback=2
     ),
     # interleave/ainterleave's count option is `nb_inputs`, not the shorter
-    # `n` alias: VERIFIED via `Registry.fenced_options` (ffmpeg 9.0.1) -- `n`
+    # `n` alias: VERIFIED via `Registry.excluded_options` (ffmpeg 9.0.1) -- `n`
     # is `nb_inputs`'s adjacent alias, and the dedup rule keeps the longer
     # name (see registry.py's docstring).
     "interleave": _NInputFilter(
@@ -1868,7 +1868,7 @@ class _Lowerer:
         # says that, so the fan-out falls back to the chain.
         self.fanout_window_conflict = False
         self.fanout_expr: exp.Expr | None = None
-        # Sticky across sinks, unlike `fanout_expr`: the loudnorm2 fences ask
+        # Sticky across sinks, unlike `fanout_expr`: the loudnorm2 limits ask
         # whether ANY COPY of the script fanned out.
         self.fanout_seen = False
         self.fanout_row: _RowTuple = {}
@@ -1927,7 +1927,7 @@ class _Lowerer:
         return self.graph
 
     def _check_loudnorm2(self) -> None:
-        """The v1 fences on ``sqlmpeg.loudnorm2``.
+        """The v1 limits on ``sqlmpeg.loudnorm2``.
 
         It is not one filter among others: its presence turns the whole
         compile into a two-command sequence with a shell handoff in the
@@ -3332,15 +3332,15 @@ class _Lowerer:
 
         * the name is a REGULAR filter of this ffmpeg (``ffmpeg.gblur``) — it
           has input pads, so it is a call, not a table: UNSUPPORTED_SQL saying
-          so, the one fenced case that is positively identifiable;
+          so, the one excluded case that is positively identifiable;
         * there is no registry at all (no ffmpeg) — the standard
           unavailability wording, same as a namespaced CALL's;
         * the name is unknown to both tables — UNKNOWN_FUNCTION with a
-          did-you-mean over ``source_names()``. Sources the v1 scope fence
+          did-you-mean over ``source_names()``. Sources the v1 scope check
           excluded (``avsynctest``'s ``|->AV``, ``movie``/``amovie``'s
           ``|->N``) are NOT retained by the registry at all, so they are
           indistinguishable from a typo here and land on the same rejection —
-          which is why its fallback hint states the fence explicitly rather
+          which is why its fallback hint states the exclusion explicitly rather
           than only listing near-misses.
         """
         registry = self.registry
@@ -5436,7 +5436,7 @@ class _Lowerer:
 
         * :data:`ARRAY_RETURNING` (namespaced spelling ONLY) and
           :data:`N_INPUT` (either spelling) come first, because both tables
-          exist precisely for names the v1 pad fence keeps OUT of the registry
+          exist precisely for names the v1 pad scope check keeps OUT of the registry
           — asking ``get`` about them first would answer "unknown" and the
           tables would never be reached;
         * then the registry proper, whose pad signature is the call's stream
@@ -5713,19 +5713,19 @@ class _Lowerer:
 
         Mirrors :meth:`_array_options` exactly: in the table, a registry to ask,
         and an ffmpeg that actually HAS the filter. The last one is why options
-        are fetched even for a call that passes none — a fenced name is in no
+        are fetched even for a call that passes none — an excluded name is in no
         registry table, so its option block is the only evidence this build has
-        it (see ``Registry.fenced_options``).
+        it (see ``Registry.excluded_options``).
         """
         if name not in N_INPUT or self.registry is None:
             return None
         if self.registry.get(name) is not None:
-            # THIS ffmpeg has the filter in-fence (acrossfade was an ordinary
+            # THIS ffmpeg has the filter in-scope (acrossfade was an ordinary
             # AA->A filter before ffmpeg 9 made it variadic): the registry's
             # own pad signature is the truth here, and the N_INPUT rescue is
-            # only for builds whose pad fence excluded the name.
+            # only for builds whose pad scope check excluded the name.
             return None
-        return self.registry.fenced_options(name)
+        return self.registry.excluded_options(name)
 
     def _lower_n_input_call(
         self,
@@ -5739,7 +5739,7 @@ class _Lowerer:
         """One node with N input pads, N being what the count option says.
 
         The stream/option split cannot come from a pad signature here (there
-        is none — the registry fenced the filter out for exactly that reason),
+        is none — the registry excluded the filter for exactly that reason),
         so it comes from the arguments themselves: the LEADING RUN of
         stream-valued arguments are the input pads, and everything after them
         is an option. That is unambiguous because an option value is always a
@@ -5851,15 +5851,15 @@ class _Lowerer:
         Three questions, one answer, because they have the same shape: is the
         name in :data:`ARRAY_RETURNING`, is there a registry at all, and does
         THIS ffmpeg actually have the filter. The last one is why the
-        options are fetched even for a call with no named arguments: a fenced
+        options are fetched even for a call with no named arguments: an excluded
         name is in no registry table, so its option block is the only evidence
-        this build has it (see ``Registry.fenced_options``). None means "not
+        this build has it (see ``Registry.excluded_options``). None means "not
         callable", and the caller falls through to the ordinary namespaced
         rejection, hint and all.
         """
         if name not in ARRAY_RETURNING or self.registry is None:
             return None
-        return self.registry.fenced_options(name)
+        return self.registry.excluded_options(name)
 
     def _lower_array_call(
         self,
@@ -6269,7 +6269,7 @@ class _Lowerer:
         FROM position can, so the branch stays.)
 
         ``Registry.options`` returns None only for a filter this ffmpeg does not
-        have (or that the v1 scope fence excluded); an empty dict is a real
+        have (or that the v1 scope check excluded); an empty dict is a real
         answer (a filter with no options) and is passed through as one.
         """
         if self.registry is None:

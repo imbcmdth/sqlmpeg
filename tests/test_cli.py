@@ -1056,7 +1056,7 @@ def test_unknown_subcommand_falls_through_to_run_and_fails_as_sql(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """`run` is the default subcommand, unconditionally --
-    no plausibility gating. A mistyped subcommand is not special-cased; it is
+    no plausibility checking. A mistyped subcommand is not special-cased; it is
     just run's SQL text, and dies as an ordinary compile error (exit 1), a
     better diagnostic than a bare usage line."""
     code = cli.main(["bogus"])

@@ -473,8 +473,8 @@ def test_count_star_is_still_an_aggregate_rejection() -> None:
 def test_count_star_over_track_rows_is_still_an_aggregate_rejection() -> None:
     """Table mode makes metadata columns legal SELECT
     outputs, but it does not make sqlmpeg a database -- ``COUNT(*)`` over a
-    row table (a bare SELECT, unconditionally table-capable) is still fenced
-    off exactly like any other aggregate."""
+    row table (a bare SELECT, unconditionally table-capable) is still rejected
+    exactly like any other aggregate."""
     err = _reject("SELECT count(*) FROM input('f.mkv') f, unnest(f.audio) t")
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
 
@@ -1306,7 +1306,7 @@ def test_to_stdout_lowercase_is_also_accepted() -> None:
 
 
 def test_to_stdout_without_format_csv_is_still_rejected() -> None:
-    """A media COPY may not target STDOUT -- the STOP-gate carve-out is
+    """A media COPY may not target STDOUT -- the TO STDOUT carve-out is
     csv-only (see test_bad_copy_is_rejected's plain "TO STDOUT" case, which
     keeps failing the exact same way)."""
     err = _reject(f"COPY ({SINK_QUERY}) TO STDOUT WITH (video_codec 'libx264')")
@@ -2046,7 +2046,7 @@ def test_a_time_window_over_an_input_still_rejects_a_non_t_column() -> None:
     assert "only the time column 'f.t' can be filtered" in err.message
 
 
-# -- ORDER BY: the one carve-out in the streaming fence ---------------------
+# -- ORDER BY: the one carve-out in the streaming rejection -----------------
 
 
 def test_order_by_is_admitted_over_track_row_columns() -> None:
@@ -2062,7 +2062,7 @@ def test_order_by_is_admitted_over_track_row_columns() -> None:
     assert [bool(o.args.get("nulls_first")) for o in order.expressions] == [False, True]
 
 
-def test_order_by_without_any_unnest_is_still_fenced() -> None:
+def test_order_by_without_any_unnest_is_still_rejected() -> None:
     err = _reject("SELECT f.audio[1] FROM input('f.mkv') f ORDER BY f.t")
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
     assert err.hint == "remove the ORDER BY clause"
@@ -2080,7 +2080,7 @@ def test_order_by_a_non_row_column_is_rejected_even_in_a_row_query(key: str) -> 
     )
 
 
-def test_the_other_streaming_fences_are_untouched_by_the_carve_out() -> None:
+def test_the_other_streaming_rejections_are_untouched_by_the_carve_out() -> None:
     err = _reject("SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t LIMIT 1")
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
 
@@ -2125,11 +2125,11 @@ def test_dot_track_is_still_a_stream_not_a_where_value() -> None:
 def test_a_non_track_accessor_is_rejected_as_a_select_output_in_a_media_query(
     column: str,
 ) -> None:
-    # this fence is MEDIA-only -- a bare SELECT (no
+    # this rejection is MEDIA-only -- a bare SELECT (no
     # COPY) is always at least table-capable, and metadata columns are legal
     # there (see test_subscript_metadata_output_is_legal_in_table_mode
-    # below). Wrapping in a real media COPY keeps this test on the fence it
-    # means to check.
+    # below). Wrapping in a real media COPY keeps this test on the rejection
+    # it means to check.
     err = _reject(
         f"COPY (SELECT f.audio[1].{column} FROM input('f.mkv') f) TO 'out.mp4'"
     )

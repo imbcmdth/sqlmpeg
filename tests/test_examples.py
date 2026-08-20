@@ -1,8 +1,9 @@
 """Tests for docs/examples.md -- the cookbook.
 
-Data-driven, not one test per recipe: every ```sql / ```pgsql fence in the
-cookbook is compiled by running the exact command line the fence below it
-shows, and the printed ffmpeg command must match that fence byte for byte.
+Data-driven, not one test per recipe: every ```sql / ```pgsql code block in
+the cookbook is compiled by running the exact command line the code block
+below it shows, and the printed ffmpeg command must match that block byte for
+byte.
 Adding a recipe to the cookbook therefore adds its test here automatically,
 and a recipe whose command drifts fails with the diff in front of it.
 
@@ -18,7 +19,7 @@ documents:
   knows. Compiled (never executed) against the real installed ffmpeg in an
   ``exec``-marked test.
 
-The command fence is run through :func:`sqlmpeg.cli.main` rather than the
+The command block is run through :func:`sqlmpeg.cli.main` rather than the
 library API, so the ``$ sqlmpeg ...`` line a reader would paste is itself
 under test -- flags included. ``-f query.sql`` is rewritten to a temp file
 holding that recipe's SQL; the path never reaches the printed command.
@@ -45,18 +46,18 @@ EXAMPLES_PATH = REPO_ROOT / "docs" / "examples.md"
 
 _TIERS = {"sql": "offline", "pgsql": "exec"}
 
-_FENCE_RE = re.compile(r"^```(?P<info>[^\n]*)\n(?P<body>.*?)^```$", re.DOTALL | re.MULTILINE)
+_BLOCK_RE = re.compile(r"^```(?P<info>[^\n]*)\n(?P<body>.*?)^```$", re.DOTALL | re.MULTILINE)
 _HEADING_RE = re.compile(r"^#{1,6} (?P<text>.+)$", re.MULTILINE)
 
 
 @dataclass(frozen=True)
 class Example:
-    """One cookbook recipe: its heading, its query, and the fence below it."""
+    """One cookbook recipe: its heading, its query, and the code block below it."""
 
     heading: str
     tier: str
     sql: str
-    command: str | None  # the whole ``` fence body ("$ ...\n<command>\n"), if any
+    command: str | None  # the whole ``` block body ("$ ...\n<command>\n"), if any
 
 
 def _heading_before(text: str, position: int) -> str:
@@ -68,20 +69,20 @@ def _heading_before(text: str, position: int) -> str:
 
 
 def _parse(text: str) -> list[Example]:
-    """Every ```sql / ```pgsql fence, paired with the fence that follows it.
+    """Every ```sql / ```pgsql code block, paired with the block that follows it.
 
-    Pairing is positional and strict: the command fence must be the very next
-    fence in the file, with no info string. Anything else (a second query
-    fence, or nothing at all) leaves ``command`` None, which the tests below
+    Pairing is positional and strict: the command block must be the very next
+    code block in the file, with no info string. Anything else (a second query
+    block, or nothing at all) leaves ``command`` None, which the tests below
     turn into a failure that says what to add.
     """
-    fences = list(_FENCE_RE.finditer(text))
+    blocks = list(_BLOCK_RE.finditer(text))
     examples: list[Example] = []
-    for index, fence in enumerate(fences):
-        tier = _TIERS.get(fence.group("info").strip())
+    for index, block in enumerate(blocks):
+        tier = _TIERS.get(block.group("info").strip())
         if tier is None:
             continue
-        following = fences[index + 1] if index + 1 < len(fences) else None
+        following = blocks[index + 1] if index + 1 < len(blocks) else None
         command = (
             following.group("body")
             if following is not None and following.group("info").strip() == ""
@@ -89,9 +90,9 @@ def _parse(text: str) -> list[Example]:
         )
         examples.append(
             Example(
-                heading=_heading_before(text, fence.start()),
+                heading=_heading_before(text, block.start()),
                 tier=tier,
-                sql=fence.group("body"),
+                sql=block.group("body"),
                 command=command,
             )
         )
@@ -116,26 +117,26 @@ _EXAMPLES = _parse(EXAMPLES_PATH.read_text(encoding="utf-8"))
 _OFFLINE = [e for e in _EXAMPLES if e.tier == "offline"]
 _EXEC = [e for e in _EXAMPLES if e.tier == "exec"]
 
-_MISSING_FENCE_HELP = (
-    "every query in docs/examples.md is followed by a fence holding the real "
-    "compiled command: a ``` fence whose first line is the `$ sqlmpeg compile "
+_MISSING_BLOCK_HELP = (
+    "every query in docs/examples.md is followed by a code block holding the real "
+    "compiled command: a ``` block whose first line is the `$ sqlmpeg compile "
     "...` invocation and whose remaining lines are exactly what it prints"
 )
 
 
 def _split_command(example: Example) -> tuple[list[str], str]:
-    """``(argv, expected stdout)`` from the recipe's command fence."""
-    assert example.command is not None, f"{example.heading}: {_MISSING_FENCE_HELP}"
+    """``(argv, expected stdout)`` from the recipe's command block."""
+    assert example.command is not None, f"{example.heading}: {_MISSING_BLOCK_HELP}"
     shown, _, expected = example.command.partition("\n")
     assert shown.startswith("$ sqlmpeg "), (
-        f"{example.heading}: the command fence must start with a `$ sqlmpeg ...` "
+        f"{example.heading}: the command block must start with a `$ sqlmpeg ...` "
         f"line, got {shown!r}"
     )
-    assert expected, f"{example.heading}: {_MISSING_FENCE_HELP}"
+    assert expected, f"{example.heading}: {_MISSING_BLOCK_HELP}"
     argv = shlex.split(shown[2:])[1:]
     assert "-f" in argv or "--file" in argv, (
         f"{example.heading}: the shown command must read the query with -f, so that the "
-        f"```sql fence above it is the text being compiled; inline SQL could drift from it"
+        f"```sql block above it is the text being compiled; inline SQL could drift from it"
     )
     return argv, expected
 
@@ -156,7 +157,7 @@ def _run(example: Example, tmp_path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# wrapping: printed `ffmpeg ...` lines are pinned <= 90 columns in the fences
+# wrapping: printed `ffmpeg ...` lines are pinned <= 90 columns in the blocks
 # ---------------------------------------------------------------------------
 
 _WRAP_WIDTH = 90
@@ -294,8 +295,8 @@ def _shell_tokens(text: str) -> list[str]:
 
 
 def _assert_shlex_invariant(actual: str, expected: str) -> None:
-    """For a fence that wrapped a single `ffmpeg` line, prove the wrap kept
-    the same shell command: the wrapped fence text and the original
+    """For a code block that wrapped a single `ffmpeg` line, prove the wrap kept
+    the same shell command: the wrapped block text and the original
     unwrapped line must tokenize identically."""
     actual_line = actual.rstrip("\n")
     if "\n" in actual_line or not actual_line.startswith("ffmpeg "):
@@ -309,7 +310,7 @@ def _go_offline(monkeypatch: pytest.MonkeyPatch) -> None:
     A fresh, unloadable ``Registry`` rather than the process-wide singleton
     (another test may already have loaded the real one), and ``probe_path``
     stubbed rather than relying on an unreadable path, because the command
-    fence shows a plain ``sqlmpeg compile`` -- the flags under test are the
+    block shows a plain ``sqlmpeg compile`` -- the flags under test are the
     ones a reader would type, so the isolation has to come from underneath
     them. ``binaries.ffmpeg_path`` is stubbed (not just ``shutil.which``) so
     this stays offline even when the ``static-ffmpeg`` provisioner
@@ -343,7 +344,7 @@ def test_the_cookbook_has_examples() -> None:
 @pytest.mark.parametrize("example", _EXAMPLES, ids=_ids(_EXAMPLES))
 def test_every_example_shows_its_compiled_command(example: Example) -> None:
     """Checked for BOTH tiers in the default suite: an exec recipe missing its
-    fence would otherwise go unnoticed until someone ran `-m exec`."""
+    command block would otherwise go unnoticed until someone ran `-m exec`."""
     _split_command(example)
 
 

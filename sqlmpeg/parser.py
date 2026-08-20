@@ -157,7 +157,7 @@ Notes for downstream passes (lower):
   COLUMNS of any row table in scope — ``a.language = b.language``.
 
 * ``ORDER BY`` over track-row columns is the ONE carve-out in the
-  ``NO_STREAMING_EQUIVALENT`` fence: ``Select.args["order"]`` is admitted only
+  ``NO_STREAMING_EQUIVALENT`` rejection: ``Select.args["order"]`` is admitted only
   when the branch's FROM clause holds at least one ``unnest`` (frames still
   never sort). VERIFIED: an ``exp.Ordered`` carries ``desc`` and
   ``nulls_first`` as plain bools and sqlglot fills BOTH from the Postgres
@@ -2448,7 +2448,7 @@ class _Resolver:
     ) -> None:
         """Reject constructs no streaming filtergraph can express.
 
-        ``array_agg`` names the one node exempt from the aggregate fence: the
+        ``array_agg`` names the one node exempt from the aggregate rejection: the
         whole SELECT column of a track-row branch, which lower collapses into
         the same stream list the bare splat produces. Every other aggregate,
         and every array_agg written anywhere else, still has no equivalent.

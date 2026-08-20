@@ -81,7 +81,7 @@ INCLUDED_NAMES = {
     "xfade", "hqdn3d", "colormap", "threshold", "a3dscope",
 }
 # Sources: single V/A output, |->V or |->A. Excluded from `get()`/`names()`
-# same as before (v1 scope fence for column-function lookup), but now
+# same as before (v1 scope check for column-function lookup), but now
 # retained and reachable via `get_source()`/`source_names()`.
 SOURCE_NAMES = {"testsrc", "testsrc2", "color", "nullsrc", "anullsrc", "sine"}
 EXCLUDED_NAMES = {
@@ -607,7 +607,7 @@ def test_get_source_unknown_name_is_none(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_get_source_excludes_multi_output_and_dynamic(monkeypatch: pytest.MonkeyPatch) -> None:
     # avsynctest (|->AV, 2-char output) and amovie/movie (|->N, dynamic) are
-    # source-shaped but excluded, same v1 scope fence as regular filters.
+    # source-shaped but excluded, same v1 scope check as regular filters.
     reg = _loaded_registry(monkeypatch)
     assert reg.get_source("avsynctest") is None
     assert reg.get_source("amovie") is None

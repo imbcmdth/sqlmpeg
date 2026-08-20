@@ -11,23 +11,23 @@ Unlike ``sqlmpeg.registry.load()``, which parses ``-help filter=X`` lazily
 per filter on first reference, this script force-loads EVERY name's
 options up front:
 
-  - every in-fence filter's options (``Registry.options()`` over
+  - every in-scope filter's options (``Registry.options()`` over
     ``Registry.names()``)
   - every source's options (``Registry.options()`` over
     ``Registry.source_names()``)
-  - the array-returning trio's options (``Registry.fenced_options()`` --
+  - the array-returning trio's options (``Registry.excluded_options()`` --
     ``channelsplit``/``acrossover``/``extractplanes`` are excluded from the
-    filters/sources tables by the v1 pad fence, so ``options()`` cannot
-    reach them; ``fenced_options()`` is the only door, see
+    filters/sources tables by the v1 pad scope check, so ``options()`` cannot
+    reach them; ``excluded_options()`` is the only door, see
     ``sqlmpeg/lower.py``'s ``ARRAY_RETURNING``)
   - the fixed-count N-input trio's options, for exactly the same reason:
-    ``amix``/``hstack``/``vstack`` are ``N->1`` and equally fenced out, and
+    ``amix``/``hstack``/``vstack`` are ``N->1`` and equally excluded, and
     their ``inputs`` option is what makes them callable at all (see
     ``sqlmpeg/lower.py``'s ``N_INPUT``)
-  - the eleven "collision census" names (``Registry.fenced_options()`` too
-    -- they are ordinary in-fence filters already covered by the
+  - the eleven "collision census" names (``Registry.excluded_options()`` too
+    -- they are ordinary in-scope filters already covered by the
     ``options()`` pass above, so this adds no new data, but it exercises
-    ``fenced_options()``'s cache-hit branch against a well-known name set;
+    ``excluded_options()``'s cache-hit branch against a well-known name set;
     see docs/dynamic-filters.md "The collision census" and
     tests/test_lower.py's ``_KNOWN_COLLISIONS``)
 
@@ -75,8 +75,8 @@ _OUTPUT_PATH = _REPO_ROOT / "tests" / "data" / "reference_registry.json"
 # Postgres/stdlib grammar under a bare call -- kept as a small literal copy
 # here (not imported from the test module) since this is generation-time
 # coverage, not a correctness dependency: every name below is an ordinary
-# in-fence filter already force-loaded via `options()`, so a stale copy
-# only under- or over-exercises `fenced_options()`, it cannot desync the
+# in-scope filter already force-loaded via `options()`, so a stale copy
+# only under- or over-exercises `excluded_options()`, it cannot desync the
 # snapshot's actual content.
 _CENSUS_NAMES = (
     "copy",
@@ -114,11 +114,11 @@ def build_registry() -> Registry:
     for name in registry.source_names():
         registry.options(name)
     for name in ARRAY_RETURNING:
-        registry.fenced_options(name)
+        registry.excluded_options(name)
     for name in N_INPUT:
-        registry.fenced_options(name)
+        registry.excluded_options(name)
     for name in _CENSUS_NAMES:
-        registry.fenced_options(name)
+        registry.excluded_options(name)
     return registry
 
 
