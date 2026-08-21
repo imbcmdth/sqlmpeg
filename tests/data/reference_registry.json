@@ -1,6 +1,6 @@
 {
   "format_version": 2,
-  "version_line": "ffmpeg version 7.1-full_build-www.gyan.dev Copyright (c) 2000-2024 the FFmpeg developers",
+  "version_line": "ffmpeg version 9.0.1-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers",
   "filters": {
     "aap": {
       "inputs": [
@@ -49,15 +49,6 @@
       ],
       "output": "audio",
       "doc": "Delay filtering to match a cue.",
-      "timeline": false
-    },
-    "acrossfade": {
-      "inputs": [
-        "audio",
-        "audio"
-      ],
-      "output": "audio",
-      "doc": "Cross fade two input audio streams.",
       "timeline": false
     },
     "acrusher": {
@@ -990,6 +981,14 @@
       "doc": "Detect audio volume.",
       "timeline": false
     },
+    "whisper": {
+      "inputs": [
+        "audio"
+      ],
+      "output": "audio",
+      "doc": "Transcribe audio using whisper.cpp.",
+      "timeline": false
+    },
     "addroi": {
       "inputs": [
         "video"
@@ -1112,6 +1111,14 @@
       "timeline": true
     },
     "blackdetect": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Detect video intervals that are (almost) black.",
+      "timeline": false
+    },
+    "blackdetect_vulkan": {
       "inputs": [
         "video"
       ],
@@ -1312,6 +1319,14 @@
       "output": "video",
       "doc": "Adjust color white balance selectively for blacks and whites.",
       "timeline": true
+    },
+    "colordetect": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Detect video color properties.",
+      "timeline": false
     },
     "colorize": {
       "inputs": [
@@ -1558,6 +1573,14 @@
       "doc": "Quick Sync Video \"deinterlacing\"",
       "timeline": false
     },
+    "deinterlace_d3d12": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Deinterlacing using Direct3D12 Video Processor",
+      "timeline": false
+    },
     "deinterlace_vaapi": {
       "inputs": [
         "video"
@@ -1686,6 +1709,14 @@
       ],
       "output": "video",
       "doc": "Draw text on top of video frames using libfreetype library.",
+      "timeline": true
+    },
+    "drawvg": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Draw vector graphics on top of video frames.",
       "timeline": true
     },
     "edgedetect": {
@@ -2108,6 +2139,22 @@
       "doc": "Grow first stream into second stream by connecting components.",
       "timeline": true
     },
+    "iccdetect": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Detect and parse ICC profiles.",
+      "timeline": false
+    },
+    "iccgen": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Generate and attach ICC profiles.",
+      "timeline": false
+    },
     "identity": {
       "inputs": [
         "video",
@@ -2142,6 +2189,14 @@
       "timeline": true
     },
     "interlace": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Convert progressive video into interlaced.",
+      "timeline": false
+    },
+    "interlace_vulkan": {
       "inputs": [
         "video"
       ],
@@ -2360,6 +2415,14 @@
       "doc": "Generate motion vectors.",
       "timeline": false
     },
+    "mestimate_d3d12": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Generate motion vectors using D3D12 hardware acceleration.",
+      "timeline": false
+    },
     "metadata": {
       "inputs": [
         "video"
@@ -2560,7 +2623,7 @@
       ],
       "output": "video",
       "doc": "Overlay one video on top of another using CUDA",
-      "timeline": false
+      "timeline": true
     },
     "owdenoise": {
       "inputs": [
@@ -2576,6 +2639,14 @@
       ],
       "output": "video",
       "doc": "Pad the input video.",
+      "timeline": false
+    },
+    "pad_cuda": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "CUDA-based GPU padding filter",
       "timeline": false
     },
     "pad_opencl": {
@@ -2659,14 +2730,6 @@
       "doc": "Pixel data analysis.",
       "timeline": true
     },
-    "pp": {
-      "inputs": [
-        "video"
-      ],
-      "output": "video",
-      "doc": "Filter video using libpostproc.",
-      "timeline": true
-    },
     "pp7": {
       "inputs": [
         "video"
@@ -2674,6 +2737,14 @@
       "output": "video",
       "doc": "Apply Postprocessing 7 filter.",
       "timeline": true
+    },
+    "premultiply_dynamic": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Premultiply or unpremultiply an image in-place, as needed.",
+      "timeline": false
     },
     "prewitt": {
       "inputs": [
@@ -2880,12 +2951,52 @@
       "doc": "Scale the input video size and/or convert the image format.",
       "timeline": false
     },
+    "vpp_amf": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "AMF video scaling and format conversion",
+      "timeline": false
+    },
+    "sr_amf": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "AMF HQ video upscaling",
+      "timeline": false
+    },
+    "frc_amf": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "AMF video Frame Rate Converter",
+      "timeline": false
+    },
     "scale_cuda": {
       "inputs": [
         "video"
       ],
       "output": "video",
       "doc": "GPU accelerated video resizer",
+      "timeline": false
+    },
+    "scale_d3d11": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Scale video using Direct3D11",
+      "timeline": false
+    },
+    "scale_d3d12": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Scale video using Direct3D12",
       "timeline": false
     },
     "scale_qsv": {
@@ -2913,6 +3024,14 @@
       "timeline": false
     },
     "scdet": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Detect video scene change",
+      "timeline": false
+    },
+    "scdet_vulkan": {
       "inputs": [
         "video"
       ],
@@ -3234,7 +3353,7 @@
         "video"
       ],
       "output": "video",
-      "doc": "Select the most representative frame in a given sequence of consecutive frames.",
+      "doc": "Select the most representative frame in a given sequence of consecutive frames using CUDA.",
       "timeline": false
     },
     "tile": {
@@ -3333,6 +3452,14 @@
       "doc": "Transpose input video.",
       "timeline": false
     },
+    "transpose_cuda": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Transpose input video using CUDA",
+      "timeline": false
+    },
     "transpose_opencl": {
       "inputs": [
         "video"
@@ -3398,6 +3525,14 @@
       "timeline": true
     },
     "v360": {
+      "inputs": [
+        "video"
+      ],
+      "output": "video",
+      "doc": "Convert 360 projection of video.",
+      "timeline": false
+    },
+    "v360_vulkan": {
       "inputs": [
         "video"
       ],
@@ -3831,6 +3966,10 @@
       "output": "video",
       "doc": "Generate all yuv colors."
     },
+    "vsrc_amf": {
+      "output": "video",
+      "doc": "AMD AMF screen capture"
+    },
     "cellauto": {
       "output": "video",
       "doc": "Create pattern generated by an elementary cellular automaton."
@@ -3858,6 +3997,10 @@
     "frei0r_src": {
       "output": "video",
       "doc": "Generate a frei0r source."
+    },
+    "gfxcapture": {
+      "output": "video",
+      "doc": "Capture graphics/screen content as a video source"
     },
     "gradients": {
       "output": "video",
@@ -4205,108 +4348,6 @@
         "maximum": null,
         "default": "0",
         "constants": [],
-        "unusable": false
-      }
-    },
-    "acrossfade": {
-      "nb_samples": {
-        "name": "nb_samples",
-        "type": "num",
-        "doc": "set number of samples for cross fade duration",
-        "minimum": 1.0,
-        "maximum": 214748000.0,
-        "default": "44100",
-        "constants": [],
-        "unusable": false
-      },
-      "duration": {
-        "name": "duration",
-        "type": "str",
-        "doc": "set cross fade duration",
-        "minimum": null,
-        "maximum": null,
-        "default": "0",
-        "constants": [],
-        "unusable": false
-      },
-      "overlap": {
-        "name": "overlap",
-        "type": "bool",
-        "doc": "overlap 1st stream end with 2nd stream start",
-        "minimum": null,
-        "maximum": null,
-        "default": "true",
-        "constants": [],
-        "unusable": false
-      },
-      "curve1": {
-        "name": "curve1",
-        "type": "str",
-        "doc": "set fade curve type for 1st stream",
-        "minimum": -1.0,
-        "maximum": 22.0,
-        "default": "tri",
-        "constants": [
-          "nofade",
-          "tri",
-          "qsin",
-          "esin",
-          "hsin",
-          "log",
-          "ipar",
-          "qua",
-          "cub",
-          "squ",
-          "cbr",
-          "par",
-          "exp",
-          "iqsin",
-          "ihsin",
-          "dese",
-          "desi",
-          "losi",
-          "sinc",
-          "isinc",
-          "quat",
-          "quatr",
-          "qsin2",
-          "hsin2"
-        ],
-        "unusable": false
-      },
-      "curve2": {
-        "name": "curve2",
-        "type": "str",
-        "doc": "set fade curve type for 2nd stream",
-        "minimum": -1.0,
-        "maximum": 22.0,
-        "default": "tri",
-        "constants": [
-          "nofade",
-          "tri",
-          "qsin",
-          "esin",
-          "hsin",
-          "log",
-          "ipar",
-          "qua",
-          "cub",
-          "squ",
-          "cbr",
-          "par",
-          "exp",
-          "iqsin",
-          "ihsin",
-          "dese",
-          "desi",
-          "losi",
-          "sinc",
-          "isinc",
-          "quat",
-          "quatr",
-          "qsin2",
-          "hsin2"
-        ],
         "unusable": false
       }
     },
@@ -6861,6 +6902,7 @@
           "CONTENT_LIGHT_LEVEL",
           "ICC_PROFILE",
           "S12M_TIMECOD",
+          "S12M_TIMECODE",
           "DYNAMIC_HDR_PLUS",
           "REGIONS_OF_INTEREST",
           "VIDEO_ENC_PARAMS",
@@ -9470,6 +9512,16 @@
           "summary"
         ],
         "unusable": false
+      },
+      "stats_file": {
+        "name": "stats_file",
+        "type": "str",
+        "doc": "set stats output file",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false
       }
     },
     "lowpass": {
@@ -9880,7 +9932,7 @@
         "doc": "set pitch quality",
         "minimum": 0.0,
         "maximum": null,
-        "default": "quality",
+        "default": "speed",
         "constants": [
           "quality",
           "speed",
@@ -11970,6 +12022,138 @@
       }
     },
     "volumedetect": {},
+    "whisper": {
+      "model": {
+        "name": "model",
+        "type": "str",
+        "doc": "Path to the whisper.cpp model file",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false
+      },
+      "language": {
+        "name": "language",
+        "type": "str",
+        "doc": "Language for transcription ('auto' for auto-detect)",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"auto\"",
+        "constants": [],
+        "unusable": false
+      },
+      "translate": {
+        "name": "translate",
+        "type": "bool",
+        "doc": "Translate from source language to English",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      },
+      "queue": {
+        "name": "queue",
+        "type": "str",
+        "doc": "Audio queue size",
+        "minimum": null,
+        "maximum": null,
+        "default": "3",
+        "constants": [],
+        "unusable": false
+      },
+      "use_gpu": {
+        "name": "use_gpu",
+        "type": "bool",
+        "doc": "Use GPU for processing",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false
+      },
+      "gpu_device": {
+        "name": "gpu_device",
+        "type": "num",
+        "doc": "GPU device to use",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "destination": {
+        "name": "destination",
+        "type": "str",
+        "doc": "Output destination",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"\"",
+        "constants": [],
+        "unusable": false
+      },
+      "format": {
+        "name": "format",
+        "type": "str",
+        "doc": "Output format (text|srt|json)",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"text\"",
+        "constants": [],
+        "unusable": false
+      },
+      "max_len": {
+        "name": "max_len",
+        "type": "num",
+        "doc": "Max segment length in characters",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "vad_model": {
+        "name": "vad_model",
+        "type": "str",
+        "doc": "Path to the VAD model file",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false
+      },
+      "vad_threshold": {
+        "name": "vad_threshold",
+        "type": "num",
+        "doc": "VAD threshold",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "0.5",
+        "constants": [],
+        "unusable": false
+      },
+      "vad_min_speech_duration": {
+        "name": "vad_min_speech_duration",
+        "type": "str",
+        "doc": "Minimum speech duration for VAD",
+        "minimum": null,
+        "maximum": null,
+        "default": "0.1",
+        "constants": [],
+        "unusable": false
+      },
+      "vad_min_silence_duration": {
+        "name": "vad_min_silence_duration",
+        "type": "str",
+        "doc": "Minimum silence duration for VAD",
+        "minimum": null,
+        "maximum": null,
+        "default": "0.5",
+        "constants": [],
+        "unusable": false
+      }
+    },
     "addroi": {
       "x": {
         "name": "x",
@@ -12558,6 +12742,58 @@
         "default": "0.1",
         "constants": [],
         "unusable": false
+      },
+      "alpha": {
+        "name": "alpha",
+        "type": "bool",
+        "doc": "check alpha instead of luma",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      }
+    },
+    "blackdetect_vulkan": {
+      "black_min_duration": {
+        "name": "black_min_duration",
+        "type": "num",
+        "doc": "set minimum detected black duration in seconds",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "2",
+        "constants": [],
+        "unusable": false
+      },
+      "picture_black_ratio_th": {
+        "name": "picture_black_ratio_th",
+        "type": "num",
+        "doc": "set the picture black ratio threshold",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "0.98",
+        "constants": [],
+        "unusable": false
+      },
+      "pixel_black_th": {
+        "name": "pixel_black_th",
+        "type": "num",
+        "doc": "set the pixel black threshold",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "0.1",
+        "constants": [],
+        "unusable": false
+      },
+      "alpha": {
+        "name": "alpha",
+        "type": "bool",
+        "doc": "check alpha instead of luma",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
       }
     },
     "blackframe": {
@@ -12958,8 +13194,48 @@
         "maximum": 39.0,
         "default": "normal",
         "constants": [
+          "addition",
+          "addition128",
+          "grainmerge",
+          "and",
+          "average",
+          "burn",
+          "darken",
+          "difference",
+          "difference128",
+          "grainextract",
+          "divide",
+          "dodge",
+          "exclusion",
+          "extremity",
+          "freeze",
+          "glow",
+          "hardlight",
+          "hardmix",
+          "heat",
+          "lighten",
+          "linearlight",
+          "multiply",
+          "multiply128",
+          "negation",
           "normal",
-          "multiply"
+          "or",
+          "overlay",
+          "phoenix",
+          "pinlight",
+          "reflect",
+          "screen",
+          "softlight",
+          "subtract",
+          "vividlight",
+          "xor",
+          "softdifference",
+          "geometric",
+          "harmonic",
+          "bleach",
+          "stain",
+          "interpolate",
+          "hardoverlay"
         ],
         "unusable": false
       },
@@ -12971,8 +13247,48 @@
         "maximum": 39.0,
         "default": "normal",
         "constants": [
+          "addition",
+          "addition128",
+          "grainmerge",
+          "and",
+          "average",
+          "burn",
+          "darken",
+          "difference",
+          "difference128",
+          "grainextract",
+          "divide",
+          "dodge",
+          "exclusion",
+          "extremity",
+          "freeze",
+          "glow",
+          "hardlight",
+          "hardmix",
+          "heat",
+          "lighten",
+          "linearlight",
+          "multiply",
+          "multiply128",
+          "negation",
           "normal",
-          "multiply"
+          "or",
+          "overlay",
+          "phoenix",
+          "pinlight",
+          "reflect",
+          "screen",
+          "softlight",
+          "subtract",
+          "vividlight",
+          "xor",
+          "softdifference",
+          "geometric",
+          "harmonic",
+          "bleach",
+          "stain",
+          "interpolate",
+          "hardoverlay"
         ],
         "unusable": false
       },
@@ -12984,8 +13300,48 @@
         "maximum": 39.0,
         "default": "normal",
         "constants": [
+          "addition",
+          "addition128",
+          "grainmerge",
+          "and",
+          "average",
+          "burn",
+          "darken",
+          "difference",
+          "difference128",
+          "grainextract",
+          "divide",
+          "dodge",
+          "exclusion",
+          "extremity",
+          "freeze",
+          "glow",
+          "hardlight",
+          "hardmix",
+          "heat",
+          "lighten",
+          "linearlight",
+          "multiply",
+          "multiply128",
+          "negation",
           "normal",
-          "multiply"
+          "or",
+          "overlay",
+          "phoenix",
+          "pinlight",
+          "reflect",
+          "screen",
+          "softlight",
+          "subtract",
+          "vividlight",
+          "xor",
+          "softdifference",
+          "geometric",
+          "harmonic",
+          "bleach",
+          "stain",
+          "interpolate",
+          "hardoverlay"
         ],
         "unusable": false
       },
@@ -12997,8 +13353,48 @@
         "maximum": 39.0,
         "default": "normal",
         "constants": [
+          "addition",
+          "addition128",
+          "grainmerge",
+          "and",
+          "average",
+          "burn",
+          "darken",
+          "difference",
+          "difference128",
+          "grainextract",
+          "divide",
+          "dodge",
+          "exclusion",
+          "extremity",
+          "freeze",
+          "glow",
+          "hardlight",
+          "hardmix",
+          "heat",
+          "lighten",
+          "linearlight",
+          "multiply",
+          "multiply128",
+          "negation",
           "normal",
-          "multiply"
+          "or",
+          "overlay",
+          "phoenix",
+          "pinlight",
+          "reflect",
+          "screen",
+          "softlight",
+          "subtract",
+          "vividlight",
+          "xor",
+          "softdifference",
+          "geometric",
+          "harmonic",
+          "bleach",
+          "stain",
+          "interpolate",
+          "hardoverlay"
         ],
         "unusable": false
       },
@@ -13010,8 +13406,48 @@
         "maximum": 39.0,
         "default": "-1",
         "constants": [
+          "addition",
+          "addition128",
+          "grainmerge",
+          "and",
+          "average",
+          "burn",
+          "darken",
+          "difference",
+          "difference128",
+          "grainextract",
+          "divide",
+          "dodge",
+          "exclusion",
+          "extremity",
+          "freeze",
+          "glow",
+          "hardlight",
+          "hardmix",
+          "heat",
+          "lighten",
+          "linearlight",
+          "multiply",
+          "multiply128",
+          "negation",
           "normal",
-          "multiply"
+          "or",
+          "overlay",
+          "phoenix",
+          "pinlight",
+          "reflect",
+          "screen",
+          "softlight",
+          "subtract",
+          "vividlight",
+          "xor",
+          "softdifference",
+          "geometric",
+          "harmonic",
+          "bleach",
+          "stain",
+          "interpolate",
+          "hardoverlay"
         ],
         "unusable": false
       },
@@ -14320,6 +14756,22 @@
         "unusable": false
       }
     },
+    "colordetect": {
+      "mode": {
+        "name": "mode",
+        "type": "str",
+        "doc": "Image properties to detect",
+        "minimum": null,
+        "maximum": null,
+        "default": "color_range+alpha_mode+all",
+        "constants": [
+          "color_range",
+          "alpha_mode",
+          "all"
+        ],
+        "unusable": false
+      }
+    },
     "colorize": {
       "hue": {
         "name": "hue",
@@ -14786,7 +15238,7 @@
         "type": "str",
         "doc": "Output color primaries",
         "minimum": 0.0,
-        "maximum": 22.0,
+        "maximum": 256.0,
         "default": "2",
         "constants": [
           "bt709",
@@ -14800,7 +15252,8 @@
           "smpte432",
           "bt2020",
           "jedec-p22",
-          "ebu3213"
+          "ebu3213",
+          "vgamut"
         ],
         "unusable": false
       },
@@ -14809,7 +15262,7 @@
         "type": "str",
         "doc": "Output transfer characteristics",
         "minimum": 0.0,
-        "maximum": 18.0,
+        "maximum": 256.0,
         "default": "2",
         "constants": [
           "bt709",
@@ -14825,7 +15278,8 @@
           "xvycc",
           "iec61966-2-4",
           "bt2020-10",
-          "bt2020-12"
+          "bt2020-12",
+          "vlog"
         ],
         "unusable": false
       },
@@ -14883,6 +15337,19 @@
           "bradford",
           "vonkries",
           "identity"
+        ],
+        "unusable": false
+      },
+      "clipgamut": {
+        "name": "clipgamut",
+        "type": "str",
+        "doc": "Controls how to clip out-of-gamut colors that arise as a result of colorspace conversion.",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "none",
+        "constants": [
+          "none",
+          "rgb"
         ],
         "unusable": false
       },
@@ -14945,7 +15412,7 @@
         "type": "str",
         "doc": "Input color primaries",
         "minimum": 0.0,
-        "maximum": 22.0,
+        "maximum": 256.0,
         "default": "2",
         "constants": [
           "bt709",
@@ -14959,7 +15426,8 @@
           "smpte432",
           "bt2020",
           "jedec-p22",
-          "ebu3213"
+          "ebu3213",
+          "vgamut"
         ],
         "unusable": false
       },
@@ -14968,7 +15436,7 @@
         "type": "str",
         "doc": "Input transfer characteristics",
         "minimum": 0.0,
-        "maximum": 18.0,
+        "maximum": 256.0,
         "default": "2",
         "constants": [
           "bt709",
@@ -14984,7 +15452,8 @@
           "xvycc",
           "iec61966-2-4",
           "bt2020-10",
-          "bt2020-12"
+          "bt2020-12",
+          "vlog"
         ],
         "unusable": false
       }
@@ -15250,7 +15719,7 @@
       "0rdiv": {
         "name": "0rdiv",
         "type": "num",
-        "doc": "set rdiv for 1nd plane",
+        "doc": "set rdiv for 1st plane",
         "minimum": 0.0,
         "maximum": null,
         "default": "1",
@@ -16200,6 +16669,48 @@
         "unusable": false
       }
     },
+    "deinterlace_d3d12": {
+      "method": {
+        "name": "method",
+        "type": "str",
+        "doc": "Deinterlacing method",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "default",
+        "constants": [
+          "default",
+          "bob",
+          "custom"
+        ],
+        "unusable": false
+      },
+      "mode": {
+        "name": "mode",
+        "type": "str",
+        "doc": "Specify the interlacing mode",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "frame",
+        "constants": [
+          "frame",
+          "field"
+        ],
+        "unusable": false
+      },
+      "deint": {
+        "name": "deint",
+        "type": "str",
+        "doc": "Specify which frames to deinterlace",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "all",
+        "constants": [
+          "all",
+          "interlaced"
+        ],
+        "unusable": false
+      }
+    },
     "deinterlace_vaapi": {
       "mode": {
         "name": "mode",
@@ -16843,7 +17354,7 @@
       "box_source": {
         "name": "box_source",
         "type": "str",
-        "doc": "use datas from bounding box in side data",
+        "doc": "use data from bounding box in side data",
         "minimum": null,
         "maximum": null,
         "default": null,
@@ -17441,6 +17952,28 @@
         "minimum": null,
         "maximum": null,
         "default": "0",
+        "constants": [],
+        "unusable": false
+      }
+    },
+    "drawvg": {
+      "script": {
+        "name": "script",
+        "type": "str",
+        "doc": "script source to draw the graphics",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false
+      },
+      "file": {
+        "name": "file",
+        "type": "str",
+        "doc": "file to load the script source",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
         "constants": [],
         "unusable": false
       }
@@ -18468,6 +19001,16 @@
         "name": "color_ranges",
         "type": "str",
         "doc": "A '|'-separated list of color ranges",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false
+      },
+      "alpha_modes": {
+        "name": "alpha_modes",
+        "type": "str",
+        "doc": "A '|'-separated list of alpha modes",
         "minimum": null,
         "maximum": null,
         "default": null,
@@ -19582,6 +20125,79 @@
         "unusable": false
       }
     },
+    "iccdetect": {
+      "force": {
+        "name": "force",
+        "type": "bool",
+        "doc": "overwrite existing tags",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false
+      }
+    },
+    "iccgen": {
+      "color_primaries": {
+        "name": "color_primaries",
+        "type": "str",
+        "doc": "select color primaries",
+        "minimum": 0.0,
+        "maximum": 22.0,
+        "default": "auto",
+        "constants": [
+          "auto",
+          "bt709",
+          "bt470m",
+          "bt470bg",
+          "smpte170m",
+          "smpte240m",
+          "film",
+          "bt2020",
+          "smpte428",
+          "smpte431",
+          "smpte432",
+          "jedec-p22",
+          "ebu3213"
+        ],
+        "unusable": false
+      },
+      "color_trc": {
+        "name": "color_trc",
+        "type": "str",
+        "doc": "select color transfer",
+        "minimum": 0.0,
+        "maximum": 18.0,
+        "default": "auto",
+        "constants": [
+          "auto",
+          "bt709",
+          "bt470m",
+          "bt470bg",
+          "smpte170m",
+          "smpte240m",
+          "linear",
+          "iec61966-2-4",
+          "bt1361e",
+          "iec61966-2-1",
+          "bt2020-10",
+          "bt2020-12",
+          "smpte2084",
+          "arib-std-b67"
+        ],
+        "unusable": false
+      },
+      "force": {
+        "name": "force",
+        "type": "bool",
+        "doc": "overwrite existing ICC profile",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      }
+    },
     "identity": {},
     "idet": {
       "intl_thres": {
@@ -19758,6 +20374,35 @@
       }
     },
     "interlace": {
+      "scan": {
+        "name": "scan",
+        "type": "str",
+        "doc": "scanning mode",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "tff",
+        "constants": [
+          "tff",
+          "bff"
+        ],
+        "unusable": false
+      },
+      "lowpass": {
+        "name": "lowpass",
+        "type": "str",
+        "doc": "set vertical low-pass filter",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "linear",
+        "constants": [
+          "off",
+          "linear",
+          "complex"
+        ],
+        "unusable": false
+      }
+    },
+    "interlace_vulkan": {
       "scan": {
         "name": "scan",
         "type": "str",
@@ -21015,6 +21660,18 @@
         "unusable": false
       }
     },
+    "mestimate_d3d12": {
+      "mb_size": {
+        "name": "mb_size",
+        "type": "num",
+        "doc": "macroblock size, only 8 and 16 are supported",
+        "minimum": 8.0,
+        "maximum": 16.0,
+        "default": "16",
+        "constants": [],
+        "unusable": false
+      }
+    },
     "metadata": {
       "mode": {
         "name": "mode",
@@ -21547,7 +22204,7 @@
         "name": "s",
         "type": "num",
         "doc": "denoising strength for all components",
-        "minimum": 1.0,
+        "minimum": 0.0,
         "maximum": 100.0,
         "default": "1",
         "constants": [],
@@ -21566,7 +22223,7 @@
       "r": {
         "name": "r",
         "type": "num",
-        "doc": "research window radius",
+        "doc": "research window size",
         "minimum": 0.0,
         "maximum": 99.0,
         "default": "15",
@@ -21578,8 +22235,8 @@
         "type": "num",
         "doc": "parallelism",
         "minimum": 1.0,
-        "maximum": 168.0,
-        "default": "36",
+        "maximum": 64.0,
+        "default": "8",
         "constants": [],
         "unusable": false
       },
@@ -21587,9 +22244,9 @@
         "name": "s1",
         "type": "num",
         "doc": "denoising strength for component 1",
-        "minimum": 1.0,
+        "minimum": 0.0,
         "maximum": 100.0,
-        "default": "1",
+        "default": "nan",
         "constants": [],
         "unusable": false
       },
@@ -21597,9 +22254,9 @@
         "name": "s2",
         "type": "num",
         "doc": "denoising strength for component 2",
-        "minimum": 1.0,
+        "minimum": 0.0,
         "maximum": 100.0,
-        "default": "1",
+        "default": "nan",
         "constants": [],
         "unusable": false
       },
@@ -21607,9 +22264,9 @@
         "name": "s3",
         "type": "num",
         "doc": "denoising strength for component 3",
-        "minimum": 1.0,
+        "minimum": 0.0,
         "maximum": 100.0,
-        "default": "1",
+        "default": "nan",
         "constants": [],
         "unusable": false
       },
@@ -21617,9 +22274,9 @@
         "name": "s4",
         "type": "num",
         "doc": "denoising strength for component 4",
-        "minimum": 1.0,
+        "minimum": 0.0,
         "maximum": 100.0,
-        "default": "1",
+        "default": "nan",
         "constants": [],
         "unusable": false
       },
@@ -21819,6 +22476,16 @@
         "name": "color_ranges",
         "type": "str",
         "doc": "A '|'-separated list of color ranges",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false
+      },
+      "alpha_modes": {
+        "name": "alpha_modes",
+        "type": "str",
+        "doc": "A '|'-separated list of alpha modes",
         "minimum": null,
         "maximum": null,
         "default": null,
@@ -22281,9 +22948,11 @@
         "type": "str",
         "doc": "alpha format",
         "minimum": 0.0,
-        "maximum": 1.0,
-        "default": "straight",
+        "maximum": 2.0,
+        "default": "auto",
         "constants": [
+          "auto",
+          "unknown",
           "straight",
           "premultiplied"
         ],
@@ -22608,6 +23277,81 @@
       }
     },
     "pad": {
+      "width": {
+        "name": "width",
+        "type": "str",
+        "doc": "set the pad area width expression",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"iw\"",
+        "constants": [],
+        "unusable": false
+      },
+      "height": {
+        "name": "height",
+        "type": "str",
+        "doc": "set the pad area height expression",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"ih\"",
+        "constants": [],
+        "unusable": false
+      },
+      "x": {
+        "name": "x",
+        "type": "str",
+        "doc": "set the x offset expression for the input image position",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"0\"",
+        "constants": [],
+        "unusable": false
+      },
+      "y": {
+        "name": "y",
+        "type": "str",
+        "doc": "set the y offset expression for the input image position",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"0\"",
+        "constants": [],
+        "unusable": false
+      },
+      "color": {
+        "name": "color",
+        "type": "str",
+        "doc": "set the color of the padded area border",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"black\"",
+        "constants": [],
+        "unusable": false
+      },
+      "eval": {
+        "name": "eval",
+        "type": "str",
+        "doc": "specify when to evaluate expressions",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "init",
+        "constants": [
+          "init",
+          "frame"
+        ],
+        "unusable": false
+      },
+      "aspect": {
+        "name": "aspect",
+        "type": "num",
+        "doc": "pad to fit an aspect instead of a resolution",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "0/1",
+        "constants": [],
+        "unusable": false
+      }
+    },
+    "pad_cuda": {
       "width": {
         "name": "width",
         "type": "str",
@@ -23195,18 +23939,6 @@
         "unusable": false
       }
     },
-    "pp": {
-      "subfilters": {
-        "name": "subfilters",
-        "type": "str",
-        "doc": "set postprocess subfilters",
-        "minimum": null,
-        "maximum": null,
-        "default": "\"de\"",
-        "constants": [],
-        "unusable": false
-      }
-    },
     "pp7": {
       "qp": {
         "name": "qp",
@@ -23230,6 +23962,28 @@
           "soft",
           "medium"
         ],
+        "unusable": false
+      }
+    },
+    "premultiply_dynamic": {
+      "planes": {
+        "name": "planes",
+        "type": "num",
+        "doc": "set planes",
+        "minimum": 0.0,
+        "maximum": 15.0,
+        "default": "15",
+        "constants": [],
+        "unusable": false
+      },
+      "inplace": {
+        "name": "inplace",
+        "type": "bool",
+        "doc": "enable inplace mode",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
         "unusable": false
       }
     },
@@ -24235,10 +24989,12 @@
           "bt601",
           "bt470",
           "smpte170m",
+          "bt470bg",
           "bt709",
           "fcc",
           "smpte240m",
-          "bt2020"
+          "bt2020",
+          "bt2020nc"
         ],
         "unusable": false
       },
@@ -24254,10 +25010,12 @@
           "bt601",
           "bt470",
           "smpte170m",
+          "bt470bg",
           "bt709",
           "fcc",
           "smpte240m",
-          "bt2020"
+          "bt2020",
+          "bt2020nc"
         ],
         "unusable": false
       },
@@ -24337,6 +25095,84 @@
         ],
         "unusable": false
       },
+      "in_primaries": {
+        "name": "in_primaries",
+        "type": "str",
+        "doc": "set input primaries",
+        "minimum": -1.0,
+        "maximum": 22.0,
+        "default": "auto",
+        "constants": [
+          "auto",
+          "bt709",
+          "bt470m",
+          "bt470bg",
+          "smpte170m",
+          "smpte240m",
+          "film",
+          "bt2020",
+          "smpte428",
+          "smpte431",
+          "smpte432",
+          "jedec-p22",
+          "ebu3213"
+        ],
+        "unusable": false
+      },
+      "out_primaries": {
+        "name": "out_primaries",
+        "type": "str",
+        "doc": "set output primaries",
+        "minimum": -1.0,
+        "maximum": 22.0,
+        "default": "auto",
+        "constants": [
+          "auto",
+          "bt709",
+          "bt470m",
+          "bt470bg",
+          "smpte170m",
+          "smpte240m",
+          "film",
+          "bt2020",
+          "smpte428",
+          "smpte431",
+          "smpte432",
+          "jedec-p22",
+          "ebu3213"
+        ],
+        "unusable": false
+      },
+      "out_transfer": {
+        "name": "out_transfer",
+        "type": "str",
+        "doc": "set output color transfer",
+        "minimum": -1.0,
+        "maximum": 18.0,
+        "default": "auto",
+        "constants": [
+          "auto",
+          "bt709",
+          "bt470m",
+          "gamma22",
+          "bt470bg",
+          "gamma28",
+          "smpte170m",
+          "smpte240m",
+          "linear",
+          "iec61966-2-1",
+          "srgb",
+          "iec61966-2-4",
+          "xvycc",
+          "bt1361e",
+          "bt2020-10",
+          "bt2020-12",
+          "smpte2084",
+          "smpte428",
+          "arib-std-b67"
+        ],
+        "unusable": false
+      },
       "in_v_chr_pos": {
         "name": "in_v_chr_pos",
         "type": "num",
@@ -24401,6 +25237,16 @@
         "constants": [],
         "unusable": false
       },
+      "reset_sar": {
+        "name": "reset_sar",
+        "type": "bool",
+        "doc": "reset SAR to 1 and scale to square pixels if scaling proportionally",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      },
       "param0": {
         "name": "param0",
         "type": "num",
@@ -24432,6 +25278,386 @@
           "init",
           "frame"
         ],
+        "unusable": false
+      }
+    },
+    "vpp_amf": {
+      "w": {
+        "name": "w",
+        "type": "str",
+        "doc": "Output video width",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"iw\"",
+        "constants": [],
+        "unusable": false
+      },
+      "h": {
+        "name": "h",
+        "type": "str",
+        "doc": "Output video height",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"ih\"",
+        "constants": [],
+        "unusable": false
+      },
+      "format": {
+        "name": "format",
+        "type": "str",
+        "doc": "Output pixel format",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"same\"",
+        "constants": [],
+        "unusable": false
+      },
+      "scale_type": {
+        "name": "scale_type",
+        "type": "str",
+        "doc": "Scale type",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "bilinear",
+        "constants": [
+          "bilinear",
+          "bicubic"
+        ],
+        "unusable": false
+      },
+      "color_profile": {
+        "name": "color_profile",
+        "type": "str",
+        "doc": "Color profile",
+        "minimum": -1.0,
+        "maximum": 8.0,
+        "default": "-1",
+        "constants": [
+          "bt601",
+          "bt709",
+          "bt2020"
+        ],
+        "unusable": false
+      },
+      "in_color_range": {
+        "name": "in_color_range",
+        "type": "str",
+        "doc": "Input color range",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "0",
+        "constants": [
+          "studio",
+          "full"
+        ],
+        "unusable": false
+      },
+      "out_color_range": {
+        "name": "out_color_range",
+        "type": "str",
+        "doc": "Output color range",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "0",
+        "constants": [
+          "studio",
+          "full"
+        ],
+        "unusable": false
+      },
+      "in_primaries": {
+        "name": "in_primaries",
+        "type": "str",
+        "doc": "Input color primaries",
+        "minimum": 0.0,
+        "maximum": 22.0,
+        "default": "0",
+        "constants": [
+          "bt709",
+          "bt470m",
+          "bt470bg",
+          "smpte170m",
+          "smpte240m",
+          "film",
+          "bt2020",
+          "smpte428",
+          "smpte431",
+          "smpte432",
+          "jedec-p22"
+        ],
+        "unusable": false
+      },
+      "out_primaries": {
+        "name": "out_primaries",
+        "type": "str",
+        "doc": "Output color primaries",
+        "minimum": 0.0,
+        "maximum": 22.0,
+        "default": "0",
+        "constants": [
+          "bt709",
+          "bt470m",
+          "bt470bg",
+          "smpte170m",
+          "smpte240m",
+          "film",
+          "bt2020",
+          "smpte428",
+          "smpte431",
+          "smpte432",
+          "jedec-p22"
+        ],
+        "unusable": false
+      },
+      "in_trc": {
+        "name": "in_trc",
+        "type": "str",
+        "doc": "Input transfer characteristics",
+        "minimum": 0.0,
+        "maximum": 18.0,
+        "default": "0",
+        "constants": [
+          "bt709",
+          "gamma22",
+          "gamma28",
+          "smpte170m",
+          "smpte240m",
+          "linear",
+          "log",
+          "log-sqrt",
+          "iec61966-2-4",
+          "bt1361-ecg",
+          "iec61966-2-1",
+          "bt2020-10",
+          "bt2020-12",
+          "smpte2084",
+          "smpte428",
+          "arib-std-b67"
+        ],
+        "unusable": false
+      },
+      "out_trc": {
+        "name": "out_trc",
+        "type": "str",
+        "doc": "Output transfer characteristics",
+        "minimum": 0.0,
+        "maximum": 18.0,
+        "default": "0",
+        "constants": [
+          "bt709",
+          "gamma22",
+          "gamma28",
+          "smpte170m",
+          "smpte240m",
+          "linear",
+          "log",
+          "log-sqrt",
+          "iec61966-2-4",
+          "bt1361-ecg",
+          "iec61966-2-1",
+          "bt2020-10",
+          "bt2020-12",
+          "smpte2084",
+          "smpte428",
+          "arib-std-b67"
+        ],
+        "unusable": false
+      },
+      "force_original_aspect_ratio": {
+        "name": "force_original_aspect_ratio",
+        "type": "str",
+        "doc": "decrease or increase w/h if necessary to keep the original AR",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "disable",
+        "constants": [
+          "disable",
+          "decrease",
+          "increase"
+        ],
+        "unusable": false
+      },
+      "force_divisible_by": {
+        "name": "force_divisible_by",
+        "type": "num",
+        "doc": "enforce that the output resolution is divisible by a defined integer when force_original_aspect_ratio is used",
+        "minimum": 1.0,
+        "maximum": 256.0,
+        "default": "1",
+        "constants": [],
+        "unusable": false
+      },
+      "reset_sar": {
+        "name": "reset_sar",
+        "type": "bool",
+        "doc": "reset SAR to 1 and scale to square pixels if scaling proportionally",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      }
+    },
+    "sr_amf": {
+      "w": {
+        "name": "w",
+        "type": "str",
+        "doc": "Output video width",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"iw\"",
+        "constants": [],
+        "unusable": false
+      },
+      "h": {
+        "name": "h",
+        "type": "str",
+        "doc": "Output video height",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"ih\"",
+        "constants": [],
+        "unusable": false
+      },
+      "format": {
+        "name": "format",
+        "type": "str",
+        "doc": "Output pixel format",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"same\"",
+        "constants": [],
+        "unusable": false
+      },
+      "sharpness": {
+        "name": "sharpness",
+        "type": "num",
+        "doc": "Sharpness",
+        "minimum": -1.0,
+        "maximum": 2.0,
+        "default": "-1",
+        "constants": [],
+        "unusable": false
+      },
+      "keep-ratio": {
+        "name": "keep-ratio",
+        "type": "bool",
+        "doc": "Keep aspect ratio",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      },
+      "fill": {
+        "name": "fill",
+        "type": "bool",
+        "doc": "Fill",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      },
+      "algorithm": {
+        "name": "algorithm",
+        "type": "str",
+        "doc": "Scaling algorithm",
+        "minimum": -1.0,
+        "maximum": 4.0,
+        "default": "-1",
+        "constants": [
+          "bilinear",
+          "bicubic",
+          "sr1-0",
+          "point",
+          "sr1-1"
+        ],
+        "unusable": false
+      }
+    },
+    "frc_amf": {
+      "engine_type": {
+        "name": "engine_type",
+        "type": "str",
+        "doc": "Engine type",
+        "minimum": -1.0,
+        "maximum": 3.0,
+        "default": "-1",
+        "constants": [
+          "dx11",
+          "dx12"
+        ],
+        "unusable": false
+      },
+      "enable": {
+        "name": "enable",
+        "type": "bool",
+        "doc": "Enable FRC",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false
+      },
+      "fallback_mode": {
+        "name": "fallback_mode",
+        "type": "str",
+        "doc": "Fallback behavior in case of low interpolation confidence",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "blend",
+        "constants": [
+          "duplicate",
+          "blend"
+        ],
+        "unusable": false
+      },
+      "indicator": {
+        "name": "indicator",
+        "type": "bool",
+        "doc": "Show FRC indicator square in the top left corner of the video.",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      },
+      "profile": {
+        "name": "profile",
+        "type": "str",
+        "doc": "Level of hierarchical motion search",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "high",
+        "constants": [
+          "low",
+          "high",
+          "super"
+        ],
+        "unusable": false
+      },
+      "mv_search_mode": {
+        "name": "mv_search_mode",
+        "type": "str",
+        "doc": "Performance mode of the motion search",
+        "minimum": 0.0,
+        "maximum": 1.0,
+        "default": "native",
+        "constants": [
+          "native",
+          "performance"
+        ],
+        "unusable": false
+      },
+      "use_future_frame": {
+        "name": "use_future_frame",
+        "type": "bool",
+        "doc": "Enable dependency on future frame, improves quality for the cost of latency",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
         "unusable": false
       }
     },
@@ -24491,6 +25717,18 @@
         "constants": [],
         "unusable": false
       },
+      "use_filters": {
+        "name": "use_filters",
+        "type": "str",
+        "doc": "Use generic filters instead of fixed function kernels",
+        "minimum": -1.0,
+        "maximum": 1.0,
+        "default": "auto",
+        "constants": [
+          "auto"
+        ],
+        "unusable": false
+      },
       "param": {
         "name": "param",
         "type": "num",
@@ -24522,6 +25760,80 @@
         "minimum": 1.0,
         "maximum": 256.0,
         "default": "1",
+        "constants": [],
+        "unusable": false
+      },
+      "reset_sar": {
+        "name": "reset_sar",
+        "type": "bool",
+        "doc": "reset SAR to 1 and scale to square pixels if scaling proportionally",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      }
+    },
+    "scale_d3d11": {
+      "width": {
+        "name": "width",
+        "type": "str",
+        "doc": "Output video width",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"iw\"",
+        "constants": [],
+        "unusable": false
+      },
+      "height": {
+        "name": "height",
+        "type": "str",
+        "doc": "Output video height",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"ih\"",
+        "constants": [],
+        "unusable": false
+      },
+      "format": {
+        "name": "format",
+        "type": "str",
+        "doc": "Output video pixel format",
+        "minimum": null,
+        "maximum": null,
+        "default": "none",
+        "constants": [],
+        "unusable": false
+      }
+    },
+    "scale_d3d12": {
+      "w": {
+        "name": "w",
+        "type": "str",
+        "doc": "Output video width",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"iw\"",
+        "constants": [],
+        "unusable": false
+      },
+      "h": {
+        "name": "h",
+        "type": "str",
+        "doc": "Output video height",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"ih\"",
+        "constants": [],
+        "unusable": false
+      },
+      "format": {
+        "name": "format",
+        "type": "str",
+        "doc": "Output video pixel format",
+        "minimum": null,
+        "maximum": null,
+        "default": "none",
         "constants": [],
         "unusable": false
       }
@@ -24700,6 +26012,16 @@
         "default": "1",
         "constants": [],
         "unusable": false
+      },
+      "reset_sar": {
+        "name": "reset_sar",
+        "type": "bool",
+        "doc": "reset SAR to 1 and scale to square pixels if scaling proportionally",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
       }
     },
     "scale_vulkan": {
@@ -24736,6 +26058,19 @@
         ],
         "unusable": false
       },
+      "debayer": {
+        "name": "debayer",
+        "type": "str",
+        "doc": "Debayer algorithm to use",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "bilinear_hq",
+        "constants": [
+          "bilinear",
+          "bilinear_hq"
+        ],
+        "unusable": false
+      },
       "format": {
         "name": "format",
         "type": "str",
@@ -24765,6 +26100,28 @@
       }
     },
     "scdet": {
+      "threshold": {
+        "name": "threshold",
+        "type": "num",
+        "doc": "set scene change detect threshold",
+        "minimum": 0.0,
+        "maximum": 100.0,
+        "default": "10",
+        "constants": [],
+        "unusable": false
+      },
+      "sc_pass": {
+        "name": "sc_pass",
+        "type": "bool",
+        "doc": "Set the flag to pass scene change frames",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      }
+    },
+    "scdet_vulkan": {
       "threshold": {
         "name": "threshold",
         "type": "num",
@@ -25078,7 +26435,7 @@
         "type": "str",
         "doc": "select color primaries",
         "minimum": -1.0,
-        "maximum": 22.0,
+        "maximum": 256.0,
         "default": "auto",
         "constants": [
           "auto",
@@ -25094,7 +26451,8 @@
           "smpte431",
           "smpte432",
           "jedec-p22",
-          "ebu3213"
+          "ebu3213",
+          "vgamut"
         ],
         "unusable": false
       },
@@ -25103,7 +26461,7 @@
         "type": "str",
         "doc": "select color transfer",
         "minimum": -1.0,
-        "maximum": 18.0,
+        "maximum": 256.0,
         "default": "auto",
         "constants": [
           "auto",
@@ -25123,7 +26481,8 @@
           "bt2020-12",
           "smpte2084",
           "smpte428",
-          "arib-std-b67"
+          "arib-std-b67",
+          "vlog"
         ],
         "unusable": false
       },
@@ -25175,6 +26534,22 @@
           "bottom"
         ],
         "unusable": false
+      },
+      "alpha_mode": {
+        "name": "alpha_mode",
+        "type": "str",
+        "doc": "select alpha moda",
+        "minimum": -1.0,
+        "maximum": 2.0,
+        "default": "auto",
+        "constants": [
+          "auto",
+          "unspecified",
+          "unknown",
+          "premultiplied",
+          "straight"
+        ],
+        "unusable": false
       }
     },
     "setpts": {
@@ -25185,6 +26560,16 @@
         "minimum": null,
         "maximum": null,
         "default": "\"PTS\"",
+        "constants": [],
+        "unusable": false
+      },
+      "strip_fps": {
+        "name": "strip_fps",
+        "type": "bool",
+        "doc": "Unset framerate metadata",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
         "constants": [],
         "unusable": false
       }
@@ -25488,6 +26873,7 @@
           "CONTENT_LIGHT_LEVEL",
           "ICC_PROFILE",
           "S12M_TIMECOD",
+          "S12M_TIMECODE",
           "DYNAMIC_HDR_PLUS",
           "REGIONS_OF_INTEREST",
           "VIDEO_ENC_PARAMS",
@@ -25875,7 +27261,7 @@
       "main_pad": {
         "name": "main_pad",
         "type": "num",
-        "doc": "Expansion (padding) coeffiecient for each cube face of the main video",
+        "doc": "Expansion (padding) coefficient for each cube face of the main video",
         "minimum": 0.0,
         "maximum": 10.0,
         "default": "0",
@@ -26071,6 +27457,20 @@
         "maximum": null,
         "default": "auto",
         "constants": [],
+        "unusable": false
+      },
+      "shaping": {
+        "name": "shaping",
+        "type": "str",
+        "doc": "set shaping engine",
+        "minimum": -1.0,
+        "maximum": 1.0,
+        "default": "auto",
+        "constants": [
+          "auto",
+          "simple",
+          "complex"
+        ],
         "unusable": false
       }
     },
@@ -27264,6 +28664,40 @@
         "unusable": false
       }
     },
+    "transpose_cuda": {
+      "dir": {
+        "name": "dir",
+        "type": "str",
+        "doc": "set transpose direction",
+        "minimum": 0.0,
+        "maximum": 6.0,
+        "default": "cclock_flip",
+        "constants": [
+          "cclock_flip",
+          "clock",
+          "cclock",
+          "clock_flip",
+          "reversal",
+          "hflip",
+          "vflip"
+        ],
+        "unusable": false
+      },
+      "passthrough": {
+        "name": "passthrough",
+        "type": "str",
+        "doc": "do not apply transposition if the input matches the specified geometry",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "none",
+        "constants": [
+          "none",
+          "landscape",
+          "portrait"
+        ],
+        "unusable": false
+      }
+    },
     "transpose_opencl": {
       "dir": {
         "name": "dir",
@@ -28086,6 +29520,142 @@
         "unusable": false
       }
     },
+    "v360_vulkan": {
+      "input": {
+        "name": "input",
+        "type": "str",
+        "doc": "set input projection",
+        "minimum": 0.0,
+        "maximum": 24.0,
+        "default": "e",
+        "constants": [
+          "e",
+          "equirect",
+          "flat",
+          "dfisheye",
+          "sg",
+          "fisheye"
+        ],
+        "unusable": false
+      },
+      "output": {
+        "name": "output",
+        "type": "str",
+        "doc": "set output projection",
+        "minimum": 0.0,
+        "maximum": 24.0,
+        "default": "flat",
+        "constants": [
+          "e",
+          "equirect",
+          "flat",
+          "dfisheye",
+          "sg",
+          "fisheye"
+        ],
+        "unusable": false
+      },
+      "w": {
+        "name": "w",
+        "type": "num",
+        "doc": "output width",
+        "minimum": 0.0,
+        "maximum": 32767.0,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "h": {
+        "name": "h",
+        "type": "num",
+        "doc": "output height",
+        "minimum": 0.0,
+        "maximum": 32767.0,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "yaw": {
+        "name": "yaw",
+        "type": "num",
+        "doc": "yaw rotation",
+        "minimum": -180.0,
+        "maximum": 180.0,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "pitch": {
+        "name": "pitch",
+        "type": "num",
+        "doc": "pitch rotation",
+        "minimum": -180.0,
+        "maximum": 180.0,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "roll": {
+        "name": "roll",
+        "type": "num",
+        "doc": "roll rotation",
+        "minimum": -180.0,
+        "maximum": 180.0,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "rorder": {
+        "name": "rorder",
+        "type": "str",
+        "doc": "rotation order",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"ypr\"",
+        "constants": [],
+        "unusable": false
+      },
+      "h_fov": {
+        "name": "h_fov",
+        "type": "num",
+        "doc": "set output horizontal FOV angle",
+        "minimum": 1e-05,
+        "maximum": 360.0,
+        "default": "90",
+        "constants": [],
+        "unusable": false
+      },
+      "v_fov": {
+        "name": "v_fov",
+        "type": "num",
+        "doc": "set output vertical FOV angle",
+        "minimum": 1e-05,
+        "maximum": 360.0,
+        "default": "45",
+        "constants": [],
+        "unusable": false
+      },
+      "ih_fov": {
+        "name": "ih_fov",
+        "type": "num",
+        "doc": "set input horizontal FOV angle",
+        "minimum": 1e-05,
+        "maximum": 360.0,
+        "default": "90",
+        "constants": [],
+        "unusable": false
+      },
+      "iv_fov": {
+        "name": "iv_fov",
+        "type": "num",
+        "doc": "set input vertical FOV angle",
+        "minimum": 1e-05,
+        "maximum": 360.0,
+        "default": "45",
+        "constants": [],
+        "unusable": false
+      }
+    },
     "vaguedenoiser": {
       "threshold": {
         "name": "threshold",
@@ -28405,7 +29975,7 @@
         "doc": "set the red luma coefficient",
         "minimum": 0.0,
         "maximum": 1.0,
-        "default": "0.072186",
+        "default": "0.212656",
         "constants": [],
         "unusable": false
       },
@@ -28425,7 +29995,7 @@
         "doc": "set the blue luma coefficient",
         "minimum": 0.0,
         "maximum": 1.0,
-        "default": "0.212656",
+        "default": "0.072186",
         "constants": [],
         "unusable": false
       },
@@ -29832,7 +31402,7 @@
         "type": "str",
         "doc": "set filter type",
         "minimum": 0.0,
-        "maximum": 5.0,
+        "maximum": 6.0,
         "default": "bilinear",
         "constants": [
           "point",
@@ -29840,6 +31410,7 @@
           "bicubic",
           "spline16",
           "spline36",
+          "spline64",
           "lanczos"
         ],
         "unusable": false
@@ -33357,6 +34928,52 @@
         "unusable": false
       }
     },
+    "vsrc_amf": {
+      "monitor_index": {
+        "name": "monitor_index",
+        "type": "num",
+        "doc": "Index of display monitor to capture",
+        "minimum": 0.0,
+        "maximum": 8.0,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "framerate": {
+        "name": "framerate",
+        "type": "str",
+        "doc": "Capture framerate",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"60\"",
+        "constants": [],
+        "unusable": false
+      },
+      "duplicate_output": {
+        "name": "duplicate_output",
+        "type": "bool",
+        "doc": "Use display output duplication for screen capture",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false
+      },
+      "capture_mode": {
+        "name": "capture_mode",
+        "type": "str",
+        "doc": "Capture synchronization mode",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "keep_framerate",
+        "constants": [
+          "keep_framerate",
+          "wait_for_present",
+          "get_current"
+        ],
+        "unusable": false
+      }
+    },
     "cellauto": {
       "filename": {
         "name": "filename",
@@ -33840,6 +35457,225 @@
         "maximum": null,
         "default": null,
         "constants": [],
+        "unusable": false
+      }
+    },
+    "gfxcapture": {
+      "window_title": {
+        "name": "window_title",
+        "type": "str",
+        "doc": "ECMAScript regular expression to match against the window title. Supports PCRE style (?i) prefix for case-insensitivity.",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false
+      },
+      "window_class": {
+        "name": "window_class",
+        "type": "str",
+        "doc": "as window_title, but against the window class",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false
+      },
+      "window_exe": {
+        "name": "window_exe",
+        "type": "str",
+        "doc": "as window_title, but against the windows executable name",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false
+      },
+      "monitor_idx": {
+        "name": "monitor_idx",
+        "type": "str",
+        "doc": "index of the monitor to capture",
+        "minimum": -2.0,
+        "maximum": null,
+        "default": "-2",
+        "constants": [
+          "window"
+        ],
+        "unusable": false
+      },
+      "capture_cursor": {
+        "name": "capture_cursor",
+        "type": "bool",
+        "doc": "capture mouse cursor",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false
+      },
+      "capture_border": {
+        "name": "capture_border",
+        "type": "bool",
+        "doc": "capture full window border",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      },
+      "display_border": {
+        "name": "display_border",
+        "type": "bool",
+        "doc": "display yellow border around captured window",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      },
+      "max_framerate": {
+        "name": "max_framerate",
+        "type": "str",
+        "doc": "set maximum capture frame rate",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"60\"",
+        "constants": [],
+        "unusable": false
+      },
+      "hwnd": {
+        "name": "hwnd",
+        "type": "str",
+        "doc": "pre-existing HWND handle",
+        "minimum": 0.0,
+        "maximum": 1.84467e+19,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "hmonitor": {
+        "name": "hmonitor",
+        "type": "str",
+        "doc": "pre-existing HMONITOR handle",
+        "minimum": 0.0,
+        "maximum": 1.84467e+19,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "width": {
+        "name": "width",
+        "type": "num",
+        "doc": "force width of the output frames, negative values round down the width to the nearest multiple of that number",
+        "minimum": null,
+        "maximum": null,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "height": {
+        "name": "height",
+        "type": "num",
+        "doc": "force height of the output frames, negative values round down the height to the nearest multiple of that number",
+        "minimum": null,
+        "maximum": null,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "crop_left": {
+        "name": "crop_left",
+        "type": "num",
+        "doc": "number of pixels to crop from the left of the captured area",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "crop_top": {
+        "name": "crop_top",
+        "type": "num",
+        "doc": "number of pixels to crop from the top of the captured area",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "crop_right": {
+        "name": "crop_right",
+        "type": "num",
+        "doc": "number of pixels to crop from the right of the captured area",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "crop_bottom": {
+        "name": "crop_bottom",
+        "type": "num",
+        "doc": "number of pixels to crop from the bottom of the captured area",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "premultiplied": {
+        "name": "premultiplied",
+        "type": "bool",
+        "doc": "return premultiplied alpha frames",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      },
+      "resize_mode": {
+        "name": "resize_mode",
+        "type": "str",
+        "doc": "capture source resize behavior",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "crop",
+        "constants": [
+          "crop",
+          "scale",
+          "scale_aspect"
+        ],
+        "unusable": false
+      },
+      "scale_mode": {
+        "name": "scale_mode",
+        "type": "str",
+        "doc": "scaling algorithm",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "bilinear",
+        "constants": [
+          "point",
+          "bilinear",
+          "bicubic"
+        ],
+        "unusable": false
+      },
+      "output_fmt": {
+        "name": "output_fmt",
+        "type": "str",
+        "doc": "desired output format",
+        "minimum": 0.0,
+        "maximum": null,
+        "default": "8bit",
+        "constants": [
+          "8bit",
+          "bgra",
+          "10bit",
+          "x2bgr10",
+          "16bit",
+          "rgbaf16"
+        ],
         "unusable": false
       }
     },
@@ -35338,7 +37174,7 @@
       "channel_layout": {
         "name": "channel_layout",
         "type": "str",
-        "doc": "<string>     ..F.A......",
+        "doc": "<channel_layout> ..F.A......",
         "minimum": null,
         "maximum": null,
         "default": null,
@@ -35451,6 +37287,21 @@
           "full",
           "pc",
           "jpeg"
+        ],
+        "unusable": false
+      },
+      "alpha_mode": {
+        "name": "alpha_mode",
+        "type": "str",
+        "doc": "select alpha mode",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "unspecified",
+        "constants": [
+          "unspecified",
+          "unknown",
+          "straight",
+          "premultiplied"
         ],
         "unusable": false
       }
@@ -35663,8 +37514,302 @@
         "constants": [],
         "unusable": false
       }
+    },
+    "acrossfade": {
+      "inputs": {
+        "name": "inputs",
+        "type": "num",
+        "doc": "set number of input files to cross fade",
+        "minimum": 1.0,
+        "maximum": null,
+        "default": "2",
+        "constants": [],
+        "unusable": false
+      },
+      "nb_samples": {
+        "name": "nb_samples",
+        "type": "num",
+        "doc": "set number of samples for cross fade duration",
+        "minimum": 1.0,
+        "maximum": 214748000.0,
+        "default": "44100",
+        "constants": [],
+        "unusable": false
+      },
+      "duration": {
+        "name": "duration",
+        "type": "str",
+        "doc": "set cross fade duration",
+        "minimum": null,
+        "maximum": null,
+        "default": "0",
+        "constants": [],
+        "unusable": false
+      },
+      "overlap": {
+        "name": "overlap",
+        "type": "bool",
+        "doc": "overlap 1st stream end with 2nd stream start",
+        "minimum": null,
+        "maximum": null,
+        "default": "true",
+        "constants": [],
+        "unusable": false
+      },
+      "curve1": {
+        "name": "curve1",
+        "type": "str",
+        "doc": "set fade curve type for 1st stream",
+        "minimum": -1.0,
+        "maximum": 22.0,
+        "default": "tri",
+        "constants": [
+          "nofade",
+          "tri",
+          "qsin",
+          "esin",
+          "hsin",
+          "log",
+          "ipar",
+          "qua",
+          "cub",
+          "squ",
+          "cbr",
+          "par",
+          "exp",
+          "iqsin",
+          "ihsin",
+          "dese",
+          "desi",
+          "losi",
+          "sinc",
+          "isinc",
+          "quat",
+          "quatr",
+          "qsin2",
+          "hsin2"
+        ],
+        "unusable": false
+      },
+      "curve2": {
+        "name": "curve2",
+        "type": "str",
+        "doc": "set fade curve type for 2nd stream",
+        "minimum": -1.0,
+        "maximum": 22.0,
+        "default": "tri",
+        "constants": [
+          "nofade",
+          "tri",
+          "qsin",
+          "esin",
+          "hsin",
+          "log",
+          "ipar",
+          "qua",
+          "cub",
+          "squ",
+          "cbr",
+          "par",
+          "exp",
+          "iqsin",
+          "ihsin",
+          "dese",
+          "desi",
+          "losi",
+          "sinc",
+          "isinc",
+          "quat",
+          "quatr",
+          "qsin2",
+          "hsin2"
+        ],
+        "unusable": false
+      }
+    },
+    "amerge": {
+      "inputs": {
+        "name": "inputs",
+        "type": "num",
+        "doc": "specify the number of inputs",
+        "minimum": 1.0,
+        "maximum": 64.0,
+        "default": "2",
+        "constants": [],
+        "unusable": false
+      },
+      "layout_mode": {
+        "name": "layout_mode",
+        "type": "str",
+        "doc": "method used to determine the output channel layout",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "legacy",
+        "constants": [
+          "legacy",
+          "reset",
+          "normal"
+        ],
+        "unusable": false
+      }
+    },
+    "join": {
+      "inputs": {
+        "name": "inputs",
+        "type": "num",
+        "doc": "Number of input streams.",
+        "minimum": 1.0,
+        "maximum": null,
+        "default": "2",
+        "constants": [],
+        "unusable": false
+      },
+      "channel_layout": {
+        "name": "channel_layout",
+        "type": "str",
+        "doc": "Channel layout of the output stream.",
+        "minimum": null,
+        "maximum": null,
+        "default": "\"stereo\"",
+        "constants": [],
+        "unusable": false
+      },
+      "map": {
+        "name": "map",
+        "type": "str",
+        "doc": "A comma-separated list of channels maps in the format 'input_stream.input_channel-output_channel.",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false
+      }
+    },
+    "interleave": {
+      "nb_inputs": {
+        "name": "nb_inputs",
+        "type": "num",
+        "doc": "set number of inputs",
+        "minimum": 1.0,
+        "maximum": null,
+        "default": "2",
+        "constants": [],
+        "unusable": false
+      },
+      "duration": {
+        "name": "duration",
+        "type": "str",
+        "doc": "how to determine the end-of-stream",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "longest",
+        "constants": [
+          "longest",
+          "shortest",
+          "first"
+        ],
+        "unusable": false
+      }
+    },
+    "ainterleave": {
+      "nb_inputs": {
+        "name": "nb_inputs",
+        "type": "num",
+        "doc": "set number of inputs",
+        "minimum": 1.0,
+        "maximum": null,
+        "default": "2",
+        "constants": [],
+        "unusable": false
+      },
+      "duration": {
+        "name": "duration",
+        "type": "str",
+        "doc": "how to determine the end-of-stream",
+        "minimum": 0.0,
+        "maximum": 2.0,
+        "default": "longest",
+        "constants": [
+          "longest",
+          "shortest",
+          "first"
+        ],
+        "unusable": false
+      }
+    },
+    "ladspa": {
+      "file": {
+        "name": "file",
+        "type": "str",
+        "doc": "set library name or full path",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false
+      },
+      "plugin": {
+        "name": "plugin",
+        "type": "str",
+        "doc": "set plugin name",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false
+      },
+      "controls": {
+        "name": "controls",
+        "type": "str",
+        "doc": "set plugin options",
+        "minimum": null,
+        "maximum": null,
+        "default": null,
+        "constants": [],
+        "unusable": false
+      },
+      "sample_rate": {
+        "name": "sample_rate",
+        "type": "num",
+        "doc": "set sample rate",
+        "minimum": 1.0,
+        "maximum": null,
+        "default": "44100",
+        "constants": [],
+        "unusable": false
+      },
+      "nb_samples": {
+        "name": "nb_samples",
+        "type": "num",
+        "doc": "set the number of samples per requested frame",
+        "minimum": 1.0,
+        "maximum": null,
+        "default": "1024",
+        "constants": [],
+        "unusable": false
+      },
+      "duration": {
+        "name": "duration",
+        "type": "str",
+        "doc": "set audio duration",
+        "minimum": null,
+        "maximum": null,
+        "default": "-0.000001",
+        "constants": [],
+        "unusable": false
+      },
+      "latency": {
+        "name": "latency",
+        "type": "bool",
+        "doc": "enable latency compensation",
+        "minimum": null,
+        "maximum": null,
+        "default": "false",
+        "constants": [],
+        "unusable": false
+      }
     }
   },
-  "snapshot_of": "ffmpeg version 7.1-full_build-www.gyan.dev Copyright (c) 2000-2024 the FFmpeg developers",
-  "generated": "2026-08-16"
+  "snapshot_of": "ffmpeg version 9.0.1-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers",
+  "generated": "2026-08-21"
 }

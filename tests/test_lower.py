@@ -2703,6 +2703,7 @@ Filters:
  ... amerge            N->A       Merge two or more audio streams into a single multi-channel stream.
  ... join              N->A       Join multiple audio streams into multi-channel output.
  ..C amix              N->A       Audio mixing.
+ .. ladspa             N->A       Apply LADSPA effect.
  .S. hstack            N->V       Stack video inputs horizontally.
  .S. vstack            N->V       Stack video inputs vertically.
  ... interleave        N->V       Temporally interleave video inputs.
@@ -2942,6 +2943,28 @@ sine AVOptions:
    r                 <int>        ..F.A...... set the sample rate (from 1 to INT_MAX) (default 44100)
    duration          <duration>   ..F.A...... set the audio duration (default 0)
    d                 <duration>   ..F.A...... set the audio duration (default 0)
+
+""",
+    # ladspa is `N->A` with no count option at all -- its pad count comes
+    # from the loaded plugin's own ports. Real ffmpeg 9.0.1 capture
+    # (--enable-ladspa), not 7.1 like the rest of this fixture set: 7.1's
+    # reference snapshot predates ladspa joining the N_INPUT table.
+    "ladspa": """\
+ladspa AVOptions:
+   file              <string>     ..F.A...... set library name or full path
+   f                 <string>     ..F.A...... set library name or full path
+   plugin            <string>     ..F.A...... set plugin name
+   p                 <string>     ..F.A...... set plugin name
+   controls          <string>     ..F.A...... set plugin options
+   c                 <string>     ..F.A...... set plugin options
+   sample_rate       <int>        ..F.A...... set sample rate (from 1 to INT_MAX) (default 44100)
+   s                 <int>        ..F.A...... set sample rate (from 1 to INT_MAX) (default 44100)
+   nb_samples        <int>        ..F.A...... set the number of samples per requested frame (from 1 to INT_MAX) (default 1024)
+   n                 <int>        ..F.A...... set the number of samples per requested frame (from 1 to INT_MAX) (default 1024)
+   duration          <duration>   ..F.A...... set audio duration (default -0.000001)
+   d                 <duration>   ..F.A...... set audio duration (default -0.000001)
+   latency           <boolean>    ..F.A...... enable latency compensation (default false)
+   l                 <boolean>    ..F.A...... enable latency compensation (default false)
 
 """,
 }
@@ -4751,6 +4774,67 @@ def test_amerge_join_interleave_ainterleave_reachable_through_the_namespace(
         _registry,
     )
     assert g.nodes["n1"].filter == "interleave"
+
+
+# ---------------------------------------------------------------------------
+# ladspa joins the N_INPUT table -- the one entry with no count option
+# ---------------------------------------------------------------------------
+#
+# Every other N_INPUT filter's pad count is fixed by an option (`inputs` or
+# `nb_inputs`); ladspa's is fixed by the loaded LADSPA plugin's own ports, so
+# there is no option to read it back from or write it to -- whatever count of
+# audio streams the call supplies IS the count.
+
+
+def test_ladspa_is_callable_bare_with_named_options(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT ladspa(a.audio[1], file => 'amp', plugin => 'amp_mono') "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    node = g.nodes["n1"]
+    assert node.filter == "ladspa"
+    assert node.inputs == ["src:a:a:0"]
+    assert node.outputs == ["audio"]
+    assert node.args == {"file": "amp", "plugin": "amp_mono"}
+
+
+def test_ladspa_takes_any_number_of_streams_and_emits_no_count_option(
+    _registry: Registry,
+) -> None:
+    g = _dyn(
+        "SELECT ladspa(a.audio[1], a.audio[2]) FROM input('x.mp4') a", _registry
+    )
+    node = g.nodes["n1"]
+    assert node.filter == "ladspa"
+    assert node.inputs == ["src:a:a:0", "src:a:a:1"]
+    assert node.args == {}
+    assert "inputs" not in node.args
+
+
+def test_ladspa_rejects_an_unknown_option(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT ladspa(a.audio[1], file => 'amp', bogus => 1) "
+        "FROM input('x.mp4') a",
+        _registry,
+    )
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+
+
+def test_ladspa_rejects_a_video_stream(_registry: Registry) -> None:
+    err = _reject_dyn(
+        "SELECT ladspa(a.frame, file => 'amp') FROM input('x.mp4') a", _registry
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "its stream inputs are all audio" in err.message
+
+
+def test_ladspa_reachable_through_the_namespace(_registry: Registry) -> None:
+    g = _dyn(
+        "SELECT ffmpeg.ladspa(a.audio[1], file => 'amp') FROM input('x.mp4') a",
+        _registry,
+    )
+    assert g.nodes["n1"].filter == "ladspa"
 
 
 # ---------------------------------------------------------------------------

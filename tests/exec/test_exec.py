@@ -1641,6 +1641,58 @@ def test_amerge_runs_and_produces_one_multichannel_stream(tmp_path: Path) -> Non
     assert streams[0]["channels"] == 2  # two mono `sine` tracks merged
 
 
+def _find_ladspa_plugin() -> Path | None:
+    """The first loadable LADSPA plugin file this machine has, or None.
+
+    Searches ``LADSPA_PATH`` (``;``-separated on Windows, ``:`` elsewhere,
+    ffmpeg's own convention) plus ffmpeg's compiled-in default
+    (``/usr/lib/ladspa`` on Linux builds; gyan's Windows builds carry no
+    such default) for a ``.dll``/``.so``/``.dylib`` file. Best-effort: it
+    proves a plugin FILE exists, not that it is a valid LADSPA plugin ffmpeg
+    can load -- good enough to decide whether this exec test can run at all.
+    """
+    search_dirs = [
+        Path(p) for p in os.environ.get("LADSPA_PATH", "").split(os.pathsep) if p
+    ]
+    search_dirs.append(Path("/usr/lib/ladspa"))
+    for directory in search_dirs:
+        if not directory.is_dir():
+            continue
+        for pattern in ("*.dll", "*.so", "*.dylib"):
+            found = next(directory.glob(pattern), None)
+            if found is not None:
+                return found
+    return None
+
+
+def test_ladspa_runs_and_produces_one_audio_stream(tmp_path: Path) -> None:
+    """`ladspa` joins the N_INPUT table with no count option -- ffmpeg derives
+    its pad count from the plugin's own ports. Running it for real needs an
+    actual LADSPA plugin FILE on this machine (`LADSPA_PATH`, or ffmpeg's
+    compiled-in default); gyan's Windows ffmpeg builds carry no bundled
+    plugins and this repo does not vendor one, so this test skips on a plain
+    Windows checkout rather than fabricate a plugin path that would only
+    ever fail at run time."""
+    plugin_file = _find_ladspa_plugin()
+    if plugin_file is None:
+        pytest.skip(
+            "no LADSPA plugin file found (checked $LADSPA_PATH and "
+            "/usr/lib/ladspa) -- nothing for ladspa() to load on this machine"
+        )
+    _require_fixture(_AV2)
+    out_path = tmp_path / "ladspa.mka"
+    query = (
+        f"SELECT ladspa(a.audio[1], file => '{plugin_file.stem}') "
+        f"FROM input('{_sql_path(_AV2)}') a"
+    )
+
+    _compile_and_run(query, out_path)
+
+    streams = _ffprobe_streams(out_path)
+    assert len(streams) == 1
+    assert streams[0]["codec_type"] == "audio"
+
+
 def test_metadata_from_copies_an_inputs_global_tags_through(tmp_path: Path) -> None:
     """`metadata_from <alias>` round-trips a real input's container-level
     tags onto the output via ffprobe's format tags, not just the compiled

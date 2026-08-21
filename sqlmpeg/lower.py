@@ -185,7 +185,10 @@ compiles therefore depends on what that ffmpeg reports, and an empty registry
   the count option must agree with how many were supplied (``UDF_ARG_TYPE``
   naming both numbers when it does not). Unlike the array trio these are
   reachable BARE as well as namespaced — no Postgres grammar claims their
-  names.
+  names. ``ladspa`` (``N->A``) joins the same table but with no count option
+  at all — its pad count is whatever the loaded LADSPA plugin's own ports
+  say, so the streams supplied ARE the count, nothing to cross-check and
+  nothing to write back.
 * ``sqlmpeg.<name>(...)`` is a THIRD namespace, resolved against
   :data:`sqlmpeg.macros.MACROS` and NEVER the registry -- macros work offline,
   with no ffmpeg on PATH at all. A macro owns its own fixed
@@ -694,7 +697,10 @@ class _NInputFilter:
     name: str
     stream: StreamType  # what every one of its INPUT pads carries
     output: StreamType  # its single output pad
-    option: str  # the option whose value IS the input-pad count
+    option: str | None  # the option whose value IS the input-pad count; None
+    # when there is no such option (ladspa: the plugin's own ports decide) --
+    # then the supplied stream count is never checked against anything and
+    # never written back.
     fallback: int  # count when the option is neither written nor introspectable
     # Write the count onto the node even when it equals the fallback. True for
     # the filters that are N-input on EVERY ffmpeg (amix: pins carry
@@ -736,6 +742,9 @@ N_INPUT: dict[str, _NInputFilter] = {
     ),
     "ainterleave": _NInputFilter(
         name="ainterleave", stream="audio", output="audio", option="nb_inputs", fallback=2
+    ),
+    "ladspa": _NInputFilter(
+        name="ladspa", stream="audio", output="audio", option=None, fallback=0, emit_default=False
     ),
 }
 
@@ -5777,25 +5786,31 @@ class _Lowerer:
             extras=call.args[count:],
             timeline=False,
         )
-        declared = self._n_input_count(spec, args, options)
-        if declared != count:
-            anchor = next(
-                (arg.value for arg in call.named if arg.name == spec.option), node
-            )
-            raise _error(
-                ErrorCode.UDF_ARG_TYPE,
-                f"{call.display}() was given {_stream_count(count)} but its "
-                f"'{spec.option}' option says {declared}",
-                anchor,
-                fallback=select,
-                hint=_N_INPUT_HINT,
-            )
-        # Write the count onto the node unless this spec omits a defaulted one
-        # (`emit_default`): ffmpeg only NEEDS `inputs=N` to grow pads beyond
-        # the option's default of 2, and for a filter that is variadic only on
-        # newer builds the omitted default is what keeps the command portable.
-        if spec.emit_default or spec.option in args or count != spec.fallback:
-            args[spec.option] = count
+        # A filter with no count option (ladspa) has nothing to cross-check the
+        # supplied stream count against and nothing to write back -- the
+        # streams themselves ARE the count, decided by the loaded plugin.
+        option_name = spec.option
+        if option_name is not None:
+            declared = self._n_input_count(spec, option_name, args, options)
+            if declared != count:
+                anchor = next(
+                    (arg.value for arg in call.named if arg.name == option_name), node
+                )
+                raise _error(
+                    ErrorCode.UDF_ARG_TYPE,
+                    f"{call.display}() was given {_stream_count(count)} but its "
+                    f"'{option_name}' option says {declared}",
+                    anchor,
+                    fallback=select,
+                    hint=_N_INPUT_HINT,
+                )
+            # Write the count onto the node unless this spec omits a defaulted
+            # one (`emit_default`): ffmpeg only NEEDS `inputs=N` to grow pads
+            # beyond the option's default of 2, and for a filter that is
+            # variadic only on newer builds the omitted default is what keeps
+            # the command portable.
+            if spec.emit_default or option_name in args or count != spec.fallback:
+                args[option_name] = count
         streams = {
             position: self._lower_expr(arg, env, select)
             for position, arg in enumerate(call.args[:count])
@@ -5822,6 +5837,7 @@ class _Lowerer:
     def _n_input_count(
         self,
         spec: _NInputFilter,
+        option_name: str,
         args: dict[str, object],
         options: dict[str, FilterOption],
     ) -> int:
@@ -5830,12 +5846,14 @@ class _Lowerer:
         `args` has already been validated against the option table, so a
         written value is a number in range; only the DEFAULT needs care, since
         `FilterOption.default` is verbatim ffmpeg text that is documented as
-        never re-typed (it can be a constant name, or absent entirely).
+        never re-typed (it can be a constant name, or absent entirely). Called
+        only when `spec.option` is not None; `option_name` is that narrowed
+        value, passed separately so mypy sees a plain `str`.
         """
-        written = args.get(spec.option)
+        written = args.get(option_name)
         if isinstance(written, (int, float)) and not isinstance(written, bool):
             return int(written)
-        option = options.get(spec.option)
+        option = options.get(option_name)
         if option is not None and option.default is not None:
             try:
                 return int(float(option.default))
