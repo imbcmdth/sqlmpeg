@@ -28,8 +28,9 @@ record: filters take them and return them, `-map` maps them,
 `SELECT a` selects one, `array_agg(a)` gathers them. The graph node
 behind a record (what the emitter turns into a `-map` or a pad label)
 is internal and has no name in the language. A filter output is a
-record whose RO facts are NULL (nothing probed them) and whose W
-fields ride through (how tags already survive filters). Subtitle and
+record whose facts were never probed; it has no readable fields (R3),
+and its W fields ride through to whatever maps it (how tags already
+survive filters). Subtitle and
 data streams are passthrough-only (no filter accepts them).
 
 ## 3. Stream records - what a row about a stream carries
@@ -151,13 +152,12 @@ R2. `SELECT *`: over a container, its array columns (stream arrays
     the metadata table. `SELECT a` over unnest rows is the stream.
 R3. Field access: `f.audio[1].codec`, `a.index`, `(f.audio[1]).index`
     read a field; `a.language` / `f.title` read a tag (O6 sugar).
-    A filter output is still a stream record, so `volume(a, 0.2)
-    .language` is legal - and the filter is a NO-OP: its output is
-    never mapped. The IR pass drops the node and logs a warning. For a
-    W field (a tag) the read folds to the input's value, since tags
-    ride unchanged. For an RO fact it does NOT fold - `scale(v, 640,
-    -2).width` is not `v.width` - the value is NULL (unknown) and the
-    warning says so. (Decides O5: NULL, never a rejection.)
+    Field access on a FILTER OUTPUT is a typed rejection: the output
+    pin is connected to nothing, so the node never exists, and a
+    stream nobody mapped has nothing to report - `scale(v, 640,
+    -2).width` cannot be known without running it, and `volume(a,
+    0.2).language` is just `a.language` spelled twice. The hint
+    names the input-side read.
 R4. Construction is "a stream plus W-field columns": in a function
     body, CTE, or SELECT list, `SELECT a.audio[1], 'eng' AS language`
     yields that stream with `language` overridden - the existing tag-
@@ -203,7 +203,7 @@ R9. Homonyms: type names and column/alias names are separate
   accessor sugar over it (O6).
 - Other behavior changes: `disposition` readable (new), RO-field
   construction rejected (new), `SELECT *` defined per R2, cues
-  writable, dangling-filter elision with a warning.
+  writable, field access on a filter output rejected.
 
 ## 8. Open for the maintainer
 
