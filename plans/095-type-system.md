@@ -36,8 +36,7 @@ data streams are passthrough-only (no filter accepts them).
 
     CREATE TYPE video_stream AS (
         index          number,     -- RO  1-based, agrees with f.video[k]
-        language       text,       -- W   tag
-        title          text,       -- W   tag
+        tags           tag[],      -- W   language, title, any key
         disposition    text,       -- W   ffmpeg disposition spec
         codec          text,       -- RO
         width          number,     -- RO
@@ -49,8 +48,7 @@ data streams are passthrough-only (no filter accepts them).
 
     CREATE TYPE audio_stream AS (
         index          number,     -- RO
-        language       text,       -- W
-        title          text,       -- W
+        tags           tag[],      -- W   language, title, any key
         disposition    text,       -- W
         codec          text,       -- RO
         channels       number,     -- RO
@@ -60,12 +58,10 @@ data streams are passthrough-only (no filter accepts them).
         duration       number);    -- RO
 
     CREATE TYPE subtitle_stream AS (
-        index number, language text, title text,
-        disposition text, codec text);   -- index/codec RO
-
+        index number, tags tag[], disposition text, codec text);
     CREATE TYPE data_stream AS (
-        index number, language text, title text,
-        disposition text, codec text);   -- index/codec RO
+        index number, tags tag[], disposition text, codec text);
+    -- index/codec RO; tags/disposition W
 
 W = writable: an assertion the query may make; emitted as that
 stream's tag (`-metadata:s:N`, `-disposition:N`). RO = read-only: a
@@ -98,9 +94,15 @@ symmetric.
 
     CREATE TYPE cue AS (           -- 094
         index   number,   -- RO
-        start_t number,   -- RO
-        end_t   number,   -- RO
-        text    text);    -- RO   (cues are read, not written, v1)
+        start_t number,   -- W   seconds
+        end_t   number,   -- W   seconds
+        text    text);    -- W
+
+A `cue[]` in a subtitle position IS a WebVTT subtitle stream: reading
+one (`unnest(v.cues)`) and writing one (`ARRAY[ROW(...)::cue, ...]`,
+or `array_agg(ROW(...)::cue)` over rows) are symmetric with chapters,
+and chapters<->cues converts both ways. Emission reuses the `data:`
+WebVTT input mechanism `sqlmpeg.empty_captions()` already uses.
 
 Constraints checked at compile time for constructed chapters:
 start_t < end_t, ascending, non-overlapping.
@@ -115,23 +117,25 @@ start_t < end_t, ascending, non-overlapping.
         chapters    chapter[],
         attachments attachment[],      -- 094
         duration    number,            -- RO
-        title       text,              -- W   container tags:
-        artist      text,              -- W
-        album       text,              -- W
-        album_artist text,             -- W
-        date        text,              -- W
-        genre       text,              -- W
-        comment     text,              -- W
-        composer    text,              -- W
-        track       text,              -- W
-        copyright   text,              -- W
-        encoder     text,              -- W
-        description text);             -- W
+        tags        tag[]);            -- W   container tags
 
-`input('path') f` is a table of ONE `container` row. Two names on
-the alias are not fields: `f.frame` is parser sugar for `f.video[1]`,
-and `f.t` is the seek handle, legal only in `WHERE` trim windows.
-Neither takes part in `SELECT *`.
+    CREATE TYPE tag AS (key text, value text);
+
+Tags are an array, not a set of named columns: no collision between a
+tag key and a column name (`audio`, `track`, `duration` are plausible
+keys), and free-form keys are the only kind - reading and writing
+share one shape. Stream records carry `tags tag[]` the same way
+(`language`, `title` live there, not as fields). DECISION O6: the
+well-known keys stay readable as ACCESSOR SUGAR - `f.title`,
+`a.language` - meaning "the tag named so", resolved only when no real
+field has that name, and never part of `SELECT *`. This keeps `CASE
+WHEN f.title IS NULL ...` readable; the alternative is
+`unnest(f.tags) t WHERE t.key = 'title'` everywhere.
+
+`input('path') f` is a table of ONE `container` row. `f.t` is not a
+field: it is the seek handle, legal only in `WHERE` trim windows, and
+takes no part in `SELECT *`. `f.frame` is REMOVED (a holdover from
+before track rows; it was only ever `f.video[1]`).
 
 A generated source (`ffmpeg.sine(...) s`) is a `container` whose one
 array holds one record with every fact NULL; the other arrays are
@@ -145,10 +149,15 @@ R2. `SELECT *`: over a container, its array columns (stream arrays
     in v/a/s/d order, then `chapters`, `attachments`) - the remux
     shape, never the scalars. Over unnest rows, the record's fields -
     the metadata table. `SELECT a` over unnest rows is the stream.
-R3. Field access: `f.audio[1].language`, `a.language`,
-    `(f.audio[1]).language` read a field. On a filter output the RO
-    facts are NULL (DECISION O5: NULL, or a typed rejection?); W
-    fields read the riding tag.
+R3. Field access: `f.audio[1].codec`, `a.index`, `(f.audio[1]).index`
+    read a field; `a.language` / `f.title` read a tag (O6 sugar).
+    A filter output is still a stream record, so `volume(a, 0.2)
+    .language` is legal - and the filter is a NO-OP: its output is
+    never mapped. The IR pass drops the node and logs a warning. For a
+    W field (a tag) the read folds to the input's value, since tags
+    ride unchanged. For an RO fact it does NOT fold - `scale(v, 640,
+    -2).width` is not `v.width` - the value is NULL (unknown) and the
+    warning says so. (Decides O5: NULL, never a rejection.)
 R4. Construction is "a stream plus W-field columns": in a function
     body, CTE, or SELECT list, `SELECT a.audio[1], 'eng' AS language`
     yields that stream with `language` overridden - the existing tag-
@@ -182,25 +191,28 @@ R9. Homonyms: type names and column/alias names are separate
   "expected audio, got video".
 - Error hints, docs/rows.md tables, and the LLM prompt's column
   sections render from the same data.
+- BREAKING: `f.frame` disappears (`f.video[1]` everywhere: ~24
+  cookbook lines, 13 queries, the README). Pinned bytes unchanged.
 - BREAKING: `.track` disappears. `SELECT a` / `array_agg(a)` /
   `GROUP BY a` / `scale(a, ...)` replace `a.track` everywhere
   (~20 recipes, the queries, tests); `a.track` becomes a typed
   rejection with the hint "the row is the stream: use a". Every
   pinned ffmpeg command stays byte-identical.
+- BREAKING: container and stream tags become `tags tag[]`; the
+  twelve named container columns and `language`/`title` fields are
+  accessor sugar over it (O6).
 - Other behavior changes: `disposition` readable (new), RO-field
-  construction rejected (new), `SELECT *` defined per R2.
+  construction rejected (new), `SELECT *` defined per R2, cues
+  writable, dangling-filter elision with a warning.
 
 ## 8. Open for the maintainer
 
 O1. `disposition` as a readable W field (section 3) - yes/no.
 O2. Constructed chapters must set start_t and end_t; title may be
     NULL. Agree?
-O3. Container W fields: the twelve tags listed, or any free-form key?
-    Today tag columns accept free-form keys on output. Proposed:
-    free-form stays for OUTPUT (ffmpeg accepts any key), the twelve
-    are the READABLE ones.
-O5. Reading an RO fact off a filter output (`scale(f.frame).width`):
-    NULL (SQL's "unknown"; proposed) or a typed rejection?
+O3. (resolved by `tags tag[]`: free-form everywhere.)
+O6. Accessor sugar for well-known tag keys (`f.title`, `a.language`)
+    on top of `tags` - keep, or require the unnest form?
 O4. Attachment read side: ffprobe reports attachments as streams
     (codec_type attachment, filename/mimetype tags). Proposed: they
     populate `f.attachments`, never `f.data`.
