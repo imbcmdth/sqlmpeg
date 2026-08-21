@@ -1,6 +1,8 @@
 # 094 — chapters is an output column: literals, copies, and WebVTT cues
 
-Runs after 092 (chapters as an input array column). The output row
+Runs after 092 (chapters as an input array column) AND after 095 (the
+declared type system) - `chapter` and `attachment` are registered
+types there, not invented here. The output row
 takes the input row's shape: stream arrays, scalar tags, and a
 `chapters` record array. A column named `chapters` holding an array of
 chapter records IS the file's chapter list. The sink options
