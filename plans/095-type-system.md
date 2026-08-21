@@ -1,88 +1,201 @@
-# 095 — A declared type system
+# 095 — The type system (spec for review)
 
-Maintainer directive (2026-08-21): stop relying on ad-hoc shapes;
-declare the types once and derive everything from them. Must land
-BEFORE 094 (chapter/attachment literals) and before the function work,
-or each invents type machinery locally.
+Status: PROPOSED. Review, amend, then implement. After implementation
+this document moves to docs/types.md as the reference.
 
-Evidence the ad-hoc shapes cost real money: three registries must
-agree by hand (`_INPUT_COLUMNS`, `_UNNEST_COLUMNS`, `ROW_SCHEMAS`),
-and 092 had to split `_UNNEST_COLUMNS` because "array column" and
-"array of streams" were one frozenset by accident.
+Why: the compiler carries its shapes as ad-hoc frozensets that must
+agree by hand; 092 had to split one because "array column" and "array
+of streams" were the same set by accident. Functions (096) and record
+literals (094) need declared types to stand on. One source of truth,
+everything else derived - hints, docs, the LLM prompt.
 
-## The vocabulary (built-in, documented; users never declare them)
+Syntax is Postgres's `CREATE TYPE ... AS (...)`. The types are
+BUILT-IN and documented; users do not declare them. (Verified:
+sqlglot parses these declarations and `::audio_stream[]` casts today.)
 
-Handles - opaque references to a graph node, typed by media kind, the
-things filters consume:
+## 1. Scalars
+
+    text      -- SQL text
+    number    -- integer or float; Postgres typing (int/int truncates,
+              -- any float operand gives float)
+    boolean   -- predicates only; not a column type
+
+## 2. Handles - a reference to a stream in the graph
 
     video, audio, subtitle, data
 
-Records - what a row of each kind carries:
+A handle is what filters consume and produce, and what a `-map` maps.
+It carries its riding tags (provenance: language/title that survive
+through filters) but no probed facts. A filter call's type is the
+handle type of its output pad: `volume(x) : audio`, `overlay(v, w) :
+video`. Subtitle and data handles are passthrough-only (no filter
+accepts them).
 
-    video_stream(track video, index number, language text,
-                 title text, codec text, width number, height number,
-                 fps text, color_transfer text, bitrate number,
-                 duration number)
-    audio_stream(track audio, index number, language text,
-                 title text, codec text, channels number,
-                 sample_rate number, channel_layout text,
-                 bitrate number, duration number)
-    subtitle_stream(track subtitle, index, language, title, codec)
-    data_stream(track data, index, language, title, codec)
-    chapter(index number, title text, start_t number, end_t number)
-    attachment(...)   -- 094
-    cue(...)          -- 094
+## 3. Stream records - what a row about a stream carries
 
-The container - the type of an INPUT ROW:
+    CREATE TYPE video_stream AS (
+        track          video,      -- the handle
+        index          number,     -- RO  1-based, agrees with f.video[k]
+        language       text,       -- W   tag
+        title          text,       -- W   tag
+        disposition    text,       -- W   ffmpeg disposition spec
+        codec          text,       -- RO
+        width          number,     -- RO
+        height         number,     -- RO
+        fps            text,       -- RO  verbatim, e.g. 30000/1001
+        color_transfer text,       -- RO
+        bitrate        number,     -- RO
+        duration       number);    -- RO
 
-    container(video video_stream[], audio audio_stream[],
-              subtitle subtitle_stream[], data data_stream[],
-              chapters chapter[], attachments attachment[],
-              frame video, duration number,
-              title text, artist text, album text, album_artist text,
-              date text, genre text, comment text, composer text,
-              track text, copyright text, encoder text,
-              description text)
+    CREATE TYPE audio_stream AS (
+        track          audio,
+        index          number,     -- RO
+        language       text,       -- W
+        title          text,       -- W
+        disposition    text,       -- W
+        codec          text,       -- RO
+        channels       number,     -- RO
+        sample_rate    number,     -- RO
+        channel_layout text,       -- RO
+        bitrate        number,     -- RO
+        duration       number);    -- RO
 
-`t` stays a pseudo-column (a seek handle, not a field).
+    CREATE TYPE subtitle_stream AS (
+        track subtitle, index number, language text, title text,
+        disposition text, codec text);   -- index/codec RO
 
-## Rules
+    CREATE TYPE data_stream AS (
+        track data, index number, language text, title text,
+        disposition text, codec text);   -- index/codec RO
 
-- `input(...) f` is a table of ONE `container` row. `unnest(f.audio)`
-  is `audio_stream[]` -> `audio_stream` rows. Everything in rows.md
-  becomes a consequence of the declarations, not prose.
-- ONE implicit coercion, declared deliberately: a RECORD in stream
-  position means its `.track` handle. That is what keeps
-  `SELECT f.audio` splatting into maps. No other implicit conversion.
-- Filter pad checking becomes type checking against handle types;
-  UDF_ARG_TYPE messages speak the same vocabulary as every other
-  error ("expected audio, got video").
-- Casts to these type names parse today (verified: `::audio_stream`,
-  `::audio_stream[]`, `CREATE TYPE ... AS (...)`), so 094's literals
-  and 095's function RETURNS clauses drop straight in.
+W = writable: an assertion the query may make; emitted as that
+stream's tag (`-metadata:s:N`, `-disposition:N`). RO = read-only: a
+probed fact; a constructed record that sets one is a typed rejection.
+Every W field is nullable; NULL clears.
 
-## Implementation shape
+DECISION (maintainer): `disposition` joins the record as a W field
+(today it is a reserved tag key with no read side). Reading it back
+from ffprobe's disposition flags is cheap and makes the record
+symmetric.
 
-- One `sqlmpeg/types.py`: the declarations as data (name -> fields,
-  field -> type), plus the handle/record/array relationships.
-  `ROW_SCHEMAS`, `_INPUT_COLUMNS`, `_UNNEST_COLUMNS`,
-  `_STREAM_ARRAY_COLUMNS`, `INPUT_TAG_COLUMNS` all become views over
-  it - deleted as separate sources of truth.
-- parser/lower consult the registry instead of frozensets; error
-  hints render from it (so a new column is documented automatically).
-- The LLM prompt renders the type tables from the same registry, the
-  way it already renders sink/input options.
-- No behavior change is intended. Error MESSAGE text will move where
-  it names shapes; that is the whole point, but every message change
-  must be deliberate and the goldens regenerated with eyes on the
-  diff.
+## 4. Non-stream records
 
-## Checks
-ruff, mypy, both suites; every pinned recipe byte-identical (this is a
-refactor, not a feature). Goldens regenerated only for messages whose
-wording intentionally moved.
+    CREATE TYPE chapter AS (
+        index   number,   -- RO  ffprobe's order, 1-based
+        title   text,     -- W
+        start_t number,   -- W   seconds
+        end_t   number);  -- W   seconds
+
+    CREATE TYPE attachment AS (    -- 094
+        filename text,    -- W
+        mimetype text,    -- W
+        path     text);   -- W   source file when constructing;
+                          --     NULL when read from a container
+
+    CREATE TYPE cue AS (           -- 094
+        index   number,   -- RO
+        start_t number,   -- RO
+        end_t   number,   -- RO
+        text    text);    -- RO   (cues are read, not written, v1)
+
+Constraints checked at compile time for constructed chapters:
+start_t < end_t, ascending, non-overlapping.
+
+## 5. The container - the type of an input row
+
+    CREATE TYPE container AS (
+        video       video_stream[],
+        audio       audio_stream[],
+        subtitle    subtitle_stream[],
+        data        data_stream[],
+        chapters    chapter[],
+        attachments attachment[],      -- 094
+        frame       video,             -- sugar: video[1].track
+        duration    number,            -- RO
+        title       text,              -- W   container tags:
+        artist      text,              -- W
+        album       text,              -- W
+        album_artist text,             -- W
+        date        text,              -- W
+        genre       text,              -- W
+        comment     text,              -- W
+        composer    text,              -- W
+        track       text,              -- W
+        copyright   text,              -- W
+        encoder     text,              -- W
+        description text);             -- W
+
+`input('path') f` is a table of ONE `container` row. `t` is not a
+field: it is the seek handle, legal only in `WHERE` trim windows.
+
+A generated source (`ffmpeg.sine(...) s`) is a `container` whose one
+array holds one record: the handle set, every fact NULL, the other
+arrays empty.
+
+## 6. Rules
+
+R1. `unnest(f.<array>) a` turns `T[]` into rows of `T`. Works for the
+    four stream arrays, `chapters`, `attachments`.
+R2. ONE implicit coercion: a stream RECORD in stream position means
+    its `.track`. This is what makes `SELECT f.audio` splat and
+    `SELECT a.track` and `SELECT f.audio[1]` equivalent to their
+    handles. No other implicit conversion exists.
+R3. Field access: `f.audio[1].language`, `a.language`,
+    `(f.audio[1]).language` all read the record field. On a handle
+    (filter output, `f.frame`) there are no fields - typed rejection.
+R4. Construction:
+    - narrow records (chapter, attachment): positional
+      `ROW(...)::chapter`, or `ARRAY[ROW(...)::chapter, ...]`.
+    - stream records: by SELECT aliases in a function body or CTE -
+      `SELECT a.audio[1] AS track, 'eng' AS language` builds an
+      `audio_stream` with `track` and `language` set and every other
+      field NULL. Positional ROW() for stream records is a typed
+      rejection (too wide to be safe).
+    - Setting an RO field in any construction is a typed rejection.
+R5. Tags ARE writable fields. Today's "tag column" is exactly R4's
+    alias construction applied to a row - the two stories merge. A
+    record reaching an output emits its non-NULL W fields.
+R6. The OUTPUT row is positional streams + container scalars +
+    record arrays (`chapters`, `attachments`). It is NOT a `container`:
+    named stream arrays (`... AS audio`) are rejected on output -
+    streams are positional, one way to say it.
+R7. Nullability is SQL's: an outer join's gap side is a NULL record;
+    `COALESCE(b.track, ffmpeg.anullsrc(...))` produces a handle.
+R8. CTE/view rows have the body's column types (an anonymous row
+    type), as in SQL. A function's `RETURNS` names one of the types
+    above, an array of one, or `TABLE(...)` of them.
+R9. Homonyms: type names and column/alias names are separate
+    namespaces (SQL's rule). `f.audio` is an `audio_stream[]`, not an
+    `audio`. Type names are legal as aliases but discouraged in docs.
+
+## 7. What the implementation derives from this
+
+- `sqlmpeg/types.py`: the declarations as data. `ROW_SCHEMAS`,
+  `_INPUT_COLUMNS`, `_UNNEST_COLUMNS`, `_STREAM_ARRAY_COLUMNS`,
+  `INPUT_TAG_COLUMNS`, the tag-key handling, and the per-field
+  writability all become views over it.
+- Filter pad checks = handle-type checks; UDF_ARG_TYPE speaks
+  "expected audio, got video".
+- Error hints, docs/rows.md tables, and the LLM prompt's column
+  sections render from the same data.
+- No behavior change intended beyond: `disposition` readable (new),
+  RO-field construction rejected (new), positional ROW for stream
+  records rejected (new). Every pinned recipe byte-identical.
+
+## 8. Open for the maintainer
+
+O1. `disposition` as a readable W field (section 3) - yes/no.
+O2. Record-by-alias construction requiring `track` to be set, or may
+    a record be all-NULL (a "placeholder")? Proposed: `track` required
+    for stream records; chapters need start_t/end_t.
+O3. Container W fields: the twelve tags listed, or any free-form key?
+    Today tag columns accept free-form keys on output. Proposed:
+    free-form stays for OUTPUT (ffmpeg accepts any key), the twelve
+    are the READABLE ones.
+O4. Attachment read side: ffprobe reports attachments as streams
+    (codec_type attachment, filename/mimetype tags). Proposed: they
+    populate `f.attachments`, never `f.data`.
 
 ## After this lands
-094 (chapter/attachment/cue literals + output columns), then the
-function work (scalar and table-returning), which gets
-`RETURNS audio_stream[]` for free.
+094 (literals, output columns, cues), then 096 (functions: scalar and
+table-returning, with RETURNS over these types).
