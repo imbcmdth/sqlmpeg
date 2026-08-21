@@ -33,12 +33,18 @@ chapter records IS the file's chapter list. The sink options
    chapters` over any row source - a VALUES CTE (the old writing
    shape, now consumed relationally), track rows, or cue rows.
 
-## Cue rows: WebVTT as a row source
+## Cues: WebVTT as rows, both directions
 - `unnest(v.cues) c` over an input whose stream is WebVTT (or a
   sidecar .vtt input) yields rows `index, start_t, end_t, text`.
   ffprobe does not enumerate cues; sqlmpeg parses the VTT text itself
   (it already reads and writes VTT for the empty-captions fill). v1:
   WebVTT only; SRT is a follow-up.
+- WRITING: a `cue[]` in a subtitle position is a WebVTT subtitle
+  stream - `ARRAY[ROW('Hello', 0, 2.5)::cue, ...]` literal, or
+  `array_agg(ROW(c.title, c.start_t, c.end_t)::cue)` over chapter
+  rows (chapters -> cues). Emission: the `data:` WebVTT input that
+  `sqlmpeg.empty_captions()` already builds, with cues in it.
+  Symmetric with chapters; the 095 `cue` type's fields are W.
 - The canonical conversion: WebVTT is HLS's chapter-metadata format,
   so `array_agg(ROW(c.text, c.start_t, c.end_t)::chapter) AS chapters
   FROM input('chapters.vtt') v, unnest(v.cues) c` is the first import
@@ -55,9 +61,10 @@ rewrite.
 ## Removals and sweep
 - Sink options `chapters`, `chapters_from` deleted (tests, prompt
   table regen, errors.md if a captured example names them).
-- Recipe 40 rewritten to the column form; a new recipe for the VTT
-  import; rows.md gains the `chapter` type and cue rows; dialect.md
-  gains `ARRAY[ROW(...)::type]` in the value grammar.
+- Recipe 40 rewritten to the column form; new recipes for the VTT
+  import (cues -> chapters) and its mirror (chapters -> a WebVTT
+  subtitle track); rows.md gains the `chapter`/`cue` types and cue
+  rows; dialect.md gains `ARRAY[ROW(...)::type]` in the value grammar.
 
 ## Waves
 1. Recipes red first (40 rewritten, new VTT-import recipe, a literal
