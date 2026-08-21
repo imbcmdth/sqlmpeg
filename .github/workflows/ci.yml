@@ -1,5 +1,8 @@
 name: CI
 
+# On pull_request, actions/checkout checks out refs/pull/N/merge -- the
+# MERGE RESULT of the PR into main, not the PR branch tip -- so PR runs
+# test what main would become. Keep it that way.
 on:
   push:
     branches: [main]
@@ -34,7 +37,7 @@ jobs:
       # No ffmpeg installed yet, on purpose: the default suite must be
       # deterministic on a bare machine, compiling against
       # tests/data/reference_registry.json wherever a test needs a filter
-      # surface (RFC-007: the snapshot exists for offline CI).
+      # surface -- the snapshot exists for offline CI.
       - name: Test (pytest, exec tests excluded by default)
         run: python -m pytest tests/
 
