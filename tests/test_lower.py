@@ -6096,6 +6096,12 @@ def test_an_unprobed_field_is_null_for_every_row() -> None:
         ("NOT (t.channels = 2)", ["src:f:a:1"]),
         ("t.index = 1", ["src:f:a:0"]),
         ("t.index = 3", ["src:f:a:2"]),
+        ("t.tags.language IN ('eng', 'fra')", ["src:f:a:0", "src:f:a:1"]),
+        # NULL matches nothing, same as `=`: the untagged third track survives
+        # neither the IN nor the NOT IN.
+        ("t.tags.language NOT IN ('eng')", ["src:f:a:1"]),
+        ("t.channels IN (6, 99)", ["src:f:a:1"]),
+        ("t.channels NOT IN (2)", ["src:f:a:1"]),
     ],
 )
 def test_the_compile_time_predicate_evaluator(
@@ -6103,6 +6109,32 @@ def test_the_compile_time_predicate_evaluator(
 ) -> None:
     g = _lower(_row_query(predicate), _row_probes())
     assert [o.ref for o in g.outputs] == expected
+
+
+@pytest.mark.parametrize(
+    ("desugared", "written"),
+    [
+        (
+            "t.tags.language IN ('eng', 'fra')",
+            "t.tags.language = 'eng' OR t.tags.language = 'fra'",
+        ),
+        (
+            "t.tags.language NOT IN ('eng', 'deu')",
+            "t.tags.language != 'eng' AND t.tags.language != 'deu'",
+        ),
+        ("t.channels IN (6)", "t.channels = 6"),
+        ("t.channels NOT IN (2, 99)", "t.channels != 2 AND t.channels != 99"),
+    ],
+)
+def test_in_desugars_to_the_same_graph_as_the_hand_written_chain(
+    desugared: str, written: str
+) -> None:
+    """`IN`/`NOT IN` are a spelling, not a second evaluator: the graph an `IN`
+    query lowers to is identical -- node for node -- to the one its `=`/`OR`
+    (or `!=`/`AND`) equivalent lowers to."""
+    via_in = _lower(_row_query(desugared), _row_probes())
+    via_chain = _lower(_row_query(written), _row_probes())
+    assert via_in.to_dict() == via_chain.to_dict()
 
 
 def test_not_over_an_unknown_stays_unknown() -> None:

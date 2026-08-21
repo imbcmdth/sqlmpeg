@@ -1809,6 +1809,32 @@ def test_a_flag_read_back_off_the_output_finds_the_track(tmp_path: Path) -> None
     assert sinks[0].result.rows == [[2]]
 
 
+def test_in_selects_both_language_tracks_and_not_in_selects_one(tmp_path: Path) -> None:
+    """`IN`/`NOT IN` desugar to `=`/`OR` and `!=`/`AND`, but the row filter
+    still has to run for real against av2.mp4's two tagged audio tracks
+    (`language=eng`, `language=fra`), not just type-check."""
+    _require_fixture(_AV2)
+    both_path = tmp_path / "both.mka"
+    both_query = (
+        "SELECT array_agg(t) "
+        f"FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) t "
+        "WHERE t.tags.language IN ('eng', 'fra')"
+    )
+    _compile_and_run(both_query, both_path)
+    both_streams = _ffprobe_streams(both_path)
+    assert [s["tags"]["language"] for s in both_streams] == ["eng", "fra"]
+
+    one_path = tmp_path / "one.mka"
+    one_query = (
+        "SELECT t "
+        f"FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) t "
+        "WHERE t.tags.language NOT IN ('eng')"
+    )
+    _compile_and_run(one_query, one_path)
+    one_streams = _ffprobe_streams(one_path)
+    assert [s["tags"]["language"] for s in one_streams] == ["fra"]
+
+
 def test_amerge_runs_and_produces_one_multichannel_stream(tmp_path: Path) -> None:
     """`amerge` is excluded from the registry's tables; N_INPUT is what makes
     it callable at all (mirrors the amix exec test), and running it for real

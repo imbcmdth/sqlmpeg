@@ -1391,6 +1391,45 @@ def _unwrap_paren(node: exp.Expr) -> exp.Expr:
     return node
 
 
+def _desugar_in(node: exp.Expr) -> exp.Expr:
+    """Rewrite `x IN (a, b, ...)` / `x NOT IN (...)` into the `=`/`!=` chain.
+
+    Runs in place, splicing the chain into the tree where `node` sat, so
+    every later pass -- including lower's row-predicate evaluator -- sees
+    only AND/OR/comparisons, the one grammar this compiler evaluates. That
+    single rewrite is also where the semantics come from: each element is
+    type-checked as an ordinary `=`/`!=` operand (so a mismatched element
+    is rejected right where it stands), and NULL behaves exactly as it
+    does for `=` -- a NULL operand matches nothing, so `IN` is never TRUE
+    and `NOT IN` is never TRUE either.
+
+    Returns `node` unchanged when it is not an `IN`/`NOT IN` over a
+    literal list -- the subquery form (`IN (SELECT ...)`) is rejected
+    earlier, by `_check_expression`, so it never reaches here.
+    """
+    negate = False
+    target = node
+    if isinstance(node, exp.Not) and isinstance(node.this, exp.Expr):
+        inner = _unwrap_paren(node.this)
+        if isinstance(inner, exp.In):
+            negate, target = True, inner
+    if not isinstance(target, exp.In) or target.args.get("query") is not None:
+        return node
+    operand = target.this
+    elements = [e for e in target.expressions if isinstance(e, exp.Expr)]
+    if not isinstance(operand, exp.Expr) or not elements:
+        return node
+    comparator = exp.NEQ if negate else exp.EQ
+    combine = exp.And if negate else exp.Or
+    chain: exp.Expr = comparator(this=operand.copy(), expression=elements[0].copy())
+    for element in elements[1:]:
+        chain = combine(
+            this=chain, expression=comparator(this=operand.copy(), expression=element.copy())
+        )
+    replaced = node.replace(chain)
+    return replaced if isinstance(replaced, exp.Expr) else chain
+
+
 def _bare_array_error(sub: exp.Column, fallback: exp.Expr) -> SqlmpegError | None:
     """``<alias>.<type>.<name>`` (no subscript) is a 3-part ``exp.Column``.
 
@@ -3166,9 +3205,11 @@ class _Resolver:
         match (a text column never equals a numeric one, whatever the files
         turned out to contain). Everything else is the same closed grammar:
         AND/OR/NOT over comparisons, BETWEEN and IS [NOT] NULL, with only
-        track-row columns and literals as operands.
+        track-row columns and literals as operands. ``IN`` / ``NOT IN`` never
+        reach the dispatch below -- :func:`_desugar_in` rewrites them into
+        that same grammar first.
         """
-        node = _unwrap_paren(node)
+        node = _desugar_in(_unwrap_paren(node))
         if isinstance(node, exp.And | exp.Or):
             self._check_join_predicate(node.this, scope, join)
             expression = node.args.get("expression")
@@ -4128,10 +4169,11 @@ class _Resolver:
 
         The same closed grammar :meth:`_check_row_predicate` checks --
         AND/OR/NOT over comparisons of one accessor against one literal, plus
-        BETWEEN and IS [NOT] NULL -- with an accessor (a ``Dot``-over-
-        ``Bracket`` shape) standing where a row column stood there.
+        BETWEEN and IS [NOT] NULL, IN/NOT IN desugared the same way -- with an
+        accessor (a ``Dot``-over-``Bracket`` shape) standing where a row
+        column stood there.
         """
-        node = _unwrap_paren(node)
+        node = _desugar_in(_unwrap_paren(node))
         if isinstance(node, exp.And | exp.Or):
             self._check_subscript_predicate(node.this, scope, where)
             expression = node.args.get("expression")
@@ -4463,14 +4505,17 @@ class _Resolver:
 
         The grammar is small and closed: ``AND`` / ``OR`` / ``NOT`` over
         comparisons of ONE row column against ONE literal (or against a CASE /
-        ``||`` value), plus ``BETWEEN`` and ``IS [NOT] NULL``. Evaluation is
-        lower's (it has the probes); this
+        ``||`` value), plus ``BETWEEN`` and ``IS [NOT] NULL``. ``IN`` / ``NOT
+        IN`` never reach the dispatch below -- :func:`_desugar_in` rewrites
+        them into an ``=``/``OR`` (or ``!=``/``AND``) chain first, so this is
+        also where an ``IN`` list gets its element-by-element type check.
+        Evaluation is lower's (it has the probes); this
         checks the shape and the TYPES, which are static — a row column's type
         comes from :data:`ROW_SCHEMAS`, not from whatever the file happened to
         contain, so ``t.channels = 'stereo'`` is rejected even for a track
         whose channel count was never probed.
         """
-        node = _unwrap_paren(node)
+        node = _desugar_in(_unwrap_paren(node))
         if isinstance(node, exp.And | exp.Or):
             self._check_row_predicate(node.this, scope, where)
             expression = node.args.get("expression")

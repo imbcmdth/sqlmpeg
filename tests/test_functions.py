@@ -694,7 +694,7 @@ def test_a_rejection_over_an_argument_lands_on_the_argument() -> None:
     """The argument is the writer's own text, so it outranks the body's."""
     sql = (
         "CREATE FUNCTION lang(raw text) RETURNS text AS $$\n"
-        "  SELECT CASE WHEN raw IN ('en') THEN 'eng' ELSE raw END\n"
+        "  SELECT CASE WHEN raw LIKE 'e%' THEN 'eng' ELSE raw END\n"
         "$$ LANGUAGE sql;\n"
         "SELECT lang(t.tags.language) AS language\n"
         "FROM input('a.mka') f, unnest(f.audio) t"

@@ -545,7 +545,8 @@ def gen_pred(ctx: Ctx, depth: int = 0) -> str:
         return f"{gen_value(ctx, depth + 1)} IS {'NOT ' if rng.random() < 0.5 else ''}NULL"
     if r < 0.8:
         vals = ", ".join(gen_value(ctx, depth + 1) for _ in range(rng.randint(1, 3)))
-        return f"{gen_value(ctx, depth + 1)} IN ({vals})"
+        kw = "NOT IN" if rng.random() < 0.5 else "IN"
+        return f"{gen_value(ctx, depth + 1)} {kw} ({vals})"
     if r < 0.85 and ctx.items:
         # A boolean stands alone as a condition.
         return gen_row_col(ctx)

@@ -1888,6 +1888,13 @@ def test_a_join_on_columns_of_different_types_is_rejected() -> None:
     assert "so they can never match" in err.message
 
 
+def test_a_join_on_may_use_in_and_not_in() -> None:
+    sql = _joined(
+        on="ON a.tags.language IN ('eng', 'fra') AND b.channels NOT IN (0)"
+    )
+    assert sorted(_resolve(sql).track_rows) == ["a", "b"]
+
+
 def test_a_join_cannot_match_on_the_row_stream() -> None:
     err = _reject(_joined(on="ON a = b"))
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -2063,6 +2070,11 @@ def test_an_unknown_row_column_in_the_select_list_is_rejected() -> None:
         "NOT (t.tags.language = 'eng')",
         "t.tags.language = 'eng' AND t.channel_layout = 'stereo'",
         "(t.tags.language = 'eng' OR t.tags.language IS NULL) AND t.channels = 2",
+        "t.tags.language IN ('eng', 'fra')",
+        "t.tags.language NOT IN ('eng', 'fra')",
+        "t.channels IN (2, 6)",
+        "t.disposition.forced IN (true, false)",
+        "t.tags.language IN ('eng') AND t.channels = 2",
     ],
 )
 def test_row_predicates_are_admitted(predicate: str) -> None:
@@ -2075,7 +2087,6 @@ def test_row_predicates_are_admitted(predicate: str) -> None:
     "predicate",
     [
         "t.tags.language LIKE 'e%'",
-        "t.tags.language IN ('eng', 'fra')",
         "t.channels BETWEEN SYMMETRIC 2 AND 6",
         "t.channels = t.sample_rate",
         "t.tags.language IS TRUE",
@@ -2100,6 +2111,47 @@ def test_a_row_predicate_is_typed_against_the_static_column_type() -> None:
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'t.tags.language' is text" in err.message
+
+
+def test_an_in_list_types_each_element_and_anchors_on_the_offending_one() -> None:
+    # `2` and `6` are valid; `'x'` is the one that breaks the list, and the
+    # rejection has to point at IT, not at the list or its first element.
+    sql = (
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.channels IN (2, 'x', 6)"
+    )
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t.channels' is number" in err.message
+    assert "a string" in err.message
+    assert err.line == 1
+    assert err.col == sql.index("'x'") + 1
+
+
+def test_in_with_an_empty_list_is_still_rejected() -> None:
+    err = _reject(
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE t.tags.language IN ()"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_in_select_over_a_row_column_still_has_no_streaming_equivalent() -> None:
+    # The subquery form is still a subquery predicate wherever it is spelled --
+    # desugaring only ever touches the literal-list form.
+    err = _reject(
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.tags.language IN (SELECT 'eng')"
+    )
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+
+
+def test_the_rows_md_worked_example_compiles() -> None:
+    res = _resolve(
+        "SELECT t, CASE WHEN t.tags.language IN ('en', 'english') THEN 'eng' "
+        "ELSE t.tags.language END AS language "
+        "FROM input('f.mkv') f, unnest(f.audio) t"
+    )
+    assert res.track_rows["t"].source == "f"
 
 
 def test_a_row_predicate_may_not_compare_the_stream_column() -> None:
@@ -2278,6 +2330,9 @@ def test_bare_array_metadata_access_is_rejected_in_where() -> None:
         "f.audio[1].tags.language = 'eng' AND f.audio[2].tags.language = 'fra'",
         "(f.audio[1].tags.language = 'eng' OR f.audio[1].tags.language IS NULL) "
         "AND f.audio[1].channels = 2",
+        "f.audio[1].tags.language IN ('eng', 'fra')",
+        "f.audio[1].tags.language NOT IN ('eng', 'fra')",
+        "f.audio[1].channels IN (2, 6)",
     ],
 )
 def test_subscript_metadata_predicates_are_admitted(predicate: str) -> None:

@@ -235,8 +235,9 @@ _DIALECT_TAIL = """\
   `chapters` included.
 - `WHERE` over row columns compares a column against a literal; `ON`
   compares a column against another row's column or a literal: `=`, `!=`,
-  `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`. Every
-  one of these is decided while compiling, over probed metadata only --
+  `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL`, `[NOT] IN (literals)`,
+  `AND`/`OR`/`NOT`. Every one of these is decided while compiling, over
+  probed metadata only --
   never a runtime ffmpeg predicate. `ORDER BY` over row columns re-sorts the
   rows (multi-key, Postgres `NULLS FIRST`/`LAST`) -- the one carve-out to
   the No streaming equivalent rule below; frames themselves still never
