@@ -40,12 +40,11 @@ Every FROM item is a compile-time table; the column model per shape is
 | --- | --- | --- |
 | `input('path', name => value, ...) alias` | 1 | alias mandatory; path is a literal, never computed; trailing named options are ffmpeg's per-input flags |
 | `ffmpeg.<source>(name => value, ...) alias` | 1 | generated stream (testsrc2, sine, color, anullsrc, ...), no `-i`; options named-only |
-| `unnest(alias.audio\|video\|subtitle\|data) alias` | one per track | the argument names an input declared earlier in the same FROM |
-| `chapters(alias) alias` | one per chapter | metadata only - no stream column |
+| `unnest(alias.<array>) alias` | one per element | the four stream arrays or `chapters`, of an input declared earlier in the same FROM |
 | `cte_or_view_name [alias]` | its body's rows | a multi-row body is a multi-row source |
 
 Comma between items is a cross join with real multiplicity.
-`JOIN ... ON` exists ONLY between two `unnest` tables: `INNER`,
+`JOIN ... ON` exists ONLY between two `unnest` tables (chapter rows included): `INNER`,
 `LEFT [OUTER]`, `FULL [OUTER]`, each with its own `ON`. An outer
 join's gap side has NULL streams; fill with `COALESCE` and a generated
 source ([rows.md](rows.md#joins)).
@@ -149,7 +148,8 @@ Every one of these is a typed rejection, never a silent reinterpretation:
 - **Identifiers**: double-quoted identifiers (except tag-key aliases);
   the reserved names `ffmpeg` and `sqlmpeg` as aliases.
 - **Timeline**: `WHERE t` on generated sources (give the source its
-  own `duration`); selecting chapter rows as streams; a data/subtitle
+  own `duration`); selecting chapter rows as streams; a bare
+  `f.chapters` in a media query, or subscripting it (`unnest` it); a data/subtitle
   track through any filter (passthrough only).
 
 What a specific rejection looks like, with captured JSON for every

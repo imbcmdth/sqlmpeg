@@ -11,6 +11,7 @@ One row per input: the shape of a container file. Arrays of streams plus the con
 | column | type | notes |
 | --- | --- | --- |
 | `video`, `audio`, `subtitle`, `data` | stream array | splat (`f.audio` = every track), subscript (`f.audio[1]`, 1-based), or `unnest` into track rows. `subtitle`/`data` are passthrough-only |
+| `chapters` | record array | `unnest` into chapter rows; no splat, no subscript. Bare, it prints as one array cell |
 | `frame` | stream | the first video track; sugar for `f.video[1]` |
 | `t` | timeline | only in `WHERE` trim windows: `f.t BETWEEN 5 AND 60`, either bound alone, or against chapter bounds |
 | `duration` | number | probed container duration in seconds |
@@ -20,7 +21,7 @@ Subscripts reach track-row columns without unnest: `f.audio[1].language` (strict
 
 ## Track rows - `unnest(f.audio) t`
 
-One row per track. The argument is an array column of an input declared earlier in the same FROM list; alias mandatory. All four arrays unnest; the schema varies by stream type:
+One row per track. The argument is an array column of an input declared earlier in the same FROM list; alias mandatory. All five array columns unnest - the four stream arrays here, and `chapters` below. The schema varies by stream type:
 
 | column | type | audio | video | subtitle | data |
 | --- | --- | --- | --- | --- | --- |
@@ -38,9 +39,9 @@ One row per track. The argument is an array column of an input declared earlier 
 
 `WHERE` over row columns filters tracks; `ORDER BY` re-sorts them (multi-key, Postgres NULL placement) - without it, rows keep file order, which is player-visible and never changed implicitly. Both take the compile-time predicate grammar: `=`, `!=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, statically type-checked.
 
-## Chapter rows - `chapters(f)`
+## Chapter rows - `unnest(f.chapters) c`
 
-One row per chapter, from the container. No `track` column - a chapter is not a stream, so there is nothing to select into a media query; the columns feed trim windows (`WHERE f.t BETWEEN c.start_t AND c.end_t`), fan-out destinations, tag columns, and table/CSV output.
+The same shape as track rows, over the container's chapter list. No `track` column - a chapter is not a stream, so nothing here can be selected into a media query; the columns feed trim windows (`WHERE f.t BETWEEN c.start_t AND c.end_t`), fan-out destinations, tag columns, and table/CSV output. Chapter rows cross join with track rows like any other pair of sources.
 
 | column | type | notes |
 | --- | --- | --- |
@@ -104,6 +105,6 @@ The row count is the RESOLVED count against the actual file: a `WHERE` that narr
 
 ## Inspecting
 
-Any of these shapes prints as a table with a bare SELECT (no COPY), or as CSV with `COPY ... TO STDOUT WITH (format 'csv')` - [recipes 30-32](examples.md#30-look-at-a-files-tracks-as-a-table). A bare input array column (`f.audio`, not subscripted) prints as one cell, Postgres array-literal style - `{<audio 0:a:0>,<audio 0:a:1>}`, braces even for one element; a subscript (`f.audio[1]`) or a track row's own `.track` still prints its plain `<audio 0:a:0>` placeholder.
+Any of these shapes prints as a table with a bare SELECT (no COPY), or as CSV with `COPY ... TO STDOUT WITH (format 'csv')` - [recipes 30-32](examples.md#30-look-at-a-files-tracks-as-a-table). A bare input array column (`f.audio`, not subscripted) prints as one cell, Postgres array-literal style - `{<audio 0:a:0>,<audio 0:a:1>}`, braces even for one element; a subscript (`f.audio[1]`) or a track row's own `.track` still prints its plain `<audio 0:a:0>` placeholder. `f.chapters` prints the same way, its records parenthesized in schema order: `{(1,Intro,0.0,1.0),(2,Credits,1.0,2.0)}`.
 
 `GROUP BY` and `array_agg` are legal here too - table mode has no destination to fan out over, so every group just prints as one row, in first-appearance order, `array_agg` an array cell of the group's tracks. It is how you preview a fan-out COPY's partitions before writing any file - [recipe 56](examples.md#56-preview-a-grouped-shape-as-a-table).

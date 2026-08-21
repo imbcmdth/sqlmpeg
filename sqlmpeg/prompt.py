@@ -274,18 +274,18 @@ _DIALECT_TAIL = """\
   missing side.
 
 ### Chapters
-- `chapters(<alias>)` in `FROM` is a sibling of `unnest(...)`: a compile-time
-  TABLE, one row per chapter of that input, straight from its container.
-  `chapters(f)` takes exactly one bare input alias (no array, no subscript)
-  and needs its own alias: `FROM input('film.mkv') f, chapters(f) c`. It may
-  not combine with `unnest(...)` or a second `chapters(...)` in the same
-  query -- neither has anything to align against the other.
+- `chapters` is an array column of the input alias, an array of records;
+  unnest it like a track array: `FROM input('film.mkv') f,
+  unnest(f.chapters) c`. Chapter rows cross join with track rows like any
+  other source. Bare `f.chapters` is a value - it prints as one array cell
+  in a metadata query; in a media `COPY`, or subscripted, it is a typed
+  rejection (unnest it).
 - Every row carries `index` (1-based, ffprobe's own chapter order), `title`,
-  `start_t`, `end_t` (seconds). There is no `track` column at all -- a
-  chapter is not a stream -- so `chapters(...)` can only be read as a
-  metadata query (no `COPY`, or `COPY ... WITH (FORMAT csv)`); selecting one
-  of its columns into a media `COPY` is a typed rejection. `WHERE`/`ORDER BY`
-  over its columns work exactly like a track row's.
+  `start_t`, `end_t` (seconds). There is no `track` column -- a chapter is
+  not a stream -- so selecting one of its columns into a media `COPY` is a
+  typed rejection; the columns feed `WHERE`/`ORDER BY`, trim windows
+  (`WHERE f.t BETWEEN c.start_t AND c.end_t`), fan-out destinations, and
+  tag columns, exactly like a track row's.
 - To WRITE chapters, define them with a VALUES CTE and hand it to a sink
   option: `WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro'),
   (60, 300, 'Act One')) COPY (...) TO 'out.mkv' WITH (chapters marks)`. The
@@ -505,6 +505,14 @@ A handful of names are exceptions to "one stream in, one filter, one call":
   to ffmpeg is however many streams you wrote; give `inputs => <n>`
   explicitly only if you need to override that. `interleave`/`ainterleave`
   are the same shape, but their count option is `nb_inputs`, not `inputs`.
+  `ladspa(audio, ..., file => '<library>', plugin => '<label>')` is the
+  same shape with no count option at all - the loaded plugin's ports
+  decide.
+- Plugin filters compile like any other call when the build ships them:
+  `frei0r(video, filter_name => '<plugin>', filter_params => 'a|b')` and
+  the source `ffmpeg.frei0r_src(...)` (found via the `FREI0R_PATH`
+  environment variable), and `ladspa` above (`LADSPA_PATH`). Plugin
+  parameters are opaque strings; the plugin defines their meaning.
 - `ffmpeg.channelsplit(audio)`, `ffmpeg.acrossover(audio)`, and
   `ffmpeg.extractplanes(video)` are the one exception to "namespaced options
   are all named": each RETURNS AN ARRAY (one stream per channel, per
@@ -573,7 +581,7 @@ cannot seek an output it copies, so that one becomes one command per file,
 ```sql-probed
 COPY (
   SELECT f.video[1], f.audio[1]
-  FROM input('film.mkv') f, chapters(f) c
+  FROM input('film.mkv') f, unnest(f.chapters) c
   WHERE f.t BETWEEN c.start_t AND c.end_t
 ) TO ('ch' || c.index::text || '.mkv')
 ```
