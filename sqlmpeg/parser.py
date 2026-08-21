@@ -5045,10 +5045,17 @@ class _Resolver:
 def resolve(tree: exp.Expression) -> Resolved:
     """Validate the AST against the v0 dialect and build the input table.
 
+    User-defined functions are lifted out and inlined first
+    (:func:`sqlmpeg.functions.expanded`), so what the resolver validates is
+    always a script with no ``CREATE FUNCTION`` and no call to one left in it.
+
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
+    from .functions import expanded  # deferred: functions.py imports this module
+
     try:
-        return _Resolver().run(tree)
+        with expanded(tree) as script:
+            return _Resolver().run(script)
     except SqlmpegError:
         raise
     except Exception as err:  # backstop: guardrail #7, no panics on user input
