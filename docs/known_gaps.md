@@ -13,6 +13,20 @@ output is plain ffmpeg, so the two mix freely in a script.
 | Protocol options | `-headers`, `-user_agent`, `-rtsp_transport`, `-timeout` | Network inputs and outputs are passed to ffmpeg verbatim; per-protocol tuning options have no input/sink spelling. Authenticated URLs work only if the credential fits in the URL itself. |
 | Lossless concat | concat demuxer (`-f concat -i list.txt -c copy`) | Joining files without re-encoding needs the demuxer's list-file protocol. `concat` in sqlmpeg is the filter, which re-encodes. |
 
+## Not callable
+
+- Variable-pad filters (`split`, `concat`) and multi-output filters
+  (`scale2ref`, `feedback`): `UNSUPPORTED_SQL`. `UNION ALL` is concat;
+  the compiler inserts its own splits. The N-input set (`amix`,
+  `hstack`, `vstack`, `amerge`, `ffmpeg.join`, `interleave`,
+  `ainterleave`, `ladspa`) and the array-returning trio
+  (`channelsplit`, `acrossover`, `extractplanes`) are the exceptions.
+- Sources with more than one output pad (`avsynctest`, `movie`); all
+  sinks.
+- Options typed `binary` or `dictionary`: setting one is
+  `FILTER_OPTION_TYPE`; the filter's other options work.
+- Runtime filter commands (`sendcmd`, `zmq`).
+
 ## Sharp edges
 
 - **Stream-copied splits snap to keyframes.** An output fan-out that

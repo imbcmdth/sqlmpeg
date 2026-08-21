@@ -1314,3 +1314,102 @@ $ sqlmpeg compile -f query.sql
 ffmpeg -i tests/fixtures/av-2eng.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy \
   -metadata:s:1 language=eng -map 0:a:1 -c:2 copy -metadata:s:2 language=eng combo.mkv
 ```
+
+## 58. Burn a title onto the picture
+
+`drawtext` works out of the box; the font is an option like any other, so name one - fontconfig fallbacks vary by build, and a named file is the same everywhere:
+
+```pgsql
+COPY (
+  SELECT drawtext(f.frame, text => :'text', fontfile => :'font', fontsize => 48, x => 20, y => 20, fontcolor => 'white'),
+         f.audio[1]
+  FROM input(:'source') f
+) TO :'dest'
+```
+
+```
+$ sqlmpeg compile -f query.sql -v text=Hello -v font=arial.ttf -v source=film.mkv -v dest=titled.mp4
+ffmpeg -i film.mkv -filter_complex \
+  '[0:v:0]drawtext=text=Hello:fontfile=arial.ttf:fontsize=48:x=20:y=20:fontcolor=white[out0]' \
+  -map '[out0]' -map 0:a:0 -c:1 copy titled.mp4
+```
+
+## 59. Turn an image sequence into a video, and back
+
+An image sequence is an input like any other - ffmpeg's `%04d` pattern names the files, and `framerate` says how fast to play them:
+
+```sql
+COPY (SELECT f.frame FROM input(:'frames', framerate => 24) f)
+TO :'dest' WITH (video_codec 'libx264', crf 18)
+```
+
+```
+$ sqlmpeg compile -f query.sql -v frames=frames/%04d.png -v dest=out.mp4
+ffmpeg -framerate 24 -i frames/%04d.png -map 0:v:0 -c:0 libx264 -crf:0 18 out.mp4
+```
+
+The reverse is a pattern in the destination - here one frame per second:
+
+```pgsql
+COPY (SELECT fps(f.frame, 1) FROM input(:'source') f) TO :'dest'
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=frame-%04d.png
+ffmpeg -i film.mkv -filter_complex '[0:v:0]fps=fps=1[out0]' -map '[out0]' frame-%04d.png
+```
+
+## 60. Draw a waveform for an audio file
+
+`showwaves` is an audio-to-video filter: it takes the track and returns a picture. Select the same track again as audio and the result is a video with sound - the compiler splits the stream for you:
+
+```pgsql
+COPY (
+  SELECT showwaves(f.audio[1], size => '1280x240', mode => 'line'), f.audio[1]
+  FROM input(:'source') f
+) TO :'dest'
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=song.mp3 -v dest=waves.mp4
+ffmpeg -i song.mp3 -filter_complex \
+  '[0:a:0]asplit=2[src_f_a_0_split0][out1];'\
+'[src_f_a_0_split0]showwaves=size=1280x240:mode=line[out0]' -map '[out0]' -map '[out1]' \
+  waves.mp4
+```
+
+## 61. Record a stream
+
+A URL is an input path; ffmpeg owns the protocol. Stream-copy a live HLS or RTMP source straight to disk:
+
+```sql
+COPY (SELECT f.video[1], f.audio[1] FROM input(:'url') f) TO :'dest'
+```
+
+```
+$ sqlmpeg compile -f query.sql -v url=https://example.com/live/stream.m3u8 -v dest=capture.mp4
+ffmpeg -i https://example.com/live/stream.m3u8 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy \
+  capture.mp4
+```
+
+Add `WITH (duration 60)` to stop after a minute; per-protocol options (headers, transports) are not expressible yet - see [known_gaps.md](known_gaps.md).
+
+## 62. Use a plugin filter
+
+`frei0r` loads effect plugins at runtime (most builds ship it enabled); its options name the plugin and pass its parameters, and it compiles like any other filter:
+
+```pgsql
+COPY (
+  SELECT frei0r(f.frame, filter_name => 'glow', filter_params => '0.5'), f.audio[1]
+  FROM input(:'source') f
+) TO :'dest'
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=glow.mp4
+ffmpeg -i film.mkv -filter_complex \
+  '[0:v:0]frei0r=filter_name=glow:filter_params=0.5[out0]' -map '[out0]' -map 0:a:0 -c:1 \
+  copy glow.mp4
+```
+
+ffmpeg finds plugins through the `FREI0R_PATH` environment variable. Audio plugins go through `ladspa` the same way.

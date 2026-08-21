@@ -115,12 +115,7 @@ To choose which tracks to pass in the first place (by language, codec, resolutio
 
 ## Not supported
 
-Not callable:
-
-- Variable-pad filters (`split`, `concat`) and multi-output filters (`scale2ref`, `feedback`), except the array-returning and N-input sets above. Calling one: `UNSUPPORTED_SQL`.
-- Sources with more than one output pad (`avsynctest`, `movie`); all sinks.
-- Options typed `binary` or `dictionary`: setting one is `FILTER_OPTION_TYPE`; the filter's other options work.
-- Runtime filter commands (`sendcmd`, `zmq`).
+The canonical list of what cannot be called or expressed is [known_gaps.md](known_gaps.md).
 
 ## Introspection and binaries
 
