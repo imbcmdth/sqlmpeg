@@ -912,15 +912,15 @@ $ sqlmpeg -f query.sql
 
 ## 40. Write chapters
 
-Chapters are rows too, so define them with `VALUES` and hand them to the sink. They compile to one extra self-contained input - no file on disk:
+A `chapters` column IS the file's chapter list, the same shape `unnest(f.chapters)` reads. Build it from `chapter` records; it compiles to one extra self-contained input - no file on disk:
 
 ```pgsql
 COPY (
-  WITH marks(start_t, end_t, title) AS (
-    VALUES (0, 60, 'Intro'), (60, 300, 'Act One')
-  )
-  SELECT f.video[1], f.audio[1] FROM input(:'source') f
-) TO :'dest' WITH (chapters marks)
+  SELECT f.video[1], f.audio[1],
+         ARRAY[ROW('Intro', 0, 60)::chapter,
+               ROW('Act One', 60, 300)::chapter] AS chapters
+  FROM input(:'source') f
+) TO :'dest'
 ```
 
 ```
@@ -1431,3 +1431,38 @@ ffmpeg -i film.mkv -filter_complex \
 ```
 
 ffmpeg finds plugins through the `FREI0R_PATH` environment variable. Audio plugins go through `ladspa` the same way.
+
+## 63. Copy or rebuild a chapter list
+
+`g.chapters AS chapters` takes another file's chapters wholesale, and `NULL AS chapters` writes none at all:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1], g.chapters AS chapters
+  FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-chapters.mkv') g
+) TO 'borrowed.mkv'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-chapters.mkv -map 0:v:0 -c:0 copy   -map 0:a:0 -c:1 copy -map_chapters 1 borrowed.mkv
+```
+
+Gathering rows builds one instead. A `VALUES` list is just another row source, so this compiles to exactly the same command as [recipe 40](#40-write-chapters) - two spellings, one file:
+
+```sql
+COPY (
+  WITH marks(start_t, end_t, title) AS (
+    VALUES (0, 60, 'Intro'), (60, 300, 'Act One')
+  )
+  SELECT f.video[1], f.audio[1],
+         array_agg(ROW(m.title, m.start_t, m.end_t)::chapter) AS chapters
+  FROM input(:'source') f, marks m
+  GROUP BY f.video[1], f.audio[1]
+) TO :'dest'
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=chaptered.mkv
+ffmpeg -i film.mkv -f ffmetadata -i   'data:text/plain;''base64,''O0ZGTUVUQURBVEExCltDSEFQVEVSXQpUSU1FQkFTRT0xLzEKU1RBUlQ9MApFTkQ9NjAKdGl0bGU9SW50cm8KW0NIQVBURVJdClRJTUVCQVNFPTEvMQpTVEFSVD02MApFTkQ9MzAwCnRpdGxlPUFjdCBPbmUK'   -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map_chapters 1 chaptered.mkv
+```
