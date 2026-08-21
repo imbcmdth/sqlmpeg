@@ -177,6 +177,16 @@ from sqlglot import exp
 from sqlglot.errors import ParseError, SqlglotError
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
+from sqlmpeg.types import (
+    CHAPTERS_COLUMN,
+    INPUT_COLUMNS,
+    INPUT_DURATION_COLUMN,
+    INPUT_TAG_COLUMNS,
+    ROW_SCHEMAS,
+    ROW_STREAM_COLUMN,
+    STREAM_ARRAY_COLUMNS,
+    UNNEST_COLUMNS,
+)
 
 __all__ = [
     "FILTER_NAMESPACE",
@@ -250,116 +260,12 @@ _BRACKET_ALLOWED = frozenset({"this", "expressions"})
 # its own explicit rejection below.
 _COPY_ALLOWED = frozenset({"this", "kind", "credentials", "files", "params"})
 
-# The scalar pseudo-column every INPUT alias carries: the probed container
-# duration in seconds. A value, never a stream, so it is only legal inside a
-# compile-time expression; lower reads it off the probe.
-INPUT_DURATION_COLUMN = "duration"
-
-# The record-array pseudo-column every INPUT alias carries: the container's
-# chapter list. An array VALUE like the stream arrays, unnested the same way,
-# but its records are not streams -- no subscript, nothing to select as output.
-CHAPTERS_COLUMN = "chapters"
-
-# The structural column names an INPUT alias exposes. A CTE alias exposes
-# whatever its body named with AS, so the whitelist does not apply there (lower
-# checks those). `subtitle`/`data` have the same array/subscript/splat surface
-# as video/audio but are passthrough-only downstream (lower enforces that half).
-_INPUT_COLUMNS = frozenset(
-    {
-        "frame",
-        "video",
-        "audio",
-        "subtitle",
-        "data",
-        "t",
-        INPUT_DURATION_COLUMN,
-        CHAPTERS_COLUMN,
-    }
-)
-
-# The container tags an INPUT alias also exposes, as text pseudo-columns read
-# off the probe's `format.tags`. Values, never streams, like `duration`; a key
-# the file does not carry reads NULL. Ordered as the hints name them.
-INPUT_TAG_COLUMNS = (
-    "title",
-    "artist",
-    "album",
-    "album_artist",
-    "date",
-    "genre",
-    "comment",
-    "composer",
-    "track",
-    "copyright",
-    "encoder",
-    "description",
-)
+# Membership form of the container tag columns; every other column set this
+# module works with is a view imported from sqlmpeg.types.
 _INPUT_TAG_COLUMNS = frozenset(INPUT_TAG_COLUMNS)
 
 # What a hint says about them: three keys standing for the twelve.
 _INPUT_TAGS_HINT = f"container tags ({', '.join(INPUT_TAG_COLUMNS[:3])}, ...)"
-
-# The array columns whose elements are STREAMS: the only ones a subscript or
-# a `[k].<column>` metadata accessor reaches.
-_STREAM_ARRAY_COLUMNS = frozenset({"video", "audio", "subtitle", "data"})
-
-# The array columns `unnest(<alias>.<name>)` accepts. Exactly the
-# array-typed half of `_INPUT_COLUMNS`: `frame` is one stream, `t` is a
-# timeline and `duration` is a scalar, and none of them is a set of rows.
-_UNNEST_COLUMNS = _STREAM_ARRAY_COLUMNS | {CHAPTERS_COLUMN}
-
-# The compile-time type of a track-row column. `stream` is the track itself
-# (the only column that can BE an output); `text` and `number` are probed
-# metadata, comparable against literals of the matching kind and nothing else.
-RowColumnType = str  # "stream" | "text" | "number"
-
-ROW_STREAM_COLUMN = "track"
-
-# Every row type carries these. `index` is 1-BASED, deliberately: it is the
-# same number `<alias>.<type>[k]` takes, so `WHERE t.index = 1` and
-# `f.audio[1]` name the same track. (probe's `StreamMeta.index` is 0-based;
-# lower does the +1.)
-_ROW_COMMON: dict[str, RowColumnType] = {
-    ROW_STREAM_COLUMN: "stream",
-    "index": "number",
-    "language": "text",
-    "title": "text",
-    "codec": "text",
-}
-
-# `data` rows get the caption schema: a data track has no dimensions, no
-# channels and no frame rate, and inventing columns a probe never fills would
-# just make every one of them NULL.
-ROW_SCHEMAS: dict[str, dict[str, RowColumnType]] = {
-    "audio": _ROW_COMMON
-    | {
-        "channels": "number",
-        "channel_layout": "text",
-        "sample_rate": "number",
-        "bitrate": "number",
-        "duration": "number",
-    },
-    "video": _ROW_COMMON
-    | {
-        "width": "number",
-        "height": "number",
-        "fps": "text",  # verbatim "30000/1001", exactly as ffprobe prints it
-        "bitrate": "number",
-        "duration": "number",
-        "color_transfer": "text",
-    },
-    "subtitle": dict(_ROW_COMMON),
-    "data": dict(_ROW_COMMON),
-    # `unnest(f.chapters)` rows: no `track` column at all -- a chapter is not
-    # a stream, so there is nothing to select as output, only metadata to read
-    # or filter on. `index` is ffprobe's own chapter order, 1-based.
-    CHAPTERS_COLUMN: {
-        "index": "number",
-        "title": "text",
-        "start_t": "number",
-        "end_t": "number",
-    },
-}
 
 # sqlglot's Postgres dialect INDEX_OFFSET. Parsing rebases a subscript by
 # -INDEX_OFFSET and generating adds it back; see the module docstring.
@@ -550,7 +456,7 @@ def is_value_expr(node: exp.Expr | None) -> bool:
 
 def _is_input_column(name: str) -> bool:
     """True for a column name an INPUT alias exposes, structural or tag."""
-    return name in _INPUT_COLUMNS or name in _INPUT_TAG_COLUMNS
+    return name in INPUT_COLUMNS or name in _INPUT_TAG_COLUMNS
 
 
 def _is_input_duration(node: exp.Expr | None, scope: dict[str, str]) -> bool:
@@ -1191,7 +1097,7 @@ def _bare_array_error(sub: exp.Column, fallback: exp.Expr) -> SqlmpegError | Non
         isinstance(db_node, exp.Expr)
         and not sub.args.get("catalog")
         and isinstance(table_node, exp.Expr)
-        and _ident_name(table_node) in _UNNEST_COLUMNS
+        and _ident_name(table_node) in UNNEST_COLUMNS
     ):
         alias = _ident_name(db_node)
         array_column = _ident_name(table_node)
@@ -3060,13 +2966,13 @@ class _Resolver:
                 hint="a track row's columns are PROBED metadata, so its tracks "
                 "must come from a file: unnest an input('path') alias",
             )
-        if column not in _UNNEST_COLUMNS:
+        if column not in UNNEST_COLUMNS:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"'{source}.{column}' is not an array column",
                 argument,
                 fallback=unnest,
-                hint=f"unnest one of {_listed_columns(_UNNEST_COLUMNS)}, "
+                hint=f"unnest one of {_listed_columns(UNNEST_COLUMNS)}, "
                 f"e.g. unnest({source}.audio) t",
             )
 
@@ -3355,7 +3261,7 @@ class _Resolver:
                     f"unknown column '{name}.{sub.name}'",
                     sub,
                     fallback=select,
-                    hint=f"an input exposes {', '.join(sorted(_INPUT_COLUMNS))} "
+                    hint=f"an input exposes {', '.join(sorted(INPUT_COLUMNS))} "
                     f"and {_INPUT_TAGS_HINT}",
                 )
             # A track-row table's schema is fixed by the stream type it
@@ -3433,14 +3339,14 @@ class _Resolver:
                 fallback=fallback,
                 hint=chapters_unnest_hint(alias),
             )
-        if array_column not in _STREAM_ARRAY_COLUMNS:
+        if array_column not in STREAM_ARRAY_COLUMNS:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"'{alias}.{array_column}' has no per-track metadata",
                 inner,
                 fallback=fallback,
                 hint=f"metadata accessors need an array column: "
-                f"{_listed_columns(_STREAM_ARRAY_COLUMNS)}",
+                f"{_listed_columns(STREAM_ARRAY_COLUMNS)}",
             )
         if subscript_index(bracket) is None:  # defensive: _check_subscript checked it
             raise _error(

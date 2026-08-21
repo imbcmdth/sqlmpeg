@@ -301,13 +301,8 @@ from sqlmpeg.macros import INPUT_MACROS, MACROS, InputMacro, Macro, macro_names
 from sqlmpeg.parser import (
     _ARITHMETIC,
     _ARITHMETIC_NAMES,
-    CHAPTERS_COLUMN,
     FILTER_NAMESPACE,
-    INPUT_DURATION_COLUMN,
-    INPUT_TAG_COLUMNS,
     MACRO_NAMESPACE,
-    ROW_SCHEMAS,
-    ROW_STREAM_COLUMN,
     RawRowJoin,
     RawSink,
     RawSinkOption,
@@ -348,11 +343,18 @@ from sqlmpeg.table import (
     TableResult,
     TableSink,
 )
+from sqlmpeg.types import (
+    CHAPTERS_COLUMN,
+    FRAME_COLUMN,
+    INPUT_DURATION_COLUMN,
+    INPUT_TAG_COLUMNS,
+    ROW_SCHEMAS,
+    ROW_STREAM_COLUMN,
+    STREAM_TAG_COLUMNS,
+    TIME_COLUMN,
+)
 
 __all__ = ["lower", "lower_table"]
-
-_FRAME_COLUMN = "frame"
-_TIME_COLUMN = "t"
 
 # The array-typed pseudo-columns an input exposes, and their element type.
 # subtitle/data have the identical array/subscript/splat surface but are
@@ -385,9 +387,8 @@ _UNSUPPORTED_KIND = "<expr>"
 # only kinds that may occupy a call's leading (stream input) positions.
 _STREAM_KINDS: frozenset[str] = frozenset({"video", "audio", "subtitle", "data"})
 
-# Provenance tags copied onto a passthrough Output. "und" is what mp4 muxers
-# stamp on untagged streams; it carries no information, so it is not copied.
-_PROVENANCE_KEYS = ("language", "title")
+# What an mp4 muxer stamps on an untagged stream: no information, so it is
+# never copied onto a passthrough Output.
 _UNDEFINED_LANGUAGE = "und"
 
 _TIME_HINT = (
@@ -3474,7 +3475,7 @@ class _Lowerer:
         if parsed is None:
             return False
         table_node = parsed[0].args.get("table")
-        if table_node is None or _fold(parsed[0].this) != _TIME_COLUMN:
+        if table_node is None or _fold(parsed[0].this) != TIME_COLUMN:
             return False
         return not isinstance(env.bindings.get(_fold(table_node)), _RowBinding)
 
@@ -4253,7 +4254,7 @@ class _Lowerer:
                     hint=_TIME_HINT,
                 )
             alias = _fold(table_node)
-            if _fold(column.this) != _TIME_COLUMN:
+            if _fold(column.this) != TIME_COLUMN:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"only the time column '{alias}.t' can be filtered, "
@@ -5058,7 +5059,7 @@ class _Lowerer:
         * anything else — an unknown column.
         """
         produces = f"{binding.display} produces 1 {binding.output} stream"
-        if name == _TIME_COLUMN:
+        if name == TIME_COLUMN:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"'{binding.alias}.t' is a time column, not a stream",
@@ -5066,7 +5067,7 @@ class _Lowerer:
                 fallback=select,
                 hint=_SOURCE_DURATION_HINT,
             )
-        if name == _FRAME_COLUMN:
+        if name == FRAME_COLUMN:
             if binding.output != "video":
                 raise _error(
                     ErrorCode.STREAM_NOT_FOUND,
@@ -5131,7 +5132,7 @@ class _Lowerer:
         anchor: exp.Expr,
         select: exp.Select,
     ) -> _Value:
-        if name == _TIME_COLUMN:
+        if name == TIME_COLUMN:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"'{alias}.t' is a time column, not a stream",
@@ -5178,7 +5179,7 @@ class _Lowerer:
                 fallback=select,
                 hint=chapters_unnest_hint(alias),
             )
-        if name == _FRAME_COLUMN:
+        if name == FRAME_COLUMN:
             if index is not None:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -5397,14 +5398,14 @@ class _Lowerer:
         # v0 compat: a CTE that selects exactly one video column is reachable
         # as `<cte>.frame` whatever (if anything) its AS named it. `frame` is
         # singular sugar, so an array column does not answer to it.
-        if name == _FRAME_COLUMN and _is_single_video_column(binding):
+        if name == FRAME_COLUMN and _is_single_video_column(binding):
             return binding.columns[0]
         return None
 
     def _cte_columns_hint(self, binding: _CteBinding) -> str:
         names = {column.name for column in binding.columns if column.name is not None}
         if _is_single_video_column(binding):
-            names.add(_FRAME_COLUMN)
+            names.add(FRAME_COLUMN)
         if not names:
             return (
                 f"'{binding.name}' has no named columns; name them with AS "
@@ -6896,7 +6897,7 @@ def _provenance(stream: _Stream) -> dict[str, str]:
     if source is None:
         return {}
     metadata: dict[str, str] = {}
-    for key in _PROVENANCE_KEYS:
+    for key in STREAM_TAG_COLUMNS:
         value = source.metadata.get(key)
         if value is None:
             continue

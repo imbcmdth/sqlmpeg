@@ -1,0 +1,406 @@
+"""The built-in types, declared as data.
+
+Every shape the compiler knows is declared once here — the scalars, the four
+stream records, the non-stream records, and the `container` an `input()`
+alias is one row of. The column sets parser and lower work with
+(:data:`ROW_SCHEMAS`, :data:`INPUT_COLUMNS`, :data:`UNNEST_COLUMNS`, ...) are
+VIEWS over these declarations, computed at the bottom of this module. Nothing
+else may restate them.
+
+A :class:`Type` is a name, a kind, and an ordered tuple of :class:`Field`. A
+field's ``type`` is another type's name, ``[]``-suffixed for an array.
+
+Kinds:
+
+    scalar     ``text``, ``number``, ``boolean`` — Postgres typing; boolean
+               is predicates only, never a column.
+    handle     internal, with no name in the language: ``stream`` is the
+               graph node behind a stream record, ``seek`` is ``<alias>.t``.
+    stream     a record ABOUT a stream: ``video_stream``, ``audio_stream``,
+               ``subtitle_stream``, ``data_stream``. The record IS the
+               stream; identity is nominal, never field-by-field.
+    record     a record that is not a stream: ``tag``, ``flag``, ``chapter``,
+               ``attachment``, ``cue``.
+    container  the type of an `input()` row.
+
+Field flags:
+
+    writable   W: an assertion a query may make about the value, emitted as
+               that stream's or container's metadata. Its opposite covers
+               both a probed fact (RO — setting it is a rejection) and a
+               handle, which is not a value a query can assert either way.
+    exposed    the compiler surfaces this field TODAY. A field declared here
+               but not yet wired up carries ``exposed=False`` and stays out
+               of every view.
+    tag_entry  the field is one named entry of its type's ``tags`` map,
+               exposed as a column of its own.
+
+Field ORDER is column order: a row prints its fields in declaration order,
+so every declaration below is written in the order that row already prints.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+__all__ = [
+    "CHAPTERS_COLUMN",
+    "COLUMN_TYPES",
+    "FRAME_COLUMN",
+    "INPUT_COLUMNS",
+    "INPUT_DURATION_COLUMN",
+    "INPUT_TAG_COLUMNS",
+    "ROW_COMMON",
+    "ROW_SCHEMAS",
+    "ROW_STREAM_COLUMN",
+    "STREAM_ARRAY_COLUMNS",
+    "STREAM_TAG_COLUMNS",
+    "TIME_COLUMN",
+    "TYPES",
+    "UNNEST_COLUMNS",
+    "Field",
+    "RowColumnType",
+    "Type",
+    "TypeKind",
+    "element_type",
+    "is_array",
+    "resolve",
+]
+
+TypeKind = Literal["scalar", "handle", "stream", "record", "container"]
+
+# The compile-time type of a row column. `stream` is the row's own stream (the
+# only column that can BE an output); `text` and `number` are probed metadata,
+# comparable against literals of the matching kind and nothing else. The three
+# names are type names, so a field whose type is one of them is a column.
+RowColumnType = str  # "stream" | "text" | "number"
+
+COLUMN_TYPES = frozenset({"stream", "text", "number"})
+
+_ARRAY_SUFFIX = "[]"
+
+
+@dataclass(frozen=True)
+class Field:
+    """One field of a type: a name, a type reference, and its flags."""
+
+    name: str
+    type: str
+    writable: bool
+    exposed: bool = True
+    tag_entry: bool = False
+
+
+@dataclass(frozen=True)
+class Type:
+    """One declared type: a name, a kind, and its fields in column order."""
+
+    name: str
+    kind: TypeKind
+    fields: tuple[Field, ...] = ()
+
+    def field(self, name: str) -> Field | None:
+        """The field called `name`, or None."""
+        for entry in self.fields:
+            if entry.name == name:
+                return entry
+        return None
+
+    def columns(self) -> dict[str, RowColumnType]:
+        """The exposed fields that are row columns, in declaration order."""
+        return {f.name: f.type for f in self.fields if f.exposed and f.type in COLUMN_TYPES}
+
+
+def is_array(ref: str) -> bool:
+    """True if a field's type reference is an array."""
+    return ref.endswith(_ARRAY_SUFFIX)
+
+
+def element_type(ref: str) -> str:
+    """The element type name of a reference; the reference itself if scalar."""
+    return ref[: -len(_ARRAY_SUFFIX)] if is_array(ref) else ref
+
+
+def resolve(ref: str) -> Type:
+    """The declared type a field's type reference names.
+
+    Raises ValueError for an undeclared name — a programmer error, since
+    every reference here is written in this module.
+    """
+    name = element_type(ref)
+    declared = TYPES.get(name)
+    if declared is None:
+        raise ValueError(f"undeclared type '{name}'")
+    return declared
+
+
+def _ro(name: str, type_: str, *, exposed: bool = True, tag_entry: bool = False) -> Field:
+    """A probed fact or a handle: not an assertion the query can make."""
+    return Field(name, type_, writable=False, exposed=exposed, tag_entry=tag_entry)
+
+
+def _w(name: str, type_: str, *, exposed: bool = True, tag_entry: bool = False) -> Field:
+    """A writable field: an assertion the query may make. NULL clears it."""
+    return Field(name, type_, writable=True, exposed=exposed, tag_entry=tag_entry)
+
+
+def _stream_type(name: str, *probed: Field) -> Type:
+    """A stream record: the shared head, this kind's probed fields, the maps.
+
+    `index` is 1-BASED, deliberately: it is the same number
+    ``<alias>.<array>[k]`` takes, so ``WHERE t.index = 1`` and ``f.audio[1]``
+    name the same stream. (probe's `StreamMeta.index` is 0-based; lower does
+    the +1.) `language` and `title` are entries of `tags`, exposed as columns.
+    """
+    return Type(
+        name,
+        "stream",
+        (
+            # The row's own stream, as a column of the row.
+            _ro("track", "stream"),
+            _ro("index", "number"),
+            _w("language", "text", tag_entry=True),
+            _w("title", "text", tag_entry=True),
+            _ro("codec", "text"),
+            *probed,
+            # Declared, not wired up: the free-form tag map and the closed
+            # disposition key set.
+            _w("tags", "tag[]", exposed=False),
+            _w("disposition", "flag[]", exposed=False),
+        ),
+    )
+
+
+# The container tags exposed as text columns on an `input()` alias, read off
+# the probe's `format.tags`. Ordered as the hints name them.
+_CONTAINER_TAG_KEYS = (
+    "title",
+    "artist",
+    "album",
+    "album_artist",
+    "date",
+    "genre",
+    "comment",
+    "composer",
+    "track",
+    "copyright",
+    "encoder",
+    "description",
+)
+
+_DECLARED: tuple[Type, ...] = (
+    Type("text", "scalar"),
+    Type("number", "scalar"),
+    Type("boolean", "scalar"),
+    # Internal, unnameable in the language: the graph node a stream record
+    # stands for, and the seek handle `<alias>.t`.
+    Type("stream", "handle"),
+    Type("seek", "handle"),
+    Type("tag", "record", (_w("key", "text"), _w("value", "text"))),
+    # The closed set of disposition keys ffmpeg knows; an unknown key is a
+    # typed rejection.
+    Type("flag", "record", (_w("key", "text"), _w("set", "boolean"))),
+    _stream_type(
+        "video_stream",
+        _ro("width", "number"),
+        _ro("height", "number"),
+        _ro("fps", "text"),  # verbatim "30000/1001", exactly as ffprobe prints it
+        _ro("bitrate", "number"),
+        _ro("duration", "number"),
+        _ro("color_transfer", "text"),
+    ),
+    _stream_type(
+        "audio_stream",
+        _ro("channels", "number"),
+        _ro("channel_layout", "text"),
+        _ro("sample_rate", "number"),
+        _ro("bitrate", "number"),
+        _ro("duration", "number"),
+    ),
+    # Subtitle and data streams carry the common head only: a caption track
+    # has no dimensions, no channels and no frame rate, and columns a probe
+    # never fills would just be NULL on every row. `data` is the bucket for
+    # what ffprobe cannot classify — never attachments, never cues.
+    _stream_type("subtitle_stream"),
+    _stream_type("data_stream"),
+    # A chapter is not a stream: nothing to select as output, only metadata
+    # to read or filter on. `index` is ffprobe's own chapter order, 1-based.
+    Type(
+        "chapter",
+        "record",
+        (
+            _ro("index", "number"),
+            _w("title", "text"),
+            _w("start_t", "number"),  # seconds
+            _w("end_t", "number"),  # seconds
+        ),
+    ),
+    # Declared, not wired up.
+    Type(
+        "attachment",
+        "record",
+        (
+            _w("filename", "text", exposed=False),
+            _w("mimetype", "text", exposed=False),
+            # The source file when constructing; NULL when read from a
+            # container.
+            _w("path", "text", exposed=False),
+        ),
+    ),
+    Type(
+        "cue",
+        "record",
+        (
+            _ro("index", "number", exposed=False),
+            _w("start_t", "number", exposed=False),  # seconds
+            _w("end_t", "number", exposed=False),  # seconds
+            _w("text", "text", exposed=False),
+        ),
+    ),
+    Type(
+        "container",
+        "container",
+        (
+            _w("video", "video_stream[]"),
+            _w("audio", "audio_stream[]"),
+            # Same array/subscript/splat surface as video/audio, but
+            # passthrough-only downstream (lower enforces that half).
+            _w("subtitle", "subtitle_stream[]"),
+            _w("data", "data_stream[]"),
+            _w("chapters", "chapter[]"),
+            _w("attachments", "attachment[]", exposed=False),
+            # The first video stream, as a column of its own.
+            _ro("frame", "video_stream"),
+            # The seek handle: legal only in a WHERE trim window, never a
+            # value and never part of SELECT *.
+            _ro("t", "seek"),
+            # The probed container length in seconds. A value, never a
+            # stream, so it is only legal inside a compile-time expression;
+            # lower reads it off the probe.
+            _ro("duration", "number"),
+            # Declared, not wired up: the free-form container tag map the
+            # named tag columns below are entries of.
+            _w("tags", "tag[]", exposed=False),
+            *(_w(key, "text", tag_entry=True) for key in _CONTAINER_TAG_KEYS),
+        ),
+    ),
+)
+
+TYPES: dict[str, Type] = {declared.name: declared for declared in _DECLARED}
+
+_CONTAINER = TYPES["container"]
+
+
+def _sole(names: tuple[str, ...], what: str) -> str:
+    """The one name a singleton view derives.
+
+    Raises ValueError when the declarations above stopped agreeing with the
+    view — a programmer error, and what test_types.py guards.
+    """
+    if len(names) != 1:
+        raise ValueError(f"{what}: expected one field, found {list(names)}")
+    return names[0]
+
+
+def _container_fields(*, tags: bool = False) -> tuple[Field, ...]:
+    """The exposed container fields, the named tag columns or the rest."""
+    return tuple(f for f in _CONTAINER.fields if f.exposed and f.tag_entry == tags)
+
+
+def _array_columns(*kinds: TypeKind) -> tuple[str, ...]:
+    """The exposed container array columns whose elements have those kinds."""
+    return tuple(
+        f.name for f in _container_fields() if is_array(f.type) and resolve(f.type).kind in kinds
+    )
+
+
+# --- Views. Everything below is derived; nothing below declares. ---
+
+# The record-array column an input's chapter list lives in. An array VALUE
+# like the stream arrays, unnested the same way, but its records are not
+# streams — no subscript, nothing to select as output.
+CHAPTERS_COLUMN = _sole(
+    tuple(f.name for f in _CONTAINER.fields if element_type(f.type) == "chapter"),
+    "the chapter array column",
+)
+
+# The scalar pseudo-column every INPUT alias carries.
+INPUT_DURATION_COLUMN = _sole(
+    tuple(f.name for f in _container_fields() if f.type == "number"),
+    "the container's scalar column",
+)
+
+# The seek-handle column, legal only in a WHERE trim window.
+TIME_COLUMN = _sole(
+    tuple(f.name for f in _container_fields() if f.type == "seek"),
+    "the container's seek column",
+)
+
+# The container's single-stream column: `<alias>.frame`, the first video
+# stream under another name.
+FRAME_COLUMN = _sole(
+    tuple(
+        f.name
+        for f in _container_fields()
+        if not is_array(f.type) and resolve(f.type).kind == "stream"
+    ),
+    "the container's single-stream column",
+)
+
+# The column a row's own stream is read as.
+ROW_STREAM_COLUMN = _sole(
+    tuple(
+        dict.fromkeys(
+            f.name
+            for t in TYPES.values()
+            if t.kind == "stream"
+            for f in t.fields
+            if f.type == "stream"
+        )
+    ),
+    "the row's stream column",
+)
+
+# The structural column names an INPUT alias exposes. A CTE alias exposes
+# whatever its body named with AS, so the whitelist does not apply there (lower
+# checks those).
+INPUT_COLUMNS = frozenset(f.name for f in _container_fields())
+
+# The container tags an INPUT alias also exposes. Values, never streams, like
+# `duration`; a key the file does not carry reads NULL.
+INPUT_TAG_COLUMNS = tuple(f.name for f in _container_fields(tags=True))
+
+# The array columns whose elements are STREAMS: the only ones a subscript or
+# a `[k].<column>` metadata accessor reaches.
+_STREAM_ARRAYS = _array_columns("stream")
+STREAM_ARRAY_COLUMNS = frozenset(_STREAM_ARRAYS)
+
+# The array columns `unnest(<alias>.<name>)` accepts: every array of records.
+# `frame` is one stream, `t` is a timeline and `duration` is a scalar, and
+# none of them is a set of rows.
+UNNEST_COLUMNS = frozenset(_array_columns("stream", "record"))
+
+# The columns each unnest row table exposes, per container array column. A
+# chapter row has no `track` column at all, and so no schema entry for one.
+ROW_SCHEMAS: dict[str, dict[str, RowColumnType]] = {
+    f.name: resolve(f.type).columns() for f in _container_fields() if f.name in UNNEST_COLUMNS
+}
+
+# What every stream row carries, whatever its type.
+ROW_COMMON: dict[str, RowColumnType] = {
+    name: type_
+    for name, type_ in ROW_SCHEMAS[_STREAM_ARRAYS[0]].items()
+    if all(name in ROW_SCHEMAS[column] for column in _STREAM_ARRAYS)
+}
+
+# The tag entries a stream record exposes as columns of its own.
+STREAM_TAG_COLUMNS = tuple(
+    dict.fromkeys(
+        f.name
+        for t in TYPES.values()
+        if t.kind == "stream"
+        for f in t.fields
+        if f.exposed and f.tag_entry
+    )
+)
