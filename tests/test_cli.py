@@ -180,7 +180,7 @@ def test_compile_graph_only_still_works_for_a_multi_sink_script(
 # ---------------------------------------------------------------------------
 
 
-TABLE_QUERY = "SELECT t.language FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t"
+TABLE_QUERY = "SELECT t.tags.language FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t"
 
 
 @pytest.fixture
@@ -251,7 +251,7 @@ def test_compile_writes_container_tags_read_from_the_input(
     code = cli.main(
         [
             "compile",
-            "COPY (SELECT f.video[1], f.title || ' (restored)' AS title, "
+            "COPY (SELECT f.video[1], f.tags.title || ' (restored)' AS title, "
             "NULL AS artist FROM input('film.mkv') f) TO 'out.mkv'",
         ]
     )
@@ -266,7 +266,7 @@ def test_compile_writes_container_tags_read_from_the_input(
 def test_run_prints_container_tags_as_a_table(
     capsys: pytest.CaptureFixture[str], _tagged_probe: None
 ) -> None:
-    code = cli.main(["run", "SELECT f.title, f.artist FROM input('film.mkv') f"])
+    code = cli.main(["run", "SELECT f.tags.title, f.tags.artist FROM input('film.mkv') f"])
     captured = capsys.readouterr()
     assert code == 0
     assert "Angel One" in captured.out
@@ -618,7 +618,7 @@ def test_run_csv_copy_to_stdout(
     capsys: pytest.CaptureFixture[str], _two_track_probe: None
 ) -> None:
     sql = (
-        "COPY (SELECT t.language, t.codec FROM "
+        "COPY (SELECT t.tags.language, t.codec FROM "
         "input('tests/fixtures/av2.mp4') f, unnest(f.audio) t) "
         "TO STDOUT WITH (format 'csv', header true)"
     )
@@ -633,7 +633,7 @@ def test_run_csv_copy_to_a_file(
 ) -> None:
     out_path = tmp_path / "tracks.csv"
     sql = (
-        "COPY (SELECT t.language, t.codec FROM "
+        "COPY (SELECT t.tags.language, t.codec FROM "
         f"input('tests/fixtures/av2.mp4') f, unnest(f.audio) t) "
         f"TO '{out_path.as_posix()}' WITH (format 'csv')"
     )
@@ -648,7 +648,7 @@ def test_run_csv_copy_defaults_header_false(
     capsys: pytest.CaptureFixture[str], _two_track_probe: None
 ) -> None:
     sql = (
-        "COPY (SELECT t.language FROM input('tests/fixtures/av2.mp4') f, "
+        "COPY (SELECT t.tags.language FROM input('tests/fixtures/av2.mp4') f, "
         "unnest(f.audio) t) TO STDOUT WITH (format 'csv')"
     )
     code = cli.main(["run", sql])

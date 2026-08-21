@@ -71,8 +71,9 @@ Each column is one of:
   data.
 
 Subscripts are positive integer literals, 1-based.
-`(f.audio[1]).language`-style accessors reach row columns without
-unnest; in WHERE they are assertions.
+`(f.audio[1]).codec`-style accessors reach row columns without
+unnest; in WHERE they are assertions. A tag is read by path,
+`f.tags.title` / `t.tags.language`, one key at a time.
 
 ## Values and predicates
 

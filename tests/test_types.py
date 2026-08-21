@@ -34,8 +34,7 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
     "flag": {"key": ("text", "W"), "set": ("boolean", "W")},
     "video_stream": {
         "index": ("number", "RO"),
-        "language": ("text", "W"),
-        "title": ("text", "W"),
+        "tags": ("tag[]", "W"),
         "codec": ("text", "RO"),
         "width": ("number", "RO"),
         "height": ("number", "RO"),
@@ -43,36 +42,29 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
         "bitrate": ("number", "RO"),
         "duration": ("number", "RO"),
         "color_transfer": ("text", "RO"),
-        "tags": ("tag[]", "W"),
         "disposition": ("flag[]", "W"),
     },
     "audio_stream": {
         "index": ("number", "RO"),
-        "language": ("text", "W"),
-        "title": ("text", "W"),
+        "tags": ("tag[]", "W"),
         "codec": ("text", "RO"),
         "channels": ("number", "RO"),
         "channel_layout": ("text", "RO"),
         "sample_rate": ("number", "RO"),
         "bitrate": ("number", "RO"),
         "duration": ("number", "RO"),
-        "tags": ("tag[]", "W"),
         "disposition": ("flag[]", "W"),
     },
     "subtitle_stream": {
         "index": ("number", "RO"),
-        "language": ("text", "W"),
-        "title": ("text", "W"),
-        "codec": ("text", "RO"),
         "tags": ("tag[]", "W"),
+        "codec": ("text", "RO"),
         "disposition": ("flag[]", "W"),
     },
     "data_stream": {
         "index": ("number", "RO"),
-        "language": ("text", "W"),
-        "title": ("text", "W"),
-        "codec": ("text", "RO"),
         "tags": ("tag[]", "W"),
+        "codec": ("text", "RO"),
         "disposition": ("flag[]", "W"),
     },
     "chapter": {
@@ -102,31 +94,15 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
         "t": ("seek", "RO"),
         "duration": ("number", "RO"),
         "tags": ("tag[]", "W"),
-        "title": ("text", "W"),
-        "artist": ("text", "W"),
-        "album": ("text", "W"),
-        "album_artist": ("text", "W"),
-        "date": ("text", "W"),
-        "genre": ("text", "W"),
-        "comment": ("text", "W"),
-        "composer": ("text", "W"),
-        "track": ("text", "W"),
-        "copyright": ("text", "W"),
-        "encoder": ("text", "W"),
-        "description": ("text", "W"),
     },
 }
 
 # The fields declared but not surfaced by the compiler today, as
 # "<type>.<field>". Nothing else may carry `exposed=False`.
 EXPECTED_UNEXPOSED = {
-    "video_stream.tags",
     "video_stream.disposition",
-    "audio_stream.tags",
     "audio_stream.disposition",
-    "subtitle_stream.tags",
     "subtitle_stream.disposition",
-    "data_stream.tags",
     "data_stream.disposition",
     "attachment.filename",
     "attachment.mimetype",
@@ -136,27 +112,6 @@ EXPECTED_UNEXPOSED = {
     "cue.end_t",
     "cue.text",
     "container.attachments",
-    "container.tags",
-}
-
-# The named columns that are one entry of their type's tag map.
-EXPECTED_TAG_ENTRIES = {
-    f"{stream}_stream.{name}"
-    for stream in ("video", "audio", "subtitle", "data")
-    for name in ("language", "title")
-} | {
-    "container.title",
-    "container.artist",
-    "container.album",
-    "container.album_artist",
-    "container.date",
-    "container.genre",
-    "container.comment",
-    "container.composer",
-    "container.track",
-    "container.copyright",
-    "container.encoder",
-    "container.description",
 }
 
 EXPECTED_KINDS = {
@@ -165,8 +120,8 @@ EXPECTED_KINDS = {
     "boolean": "scalar",
     "stream": "handle",
     "seek": "handle",
-    "tag": "record",
-    "flag": "record",
+    "tag": "map",
+    "flag": "map",
     "video_stream": "stream",
     "audio_stream": "stream",
     "subtitle_stream": "stream",
@@ -181,8 +136,7 @@ EXPECTED_KINDS = {
 
 EXPECTED_ROW_COMMON = {
     "index": "number",
-    "language": "text",
-    "title": "text",
+    "tags": "tag[]",
     "codec": "text",
 }
 
@@ -215,22 +169,7 @@ EXPECTED_ROW_SCHEMAS = {
 }
 
 EXPECTED_INPUT_COLUMNS = frozenset(
-    {"video", "audio", "subtitle", "data", "t", "duration", "chapters"}
-)
-
-EXPECTED_INPUT_TAG_COLUMNS = (
-    "title",
-    "artist",
-    "album",
-    "album_artist",
-    "date",
-    "genre",
-    "comment",
-    "composer",
-    "track",
-    "copyright",
-    "encoder",
-    "description",
+    {"video", "audio", "subtitle", "data", "t", "duration", "chapters", "tags"}
 )
 
 EXPECTED_STREAM_ARRAY_COLUMNS = frozenset({"video", "audio", "subtitle", "data"})
@@ -274,24 +213,24 @@ def test_field_names_are_unique_within_a_type() -> None:
         assert len(names) == len(set(names)), declared.name
 
 
-def test_exposed_and_tag_entry_marks_are_the_declared_ones() -> None:
+def test_exposed_marks_are_the_declared_ones() -> None:
     unexposed = {f"{owner}.{f.name}" for owner, f in _all_fields() if not f.exposed}
-    tag_entries = {f"{owner}.{f.name}" for owner, f in _all_fields() if f.tag_entry}
     assert unexposed == EXPECTED_UNEXPOSED
-    assert tag_entries == EXPECTED_TAG_ENTRIES
 
 
-def test_tag_entries_are_text_and_writable() -> None:
-    for owner, entry in _all_fields():
-        if entry.tag_entry:
-            assert entry.type == "text", f"{owner}.{entry.name}"
-            assert entry.writable, f"{owner}.{entry.name}"
+def test_a_map_type_is_a_key_and_one_more_field() -> None:
+    for declared in TYPES.values():
+        if declared.kind == "map":
+            assert [f.name for f in declared.fields][0] == "key"
+            assert len(declared.fields) == 2
 
 
 def test_every_array_field_elements_a_declared_record() -> None:
     for owner, entry in _all_fields():
         if is_array(entry.type):
-            assert resolve(entry.type).kind in {"stream", "record"}, f"{owner}.{entry.name}"
+            assert resolve(entry.type).kind in {"stream", "record", "map"}, (
+                f"{owner}.{entry.name}"
+            )
 
 
 def test_scalars_and_handles_have_no_fields() -> None:
@@ -347,8 +286,8 @@ def test_column_set_views() -> None:
 
 
 def test_named_column_views() -> None:
-    assert types.INPUT_TAG_COLUMNS == EXPECTED_INPUT_TAG_COLUMNS
     assert types.STREAM_TAG_COLUMNS == ("language", "title")
+    assert types.TAGS_COLUMN == "tags"
     assert types.CHAPTERS_COLUMN == "chapters"
     assert types.INPUT_DURATION_COLUMN == "duration"
     assert types.TIME_COLUMN == "t"
@@ -356,7 +295,7 @@ def test_named_column_views() -> None:
 
 def test_parser_reexports_are_the_view_objects() -> None:
     assert parser.ROW_SCHEMAS is types.ROW_SCHEMAS
-    assert parser.INPUT_TAG_COLUMNS is types.INPUT_TAG_COLUMNS
+    assert parser.TAGS_COLUMN == types.TAGS_COLUMN
     assert parser.INPUT_COLUMNS is types.INPUT_COLUMNS
     assert parser.UNNEST_COLUMNS is types.UNNEST_COLUMNS
     assert parser.STREAM_ARRAY_COLUMNS is types.STREAM_ARRAY_COLUMNS

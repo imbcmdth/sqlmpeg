@@ -570,7 +570,7 @@ def _probe_format(
 def test_container_tags_are_captured_whole(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The FULL tag dict, not the language/title pair streams get."""
+    """The FULL tag dict, at both levels: streams carry theirs the same way."""
     result = _probe_format(
         tmp_path,
         monkeypatch,
@@ -587,6 +587,39 @@ def test_container_tags_are_captured_whole(
         "title": "Angel One",
         "artist": "Docs Dept",
         "major_brand": "isom",
+    }
+
+
+def test_stream_tags_are_captured_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stream's tags are the whole dict too, keys lowercased."""
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {
+                        "codec_type": "audio",
+                        "tags": {
+                            "language": "eng",
+                            "title": "Commentary",
+                            "HANDLER_NAME": "SoundHandler",
+                        },
+                    }
+                ]
+            }
+        ),
+    )
+    result = probe(str(f))
+    assert result is not None
+    assert result.streams[0].metadata == {
+        "language": "eng",
+        "title": "Commentary",
+        "handler_name": "SoundHandler",
     }
 
 
@@ -725,7 +758,10 @@ def test_probe_avs_fixture_has_subtitle_stream_with_language_tag(_fixtures: Path
     assert len(subtitle) == 1
 
     assert subtitle[0].index == 0
-    assert subtitle[0].metadata == {"language": "eng"}
+    # The whole tag dict, not a whitelist: the muxer stamps an encoder and a
+    # duration alongside the language.
+    assert subtitle[0].metadata["language"] == "eng"
+    assert set(subtitle[0].metadata) >= {"language", "encoder"}
     assert subtitle[0].width is None
     assert subtitle[0].height is None
     assert subtitle[0].fps is None

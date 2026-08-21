@@ -4,5 +4,5 @@
 COPY (
   SELECT array_agg(t)
   FROM input(:'source') f, unnest(f.audio) t
-  WHERE t.language = :'language'
+  WHERE t.tags.language = :'language'
 ) TO :'dest'

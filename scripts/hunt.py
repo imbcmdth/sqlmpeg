@@ -256,7 +256,8 @@ SOURCES = REG.source_names()
 SINK_NAMES = sorted(SINK_OPTIONS)
 INPUT_NAMES = sorted(INPUT_OPTIONS)
 
-TRACK_COLS = ["language", "codec", "index"]
+# Tags are read by path, so a row's tag column is two written parts.
+TRACK_COLS = ["tags.language", "tags.title", "codec", "index"]
 VIDEO_ROW_COLS = TRACK_COLS + ["width", "height", "fps"]
 AUDIO_ROW_COLS = TRACK_COLS + ["channels", "channel_layout", "sample_rate"]
 CHAPTER_COLS = ["index", "title", "start_t", "end_t"]
@@ -501,7 +502,7 @@ def gen_value(ctx: Ctx, depth: int = 0) -> str:
 def gen_row_col(ctx: Ctx) -> str:
     it = ctx.pick(ctx.items)
     if it.kind == "input":
-        col = ctx.pick(["duration", "t"])
+        col = ctx.pick(["duration", "t", "tags.title", "tags.artist"])
     elif it.kind == "vrow":
         col = ctx.pick(VIDEO_ROW_COLS)
     elif it.kind == "arow":

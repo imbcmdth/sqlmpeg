@@ -290,10 +290,10 @@ COPY (
 **Error JSON:**
 
 ```json
-{"line": 4, "col": 6, "code": "ROW_COUNT_MISMATCH", "message": "this query has 2 rows, and 'out.mka' is one file", "hint": "gather the rows into that one file with array_agg(...), adding GROUP BY the column they share when they share one; or give each row a file of its own with a TO expression, e.g. TO (t.language || '.mka')"}
+{"line": 4, "col": 6, "code": "ROW_COUNT_MISMATCH", "message": "this query has 2 rows, and 'out.mka' is one file", "hint": "gather the rows into that one file with array_agg(...), adding GROUP BY the column they share when they share one; or give each row a file of its own with a TO expression, e.g. TO (t.tags.language || '.mka')"}
 ```
 
-Both exits compile: `SELECT array_agg(t)` writes both tracks into `out.mka`, and `TO (t.language || '.mka')` writes one file per track instead.
+Both exits compile: `SELECT array_agg(t)` writes both tracks into `out.mka`, and `TO (t.tags.language || '.mka')` writes one file per track instead.
 
 ## UNKNOWN_SINK_OPTION
 

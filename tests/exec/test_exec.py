@@ -1655,7 +1655,7 @@ def test_disposition_tag_column_flags_the_default_track(tmp_path: Path) -> None:
     query = (
         "WITH flagged AS ("
         "  SELECT t AS track, "
-        "  CASE WHEN t.language = 'eng' THEN 'default' ELSE '0' END AS disposition "
+        "  CASE WHEN t.tags.language = 'eng' THEN 'default' ELSE '0' END AS disposition "
         f"  FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) t"
         ") SELECT array_agg(flagged.track) FROM flagged"
     )
@@ -1786,8 +1786,8 @@ def test_container_tag_columns_round_trip_through_real_ffmpeg(tmp_path: Path) ->
     out_path = tmp_path / "restored.mkv"
     query = (
         "COPY (SELECT f.video[1], f.audio[1], "
-        "f.title || ' (restored)' AS title, "
-        "CASE WHEN f.comment IS NULL THEN 'no notes' ELSE f.comment END AS comment, "
+        "f.tags.title || ' (restored)' AS title, "
+        "CASE WHEN f.tags.comment IS NULL THEN 'no notes' ELSE f.tags.comment END AS comment, "
         "NULL AS artist "
         f"FROM input('{_sql_path(_TAGGED)}') f) TO '{_sql_path(out_path)}';"
     )
@@ -1835,7 +1835,7 @@ def test_a_cte_tags_the_streams_while_the_outer_select_tags_the_file(
     query = (
         "COPY ("
         "  WITH tagged AS ("
-        "    SELECT a AS track, 'Audio (' || a.language || ')' AS title"
+        "    SELECT a AS track, 'Audio (' || a.tags.language || ')' AS title"
         f"    FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) a"
         "  )"
         "  SELECT g.video, array_agg(tagged.track), 'Director Cut' AS title"

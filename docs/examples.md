@@ -589,7 +589,7 @@ ffmpeg -i film.mp4 -loop 1 -i watermark.png -filter_complex \
 COPY (
   SELECT t
   FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
-  WHERE t.language = 'eng'
+  WHERE t.tags.language = 'eng'
 ) TO 'eng.m4a'
 ```
 
@@ -598,17 +598,17 @@ $ sqlmpeg compile -f query.sql
 ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng eng.m4a
 ```
 
-Audio rows carry `language`, `title`, `codec`, `channels`, `channel_layout`, `sample_rate`, `bitrate` and `duration`; video rows carry `width`, `height`, `fps` and friends instead. A track nobody probed has NULL in every metadata column, and NULL matches nothing - standard SQL, no new rules.
+Audio rows carry `tags` (read by path: `t.tags.language`, `t.tags.title`, any key), `codec`, `channels`, `channel_layout`, `sample_rate`, `bitrate` and `duration`; video rows carry `width`, `height`, `fps` and friends instead. A track nobody probed has NULL in every metadata column, and NULL matches nothing - standard SQL, no new rules.
 
 ## 24. Extract captions by language
 
-Caption arrays unnest the same way (columns: `language`, `title`, `codec`), so pulling the English subtitles out of a many-language file is a `WHERE`, not a subscript:
+Caption arrays unnest the same way (columns: `tags`, `codec`), so pulling the English subtitles out of a many-language file is a `WHERE`, not a subscript:
 
 ```pgsql
 COPY (
   SELECT s
   FROM input('tests/fixtures/avs.mkv') f, unnest(f.subtitle) s
-  WHERE s.language = 'eng'
+  WHERE s.tags.language = 'eng'
 ) TO 'subs.srt'
 ```
 
@@ -626,7 +626,7 @@ Two multi-language files, and every track should mix with its counterpart - Engl
 COPY (
   SELECT array_agg(amix(a, b))
   FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av3.mp4') g,
-       unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language
+       unnest(f.audio) a JOIN unnest(g.audio) b ON a.tags.language = b.tags.language
 ) TO 'mixed.mka'
 ```
 
@@ -637,7 +637,7 @@ ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex \
   -metadata:s:0 language=eng -map '[out1]' -metadata:s:1 language=fra mixed.mka
 ```
 
-Result rows follow the LEFT side's track order, so the output track order is `f`'s - track order is player-visible surface, and nothing here resorts it. And when one file carries two English tracks (a 5.1 and a stereo, say), that's not an error, it's two pairs - real join semantics - and the fix is a wider key: `ON a.language = b.language AND a.channel_layout = b.channel_layout`.
+Result rows follow the LEFT side's track order, so the output track order is `f`'s - track order is player-visible surface, and nothing here resorts it. And when one file carries two English tracks (a 5.1 and a stereo, say), that's not an error, it's two pairs - real join semantics - and the fix is a wider key: `ON a.tags.language = b.tags.language AND a.channel_layout = b.channel_layout`.
 
 ## 26. Mix everything the files have, missing tracks count as silence
 
@@ -647,7 +647,7 @@ An outer join keeps the rows only one side has, and `COALESCE` fills the gap - f
 COPY (
   SELECT array_agg(amix(a, COALESCE(b, ffmpeg.anullsrc(duration => 4))))
   FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
-       unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.language = b.language
+       unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.tags.language = b.tags.language
 ) TO 'full.mka'
 ```
 
@@ -669,12 +669,12 @@ The founding case. `concat` demands identical segment shapes, so the file that l
 COPY (
   SELECT f.video[1], array_agg(a)
   FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
-       unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.language = b.language
+       unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.tags.language = b.tags.language
   GROUP BY f.video[1]
   UNION ALL
   SELECT g2.video[1], array_agg(COALESCE(b2, ffmpeg.anullsrc(duration => 4)))
   FROM input('tests/fixtures/av2.mp4') f2, input('tests/fixtures/av-eng.mp4') g2,
-       unnest(f2.audio) a2 FULL OUTER JOIN unnest(g2.audio) b2 ON a2.language = b2.language
+       unnest(f2.audio) a2 FULL OUTER JOIN unnest(g2.audio) b2 ON a2.tags.language = b2.tags.language
   GROUP BY g2.video[1]
 ) TO 'joined.mp4'
 ```
@@ -713,12 +713,12 @@ A video gap in an outer join fills with `COALESCE(b, ffmpeg.color())` - black by
 
 ## 29. Assert what you're shipping
 
-A subscripted track has the same metadata columns a row does: `f.audio[1].language` is the first track's tag, right there in a `WHERE`. Since the predicate evaluates at compile time, this is an assertion - if track 1 isn't English, the script refuses to compile instead of quietly shipping the wrong language. (The strictly-Postgres spelling `(f.audio[1]).language` works too.)
+A subscripted track has the same metadata columns a row does: `f.audio[1].tags.language` is the first track's tag, right there in a `WHERE`. Since the predicate evaluates at compile time, this is an assertion - if track 1 isn't English, the script refuses to compile instead of quietly shipping the wrong language. (The strictly-Postgres spelling `(f.audio[1]).tags.language` works too.)
 
 ```pgsql
 COPY (
   SELECT f.audio[1] FROM input('tests/fixtures/av2.mp4') f
-  WHERE f.audio[1].language = 'eng'
+  WHERE f.audio[1].tags.language = 'eng'
 ) TO 'eng.m4a'
 ```
 
@@ -734,7 +734,7 @@ Recipe 23 answers "give me whichever track is English"; this one answers "I beli
 A SELECT with no COPY is a table query: `run` (the default subcommand, so no subcommand at all) prints the result set and executes nothing - the whole answer was known at compile time. The columns are the probed metadata, so this is ffprobe you can read:
 
 ```pgsql
-SELECT t.index, t.language, t.codec, t.channel_layout
+SELECT t.index, t.tags.language, t.codec, t.channel_layout
 FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
 ```
 
@@ -752,9 +752,9 @@ $ sqlmpeg -f query.sql
 Stream-valued cells print as placeholders carrying the stream spec, so a table query over a join shows exactly which track paired with which - and an empty cell is an outer join's gap, before you've committed to a fill:
 
 ```pgsql
-SELECT a.language, a AS film, b AS promo
+SELECT a.tags.language, a AS film, b AS promo
 FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
-     unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.language = b.language
+     unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.tags.language = b.tags.language
 ```
 
 ```
@@ -772,7 +772,7 @@ $ sqlmpeg -f query.sql
 
 ```pgsql
 COPY (
-  SELECT t.language, t.codec, t.channel_layout
+  SELECT t.tags.language, t.codec, t.channel_layout
   FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
 ) TO STDOUT WITH (format 'csv', header true)
 ```
@@ -856,7 +856,7 @@ A non-stream column in a media query sets a tag on that row's output. The alias 
 
 ```pgsql
 COPY (
-  SELECT t, 'Audio (' || t.language || ')' AS title
+  SELECT t, 'Audio (' || t.tags.language || ')' AS title
   FROM input('tests/fixtures/av-eng.mp4') f, unnest(f.audio) t
 ) TO 'titled.mka'
 ```
@@ -875,7 +875,7 @@ CASE makes the edit conditional, and it runs over every row - one expression fix
 COPY (
   WITH retagged AS (
     SELECT t AS track,
-           CASE WHEN t.language = 'fra' THEN 'fre' ELSE t.language END AS language
+           CASE WHEN t.tags.language = 'fra' THEN 'fre' ELSE t.tags.language END AS language
     FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
   )
   SELECT array_agg(retagged.track) FROM retagged
@@ -938,7 +938,7 @@ ffmpeg -i film.mkv -f ffmetadata -i \
 COPY (
   WITH flagged AS (
     SELECT t AS track,
-           CASE WHEN t.language = 'eng' THEN 'default' ELSE '0' END AS disposition
+           CASE WHEN t.tags.language = 'eng' THEN 'default' ELSE '0' END AS disposition
     FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
   )
   SELECT array_agg(flagged.track) FROM flagged
@@ -1096,7 +1096,7 @@ The same rule over track rows: each row's stream goes to a filename built from i
 
 ```pgsql
 COPY (SELECT t FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t)
-TO (t.language || '.m4a')
+TO (t.tags.language || '.m4a')
 ```
 
 ```
@@ -1157,13 +1157,13 @@ ffmpeg -i film.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata artist= -
 
 ## 52. Read the container's tags, rewrite them with CASE
 
-Container tags are columns on the input alias - `f.title`, `f.artist`, `f.comment`, and the other common keys - NULL when the file doesn't carry them. So the full CASE toolkit works: fill missing tags, build new ones from old:
+Container tags are a map on the input alias, read by path - `f.tags.title`, `f.tags.artist`, `f.tags.comment`, any key the file carries - NULL when it doesn't carry them. So the full CASE toolkit works: fill missing tags, build new ones from old:
 
 ```pgsql
 COPY (
   SELECT f.video[1], f.audio[1],
-    f.title || ' (restored)' AS title,
-    CASE WHEN f.comment IS NULL THEN 'no notes' ELSE f.comment END AS comment
+    f.tags.title || ' (restored)' AS title,
+    CASE WHEN f.tags.comment IS NULL THEN 'no notes' ELSE f.tags.comment END AS comment
   FROM input('tests/fixtures/tagged.mp4') f
 ) TO 'restored.mp4'
 ```
@@ -1174,7 +1174,7 @@ ffmpeg -i tests/fixtures/tagged.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -m
   'comment=no notes' -metadata 'title=Angel One (restored)' restored.mp4
 ```
 
-Reading needs the probe (the values live in the file), so this one is fixture-bound. The same columns work in table queries: `select f.title, f.artist, f.duration from input('movie.mp4') f` prints them.
+Reading needs the probe (the values live in the file), so this one is fixture-bound. The same paths work in table queries: `select f.tags.title, f.tags.artist, f.duration from input('movie.mp4') f` prints them, and a bare `f.tags` prints the whole map.
 
 ## 53. Tag the tracks and the container in one query
 
@@ -1183,7 +1183,7 @@ Two levels, two scopes, visible in the query text: inside the `WITH`, rows are t
 ```pgsql
 COPY (
   WITH tagged AS (
-    SELECT a AS track, 'Audio (' || a.language || ')' AS title
+    SELECT a AS track, 'Audio (' || a.tags.language || ')' AS title
     FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) a
   )
   SELECT g.video, array_agg(tagged.track), 'Director Cut' AS title
@@ -1223,10 +1223,10 @@ Explicit grouping unlocks what the plain fan-out rejects as a collision: rows th
 
 ```pgsql
 COPY (
-  SELECT array_agg(a), a.language AS title
+  SELECT array_agg(a), a.tags.language AS title
   FROM input('tests/fixtures/av-2eng.mp4') f, unnest(f.audio) a
-  GROUP BY a.language
-) TO (a.language || '.mka')
+  GROUP BY a.tags.language
+) TO (a.tags.language || '.mka')
 ```
 
 ```
@@ -1257,9 +1257,9 @@ $ sqlmpeg -f query.sql
 And grouping by a row column previews a fan-out's partitions before any file is written - here, recipe 55's per-language split:
 
 ```pgsql
-SELECT a.language, array_agg(a)
+SELECT a.tags.language, array_agg(a)
 FROM input('tests/fixtures/av-2eng.mp4') f, unnest(f.audio) a
-GROUP BY a.language
+GROUP BY a.tags.language
 ```
 
 ```
@@ -1281,7 +1281,7 @@ WITH vid AS (
 ),
 aud AS (
   SELECT a AS track FROM input('tests/fixtures/av-2eng.mp4') i2, unnest(i2.audio) a
-  WHERE a.language = 'eng'
+  WHERE a.tags.language = 'eng'
 )
 SELECT vid.track, array_agg(aud.track) FROM vid, aud GROUP BY vid.track
 ```
@@ -1303,7 +1303,7 @@ COPY (
   ),
   aud AS (
     SELECT a AS track FROM input('tests/fixtures/av-2eng.mp4') i2, unnest(i2.audio) a
-    WHERE a.language = 'eng'
+    WHERE a.tags.language = 'eng'
   )
   SELECT vid.track, array_agg(aud.track) FROM vid, aud GROUP BY vid.track
 ) TO 'combo.mkv'

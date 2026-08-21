@@ -179,12 +179,13 @@ _DIALECT_TAIL = """\
   compile-time expression (`WHERE f.t <= f.duration - 60`), never in the
   SELECT list on its own. An input this compile could not probe, or a
   container that declares no duration, makes it a typed rejection.
-- The container's own tags are text columns on an `input()` alias too:
-  `title`, `artist`, `album`, `album_artist`, `date`, `genre`, `comment`,
-  `composer`, `track`, `copyright`, `encoder`, `description`. Values like
-  `duration`, never streams; a key the file does not carry reads NULL, so
-  `CASE WHEN f.comment IS NULL THEN 'none' ELSE f.comment END` fills it. An
-  input this compile could not probe is a typed rejection.
+- The container's own tags are a MAP on an `input()` alias, read by path:
+  `f.tags.title`, `f.tags.artist`, `f.tags.comment` -- any key the file
+  carries, and keys are free-form. Values like `duration`, never streams; a
+  key the file does not carry reads NULL, so
+  `CASE WHEN f.tags.comment IS NULL THEN 'none' ELSE f.tags.comment END`
+  fills it. There is no bare `f.title` spelling. An input this compile could
+  not probe is a typed rejection.
 - There are no other columns on an `input()` or generated-source alias --
   `unnest(...)` row tables have a column model of their own (see Track rows
   below).
@@ -205,7 +206,8 @@ _DIALECT_TAIL = """\
   `SELECT t`, `array_agg(t)`, `volume(t, 0.5)`, `GROUP BY t` -- is that
   stream, and it is the only thing on a row that can appear in the SELECT
   list of a media query. Every row also carries `index` (1-based, the same
-  numbering as `<alias>.audio[k]`), `language`, `title`, `codec`. Audio rows add
+  numbering as `<alias>.audio[k]`), `tags` (the track's own tag map, read by
+  path: `t.tags.language`, `t.tags.title`, any key), `codec`. Audio rows add
   `channels`, `channel_layout`, `sample_rate`, `bitrate`, `duration`. Video
   rows add `width`, `height`, `fps` (verbatim, e.g. `'30000/1001'`),
   `bitrate`, `duration`, `color_transfer`. Subtitle and data rows carry only
@@ -227,7 +229,7 @@ _DIALECT_TAIL = """\
   float; dividing by a known zero is rejected), `CASE`, `||` (text only), and
   `::text` / `CAST(x AS text)` to spell a number for `||`. NULL propagates.
   An aliased expression column is a metadata TAG on that row's tracks, the
-  alias being the key: `SELECT t, 'Audio (' || t.language || ')' AS
+  alias being the key: `SELECT t, 'Audio (' || t.tags.language || ')' AS
   title`. In a query with NO track rows the same aliased column tags the
   CONTAINER instead (`SELECT f.video[1], 'Remastered' AS title`), and `NULL
   AS artist` clears that key in the output. To set both scopes in one query,
@@ -243,8 +245,9 @@ _DIALECT_TAIL = """\
   input-level key is the one-file shape; `GROUP BY` a row column partitions
   rows into one output file per group -- it requires a fan-out `TO
   (expression over the group keys)`, and group keys double as container tag
-  columns: `SELECT array_agg(a), a.language AS title ... GROUP BY
-  a.language) TO (a.language || '.mka')`. `ORDER BY` inside `array_agg` is
+  columns: `SELECT array_agg(a), a.tags.language AS title ... GROUP BY
+  a.tags.language) TO (a.tags.language || '.mka')`. `ORDER BY` inside
+  `array_agg` is
   rejected; `ORDER BY` before the aggregate defines the order.
 - `unnest(...) a JOIN unnest(...) b ON <predicate>` matches ROWS between two
   unnest tables: `INNER JOIN`, `LEFT [OUTER] JOIN`, `FULL OUTER JOIN` (a
@@ -258,7 +261,7 @@ _DIALECT_TAIL = """\
   (`FULL OUTER` only) unmatched right rows in their own order. A row that
   matches two rows on the other side pairs with both -- real join
   semantics, not an error; widen the `ON` key if that is not what you want,
-  e.g. `ON a.language = b.language AND a.channel_layout = b.channel_layout`.
+  e.g. `ON a.tags.language = b.tags.language AND a.channel_layout = b.channel_layout`.
 - Selecting a NULL row (an outer join's gap) bare is a typed rejection
   naming the row that failed to match. `COALESCE(<alias>, <fill>)` is
   the only accepted spelling, and `<fill>` is a generated stand-in sized for
@@ -848,7 +851,7 @@ _PROBED_EXAMPLES: tuple[tuple[str, str], ...] = (
         "Pull every English audio track out of film.mkv, whatever subscript "
         "each one happens to sit at.",
         "SELECT array_agg(t)\nFROM input('film.mkv') f, unnest(f.audio) t\n"
-        "WHERE t.language = 'eng'",
+        "WHERE t.tags.language = 'eng'",
     ),
     (
         "Mix film.mkv's audio with commentary.mkv's, matched by language; "
@@ -859,7 +862,7 @@ _PROBED_EXAMPLES: tuple[tuple[str, str], ...] = (
         "       )\n"
         "FROM input('film.mkv') f, input('commentary.mkv') g,\n"
         "     unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b\n"
-        "       ON a.language = b.language",
+        "       ON a.tags.language = b.tags.language",
     ),
 )
 
@@ -1007,7 +1010,7 @@ _REPAIR: dict[ErrorCode, str] = {
         "streams -- add `GROUP BY <the column they share>` when another column "
         "has to stay unaggregated -- or write one file per row by replacing the "
         "quoted `TO 'path'` with `TO (<expression over the row's columns>)`, "
-        "e.g. `TO (t.language || '.mka')`. Narrowing the `WHERE` until one row "
+        "e.g. `TO (t.tags.language || '.mka')`. Narrowing the `WHERE` until one row "
         "survives also works when a single track is what you meant."
     ),
     ErrorCode.UNSUPPORTED_SQL: (

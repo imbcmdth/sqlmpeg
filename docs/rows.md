@@ -14,9 +14,9 @@ One row per input: the shape of a container file. Arrays of streams plus the con
 | `chapters` | record array | `unnest` into chapter rows; no splat, no subscript. Bare, it prints as one array cell |
 | `t` | timeline | only in `WHERE` trim windows: `f.t BETWEEN 5 AND 60`, either bound alone, or against chapter bounds |
 | `duration` | number | probed container duration in seconds |
-| `title`, `artist`, `album`, `album_artist`, `date`, `genre`, `comment`, `composer`, `track`, `copyright`, `encoder`, `description` | text | the container's tags; NULL when the file doesn't carry the key |
+| `tags` | tag map | the container's own tags, read by path: `f.tags.title`, `f.tags.artist`, any key. NULL when the file doesn't carry it. Bare, it prints as one array cell of `(key,value)` records |
 
-Subscripts reach track-row columns without unnest: `f.audio[1].language` (strict-Postgres `(f.audio[1]).language` also parses). In a `WHERE` this is an **assertion** - the subscript names one track, so a false predicate refuses to compile ([recipe 29](examples.md#29-assert-what-youre-shipping)).
+Subscripts reach track-row columns without unnest: `f.audio[1].tags.language` (strict-Postgres `(f.audio[1]).tags.language` also parses). In a `WHERE` this is an **assertion** - the subscript names one track, so a false predicate refuses to compile ([recipe 29](examples.md#29-assert-what-youre-shipping)).
 
 ## Track rows - `unnest(f.audio) t`
 
@@ -27,7 +27,8 @@ The row IS the stream: a bare `t` where a stream is expected selects it, filters
 | column | type | audio | video | subtitle | data |
 | --- | --- | --- | --- | --- | --- |
 | `index` | number | yes | yes | yes | yes |
-| `language`, `title`, `codec` | text | yes | yes | yes | yes |
+| `tags` | tag map | yes | yes | yes | yes |
+| `codec` | text | yes | yes | yes | yes |
 | `channels`, `sample_rate` | number | yes | - | - | - |
 | `channel_layout` | text | yes | - | - | - |
 | `width`, `height` | number | - | yes | - | - |
@@ -36,6 +37,8 @@ The row IS the stream: a bare `t` where a stream is expected selects it, filters
 | `bitrate`, `duration` | number | yes | yes | - | - |
 
 `index` is 1-based and agrees with the subscript: `WHERE t.index = 1` and `f.audio[1]` name the same track.
+
+`tags` is a map read by path - `t.tags.language`, `t.tags.title`, any key the file carries; absent reads NULL. There is no bare `t.language` spelling. Bare, `t.tags` prints the whole map as one array cell of `(key,value)` records.
 
 `WHERE` over row columns filters tracks; `ORDER BY` re-sorts them (multi-key, Postgres NULL placement) - without it, rows keep file order, which is player-visible and never changed implicitly. Both take the compile-time predicate grammar: `=`, `!=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, statically type-checked.
 
@@ -60,12 +63,12 @@ A CTE exposes whatever its body named with `AS`, and referencing it in FROM cont
 ```sql
 SELECT array_agg(amix(a, b))
 FROM input('film.mkv') f, input('commentary.mkv') g,
-     unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language
+     unnest(f.audio) a JOIN unnest(g.audio) b ON a.tags.language = b.tags.language
 ```
 
 - `INNER`, `LEFT`, `FULL OUTER` between unnest tables; comma between them is a cross join. Joins anywhere else stay rejected.
 - Result order: the left side's track order; a FULL join appends unmatched right rows after, in their order.
-- Real join multiplicity: one row matching two pairs with both. To pair a 5.1 and a stereo English track separately, widen the key: `ON a.language = b.language AND a.channel_layout = b.channel_layout`.
+- Real join multiplicity: one row matching two pairs with both. To pair a 5.1 and a stereo English track separately, widen the key: `ON a.tags.language = b.tags.language AND a.channel_layout = b.channel_layout`.
 - `ON` takes the same grammar as `WHERE`, column vs column or literal. A bare row alias is a stream, not a value to compare, so it is not usable inside `ON`.
 
 An outer join's gap side is a NULL row. Selecting it bare is a typed rejection; fill it with `COALESCE`, by stream type: **audio** `ffmpeg.anullsrc(...)` (silence; `duration` inherits from the paired track when omitted, and no duration anywhere is a rejection), **video** `ffmpeg.color(...)` (black by default; `size`/`rate`/`duration` inherit), **captions** `sqlmpeg.empty_captions()` (a zero-cue subtitle track as one extra `data:`-URI input). Fills carry the paired row's tags, so a silence-filled French slot still emits `-metadata:s:N language=fra`. The pattern is [recipe 27](examples.md#27-concatenate-files-with-different-track-counts).
@@ -74,8 +77,8 @@ An outer join's gap side is a NULL row. Selecting it bare is a typed rejection; 
 
 An aliased non-stream SELECT column is a metadata tag; the alias is the key (free-form; quoted identifiers for unusual keys), the value any compile-time expression, `NULL` clears the key. The scope is the row shape it sits over:
 
-- **Over track rows**: tags that row's stream(s) - `-metadata:s:N`. `CASE WHEN t.language IN ('en', 'english') THEN 'eng' ELSE t.language END AS language` retags a library in one expression. Unselected tags pass through unchanged. Recipes [37-38](examples.md#37-retitle-tracks-from-their-own-metadata).
-- **Over input rows only** (no track rows in the branch): tags the container - `-metadata`. The input's own tag columns feed the expressions, so `CASE WHEN f.title IS NULL THEN 'Untitled' ELSE f.title END AS title` fills a missing title. [Recipe 52](examples.md#52-read-the-containers-tags-rewrite-them-with-case).
+- **Over track rows**: tags that row's stream(s) - `-metadata:s:N`. `CASE WHEN t.tags.language IN ('en', 'english') THEN 'eng' ELSE t.tags.language END AS language` retags a library in one expression. Unselected tags pass through unchanged. Recipes [37-38](examples.md#37-retitle-tracks-from-their-own-metadata).
+- **Over input rows only** (no track rows in the branch): tags the container - `-metadata`. The input's own tags feed the expressions, so `CASE WHEN f.tags.title IS NULL THEN 'Untitled' ELSE f.tags.title END AS title` fills a missing title. [Recipe 52](examples.md#52-read-the-containers-tags-rewrite-them-with-case).
 - **Both in one query**: layer with a CTE - tag columns in the body are per-stream, in the outer SELECT container-level, and the outer SELECT gathers the CTE's rows (`array_agg` + `GROUP BY`, see Combining rows); the outer value wins on a shared key. [Recipe 53](examples.md#53-tag-the-tracks-and-the-container-in-one-query).
 
 `disposition` is a reserved key: its value is ffmpeg's disposition spec (`'default'`, `'forced'`, `'default+forced'`, `'0'` clears) and it emits `-disposition:N` instead - [recipe 41](examples.md#41-flag-the-default-track). `metadata_from <alias>` copies an input's global tags, `strip_metadata true` drops them; a tag column overrides either for its key. The same columns in a table/CSV query print as plain data, which previews what a retag will write.

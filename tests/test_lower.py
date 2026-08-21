@@ -1351,7 +1351,7 @@ def test_a_cte_body_unnests_its_input_and_filters_the_rows() -> None:
     g = _lower(
         "WITH tracks AS ("
         "  SELECT t AS track FROM input('x.mp4') f, unnest(f.audio) t"
-        "  WHERE t.language = 'fra'"
+        "  WHERE t.tags.language = 'fra'"
         ") SELECT tracks.track FROM tracks",
         {
             "f": _probe_result(
@@ -6013,7 +6013,7 @@ def test_a_codecless_row_is_still_inspectable_as_a_table() -> None:
     codec-less tracks (codec column NULL) -- that is how you find out."""
     probes = _row_probes(_track("data", 0, language="en", codec=None))
     sinks = lower_table(
-        resolve(parse("SELECT t, t.language, t.codec FROM input('f.mpd') f, unnest(f.data) t")),
+        resolve(parse("SELECT t, t.tags.language, t.codec FROM input('f.mpd') f, unnest(f.data) t")),
         probes,
     )
     assert len(sinks) == 1
@@ -6048,12 +6048,12 @@ def test_each_row_carries_its_own_stream_meta_as_provenance() -> None:
 
 
 def test_a_where_over_a_row_column_keeps_only_the_matching_rows() -> None:
-    g = _lower(_row_query("t.language = 'eng'"), _row_probes())
+    g = _lower(_row_query("t.tags.language = 'eng'"), _row_probes())
     assert _outputs(g) == [("src:f:a:0", "audio", None)]
 
 
 def test_a_where_that_matches_nothing_is_a_typed_rejection() -> None:
-    err = _reject_lower(_row_query("t.language = 'deu'"), _row_probes())
+    err = _reject_lower(_row_query("t.tags.language = 'deu'"), _row_probes())
     assert err.code is ErrorCode.STREAM_NOT_FOUND
     assert "selects nothing" in err.message
 
@@ -6061,14 +6061,14 @@ def test_a_where_that_matches_nothing_is_a_typed_rejection() -> None:
 def test_null_matches_nothing_including_inequality() -> None:
     # The third track has no language tag, so every comparison against it is
     # UNKNOWN -- `!= 'eng'` does not rescue it, which is the whole SQL rule.
-    g = _lower(_row_query("t.language != 'eng'"), _row_probes())
+    g = _lower(_row_query("t.tags.language != 'eng'"), _row_probes())
     assert _outputs(g) == [("src:f:a:1", "audio", None)]
 
 
 def test_is_null_and_is_not_null_select_the_two_halves() -> None:
-    g = _lower(_row_query("t.language IS NULL"), _row_probes())
+    g = _lower(_row_query("t.tags.language IS NULL"), _row_probes())
     assert _outputs(g) == [("src:f:a:2", "audio", None)]
-    g = _lower(_row_query("t.language IS NOT NULL"), _row_probes())
+    g = _lower(_row_query("t.tags.language IS NOT NULL"), _row_probes())
     assert _outputs(g) == [("src:f:a:0", "audio", None), ("src:f:a:1", "audio", None)]
 
 
@@ -6091,7 +6091,7 @@ def test_an_unprobed_field_is_null_for_every_row() -> None:
         ("2 = t.channels", ["src:f:a:0", "src:f:a:2"]),
         ("6 > t.channels", ["src:f:a:0", "src:f:a:2"]),
         ("t.codec = 'aac' AND t.channels = 2", ["src:f:a:0", "src:f:a:2"]),
-        ("t.language = 'eng' OR t.language = 'fra'", ["src:f:a:0", "src:f:a:1"]),
+        ("t.tags.language = 'eng' OR t.tags.language = 'fra'", ["src:f:a:0", "src:f:a:1"]),
         ("NOT (t.channels = 2)", ["src:f:a:1"]),
         ("t.index = 1", ["src:f:a:0"]),
         ("t.index = 3", ["src:f:a:2"]),
@@ -6106,7 +6106,7 @@ def test_the_compile_time_predicate_evaluator(
 
 def test_not_over_an_unknown_stays_unknown() -> None:
     # NOT UNKNOWN is UNKNOWN, so the untagged track is dropped by BOTH of these.
-    for predicate in ("t.language = 'eng'", "NOT (t.language = 'eng')"):
+    for predicate in ("t.tags.language = 'eng'", "NOT (t.tags.language = 'eng')"):
         g = _lower(_row_query(predicate), _row_probes())
         assert "src:f:a:2" not in [o.ref for o in g.outputs]
 
@@ -6125,11 +6125,11 @@ def test_order_by_resorts_the_rows_at_compile_time() -> None:
 
 def test_order_by_puts_nulls_where_postgres_puts_them() -> None:
     # ASC -> NULLS LAST, DESC -> NULLS FIRST, both filled in by sqlglot.
-    g = _lower(_row_query(order="t.language"), _row_probes())
+    g = _lower(_row_query(order="t.tags.language"), _row_probes())
     assert [o.ref for o in g.outputs] == ["src:f:a:0", "src:f:a:1", "src:f:a:2"]
-    g = _lower(_row_query(order="t.language DESC"), _row_probes())
+    g = _lower(_row_query(order="t.tags.language DESC"), _row_probes())
     assert [o.ref for o in g.outputs] == ["src:f:a:2", "src:f:a:1", "src:f:a:0"]
-    g = _lower(_row_query(order="t.language ASC NULLS FIRST"), _row_probes())
+    g = _lower(_row_query(order="t.tags.language ASC NULLS FIRST"), _row_probes())
     assert [o.ref for o in g.outputs] == ["src:f:a:2", "src:f:a:0", "src:f:a:1"]
 
 
@@ -6139,7 +6139,7 @@ def test_order_by_applies_keys_left_to_right() -> None:
         _track("audio", 1, language="fra", channels=2),
         _track("audio", 2, language="eng", channels=2),
     )
-    g = _lower(_row_query(order="t.language, t.channels"), probes)
+    g = _lower(_row_query(order="t.tags.language, t.channels"), probes)
     assert [o.ref for o in g.outputs] == ["src:f:a:2", "src:f:a:0", "src:f:a:1"]
 
 
@@ -6164,7 +6164,7 @@ def test_subtitle_rows_work_the_same_and_stay_passthrough() -> None:
     )
     g = _lower(
         "SELECT s FROM input('f.mkv') f, unnest(f.subtitle) s "
-        "WHERE s.language = 'eng'",
+        "WHERE s.tags.language = 'eng'",
         probes,
     )
     assert _outputs(g) == [("src:f:s:0", "subtitle", None)]
@@ -6218,7 +6218,7 @@ def test_grouping_by_the_row_groups_by_the_stream_not_its_metadata() -> None:
 
 def test_selecting_a_metadata_column_is_a_typed_rejection() -> None:
     err = _reject_lower(
-        "SELECT t.language FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
+        "SELECT t.tags.language FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "is track metadata, not a stream" in err.message
@@ -6286,17 +6286,17 @@ def test_a_row_query_works_in_a_union_all_branch() -> None:
     probes["g"] = probes["f"]
     g = _lower(
         "SELECT f.video[1], t FROM input('f.mkv') f, unnest(f.audio) t "
-        "WHERE t.language = 'eng' "
+        "WHERE t.tags.language = 'eng' "
         "UNION ALL "
         "SELECT g.video[1], u FROM input('g.mkv') g, unnest(g.audio) u "
-        "WHERE u.language = 'fra'",
+        "WHERE u.tags.language = 'fra'",
         probes,
     )
     assert _filters(g) == ["concat"]
 
 
 def test_a_time_window_still_reaches_the_input_of_a_row_query() -> None:
-    g = _lower(_row_query("f.t BETWEEN 1 AND 2 AND t.language = 'eng'"), _row_probes())
+    g = _lower(_row_query("f.t BETWEEN 1 AND 2 AND t.tags.language = 'eng'"), _row_probes())
     assert g.input_trims == {"f": (1, 2)}
     assert _outputs(g) == [("src:f:a:0", "audio", None)]
 
@@ -6307,7 +6307,7 @@ def test_a_seeked_caption_row_is_still_rejected() -> None:
     probes = _row_probes(_track("subtitle", 0, language="eng"))
     err = _reject_lower(
         "SELECT s FROM input('f.mkv') f, unnest(f.subtitle) s "
-        "WHERE f.t >= 1 AND s.language = 'eng'",
+        "WHERE f.t >= 1 AND s.tags.language = 'eng'",
         probes,
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -6326,7 +6326,7 @@ def test_a_track_row_query_runs_end_to_end(tmp_path: Path) -> None:
     out = tmp_path / "eng.m4a"
     query = (
         f"SELECT t FROM input('{(FIXTURES_DIR / 'av2.mp4').as_posix()}') f, "
-        "unnest(f.audio) t WHERE t.language = 'eng'"
+        "unnest(f.audio) t WHERE t.tags.language = 'eng'"
     )
     args = build_ffmpeg_args(emit(compile_sql(query)), str(out))
     assert "-map" in args and "0:a:0" in args
@@ -6399,7 +6399,7 @@ def test_a_bare_chapters_column_prints_as_one_array_cell() -> None:
     """The array VALUE, not a row source: records in schema order, Postgres
     array-literal braces around them."""
     sinks = lower_table(
-        resolve(parse("SELECT f.title, f.chapters FROM input('f.mkv') f")),
+        resolve(parse("SELECT f.tags.title, f.chapters FROM input('f.mkv') f")),
         _chapter_probes(*_TWO_CHAPTERS),
     )
     assert sinks[0].result.columns == ["title", "chapters"]
@@ -6638,7 +6638,7 @@ def _assertion_query(predicate: str) -> str:
 
 
 def test_a_true_assertion_compiles_exactly_like_no_where_at_all() -> None:
-    g = _lower(_assertion_query("f.audio[1].language = 'eng'"), _row_probes())
+    g = _lower(_assertion_query("f.audio[1].tags.language = 'eng'"), _row_probes())
     plain = _lower("SELECT f.audio[1] FROM input('f.mkv') f", _row_probes())
     assert _outputs(g) == _outputs(plain) == [("src:f:a:0", "audio", None)]
     assert _filters(g) == []
@@ -6646,7 +6646,7 @@ def test_a_true_assertion_compiles_exactly_like_no_where_at_all() -> None:
 
 def test_a_false_assertion_is_a_typed_rejection() -> None:
     err = _reject_lower(
-        _assertion_query("f.audio[1].language = 'fra'"), _row_probes()
+        _assertion_query("f.audio[1].tags.language = 'fra'"), _row_probes()
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "WHERE assertion failed" in err.message
@@ -6668,21 +6668,21 @@ def test_is_null_reads_the_unprobed_field_correctly() -> None:
 @pytest.mark.parametrize(
     ("predicate", "expected"),
     [
-        ("f.audio[1].language = 'eng'", True),
-        ("f.audio[2].language = 'eng'", False),
+        ("f.audio[1].tags.language = 'eng'", True),
+        ("f.audio[2].tags.language = 'eng'", False),
         ("f.audio[1].channels = 2", True),
         ("f.audio[2].channels > 2", True),
         ("f.audio[1].index = 1", True),
         ("f.audio[1].index = 2", False),
-        ("f.audio[1].language = 'eng' AND f.audio[1].channels = 2", True),
-        ("f.audio[1].language = 'eng' AND f.audio[1].channels = 6", False),
-        ("f.audio[1].language = 'fra' OR f.audio[2].language = 'fra'", True),
-        ("NOT (f.audio[1].language = 'fra')", True),
-        ("NOT (f.audio[1].language = 'eng')", False),
+        ("f.audio[1].tags.language = 'eng' AND f.audio[1].channels = 2", True),
+        ("f.audio[1].tags.language = 'eng' AND f.audio[1].channels = 6", False),
+        ("f.audio[1].tags.language = 'fra' OR f.audio[2].tags.language = 'fra'", True),
+        ("NOT (f.audio[1].tags.language = 'fra')", True),
+        ("NOT (f.audio[1].tags.language = 'eng')", False),
         ("f.audio[1].channels BETWEEN 1 AND 3", True),
-        ("f.audio[3].language IS NULL", True),
-        ("f.audio[1].language IS NOT NULL", True),
-        ("f.audio[3].language IS NOT NULL", False),
+        ("f.audio[3].tags.language IS NULL", True),
+        ("f.audio[1].tags.language IS NOT NULL", True),
+        ("f.audio[3].tags.language IS NOT NULL", False),
     ],
 )
 def test_the_subscript_assertion_evaluator(predicate: str, expected: bool) -> None:
@@ -6695,18 +6695,18 @@ def test_the_subscript_assertion_evaluator(predicate: str, expected: bool) -> No
 
 
 def test_assertion_subscript_out_of_range_is_stream_not_found() -> None:
-    err = _reject_lower(_assertion_query("f.audio[9].language = 'eng'"), _row_probes())
+    err = _reject_lower(_assertion_query("f.audio[9].tags.language = 'eng'"), _row_probes())
     assert err.code is ErrorCode.STREAM_NOT_FOUND
 
 
 def test_assertion_over_an_unprobed_input_is_input_not_found() -> None:
-    err = _reject_lower(_assertion_query("f.audio[1].language = 'eng'"), {"f": None})
+    err = _reject_lower(_assertion_query("f.audio[1].tags.language = 'eng'"), {"f": None})
     assert err.code is ErrorCode.INPUT_NOT_FOUND
 
 
 def test_a_time_window_and_an_assertion_coexist_as_separate_conjuncts() -> None:
     g = _lower(
-        _assertion_query("f.t BETWEEN 1 AND 2 AND f.audio[1].language = 'eng'"),
+        _assertion_query("f.t BETWEEN 1 AND 2 AND f.audio[1].tags.language = 'eng'"),
         _row_probes(),
     )
     assert _outputs(g) == [("src:f:a:0", "audio", None)]
@@ -6750,7 +6750,7 @@ _GATHERED = "array_agg(a), array_agg(b)"
 def _join_query(
     projection: str = "a, b",
     join: str = "JOIN",
-    on: str = "ON a.language = b.language",
+    on: str = "ON a.tags.language = b.tags.language",
     where: str = "",
     order: str = "",
     column: str = "audio",
@@ -6802,7 +6802,7 @@ def test_join_multiplicity_is_real_join_semantics() -> None:
     # here matches nothing at all (`f`'s tracks carry no layout), and an empty
     # row set selects no streams, exactly as it does without a join.
     err = _reject_lower(
-        _join_query(on="ON a.language = b.language AND a.channel_layout = b.channel_layout"),
+        _join_query(on="ON a.tags.language = b.tags.language AND a.channel_layout = b.channel_layout"),
         probes,
     )
     assert err.code is ErrorCode.STREAM_NOT_FOUND
@@ -6862,7 +6862,7 @@ def test_a_full_join_appends_unmatched_right_rows_in_their_own_order() -> None:
     )
     assert err.code is ErrorCode.STREAM_NOT_FOUND
     assert "is NULL in row 3" in err.message
-    assert "b.language='deu'" in err.message
+    assert "b.tags.language='deu'" in err.message
     assert "COALESCE(a" in (err.hint or "")
     # Filled, the whole row order shows: the matched pair, the unmatched LEFT
     # row (silence on the right), then the unmatched RIGHT row appended last.
@@ -6911,7 +6911,7 @@ def test_where_filters_the_joined_rows_not_the_tables() -> None:
     one and dropped exactly the rows it is about."""
     g = _lower(
         _join_query(
-            projection="a", join="FULL OUTER JOIN", where="b.language IS NULL"
+            projection="a", join="FULL OUTER JOIN", where="b.tags.language IS NULL"
         ),
         _pair_probes(),
     )
@@ -6919,7 +6919,7 @@ def test_where_filters_the_joined_rows_not_the_tables() -> None:
 
 
 def test_order_by_re_sorts_the_joined_rows_and_keeps_the_pairing() -> None:
-    g = _lower(_join_query(_GATHERED, order="a.language DESC"), _pair_probes(
+    g = _lower(_join_query(_GATHERED, order="a.tags.language DESC"), _pair_probes(
         right=[
             _track("audio", 0, language="eng", duration=2.0),
             _track("audio", 1, language="fra", duration=2.0),
@@ -7127,7 +7127,7 @@ def test_a_joined_track_query_runs_end_to_end(tmp_path: Path) -> None:
         "SELECT array_agg(amix(a, b)) FROM "
         f"input('{(FIXTURES_DIR / 'av2.mp4').as_posix()}') f, "
         f"input('{(FIXTURES_DIR / 'av3.mp4').as_posix()}') g, "
-        "unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language"
+        "unnest(f.audio) a JOIN unnest(g.audio) b ON a.tags.language = b.tags.language"
     )
     args = build_ffmpeg_args(emit(compile_sql(query)), str(out))
     args.insert(1, "-y")
@@ -7144,7 +7144,7 @@ def test_an_empty_captions_fill_muxes_a_real_track(tmp_path: Path) -> None:
     query = (
         "SELECT s, sqlmpeg.empty_captions() FROM "
         f"input('{(FIXTURES_DIR / 'avs.mkv').as_posix()}') f, "
-        "unnest(f.subtitle) s WHERE s.language = 'eng'"
+        "unnest(f.subtitle) s WHERE s.tags.language = 'eng'"
     )
     args = build_ffmpeg_args(emit(compile_sql(query)), str(out))
     args.insert(1, "-y")
@@ -7220,7 +7220,7 @@ def test_a_tag_column_produces_no_output_stream() -> None:
 def test_a_searched_case_takes_the_first_true_branch_per_row() -> None:
     g = _lower(
         _tag_query(
-            "CASE WHEN t.language = 'fra' THEN 'fre' "
+            "CASE WHEN t.tags.language = 'fra' THEN 'fre' "
             "WHEN t.channels = 2 THEN 'two' ELSE 'other' END AS language"
         ),
         _row_probes(),
@@ -7235,7 +7235,7 @@ def test_a_searched_case_takes_the_first_true_branch_per_row() -> None:
 def test_a_simple_case_compares_its_operand_with_each_when() -> None:
     g = _lower(
         _tag_query(
-            "CASE t.language WHEN 'fra' THEN 'fre' WHEN 'eng' THEN 'en' "
+            "CASE t.tags.language WHEN 'fra' THEN 'fre' WHEN 'eng' THEN 'en' "
             "ELSE 'und' END AS language"
         ),
         _row_probes(),
@@ -7253,7 +7253,7 @@ def test_an_unknown_case_condition_is_not_true() -> None:
     """3VL straight through CASE: the untagged track's comparison is UNKNOWN,
     so its branch is skipped exactly as a FALSE one is."""
     g = _lower(
-        _tag_query("CASE WHEN t.language != 'fra' THEN 'kept' ELSE 'else' END AS title"),
+        _tag_query("CASE WHEN t.tags.language != 'fra' THEN 'kept' ELSE 'else' END AS title"),
         _row_probes(),
     )
     assert [o.metadata["title"] for o in g.outputs] == ["kept", "else", "else"]
@@ -7261,14 +7261,14 @@ def test_an_unknown_case_condition_is_not_true() -> None:
 
 def test_a_case_with_no_else_falls_through_to_null() -> None:
     g = _lower(
-        _tag_query("CASE WHEN t.language = 'fra' THEN 'fre' END AS language"),
+        _tag_query("CASE WHEN t.tags.language = 'fra' THEN 'fre' END AS language"),
         _row_probes(),
     )
     assert [o.metadata for o in g.outputs] == [{}, {"language": "fre"}, {}]
 
 
 def test_concatenation_builds_a_value_from_the_row() -> None:
-    g = _lower(_tag_query("'Audio (' || t.language || ')' AS title"), _row_probes())
+    g = _lower(_tag_query("'Audio (' || t.tags.language || ')' AS title"), _row_probes())
     assert [o.metadata.get("title") for o in g.outputs] == [
         "Audio (eng)",
         "Audio (fra)",
@@ -7319,9 +7319,9 @@ def test_a_joined_row_tags_one_sides_track_from_the_others_column() -> None:
     )
     g = _lower(
         "WITH titled AS ("
-        "  SELECT a AS track, b.title AS title"
+        "  SELECT a AS track, b.tags.title AS title"
         "  FROM input('f.mkv') f, input('g.mkv') g,"
-        "       unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language"
+        "       unnest(f.audio) a JOIN unnest(g.audio) b ON a.tags.language = b.tags.language"
         ") SELECT array_agg(titled.track) FROM titled",
         probes,
     )
@@ -7343,7 +7343,7 @@ def test_one_track_cannot_take_two_values_for_the_same_tag() -> None:
         ],
     )
     err = _reject_lower(
-        "SELECT a, b.language AS language FROM input('f.mkv') f, "
+        "SELECT a, b.tags.language AS language FROM input('f.mkv') f, "
         "input('g.mkv') g, unnest(f.audio) a, unnest(g.audio) b",
         probes,
     )
@@ -7411,14 +7411,14 @@ def _container_query(projection: str) -> str:
 
 def test_a_container_tag_column_reads_the_probed_value() -> None:
     g = _lower(
-        _container_query("f.title AS title"), _tagged_probes(title="Angel One")
+        _container_query("f.tags.title AS title"), _tagged_probes(title="Angel One")
     )
     assert g.sinks[0].tags == {"title": "Angel One"}
 
 
 def test_a_container_tag_concatenates_like_any_text_value() -> None:
     g = _lower(
-        _container_query("f.title || ' (restored)' AS title"),
+        _container_query("f.tags.title || ' (restored)' AS title"),
         _tagged_probes(title="Angel One"),
     )
     assert g.sinks[0].tags == {"title": "Angel One (restored)"}
@@ -7427,7 +7427,7 @@ def test_a_container_tag_concatenates_like_any_text_value() -> None:
 def test_an_absent_container_tag_reads_null_so_case_can_fill_it() -> None:
     g = _lower(
         _container_query(
-            "CASE WHEN f.comment IS NULL THEN 'no notes' ELSE f.comment END AS comment"
+            "CASE WHEN f.tags.comment IS NULL THEN 'no notes' ELSE f.tags.comment END AS comment"
         ),
         _tagged_probes(title="Angel One"),
     )
@@ -7437,7 +7437,7 @@ def test_an_absent_container_tag_reads_null_so_case_can_fill_it() -> None:
 def test_a_present_container_tag_wins_the_case_fill() -> None:
     g = _lower(
         _container_query(
-            "CASE WHEN f.comment IS NULL THEN 'no notes' ELSE f.comment END AS comment"
+            "CASE WHEN f.tags.comment IS NULL THEN 'no notes' ELSE f.tags.comment END AS comment"
         ),
         _tagged_probes(comment="ripped"),
     )
@@ -7445,17 +7445,17 @@ def test_a_present_container_tag_wins_the_case_fill() -> None:
 
 
 def test_a_container_tag_on_an_unprobed_input_is_input_not_found() -> None:
-    err = _reject_lower(_container_query("f.title AS title"), {"f": None})
+    err = _reject_lower(_container_query("f.tags.title AS title"), {"f": None})
     assert err.code is ErrorCode.INPUT_NOT_FOUND
-    assert "'f.title' is unknown" in err.message
+    assert "'f.tags.title' is unknown" in err.message
 
 
 def test_a_container_tag_in_stream_position_is_rejected() -> None:
     err = _reject_lower(
-        "SELECT f.title FROM input('f.mkv') f", _tagged_probes(title="Angel One")
+        "SELECT f.tags.title FROM input('f.mkv') f", _tagged_probes(title="Angel One")
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "'f.title' is a text tag, not a stream" in err.message
+    assert "'f.tags.title' is a text tag, not a stream" in err.message
     assert "give it an alias" in (err.hint or "")
 
 
@@ -7516,14 +7516,14 @@ def test_a_row_table_branch_still_tags_per_stream() -> None:
 
 
 def test_a_row_table_branch_reads_container_tags_onto_its_streams() -> None:
-    """`f.title` is a value wherever the value grammar runs; with track rows
+    """`f.tags.title` is a value wherever the value grammar runs; with track rows
     it lands on each row's stream, not on the container."""
     probes = {
         "f": ProbeResult(
             streams=[_track("audio", 0, language="eng")], tags={"artist": "Docs Dept"}
         )
     }
-    g = _lower(_tag_query("f.artist AS artist"), probes)
+    g = _lower(_tag_query("f.tags.artist AS artist"), probes)
     assert g.sinks[0].tags == {}
     assert [o.metadata for o in g.outputs] == [
         {"language": "eng", "artist": "Docs Dept"}
@@ -7546,7 +7546,7 @@ def test_container_tags_survive_the_ir_round_trip() -> None:
 
 def test_an_unaliased_row_metadata_column_is_still_not_a_stream() -> None:
     err = _reject_lower(
-        "SELECT t, t.language FROM input('f.mkv') f, unnest(f.audio) t",
+        "SELECT t, t.tags.language FROM input('f.mkv') f, unnest(f.audio) t",
         _row_probes(),
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -7556,21 +7556,21 @@ def test_an_unaliased_row_metadata_column_is_still_not_a_stream() -> None:
 
 def test_where_accepts_a_case_operand() -> None:
     g = _lower(
-        _row_query("t.language = CASE WHEN t.channels = 6 THEN 'fra' ELSE 'eng' END"),
+        _row_query("t.tags.language = CASE WHEN t.channels = 6 THEN 'fra' ELSE 'eng' END"),
         _row_probes(),
     )
     assert _refs(g) == ["src:f:a:0", "src:f:a:1"]
 
 
 def test_where_accepts_a_concatenation_operand() -> None:
-    g = _lower(_row_query("'x' || t.language = 'xfra'"), _row_probes())
+    g = _lower(_row_query("'x' || t.tags.language = 'xfra'"), _row_probes())
     assert _refs(g) == ["src:f:a:1"]
 
 
 def test_an_on_predicate_accepts_a_case_operand() -> None:
     g = _lower(
         _join_query(
-            on="ON a.language = CASE WHEN b.channels = 2 THEN b.language ELSE 'zxx' END"
+            on="ON a.tags.language = CASE WHEN b.channels = 2 THEN b.tags.language ELSE 'zxx' END"
         ),
         _pair_probes(right=[_track("audio", 0, language="eng", channels=2)]),
     )
@@ -7586,14 +7586,14 @@ def test_concatenating_a_number_is_rejected_rather_than_coerced() -> None:
 
 def test_case_results_must_share_one_type() -> None:
     err = _reject(
-        _tag_query("CASE WHEN t.language = 'fra' THEN 'fre' ELSE 2 END AS language")
+        _tag_query("CASE WHEN t.tags.language = 'fra' THEN 'fre' ELSE 2 END AS language")
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "CASE results must share one type" in err.message
 
 
 def test_a_simple_case_types_its_whens_against_the_operand() -> None:
-    err = _reject(_tag_query("CASE t.language WHEN 2 THEN 'x' END AS language"))
+    err = _reject(_tag_query("CASE t.tags.language WHEN 2 THEN 'x' END AS language"))
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "one type" in err.message
 
@@ -7610,7 +7610,7 @@ def test_a_written_tag_reads_back_out_of_the_file(tmp_path: Path) -> None:
     and ffprobe reads it back off the muxed stream."""
     out = tmp_path / "tagged.mka"
     query = (
-        "SELECT t, 'Audio (' || t.language || ')' AS title "
+        "SELECT t, 'Audio (' || t.tags.language || ')' AS title "
         f"FROM input('{(FIXTURES_DIR / 'av-eng.mp4').as_posix()}') f, "
         "unnest(f.audio) t"
     )
@@ -7639,8 +7639,8 @@ def test_a_table_query_prints_what_a_tag_would_say() -> None:
     sinks = lower_table(
         resolve(
             parse(
-                "SELECT t.index, CASE WHEN t.language = 'fra' THEN 'fre' "
-                "ELSE t.language END AS lang, 'A (' || t.language || ')' AS title "
+                "SELECT t.index, CASE WHEN t.tags.language = 'fra' THEN 'fre' "
+                "ELSE t.tags.language END AS lang, 'A (' || t.tags.language || ')' AS title "
                 "FROM input('f.mkv') f, unnest(f.audio) t"
             )
         ),
@@ -7655,7 +7655,7 @@ def test_a_table_query_prints_what_a_tag_would_say() -> None:
 
 def test_a_table_query_prints_container_tags_beside_the_duration() -> None:
     sinks = lower_table(
-        resolve(parse("SELECT f.title, f.artist, f.comment, f.duration "
+        resolve(parse("SELECT f.tags.title, f.tags.artist, f.tags.comment, f.duration "
                       "FROM input('f.mkv') f")),
         {
             "f": ProbeResult(
@@ -7673,7 +7673,7 @@ def test_a_table_query_broadcasts_a_container_tag_over_track_rows() -> None:
     sinks = lower_table(
         resolve(
             parse(
-                "SELECT t.index, f.title FROM input('f.mkv') f, unnest(f.audio) t"
+                "SELECT t.index, f.tags.title FROM input('f.mkv') f, unnest(f.audio) t"
             )
         ),
         {"f": ProbeResult(streams=list(_ROW_TRACKS), tags={"title": "Angel One"})},
@@ -7726,7 +7726,7 @@ def test_a_bare_array_column_broadcasts_beside_a_row_relation() -> None:
     cardinality mismatch; it now broadcasts one array cell over every row."""
     sinks = lower_table(
         resolve(
-            parse("SELECT f.video, t.language FROM input('f.mkv') f, unnest(f.audio) t")
+            parse("SELECT f.video, t.tags.language FROM input('f.mkv') f, unnest(f.audio) t")
         ),
         _row_probes(),
     )
@@ -7741,7 +7741,7 @@ def test_a_bare_array_column_broadcasts_beside_a_row_relation() -> None:
 def test_csv_bare_array_column_broadcasts_beside_a_row_relation() -> None:
     sinks = lower_table(
         resolve(
-            parse("SELECT f.video, t.language FROM input('f.mkv') f, unnest(f.audio) t")
+            parse("SELECT f.video, t.tags.language FROM input('f.mkv') f, unnest(f.audio) t")
         ),
         _row_probes(),
     )
@@ -7758,7 +7758,7 @@ def test_a_filtered_bare_array_broadcasts_beside_a_row_relation() -> None:
     sinks = lower_table(
         resolve(
             parse(
-                "SELECT hflip(f.video), t.language "
+                "SELECT hflip(f.video), t.tags.language "
                 "FROM input('f.mkv') f, unnest(f.audio) t"
             )
         ),
@@ -7814,7 +7814,7 @@ def test_a_subscripted_array_column_still_keeps_its_plain_cell() -> None:
 
 _TAGGED_CTE = (
     "WITH tagged AS ("
-    "  SELECT t AS track, 'Audio (' || t.language || ')' AS title"
+    "  SELECT t AS track, 'Audio (' || t.tags.language || ')' AS title"
     "  FROM input('f.mkv') f, unnest(f.audio) t"
     ") "
 )
@@ -7878,7 +7878,7 @@ def test_the_sinks_own_tag_wins_over_the_ctes_on_the_same_key() -> None:
     """
     g = _lower(
         "WITH tagged AS ("
-        "  SELECT t AS track, 'Audio (' || t.language || ')' AS title"
+        "  SELECT t AS track, 'Audio (' || t.tags.language || ')' AS title"
         "  FROM input('f.mkv') f, unnest(f.audio) t WHERE t.index = 1"
         ") SELECT tagged.track, 'Outer' AS title "
         "FROM tagged, input('f.mkv') g, unnest(g.audio) u WHERE u.index = 1",
@@ -7983,7 +7983,7 @@ def test_a_table_query_over_a_tagged_cte_prints_the_same_rows() -> None:
 # a CTE-only FROM has to come from the CTE's own splat array column instead.
 
 
-def _cte_report_query(where: str = "t.language = 'eng'", *, gather: bool = False) -> str:
+def _cte_report_query(where: str = "t.tags.language = 'eng'", *, gather: bool = False) -> str:
     column = "array_agg(aud.track)" if gather else "aud.track"
     return (
         "WITH aud AS ("
@@ -8434,7 +8434,7 @@ def test_a_computed_named_argument_is_evaluated_per_row() -> None:
 
 def test_a_computed_argument_still_meets_the_option_table() -> None:
     err = _reject_lower(
-        "SELECT gblur(t, t.language || 'x') "
+        "SELECT gblur(t, t.tags.language || 'x') "
         "FROM input('f.mkv') f, unnest(f.video) t",
         {"f": ProbeResult(streams=[_track("video", 0, width=320)])},
     )
@@ -8506,11 +8506,11 @@ _AGG_SHAPES = [
 
 _NARROWED = (
     "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
-    "WHERE t.language = 'fra'"
+    "WHERE t.tags.language = 'fra'"
 )
 _NARROWED_AGGREGATE = (
     "SELECT array_agg(t) FROM input('f.mkv') f, unnest(f.audio) t "
-    "WHERE t.language = 'fra'"
+    "WHERE t.tags.language = 'fra'"
 )
 _NARROWED_ARGV = [
     "ffmpeg", "-i", "f.mkv",
@@ -8580,9 +8580,9 @@ def test_the_group_key_itself_reads_as_a_container_tag() -> None:
         _track("audio", 1, language="eng", codec="aac"),
     )
     g = _lower(
-        "COPY (SELECT array_agg(t), t.language AS title "
-        "FROM input('f.mkv') f, unnest(f.audio) t GROUP BY t.language) "
-        "TO (t.language || '.mka')",
+        "COPY (SELECT array_agg(t), t.tags.language AS title "
+        "FROM input('f.mkv') f, unnest(f.audio) t GROUP BY t.tags.language) "
+        "TO (t.tags.language || '.mka')",
         probes,
     )
     assert g.sinks[0].tags == {"title": "eng"}
@@ -8607,12 +8607,12 @@ def test_disposition_is_still_not_a_container_key_when_grouped() -> None:
 def test_an_ungrouped_row_scalar_is_rejected_beside_an_aggregate() -> None:
     err = _reject(
         _agg_copy(
-            "SELECT array_agg(t), t.language AS title "
+            "SELECT array_agg(t), t.tags.language AS title "
             "FROM input('f.mkv') f, unnest(f.audio) t"
         )
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "'t.language' is neither aggregated nor a GROUP BY key" in err.message
+    assert "'t.tags.language' is neither aggregated nor a GROUP BY key" in err.message
     assert "GROUP BY" in (err.hint or "")
     assert "CTE" in (err.hint or "")
 
@@ -8641,7 +8641,7 @@ def test_a_row_star_is_rejected_in_a_grouped_branch() -> None:
 def test_a_to_expression_may_only_read_the_group_keys() -> None:
     err = _reject(
         "COPY (SELECT array_agg(t) FROM input('f.mkv') f, "
-        "unnest(f.audio) t GROUP BY t.language) TO (t.codec || '.mka')"
+        "unnest(f.audio) t GROUP BY t.tags.language) TO (t.codec || '.mka')"
     )
     assert "'t.codec' is neither aggregated nor a GROUP BY key" in err.message
 
@@ -8649,10 +8649,10 @@ def test_a_to_expression_may_only_read_the_group_keys() -> None:
 def test_grouping_by_a_row_column_needs_a_fan_out_destination() -> None:
     err = _reject(
         "COPY (SELECT array_agg(t) FROM input('f.mkv') f, "
-        "unnest(f.audio) t GROUP BY t.language) TO 'out.mka'"
+        "unnest(f.audio) t GROUP BY t.tags.language) TO 'out.mka'"
     )
     assert "writes one file per group" in err.message
-    assert "TO (t.language" in (err.hint or "")
+    assert "TO (t.tags.language" in (err.hint or "")
 
 
 def test_a_subscript_works_as_a_group_key() -> None:
@@ -8700,7 +8700,7 @@ def test_a_tag_survives_the_gather_onto_the_output_it_rode_in_on() -> None:
         "ffmpeg.anullsrc(duration => 1)))) "
         "FROM input('f.mkv') f, input('g.mkv') g, "
         "unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b "
-        "ON a.language = b.language) TO 'out.mka'",
+        "ON a.tags.language = b.tags.language) TO 'out.mka'",
         probes,
     )
     args = build_ffmpeg_args(emit(insert_splits(g)))
@@ -8852,8 +8852,8 @@ def test_a_grouped_table_query_over_a_row_key_is_one_row_per_group() -> None:
     sinks = lower_table(
         resolve(
             parse(
-                "SELECT t.language, array_agg(t) FROM input('f.mkv') f, "
-                "unnest(f.audio) t GROUP BY t.language"
+                "SELECT t.tags.language, array_agg(t) FROM input('f.mkv') f, "
+                "unnest(f.audio) t GROUP BY t.tags.language"
             )
         ),
         {"f": ProbeResult(streams=_LANG_TRACKS)},
@@ -8931,9 +8931,9 @@ def test_table_query_grouping_still_enforces_the_grouping_rule() -> None:
     """No GROUP BY key at all makes the whole relation one group, so an
     ungrouped row scalar beside ``array_agg`` still has nothing to match."""
     err = _reject_table(
-        "SELECT t.language, array_agg(t) FROM input('f.mkv') f, unnest(f.audio) t"
+        "SELECT t.tags.language, array_agg(t) FROM input('f.mkv') f, unnest(f.audio) t"
     )
-    assert "'t.language' is neither aggregated nor a GROUP BY key" in err.message
+    assert "'t.tags.language' is neither aggregated nor a GROUP BY key" in err.message
 
 
 def test_table_query_still_rejects_order_by_inside_array_agg() -> None:
@@ -9007,3 +9007,118 @@ def test_group_by_without_track_rows_still_has_no_streaming_equivalent() -> None
     err = _reject("COPY (SELECT f.audio[1] FROM input('f.mkv') f GROUP BY f.audio[1]) TO 'o.mka'")
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
     assert err.message == "GROUP BY has no streaming equivalent"
+
+
+def test_a_container_tag_key_is_free_form_on_the_read_side_too() -> None:
+    g = _lower(
+        _container_query("f.tags.encoded_by AS encoder"),
+        _tagged_probes(encoded_by="sqlmpeg"),
+    )
+    assert g.sinks[0].tags == {"encoder": "sqlmpeg"}
+
+
+def test_a_bare_container_tags_column_prints_as_one_array_cell() -> None:
+    """The whole map, key/value records in key order."""
+    sinks = lower_table(
+        resolve(parse("SELECT f.tags FROM input('f.mkv') f")),
+        _tagged_probes(title="Angel One", artist="Docs Dept"),
+    )
+    assert sinks[0].result.columns == ["tags"]
+    assert sinks[0].result.rows == [
+        [
+            ArrayCell(
+                elements=(
+                    RecordCell(fields=("artist", "Docs Dept")),
+                    RecordCell(fields=("title", "Angel One")),
+                )
+            )
+        ]
+    ]
+    assert "{(artist,Docs Dept),(title,Angel One)}" in render_table(sinks[0].result)
+
+
+def test_a_bare_container_tags_column_on_an_unprobed_input_is_input_not_found() -> None:
+    err = _reject_lower_table("SELECT f.tags FROM input('f.mkv') f", {"f": None})
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+    assert "cannot read tags of 'f.mkv'" in err.message
+
+
+def test_a_bare_container_tags_column_in_a_media_query_is_a_typed_rejection() -> None:
+    err = _reject_lower(
+        "SELECT f.tags FROM input('f.mkv') f", _tagged_probes(title="Angel One")
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.tags' carries no streams" in err.message
+    assert "f.tags.title" in (err.hint or "")
+
+
+def test_a_row_reads_any_tag_key_its_stream_carries() -> None:
+    probes = {
+        "f": _probe_result(
+            audios=1, audio_tags={"language": "eng", "handler_name": "SoundHandler"}
+        )
+    }
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT t.tags.handler_name "
+                "FROM input('f.mkv') f, unnest(f.audio) t"
+            )
+        ),
+        probes,
+    )
+    assert sinks[0].result.columns == ["handler_name"]
+    assert sinks[0].result.rows == [["SoundHandler"]]
+
+
+def test_a_tag_key_the_stream_lacks_reads_null() -> None:
+    sinks = lower_table(
+        resolve(
+            parse("SELECT t.tags.nosuchkey FROM input('f.mkv') f, unnest(f.audio) t")
+        ),
+        {"f": _probe_result(audios=1, audio_tags={"language": "eng"})},
+    )
+    assert sinks[0].result.rows == [[None]]
+
+
+def test_a_bare_row_tags_column_prints_the_whole_map() -> None:
+    sinks = lower_table(
+        resolve(parse("SELECT t.tags FROM input('f.mkv') f, unnest(f.audio) t")),
+        {"f": _probe_result(audios=1, audio_tags={"language": "eng", "title": "VO"})},
+    )
+    assert sinks[0].result.columns == ["tags"]
+    assert sinks[0].result.rows == [
+        [
+            ArrayCell(
+                elements=(
+                    RecordCell(fields=("language", "eng")),
+                    RecordCell(fields=("title", "VO")),
+                )
+            )
+        ]
+    ]
+
+
+def test_a_bare_row_tags_column_is_not_a_value() -> None:
+    err = _reject_lower(
+        "COPY (SELECT t, t.tags AS x FROM input('f.mkv') f, unnest(f.audio) t) "
+        "TO 'out.mka'",
+        {"f": _probe_result(audios=1, audio_tags={"language": "eng"})},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t.tags' is the whole tag map, not a single value" in err.message
+    assert "t.tags.language" in (err.hint or "")
+
+
+def test_only_language_and_title_ride_a_filter_through() -> None:
+    """A source's other tags stay put: riding them would emit -metadata
+    ffmpeg does not emit today."""
+    g = _lower(
+        "COPY (SELECT volume(f.audio[1], 0.5) FROM input('f.mkv') f) TO 'out.mka'",
+        {
+            "f": _probe_result(
+                audio_tags={"language": "fra", "title": "VF", "encoder": "Lavc"}
+            )
+        },
+    )
+    assert g.outputs[0].metadata == {"language": "fra", "title": "VF"}

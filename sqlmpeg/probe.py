@@ -46,7 +46,7 @@ class StreamMeta:
 
     type: StreamType
     index: int  # per-type, 0-based (0:a:<index>)
-    metadata: dict[str, str]  # language/title tags, when present
+    metadata: dict[str, str]  # the stream's tags in full, keys lowercased
     width: int | None
     height: int | None
     fps: str | None  # e.g. "30000/1001", verbatim from ffprobe avg_frame_rate
@@ -287,7 +287,7 @@ def _parse_streams(data: object) -> ProbeResult | None:
         raw_format = data.get("format")
         if isinstance(raw_format, dict):
             container_duration = _float_opt(raw_format, "duration")
-            container_tags = _container_tags(raw_format)
+            container_tags = _tags(raw_format)
 
         chapters = _parse_chapters(data.get("chapters"))
 
@@ -361,20 +361,14 @@ def _str_opt(raw: dict[str, object], key: str) -> str | None:
     return str(raw[key])
 
 
-def _container_tags(raw_format: dict[str, object]) -> dict[str, str]:
-    """``format.tags`` in full, keys lowercased (muxers vary the case)."""
-    tags = raw_format.get("tags")
+def _tags(raw: dict[str, object]) -> dict[str, str]:
+    """A ``tags`` object in full, keys lowercased (muxers vary the case).
+
+    One function for both levels: a stream's tags and the container's are the
+    same free-form map, and which keys a query may read is decided where they
+    resolve, not here.
+    """
+    tags = raw.get("tags")
     if not isinstance(tags, dict):
         return {}
     return {str(key).lower(): str(value) for key, value in tags.items()}
-
-
-def _tags(raw: dict[str, object]) -> dict[str, str]:
-    tags = raw.get("tags", {})
-    metadata: dict[str, str] = {}
-    if isinstance(tags, dict):
-        if "language" in tags:
-            metadata["language"] = str(tags["language"])
-        if "title" in tags:
-            metadata["title"] = str(tags["title"])
-    return metadata

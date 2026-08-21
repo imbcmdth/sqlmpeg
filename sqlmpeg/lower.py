@@ -314,6 +314,7 @@ from sqlmpeg.parser import (
     _projection_expr,
     _time_bounds,
     chapters_unnest_hint,
+    column_label,
     from_entries,
     group_keys,
     is_grouped,
@@ -323,6 +324,8 @@ from sqlmpeg.parser import (
     star_qualifier,
     subscript_index,
     subscript_metadata_shape,
+    tag_key,
+    tag_path,
     union_branches,
 )
 from sqlmpeg.parser import _ident_name as _fold
@@ -346,9 +349,9 @@ from sqlmpeg.table import (
 from sqlmpeg.types import (
     CHAPTERS_COLUMN,
     INPUT_DURATION_COLUMN,
-    INPUT_TAG_COLUMNS,
     ROW_SCHEMAS,
     STREAM_TAG_COLUMNS,
+    TAGS_COLUMN,
     TIME_COLUMN,
 )
 
@@ -416,7 +419,7 @@ _ROW_METADATA_HINT = (
     "a track row's metadata columns are what you FILTER, JOIN and SORT rows by; "
     "the only column that is a stream — and therefore the only one that can be "
     "an output — is the row itself, <alias>. Give the column an alias to write "
-    "it back as a TAG instead, e.g. SELECT t, t.language AS language"
+    "it back as a TAG instead, e.g. SELECT t, t.tags.language AS language"
 )
 _ARRAY_AGG_HINT = (
     "array_agg takes one track-row stream expression, e.g. array_agg(t) "
@@ -425,11 +428,11 @@ _ARRAY_AGG_HINT = (
 _ONE_FILE_PER_ROW_HINT = (
     "gather the rows into that one file with array_agg(...), adding GROUP BY "
     "the column they share when they share one; or give each row a file of its "
-    "own with a TO expression, e.g. TO (t.language || '.mka')"
+    "own with a TO expression, e.g. TO (t.tags.language || '.mka')"
 )
 _ONE_FILE_PER_GROUP_HINT = (
     "one group is one file, so the destination has to name the group, e.g. "
-    "TO (t.language || '.mka'); group by a column every row agrees on to write "
+    "TO (t.tags.language || '.mka'); group by a column every row agrees on to write "
     "a single file instead"
 )
 _GROUPED_CTE_HINT = (
@@ -784,7 +787,7 @@ def _computed_segments(expression: exp.Expr, row_aliases: set[str]) -> list[exp.
     """The pieces of a path expression whose text comes from row metadata.
 
     A ``||`` chain is split at its operands, so the literal directory in
-    ``'out/' || t.language`` stays a literal and only ``t.language`` is
+    ``'out/' || t.tags.language`` stays a literal and only ``t.tags.language`` is
     checked. Anything else is one segment, computed if it reads a row at all.
     """
     node = _unwrap(expression)
@@ -849,9 +852,11 @@ def _table_column_name(node: exp.Expr) -> str:
     (``language``, ``codec``, ...). A bare row/input column names itself, and
     a bare row alias names the alias, as Postgres does for a whole-row
     reference; a subscript metadata accessor names the metadata field it
-    reads (``f.audio[1].language`` -> ``language``, matching a row table's
+    reads (``f.audio[1].codec`` -> ``codec``, matching a row table's
     own column of the same name); anything else (a filter call, COALESCE,
-    ...) has no single name to fall back to.
+    ...) has no single name to fall back to. A tag path names its KEY
+    (``a.tags.language`` -> ``language``): the last part of the path, the way
+    Postgres names any field reference.
     """
     alias = _projection_name(node)
     if alias is not None:
@@ -859,12 +864,14 @@ def _table_column_name(node: exp.Expr) -> str:
     inner = _unwrap(node)
     if isinstance(inner, exp.Column):
         name = _fold(inner.this)
-        return _fold(inner.args.get("table")) if name == ROW_STREAM else name
+        if name == ROW_STREAM:
+            return _fold(inner.args.get("table"))
+        return tag_key(name) or name
     if isinstance(inner, exp.ArrayAgg):
         return "array_agg"  # Postgres's own convention for the unaliased column
     shape = subscript_metadata_shape(inner)
     if shape is not None:
-        return shape[1]
+        return tag_key(shape[1]) or shape[1]
     return "column"
 
 
@@ -1614,13 +1621,29 @@ def _cte_row_count(columns: Iterable[_Column]) -> int:
     return max(widths) if widths else 1
 
 
+def _tags_to_cell(tags: dict[str, str]) -> ArrayCell:
+    """One tag map as an array cell of ``(key,value)`` records, in key order."""
+    return ArrayCell(
+        elements=tuple(RecordCell(fields=(key, tags[key])) for key in sorted(tags))
+    )
+
+
+def _tag_cell(row: _TrackRow | None) -> CellValue:
+    """One row's whole tag map as a cell; NULL for an outer join's gap."""
+    if row is None:
+        return None
+    source = row.stream.source
+    return _tags_to_cell({} if source is None else source.metadata)
+
+
 def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
     """One probed stream's row columns.
 
-    Two sources, one table: ``language``/``title`` come from the container TAGS
-    (``StreamMeta.metadata``), everything else from a field of the StreamMeta
-    itself. An absent field is NULL, which is the whole NULL story — there is
-    no other way for a row column to be null.
+    Two sources, one table: the stream's own tags (``StreamMeta.metadata``)
+    become one column per key under its folded path name, everything else comes
+    from a field of the StreamMeta itself. An absent field is NULL, and so is a
+    key the file does not carry — which is the whole NULL story, there is no
+    other way for a row column to be null.
 
     ``index`` is +1'd: ``StreamMeta.index`` is the 0-based per-type index the
     IR ref uses, and the SQL surface is 1-based everywhere (``f.audio[1]``), so
@@ -1635,8 +1658,6 @@ def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
     schema = ROW_SCHEMAS[column]
     values: dict[str, RowValue] = {
         "index": meta.index + 1,
-        "language": meta.metadata.get("language"),
-        "title": meta.metadata.get("title"),
         "width": meta.width,
         "height": meta.height,
         "fps": meta.fps,
@@ -1646,14 +1667,16 @@ def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
                  "color_transfer"):
         probed = getattr(meta, name, None)
         values[name] = probed if isinstance(probed, str | int | float) else None
-    return {name: values.get(name) for name in schema}
+    columns = {name: values.get(name) for name in schema if name != TAGS_COLUMN}
+    columns.update({tag_path(key): value for key, value in meta.metadata.items()})
+    return columns
 
 
 def _join_keys(on: exp.Expr) -> dict[str, list[str]]:
     """Which columns each row alias was matched on, from a JOIN's ON predicate.
 
     Bookkeeping for one message only: a NULL track says what it failed to
-    match (``no 'b' row matched a.language='fra'``), and that needs the key
+    match (``no 'b' row matched a.tags.language='fra'``), and that needs the key
     columns of the side that DID match. Order is written order, deduplicated.
     """
     keys: dict[str, list[str]] = {}
@@ -2194,8 +2217,8 @@ class _Lowerer:
             f"a computed path segment may not contain {found!r}, got {value!r}",
             segment,
             fallback=raw.path_node,
-            hint="write the directory as a literal: 'out/' || t.language || "
-            "'.m4a'; metadata never chooses the directory",
+            hint="write the directory as a literal: 'out/' || t.tags.language "
+            "|| '.m4a'; metadata never chooses the directory",
         )
 
     def _null_field(self, expression: exp.Expr, env: _Env, anchor: exp.Select) -> str:
@@ -2206,7 +2229,7 @@ class _Lowerer:
             if self._eval_value(sub, env, self.fanout_row, anchor) is None:
                 table_node = sub.args.get("table")
                 prefix = f"{_fold(table_node)}." if table_node is not None else ""
-                return f"'{prefix}{sub.name}' was never probed"
+                return f"'{prefix}{column_label(_fold(sub.this))}' was never probed"
         return "no column of it has a value"
 
     # -- chapters sink options ----------------------------------------
@@ -3668,7 +3691,7 @@ class _Lowerer:
             )
         if isinstance(node, exp.EQ | exp.NEQ | exp.GT | exp.GTE | exp.LT | exp.LTE):
             # Both sides go through one value evaluator, so the operands stay in
-            # written order and `'eng' = t.language` needs no mirroring.
+            # written order and `'eng' = t.tags.language` needs no mirroring.
             return _compare(
                 node,
                 self._eval_value(node.this, env, rows, select),
@@ -3712,8 +3735,9 @@ class _Lowerer:
             name = _fold(column.this)
             if name == INPUT_DURATION_COLUMN:
                 return self._input_duration(binding.alias, column, select)
-            if name in INPUT_TAG_COLUMNS:
-                return self._input_tag(binding.alias, name, column, select)
+            key = tag_key(name)
+            if key is not None:
+                return self._input_tag(binding.alias, key, column, select)
         if not isinstance(binding, _RowBinding):  # defensive: resolve checked it
             raise _error(
                 ErrorCode.UNKNOWN_ALIAS,
@@ -3723,7 +3747,16 @@ class _Lowerer:
                 hint=self._known_hint(),
             )
         name = _fold(column.this)
-        if name not in ROW_SCHEMAS[binding.column]:
+        if name == TAGS_COLUMN:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{binding.alias}.{TAGS_COLUMN}' is the whole tag map, not a "
+                "single value",
+                column,
+                fallback=select,
+                hint=f"name the key: '{binding.alias}.{TAGS_COLUMN}.language'",
+            )
+        if name not in ROW_SCHEMAS[binding.column] and tag_key(name) is None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"unknown column '{binding.alias}.{column.name}'",
@@ -4035,8 +4068,8 @@ class _Lowerer:
         if result is None:
             raise _error(
                 ErrorCode.INPUT_NOT_FOUND,
-                f"'{alias}.{key}' is unknown: '{self._path_of(alias)}' could "
-                "not be probed",
+                f"'{alias}.{TAGS_COLUMN}.{key}' is unknown: "
+                f"'{self._path_of(alias)}' could not be probed",
                 anchor,
                 fallback=select,
                 hint="container tags are read from the file; only a readable "
@@ -4599,16 +4632,16 @@ class _Lowerer:
         it unchanged and the downstream passes learn nothing new.
 
         A metadata column is not an output: streams are the only outputs there
-        are, and ``SELECT t.language`` names a string. That is a typed
+        are, and ``SELECT t.tags.language`` names a string. That is a typed
         rejection rather than a stringly-typed output, and its hint says what
         metadata columns ARE for.
         """
         schema = ROW_SCHEMAS[binding.column]
         if name != ROW_STREAM:
-            if name not in schema:
+            if name not in schema and tag_key(name) is None:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"unknown column '{binding.alias}.{name}'",
+                    f"unknown column '{binding.alias}.{column_label(name)}'",
                     anchor,
                     fallback=select,
                     hint=f"{binding.column} track rows expose "
@@ -4616,8 +4649,8 @@ class _Lowerer:
                 )
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{binding.alias}.{name}' is track metadata, not a stream, and "
-                "a SELECT column is an output stream",
+                f"'{binding.alias}.{column_label(name)}' is track metadata, not "
+                "a stream, and a SELECT column is an output stream",
                 anchor,
                 fallback=select,
                 hint=_CHAPTER_ROW_HINT
@@ -4724,7 +4757,8 @@ class _Lowerer:
         if paired is None or not keys:
             return f"the join found no {binding.column} row of '{binding.alias}'"
         described = ", ".join(
-            f"{paired_alias}.{key}={paired.columns.get(key)!r}" for key in keys
+            f"{paired_alias}.{column_label(key)}={paired.columns.get(key)!r}"
+            for key in keys
         )
         return f"no '{binding.alias}' row matched {described}"
 
@@ -5121,14 +5155,25 @@ class _Lowerer:
                 f"expression, e.g. WHERE {alias}.t <= {alias}."
                 f"{INPUT_DURATION_COLUMN} - 60",
             )
-        if name in INPUT_TAG_COLUMNS:
+        key = tag_key(name)
+        if key is not None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{alias}.{name}' is a text tag, not a stream",
+                f"'{alias}.{column_label(name)}' is a text tag, not a stream",
                 anchor,
                 fallback=select,
                 hint=f"give it an alias to write it back, e.g. SELECT "
-                f"{alias}.video[1], {alias}.{name} AS {name}",
+                f"{alias}.video[1], {alias}.{column_label(name)} AS {key}",
+            )
+        if name == TAGS_COLUMN:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{TAGS_COLUMN}' carries no streams: it is the "
+                "container's tag map, and a SELECT column of a media query is "
+                "an output stream",
+                anchor,
+                fallback=select,
+                hint=f"read one key as a value, e.g. {alias}.{TAGS_COLUMN}.title",
             )
         if name == CHAPTERS_COLUMN:
             if index is not None:
@@ -5159,7 +5204,7 @@ class _Lowerer:
                 hint=f"an input exposes the streams {alias}.video, "
                 f"{alias}.audio, {alias}.subtitle and {alias}.data, plus the "
                 f"values {alias}.t, {alias}.{INPUT_DURATION_COLUMN} and its "
-                "container tags",
+                f"container tags ({alias}.{TAGS_COLUMN}.title, ...)",
             )
         if index is None:
             return self._enumerate(alias, array_type, anchor, select)
@@ -6672,6 +6717,13 @@ class _Lowerer:
                 ):
                     return self._chapters_cells(binding.alias, expr, select, cardinality)
                 elif (
+                    isinstance(binding, _InputBinding)
+                    and _fold(expr.this) == TAGS_COLUMN
+                ):
+                    return self._container_tag_cells(
+                        binding.alias, expr, select, cardinality
+                    )
+                elif (
                     isinstance(binding, _InputBinding | _SourceBinding)
                     and _fold(expr.this) in _ARRAY_COLUMNS
                 ):
@@ -6713,15 +6765,38 @@ class _Lowerer:
     ) -> list[CellValue]:
         """A row alias's metadata column, one value per row (NULL for a gap)."""
         schema = ROW_SCHEMAS[binding.column]
-        if name not in schema:
+        if name == TAGS_COLUMN:
+            return [_tag_cell(row) for row in binding.rows]
+        if name not in schema and tag_key(name) is None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"unknown column '{binding.alias}.{name}'",
+                f"unknown column '{binding.alias}.{column_label(name)}'",
                 anchor,
                 fallback=select,
                 hint=f"{binding.column} track rows expose {', '.join(sorted(schema))}",
             )
         return [None if row is None else row.columns.get(name) for row in binding.rows]
+
+    def _container_tag_cells(
+        self, alias: str, anchor: exp.Expr, select: exp.Select, cardinality: int
+    ) -> list[CellValue]:
+        """A bare ``<input>.tags`` as ONE array cell, broadcast to every row.
+
+        The map's entries print as key/value records in key order:
+        ``{(artist,Nobody),(title,Clip)}``. Name a key to read one of them.
+        """
+        result = self.probes.get(alias)
+        if result is None:
+            raise _error(
+                ErrorCode.INPUT_NOT_FOUND,
+                f"cannot read tags of '{self._path_of(alias)}': file not "
+                "found or unreadable",
+                anchor,
+                fallback=select,
+                hint=f"'{alias}.{TAGS_COLUMN}' is the container's own tag map, "
+                "and only a readable input has one",
+            )
+        return [_tags_to_cell(result.tags)] * cardinality
 
     def _chapters_cells(
         self, alias: str, anchor: exp.Expr, select: exp.Select, cardinality: int
@@ -6843,6 +6918,10 @@ def _provenance(stream: _Stream) -> dict[str, str]:
     only when every stream feeding them agrees (:func:`_agreed_source`).
     ``language=und`` is what an mp4 muxer stamps on an untagged stream, so it
     carries no information and is not copied.
+
+    Only STREAM_TAG_COLUMNS ride, not every key the source carries: a file's
+    ``encoder`` or ``handler_name`` tag riding through a filter would emit
+    ``-metadata`` ffmpeg does not emit today.
     """
     source = stream.source
     if source is None:
@@ -6991,7 +7070,7 @@ def _is_input_value_column(node: exp.Expr, env: _Env) -> bool:
     if not isinstance(env.bindings.get(_fold(table_node)), _InputBinding):
         return False
     name = _fold(node.this)
-    return name == INPUT_DURATION_COLUMN or name in INPUT_TAG_COLUMNS
+    return name == INPUT_DURATION_COLUMN or tag_key(name) is not None
 
 
 def _row_metadata_column(node: exp.Expr, env: _Env) -> str | None:

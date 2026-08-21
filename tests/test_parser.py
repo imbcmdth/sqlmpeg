@@ -1664,7 +1664,7 @@ def test_an_aliased_name_may_not_collide_with_another_from_entry() -> None:
 def test_unnest_binds_a_track_row_table() -> None:
     res = _resolve(
         "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
-        "WHERE t.language = 'eng'"
+        "WHERE t.tags.language = 'eng'"
     )
     assert list(res.track_rows) == ["t"]
     rows = res.track_rows["t"]
@@ -1719,7 +1719,7 @@ def test_a_row_alias_shares_the_one_flat_namespace() -> None:
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "duplicate name 't'" in err.message
-    err = _reject("SELECT t.language FROM input('f.mkv') t, unnest(t.audio) t")
+    err = _reject("SELECT t.tags.language FROM input('f.mkv') t, unnest(t.audio) t")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "duplicate name 't'" in err.message
 
@@ -1787,7 +1787,7 @@ def test_unnest_needs_an_input_not_a_cte_or_a_generated_source() -> None:
 # -- JOIN between track-row tables ----------------------
 
 
-def _joined(join: str = "JOIN", on: str = "ON a.language = b.language") -> str:
+def _joined(join: str = "JOIN", on: str = "ON a.tags.language = b.tags.language") -> str:
     return (
         "SELECT a FROM input('a.mkv') f, input('b.mkv') g, "
         f"unnest(f.audio) a {join} unnest(g.audio) b {on}"
@@ -1817,14 +1817,14 @@ def test_from_entries_reports_each_items_join_kind() -> None:
 
 def test_a_join_may_match_on_several_keys_and_on_a_literal() -> None:
     sql = _joined(
-        on="ON a.language = b.language AND a.channels = b.channels "
+        on="ON a.tags.language = b.tags.language AND a.channels = b.channels "
         "AND b.codec != 'ac3'"
     )
     assert sorted(_resolve(sql).track_rows) == ["a", "b"]
 
 
 def test_a_join_on_columns_of_different_types_is_rejected() -> None:
-    err = _reject(_joined(on="ON a.language = b.channels"))
+    err = _reject(_joined(on="ON a.tags.language = b.channels"))
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "so they can never match" in err.message
 
@@ -1849,14 +1849,14 @@ def test_a_join_with_no_on_is_the_comma_cross_join() -> None:
 
 
 def test_an_on_predicate_may_not_name_a_non_row_alias() -> None:
-    err = _reject(_joined(on="ON a.language = f.t"))
+    err = _reject(_joined(on="ON a.tags.language = f.t"))
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unknown column 'f.t'" in err.message
     assert "not a track-row table" in (err.hint or "")
 
 
 def test_unsupported_on_shapes_are_rejected() -> None:
-    err = _reject(_joined(on="ON a.language LIKE b.language"))
+    err = _reject(_joined(on="ON a.tags.language LIKE b.tags.language"))
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unsupported ON predicate" in err.message
 
@@ -1864,7 +1864,7 @@ def test_unsupported_on_shapes_are_rejected() -> None:
 @pytest.mark.parametrize(
     ("join", "on", "message"),
     [
-        ("RIGHT JOIN", "ON a.language = b.language", "RIGHT JOIN is not supported"),
+        ("RIGHT JOIN", "ON a.tags.language = b.tags.language", "RIGHT JOIN is not supported"),
         ("CROSS JOIN", "", "CROSS JOIN is not supported"),
         ("NATURAL JOIN", "", "this JOIN form is not supported"),
         ("JOIN", "USING (language)", "USING is not supported"),
@@ -1888,7 +1888,7 @@ def test_join_is_still_rejected_between_stream_level_sources() -> None:
 def test_join_is_rejected_when_its_left_side_is_not_a_row_table() -> None:
     err = _reject(
         "SELECT a FROM input('a.mkv') f, input('b.mkv') g "
-        "JOIN unnest(g.audio) a ON a.language = 'eng'"
+        "JOIN unnest(g.audio) a ON a.tags.language = 'eng'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "between unnest(...) track-row tables only" in err.message
@@ -1900,7 +1900,7 @@ def test_join_is_rejected_when_its_left_side_is_not_a_row_table() -> None:
 @pytest.mark.parametrize(
     "column",
     [
-        "index", "language", "title", "codec", "channels",
+        "index", "tags.language", "tags.title", "codec", "channels",
         "channel_layout", "sample_rate", "bitrate", "duration",
     ],
 )
@@ -1988,9 +1988,9 @@ def test_an_unknown_row_column_in_the_select_list_is_rejected() -> None:
 @pytest.mark.parametrize(
     "predicate",
     [
-        "t.language = 'eng'",
-        "'eng' = t.language",
-        "t.language != 'eng'",
+        "t.tags.language = 'eng'",
+        "'eng' = t.tags.language",
+        "t.tags.language != 'eng'",
         "t.channels > 2",
         "t.channels >= 2",
         "t.channels < 6",
@@ -1998,11 +1998,11 @@ def test_an_unknown_row_column_in_the_select_list_is_rejected() -> None:
         "t.bitrate BETWEEN 1000 AND 2000",
         "t.duration <= 2.5",
         "t.bitrate >= -1",
-        "t.language IS NULL",
-        "t.title IS NOT NULL",
-        "NOT (t.language = 'eng')",
-        "t.language = 'eng' AND t.channel_layout = 'stereo'",
-        "(t.language = 'eng' OR t.language IS NULL) AND t.channels = 2",
+        "t.tags.language IS NULL",
+        "t.tags.title IS NOT NULL",
+        "NOT (t.tags.language = 'eng')",
+        "t.tags.language = 'eng' AND t.channel_layout = 'stereo'",
+        "(t.tags.language = 'eng' OR t.tags.language IS NULL) AND t.channels = 2",
     ],
 )
 def test_row_predicates_are_admitted(predicate: str) -> None:
@@ -2014,11 +2014,11 @@ def test_row_predicates_are_admitted(predicate: str) -> None:
 @pytest.mark.parametrize(
     "predicate",
     [
-        "t.language LIKE 'e%'",
-        "t.language IN ('eng', 'fra')",
+        "t.tags.language LIKE 'e%'",
+        "t.tags.language IN ('eng', 'fra')",
         "t.channels BETWEEN SYMMETRIC 2 AND 6",
         "t.channels = t.sample_rate",
-        "t.language IS TRUE",
+        "t.tags.language IS TRUE",
     ],
 )
 def test_unsupported_row_predicates_are_rejected(predicate: str) -> None:
@@ -2036,10 +2036,10 @@ def test_a_row_predicate_is_typed_against_the_static_column_type() -> None:
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'t.channels' is number" in err.message
     err = _reject(
-        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE t.language = 5"
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE t.tags.language = 5"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "'t.language' is text" in err.message
+    assert "'t.tags.language' is text" in err.message
 
 
 def test_a_row_predicate_may_not_compare_the_stream_column() -> None:
@@ -2053,7 +2053,7 @@ def test_a_row_predicate_may_not_compare_the_stream_column() -> None:
 def test_a_time_window_and_a_row_predicate_coexist_as_separate_conjuncts() -> None:
     res = _resolve(
         "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
-        "WHERE f.t BETWEEN 1 AND 2 AND t.language = 'eng'"
+        "WHERE f.t BETWEEN 1 AND 2 AND t.tags.language = 'eng'"
     )
     assert res.track_rows["t"].source == "f"
 
@@ -2061,7 +2061,7 @@ def test_a_time_window_and_a_row_predicate_coexist_as_separate_conjuncts() -> No
 def test_a_conjunct_may_not_mix_a_row_column_with_another_alias() -> None:
     err = _reject(
         "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
-        "WHERE t.language = 'eng' OR f.t >= 1"
+        "WHERE t.tags.language = 'eng' OR f.t >= 1"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "cannot mix track-row columns" in err.message
@@ -2070,7 +2070,7 @@ def test_a_conjunct_may_not_mix_a_row_column_with_another_alias() -> None:
 def test_a_conjunct_may_reference_only_one_row_table() -> None:
     err = _reject(
         "SELECT a FROM input('f.mkv') f, unnest(f.audio) a, unnest(f.video) b "
-        "WHERE a.language = b.language"
+        "WHERE a.tags.language = b.tags.language"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "only one track-row table" in err.message
@@ -2091,7 +2091,7 @@ def test_a_time_window_over_an_input_still_rejects_a_non_t_column() -> None:
 def test_order_by_is_admitted_over_track_row_columns() -> None:
     res = _resolve(
         "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
-        "ORDER BY t.language, t.channels DESC"
+        "ORDER BY t.tags.language, t.channels DESC"
     )
     order = res.branches[0].args["order"]
     assert isinstance(order, exp.Order)
@@ -2131,7 +2131,7 @@ def test_the_other_streaming_rejections_are_untouched_by_the_carve_out() -> None
 
 @pytest.mark.parametrize(
     "spelling",
-    ["f.audio[1].language", "(f.audio[1]).language"],
+    ["f.audio[1].tags.language", "(f.audio[1]).tags.language"],
 )
 def test_both_subscript_metadata_spellings_are_admitted(spelling: str) -> None:
     # The bracket-dot and the strictly-Postgres paren-dot forms are the same
@@ -2156,7 +2156,7 @@ def test_a_subscript_has_no_track_accessor_left(sql: str) -> None:
 
 @pytest.mark.parametrize(
     "column",
-    ["language", "title", "codec", "channels", "channel_layout", "index"],
+    ["tags.language", "tags.title", "codec", "channels", "channel_layout", "index"],
 )
 def test_a_metadata_accessor_is_rejected_as_a_select_output_in_a_media_query(
     column: str,
@@ -2175,7 +2175,7 @@ def test_a_metadata_accessor_is_rejected_as_a_select_output_in_a_media_query(
 
 @pytest.mark.parametrize(
     "column",
-    ["language", "title", "codec", "channels", "channel_layout", "index"],
+    ["tags.language", "tags.title", "codec", "channels", "channel_layout", "index"],
 )
 def test_subscript_metadata_output_is_legal_in_table_mode(column: str) -> None:
     # A bare SELECT (no COPY at all) is table-capable unconditionally.
@@ -2205,18 +2205,18 @@ def test_bare_array_metadata_access_is_rejected_in_where() -> None:
 @pytest.mark.parametrize(
     "predicate",
     [
-        "f.audio[1].language = 'eng'",
-        "'eng' = f.audio[1].language",
-        "f.audio[1].language != 'eng'",
+        "f.audio[1].tags.language = 'eng'",
+        "'eng' = f.audio[1].tags.language",
+        "f.audio[1].tags.language != 'eng'",
         "f.audio[1].channels > 2",
         "f.audio[1].channels >= 2",
         "f.audio[1].channels < 6",
         "f.audio[1].bitrate BETWEEN 1000 AND 2000",
-        "f.audio[1].language IS NULL",
-        "f.audio[1].title IS NOT NULL",
-        "NOT (f.audio[1].language = 'eng')",
-        "f.audio[1].language = 'eng' AND f.audio[2].language = 'fra'",
-        "(f.audio[1].language = 'eng' OR f.audio[1].language IS NULL) "
+        "f.audio[1].tags.language IS NULL",
+        "f.audio[1].tags.title IS NOT NULL",
+        "NOT (f.audio[1].tags.language = 'eng')",
+        "f.audio[1].tags.language = 'eng' AND f.audio[2].tags.language = 'fra'",
+        "(f.audio[1].tags.language = 'eng' OR f.audio[1].tags.language IS NULL) "
         "AND f.audio[1].channels = 2",
     ],
 )
@@ -2231,7 +2231,7 @@ def test_a_subscript_predicate_is_typed_against_the_static_column_type() -> None
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "is number" in err.message
     err = _reject(
-        "SELECT f.audio[1] FROM input('f.mkv') f WHERE f.audio[1].language = 5"
+        "SELECT f.audio[1] FROM input('f.mkv') f WHERE f.audio[1].tags.language = 5"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "is text" in err.message
@@ -2240,7 +2240,7 @@ def test_a_subscript_predicate_is_typed_against_the_static_column_type() -> None
 def test_a_conjunct_may_not_mix_a_subscript_accessor_with_the_time_window() -> None:
     err = _reject(
         "SELECT f.audio[1] FROM input('f.mkv') f "
-        "WHERE f.audio[1].language = 'eng' OR f.t >= 1"
+        "WHERE f.audio[1].tags.language = 'eng' OR f.t >= 1"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "cannot mix subscript metadata accessors" in err.message
@@ -2249,7 +2249,7 @@ def test_a_conjunct_may_not_mix_a_subscript_accessor_with_the_time_window() -> N
 def test_a_time_window_and_a_subscript_predicate_coexist_as_separate_conjuncts() -> None:
     _resolve(
         "SELECT f.audio[1] FROM input('f.mkv') f "
-        "WHERE f.t BETWEEN 1 AND 2 AND f.audio[1].language = 'eng'"
+        "WHERE f.t BETWEEN 1 AND 2 AND f.audio[1].tags.language = 'eng'"
     )
 
 
@@ -2257,7 +2257,7 @@ def test_a_time_window_and_a_subscript_predicate_coexist_as_separate_conjuncts()
     ("column", "predicate"),
     [
         ("video", "f.video[1].width = 640"),
-        ("subtitle", "f.subtitle[1].language = 'eng'"),
+        ("subtitle", "f.subtitle[1].tags.language = 'eng'"),
         ("data", "f.data[1].index = 1"),
     ],
 )
@@ -2270,7 +2270,7 @@ def test_video_subtitle_and_data_subscript_accessors_resolve(
 def test_a_subscript_accessor_over_a_cte_is_rejected() -> None:
     err = _reject(
         "WITH c AS (SELECT a.video[1] AS v FROM input('a.mkv') a) "
-        "SELECT c.v FROM c WHERE c.v[1].language = 'eng'"
+        "SELECT c.v FROM c WHERE c.v[1].tags.language = 'eng'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "is a CTE" in err.message
@@ -2279,7 +2279,7 @@ def test_a_subscript_accessor_over_a_cte_is_rejected() -> None:
 def test_a_subscript_accessor_over_a_generated_source_is_rejected() -> None:
     err = _reject(
         "SELECT s.video[1] FROM ffmpeg.testsrc(duration => 2) s "
-        "WHERE s.video[1].language = 'eng'"
+        "WHERE s.video[1].tags.language = 'eng'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "is a generated source" in err.message
@@ -2289,7 +2289,7 @@ def test_a_subscript_accessor_over_a_row_alias_is_rejected() -> None:
     # In SELECT position, so the row-language WHERE grammar (which claims
     # anything mentioning a row alias first) is not what intercepts this.
     err = _reject(
-        "SELECT t[1].language FROM input('f.mkv') f, unnest(f.audio) t"
+        "SELECT t[1].tags.language FROM input('f.mkv') f, unnest(f.audio) t"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "already a track-row table" in err.message
@@ -2383,7 +2383,7 @@ def test_chapters_unnests_only_an_input_alias() -> None:
 def test_chapters_rows_combine_with_track_rows_like_any_other_array() -> None:
     """No carve-out left: two unnest tables of one input cross join."""
     res = _resolve(
-        "SELECT t.language, c.title "
+        "SELECT t.tags.language, c.title "
         "FROM input('f.mkv') f, unnest(f.audio) t, unnest(f.chapters) c"
     )
     assert [rows.column for rows in res.track_rows.values()] == ["audio", "chapters"]
@@ -2504,7 +2504,7 @@ def test_arithmetic_over_row_columns_types_as_a_number() -> None:
 
 
 def test_arithmetic_needs_numbers_on_both_sides() -> None:
-    err = _reject(f"SELECT t, t.language + 1 AS x {_ROWS}")
+    err = _reject(f"SELECT t, t.tags.language + 1 AS x {_ROWS}")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'+' needs numbers, but one side is text" in err.message
 
@@ -2524,7 +2524,7 @@ def test_cast_function_spelling_is_the_same_cast() -> None:
 
 
 def test_only_text_is_a_supported_cast_target() -> None:
-    err = _reject(f"SELECT t, t.language::int + 1 AS x {_ROWS}")
+    err = _reject(f"SELECT t, t.tags.language::int + 1 AS x {_ROWS}")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "cast to int is not supported" in err.message
     assert "::text is the only cast" in (err.hint or "")
@@ -2573,25 +2573,25 @@ def test_only_duration_is_readable_off_an_input_alias() -> None:
 
 
 def test_a_container_tag_types_as_text_in_the_value_grammar() -> None:
-    """`f.title` is text, so `||` takes it and arithmetic does not."""
+    """`f.tags.title` is text, so `||` takes it and arithmetic does not."""
     _resolve(
-        "SELECT f.video[1], f.title || ' (restored)' AS title "
+        "SELECT f.video[1], f.tags.title || ' (restored)' AS title "
         "FROM input('x.mp4') f"
     )
     err = _reject(
-        "SELECT f.video[1], f.title + 1 AS title FROM input('x.mp4') f"
+        "SELECT f.video[1], f.tags.title + 1 AS title FROM input('x.mp4') f"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
 def test_a_container_tag_is_readable_in_a_case_condition() -> None:
     _resolve(
-        "SELECT f.video[1], CASE WHEN f.comment IS NULL THEN 'none' "
-        "ELSE f.comment END AS comment FROM input('x.mp4') f"
+        "SELECT f.video[1], CASE WHEN f.tags.comment IS NULL THEN 'none' "
+        "ELSE f.tags.comment END AS comment FROM input('x.mp4') f"
     )
 
 
-def test_an_input_column_outside_the_tag_list_is_still_unknown() -> None:
+def test_an_input_column_that_is_not_a_tag_path_is_still_unknown() -> None:
     err = _reject("SELECT f.video[1], f.mood AS mood FROM input('x.mp4') f")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unknown column 'f.mood'" in err.message
@@ -2613,3 +2613,67 @@ def test_a_query_nested_too_deeply_is_a_plain_rejection() -> None:
     assert excinfo.value.code is not ErrorCode.INTERNAL
     assert "nests too deeply" in excinfo.value.message
     assert "RecursionError" not in excinfo.value.message
+
+
+def test_a_removed_stream_tag_field_names_the_path_form() -> None:
+    err = _reject("SELECT t.language FROM input('f.mkv') f, unnest(f.audio) t")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t.language' is not a column: a tag is read by path" in err.message
+    assert err.hint == "read the tag: 't.tags.language'"
+
+
+def test_a_removed_container_tag_column_names_the_path_form() -> None:
+    err = _reject("SELECT f.artist FROM input('f.mkv') f")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.artist' is not a column: a tag is read by path" in err.message
+    assert err.hint == "read the tag: 'f.tags.artist'"
+
+
+def test_a_removed_tag_field_on_a_subscript_names_the_path_form() -> None:
+    err = _reject(
+        "SELECT f.audio[1] FROM input('f.mkv') f WHERE f.audio[1].title IS NULL"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.audio[1].title' is not a column" in err.message
+    assert err.hint == "read the tag: 'f.audio[1].tags.title'"
+
+
+def test_a_chapter_row_carries_no_tags() -> None:
+    err = _reject("SELECT c.tags.title FROM input('f.mkv') f, unnest(f.chapters) c")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'c' is a chapter row, and a chapter carries no tags" in err.message
+
+
+def test_a_bare_container_tags_column_is_not_a_value() -> None:
+    err = _reject(
+        "SELECT f.video[1], f.tags || ' (x)' AS title FROM input('f.mkv') f"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.tags' is the whole tag map, not a single value" in err.message
+
+
+def test_a_bare_row_tags_column_is_not_a_comparison_operand() -> None:
+    err = _reject(
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE t.tags = 'x'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t.tags' is the whole tag map, not a single value" in err.message
+
+
+def test_a_subscripted_tag_map_wants_a_key() -> None:
+    err = _reject(
+        "SELECT f.audio[1] FROM input('f.mkv') f WHERE f.audio[1].tags IS NULL"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.audio[1].tags' is the whole tag map, not a value" in err.message
+
+
+def test_a_tag_path_types_as_text() -> None:
+    _resolve(
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.tags.whatever = 'x'"
+    )
+    err = _reject(
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE t.tags.whatever = 5"
+    )
+    assert "'t.tags.whatever' is text" in err.message

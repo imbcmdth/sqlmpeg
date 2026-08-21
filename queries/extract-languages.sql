@@ -5,5 +5,5 @@
 COPY (
   SELECT array_agg(t)
   FROM input(:'source') f, unnest(f.audio) t
-  GROUP BY t.language
-) TO (t.language || '.' || :'ext')
+  GROUP BY t.tags.language
+) TO (t.tags.language || '.' || :'ext')

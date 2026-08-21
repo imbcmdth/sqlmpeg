@@ -154,7 +154,7 @@ Notes for downstream passes (lower):
   item with the :class:`RawRowJoin` describing how it attaches (``"cross"`` for
   a comma source), which is what lower evaluates the join from. The ``ON``
   predicate is the row grammar plus one addition: both operands may be row
-  COLUMNS of any row table in scope — ``a.language = b.language``.
+  COLUMNS of any row table in scope — ``a.tags.language = b.tags.language``.
 
 * ``ORDER BY`` over track-row columns is the ONE carve-out in the
   ``NO_STREAMING_EQUIVALENT`` rejection: ``Select.args["order"]`` is admitted only
@@ -181,19 +181,20 @@ from sqlmpeg.types import (
     CHAPTERS_COLUMN,
     INPUT_COLUMNS,
     INPUT_DURATION_COLUMN,
-    INPUT_TAG_COLUMNS,
     ROW_SCHEMAS,
     STREAM_ARRAY_COLUMNS,
+    TAGS_COLUMN,
     UNNEST_COLUMNS,
+    is_array,
 )
 
 __all__ = [
     "FILTER_NAMESPACE",
     "INPUT_DURATION_COLUMN",
-    "INPUT_TAG_COLUMNS",
     "MACRO_NAMESPACE",
     "ROW_SCHEMAS",
     "ROW_STREAM",
+    "TAGS_COLUMN",
     "RawInputOption",
     "RawSink",
     "RawSinkOption",
@@ -203,6 +204,7 @@ __all__ = [
     "RawTrackRows",
     "RawValuesTable",
     "Resolved",
+    "column_label",
     "from_entries",
     "from_items",
     "group_keys",
@@ -214,6 +216,8 @@ __all__ = [
     "star_qualifier",
     "subscript_index",
     "subscript_metadata_shape",
+    "tag_key",
+    "tag_path",
     "union_branches",
 ]
 
@@ -235,10 +239,37 @@ MACRO_NAMESPACE = "sqlmpeg"
 # row columns are checked.
 ROW_STREAM = "<stream>"
 
-# The two spellings that left the language. Each keeps a rejection of its own
+# A tag is read by PATH -- `f.tags.title`, `a.tags.language` -- which parses as
+# a dotted column, one written part more than any other read. The two parts are
+# folded into one internal column name here (`_normalize_tag_paths`) so every
+# later pass looks up an ordinary column; the angle brackets keep it off the
+# surface, exactly as ROW_STREAM's do. `column_label` writes it back the way it
+# was typed wherever a rejection names it.
+_TAG_PATH_PREFIX = f"<{TAGS_COLUMN}>"
+
+# The spellings that left the language. Each keeps a rejection of its own
 # naming its replacement, so an old query says what to write instead.
 _REMOVED_ROW_STREAM = "track"
 _REMOVED_FRAME = "frame"
+# The per-stream tag fields, now entries of `tags`.
+_REMOVED_STREAM_TAGS = ("language", "title")
+# The named container tag columns, now entries of the container's `tags`.
+_REMOVED_INPUT_TAGS = frozenset(
+    {
+        "title",
+        "artist",
+        "album",
+        "album_artist",
+        "date",
+        "genre",
+        "comment",
+        "composer",
+        "track",
+        "copyright",
+        "encoder",
+        "description",
+    }
+)
 
 # A top-level (or CTE-level) query: a plain SELECT, or a UNION ALL of them.
 QueryExpr = exp.Select | exp.Union
@@ -272,12 +303,8 @@ _BRACKET_ALLOWED = frozenset({"this", "expressions"})
 # its own explicit rejection below.
 _COPY_ALLOWED = frozenset({"this", "kind", "credentials", "files", "params"})
 
-# Membership form of the container tag columns; every other column set this
-# module works with is a view imported from sqlmpeg.types.
-_INPUT_TAG_COLUMNS = frozenset(INPUT_TAG_COLUMNS)
-
-# What a hint says about them: three keys standing for the twelve.
-_INPUT_TAGS_HINT = f"container tags ({', '.join(INPUT_TAG_COLUMNS[:3])}, ...)"
+# What a hint says about tags wherever one is worth naming.
+_TAGS_HINT = f"container tags are read by path, e.g. <alias>.{TAGS_COLUMN}.title"
 
 # sqlglot's Postgres dialect INDEX_OFFSET. Parsing rebases a subscript by
 # -INDEX_OFFSET and generating adds it back; see the module docstring.
@@ -331,7 +358,7 @@ _ROW_WHERE_HINT = (
 _JOIN_HINT = (
     "JOIN matches the ROWS of two unnest tables: FROM input('a.mkv') f, "
     "input('b.mkv') g, unnest(f.audio) a JOIN unnest(g.audio) b ON "
-    "a.language = b.language (INNER, LEFT [OUTER] and FULL [OUTER] only); "
+    "a.tags.language = b.tags.language (INNER, LEFT [OUTER] and FULL [OUTER] only); "
     "at input level, FROM stays a comma cross-join"
 )
 _JOIN_ON_HINT = (
@@ -345,7 +372,7 @@ _VALUE_HINT = (
 )
 _ROW_ORDER_HINT = (
     "ORDER BY sorts track rows by their metadata columns, "
-    "e.g. ORDER BY t.language, t.channels DESC"
+    "e.g. ORDER BY t.tags.language, t.channels DESC"
 )
 _SUBSCRIPT_WHERE_HINT = (
     "a subscript metadata predicate compares <alias>.<type>[k].<column> against "
@@ -375,7 +402,7 @@ _CHAPTER_NOT_STREAM_HINT = (
 )
 _GROUP_FANOUT_HINT = (
     "one group is one file, so the destination has to name the group, "
-    "e.g. TO (t.language || '.mka')"
+    "e.g. TO (t.tags.language || '.mka')"
 )
 
 
@@ -444,6 +471,19 @@ def _frame_error(node: exp.Expr, alias: str, fallback: exp.Expr | None) -> Sqlmp
     )
 
 
+def _removed_tag_error(
+    label: str, name: str, node: exp.Expr, fallback: exp.Expr | None
+) -> SqlmpegError:
+    """A tag that used to be a field of its own; it is an entry of ``tags`` now."""
+    return _error(
+        ErrorCode.UNSUPPORTED_SQL,
+        f"'{label}.{name}' is not a column: a tag is read by path",
+        node,
+        fallback=fallback,
+        hint=f"read the tag: '{label}.{TAGS_COLUMN}.{name}'",
+    )
+
+
 def _ident_name(node: exp.Expr | None) -> str:
     """Postgres identifier folding: unquoted -> lowercase, quoted -> verbatim."""
     if node is None:
@@ -451,6 +491,27 @@ def _ident_name(node: exp.Expr | None) -> str:
     if isinstance(node, exp.Identifier):
         return node.name if node.args.get("quoted") else node.name.lower()
     return str(node.name).lower()
+
+
+# tag paths
+
+
+def tag_path(key: str) -> str:
+    """The internal column name ``<alias>.tags.<key>`` folds into."""
+    return f"{_TAG_PATH_PREFIX}{key}"
+
+
+def tag_key(name: str) -> str | None:
+    """The tag key a folded column name carries, or None for any other name."""
+    if not name.startswith(_TAG_PATH_PREFIX):
+        return None
+    return name[len(_TAG_PATH_PREFIX) :]
+
+
+def column_label(name: str) -> str:
+    """A column name as it was TYPED: a folded tag path spelled back out."""
+    key = tag_key(name)
+    return name if key is None else f"{TAGS_COLUMN}.{key}"
 
 
 # compile-time value shapes
@@ -482,8 +543,8 @@ def is_value_expr(node: exp.Expr | None) -> bool:
 
 
 def _is_input_column(name: str) -> bool:
-    """True for a column name an INPUT alias exposes, structural or tag."""
-    return name in INPUT_COLUMNS or name in _INPUT_TAG_COLUMNS
+    """True for a column name an INPUT alias exposes, structural or tag path."""
+    return name in INPUT_COLUMNS or tag_key(name) is not None
 
 
 def _is_input_duration(node: exp.Expr | None, scope: dict[str, str]) -> bool:
@@ -492,9 +553,9 @@ def _is_input_duration(node: exp.Expr | None, scope: dict[str, str]) -> bool:
 
 
 def _is_input_tag(node: exp.Expr | None, scope: dict[str, str]) -> bool:
-    """True for ``<input alias>.<container tag>``, a text scalar."""
+    """True for ``<input alias>.tags.<key>``, a text scalar."""
     name = _input_value_name(node, scope)
-    return name is not None and name in _INPUT_TAG_COLUMNS
+    return name is not None and tag_key(name) is not None
 
 
 def _input_value_name(node: exp.Expr | None, scope: dict[str, str]) -> str | None:
@@ -576,12 +637,14 @@ def subscript_metadata_shape(node: exp.Expr) -> tuple[exp.Bracket, str] | None:
     """Recognize ``<alias>.<type>[k].<column>``; return ``(bracket, name)``.
 
     VERIFIED under sqlglot 30.17 ``read="postgres"``: both
-    ``f.audio[1].language`` and the strictly-Postgres cast spelling
-    ``(f.audio[1]).language`` arrive as ``exp.Dot(this=Bracket(...) |
+    ``f.audio[1].codec`` and the strictly-Postgres cast spelling
+    ``(f.audio[1]).codec`` arrive as ``exp.Dot(this=Bracket(...) |
     Paren(Bracket(...)), expression=Identifier(<name>))`` — identical
     semantics, told apart only by an extra ``Paren`` this unwraps. Returns
-    ``None`` for anything else, ``f.audio.language`` (no subscript, a plain
+    ``None`` for anything else, ``f.audio.codec`` (no subscript, a plain
     3-part ``exp.Column``) included — that shape never reaches here at all.
+    A tag path is one Dot deeper, and `_normalize_tag_paths` folds it into
+    this same shape before any of this runs.
     """
     if not isinstance(node, exp.Dot):
         return None
@@ -610,7 +673,7 @@ def _subscript_label(bracket: exp.Bracket) -> str:
 
 def _accessor_label(bracket: exp.Bracket, name: str) -> str:
     """``<alias>.<type>[k].<name>``, written the way a user would paste it."""
-    return f"{_subscript_label(bracket)}.{name}"
+    return f"{_subscript_label(bracket)}.{column_label(name)}"
 
 
 # stars
@@ -1278,6 +1341,17 @@ def _normalize_row_aliases(select: exp.Select, path_expr: exp.Expr | None = None
     names = _unnest_aliases(select)
     if not names:
         return
+    for part in _value_parts(select, path_expr):
+        _name_the_stream(part, names)
+
+
+def _value_parts(select: exp.Select, path_expr: exp.Expr | None) -> list[exp.Expr]:
+    """The parts of one branch a value may be written in.
+
+    Everything but the FROM clause and any CTE bodies -- each of those is
+    normalized as the branch it belongs to. A fan-out ``TO`` expression is
+    included when the caller has one.
+    """
     parts: list[exp.Expr] = [p for p in select.expressions if isinstance(p, exp.Expr)]
     if path_expr is not None:
         parts.append(path_expr)
@@ -1289,8 +1363,48 @@ def _normalize_row_aliases(select: exp.Select, path_expr: exp.Expr | None = None
         on = join.args.get("on") if isinstance(join, exp.Join) else None
         if isinstance(on, exp.Expr):
             parts.append(on)
-    for part in parts:
-        _name_the_stream(part, names)
+    return parts
+
+
+def _fold_tag_path(sub: exp.Expr) -> None:
+    """Fold one written ``... .tags.<key>`` into a single column name, in place."""
+    if isinstance(sub, exp.Column):
+        # `<alias>.tags.<key>` -- a 3-part column, qualifier and all.
+        db_node = sub.args.get("db")
+        table_node = sub.args.get("table")
+        if (
+            not sub.args.get("catalog")
+            and isinstance(db_node, exp.Expr)
+            and _ident_name(table_node) == TAGS_COLUMN
+        ):
+            key = _ident_name(sub.this)
+            sub.set("this", exp.to_identifier(tag_path(key), quoted=False))
+            sub.set("table", db_node)
+            sub.set("db", None)
+        return
+    # `<alias>.<array>[k].tags.<key>` -- a Dot over the subscript's own Dot.
+    if not isinstance(sub, exp.Dot) or not isinstance(sub.this, exp.Dot):
+        return
+    inner = sub.this
+    ident = sub.args.get("expression")
+    if _ident_name(inner.args.get("expression")) != TAGS_COLUMN:
+        return
+    if not isinstance(ident, exp.Identifier) or subscript_metadata_shape(inner) is None:
+        return
+    sub.set("this", inner.this)
+    sub.set("expression", exp.to_identifier(tag_path(_ident_name(ident)), quoted=False))
+
+
+def _normalize_tag_paths(select: exp.Select, path_expr: exp.Expr | None = None) -> None:
+    """Fold every ``.tags.<key>`` path into one internal column name, in place.
+
+    Reading a tag is the one read with two written parts after the qualifier.
+    Folding them here means no later pass has to know the shape: a tag is a
+    column with an unspellable name, looked up like any other.
+    """
+    for part in _value_parts(select, path_expr):
+        for sub in list(part.walk()):
+            _fold_tag_path(sub)
 
 
 def _has_row_source(select: exp.Select, visible: set[str]) -> bool:
@@ -2283,6 +2397,7 @@ class _Resolver:
         # nowhere else. The carve-out is decided from the FROM clause alone,
         # before any of it is validated, so a branch with no rows keeps the
         # NO_STREAMING_EQUIVALENT rejection byte for byte.
+        _normalize_tag_paths(select, path_expr)
         _normalize_row_aliases(select, path_expr)
         rows = _has_row_source(select, visible)
         if rows:
@@ -2432,7 +2547,7 @@ class _Resolver:
                 return
             name = _ident_name(node.this)
             stream = name == ROW_STREAM
-            label = alias if stream else f"{alias}.{name}"
+            label = alias if stream else f"{alias}.{column_label(name)}"
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"'{label}' is neither aggregated nor a GROUP BY key",
@@ -2734,7 +2849,7 @@ class _Resolver:
                 "a track-row JOIN requires an ON predicate",
                 fallback=join,
                 hint="match the rows on their metadata, e.g. "
-                "ON a.language = b.language",
+                "ON a.tags.language = b.tags.language",
             )
         self._check_expression(spec.on, select)
 
@@ -2744,7 +2859,7 @@ class _Resolver:
         """One ON predicate: 061's row grammar, plus column-to-column comparison.
 
         The addition over :meth:`_check_row_predicate` is the whole reason JOIN
-        exists — ``a.language = b.language`` compares two row COLUMNS — so the
+        exists — ``a.tags.language = b.tags.language`` compares two row COLUMNS — so the
         two operands may now both be columns, and then their static types must
         match (a text column never equals a numeric one, whatever the files
         turned out to contain). Everything else is the same closed grammar:
@@ -2862,7 +2977,7 @@ class _Resolver:
                     other,
                     fallback=join,
                     hint="join columns of the same kind, e.g. "
-                    "ON a.language = b.language",
+                    "ON a.tags.language = b.tags.language",
                 )
             return
         self._check_row_literal(node, column, column_type, join)
@@ -3349,14 +3464,16 @@ class _Resolver:
             # lower can check either of those.
             if kind == "input" and _ident_name(sub.this) == _REMOVED_FRAME:
                 raise _frame_error(sub, name, select)
+            if kind == "input" and _ident_name(sub.this) in _REMOVED_INPUT_TAGS:
+                raise _removed_tag_error(name, _ident_name(sub.this), sub, select)
             if kind == "input" and not _is_input_column(_ident_name(sub.this)):
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"unknown column '{name}.{sub.name}'",
                     sub,
                     fallback=select,
-                    hint=f"an input exposes {', '.join(sorted(INPUT_COLUMNS))} "
-                    f"and {_INPUT_TAGS_HINT}",
+                    hint=f"an input exposes {', '.join(sorted(INPUT_COLUMNS))}; "
+                    f"{_TAGS_HINT}",
                 )
             # A track-row table's schema is fixed by the stream type it
             # unnested, so it is checkable HERE -- unlike
@@ -3387,6 +3504,18 @@ class _Resolver:
                 fallback=select,
                 hint=f"the row is the stream: use '{alias}'",
             )
+        if tag_key(name) is not None:
+            if array_column == CHAPTERS_COLUMN:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{alias}' is a chapter row, and a chapter carries no tags",
+                    column,
+                    fallback=select,
+                    hint=f"a chapter row exposes {_listed_columns(schema)}",
+                )
+            return "text"
+        if name in _REMOVED_STREAM_TAGS and name not in schema:
+            raise _removed_tag_error(alias, name, column, select)
         column_type = schema.get(name)
         if column_type is None:
             raise _error(
@@ -3479,6 +3608,21 @@ class _Resolver:
                 hint=f"the subscript is already the stream: use '{label}'",
             )
         schema = ROW_SCHEMAS[array_column]
+        if tag_key(name) is not None:
+            return "text"
+        if name in _REMOVED_STREAM_TAGS and name not in schema:
+            raise _removed_tag_error(_subscript_label(bracket), name, anchor, fallback)
+        if name == TAGS_COLUMN:
+            label = _subscript_label(bracket)
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{label}.{TAGS_COLUMN}' is the whole tag map, not a value",
+                anchor,
+                fallback=fallback,
+                hint=f"name the key: '{label}.{TAGS_COLUMN}.language', or "
+                f"unnest the array (unnest({alias}.{array_column}) t) and read "
+                f"t.{TAGS_COLUMN}",
+            )
         column_type = schema.get(name)
         if column_type is None:
             raise _error(
@@ -4101,6 +4245,17 @@ class _Resolver:
                 )
             if scope[alias] == "input" and _ident_name(column.this) == _REMOVED_FRAME:
                 raise _frame_error(column, alias, where)
+            if scope[alias] == "input" and _ident_name(column.this) in _REMOVED_INPUT_TAGS:
+                raise _removed_tag_error(alias, _ident_name(column.this), column, where)
+            if scope[alias] == "input" and _ident_name(column.this) == TAGS_COLUMN:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{alias}.{TAGS_COLUMN}' is the whole tag map, not a "
+                    "single value",
+                    column,
+                    fallback=where,
+                    hint=f"name the key: '{alias}.{TAGS_COLUMN}.title'",
+                )
             if scope[alias] == "input" and _ident_name(column.this) == CHAPTERS_COLUMN:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -4117,7 +4272,7 @@ class _Resolver:
                 fallback=where,
                 hint=f"'{alias}' is not a track-row table; the values an input "
                 f"alias carries are '{alias}.{INPUT_DURATION_COLUMN}' and its "
-                f"{_INPUT_TAGS_HINT}",
+                f"container tags ({alias}.{TAGS_COLUMN}.title, ...)",
             )
         column_type = self._check_row_column(column, alias, where)
         if column_type == "stream":
@@ -4127,7 +4282,16 @@ class _Resolver:
                 column,
                 fallback=where,
                 hint="filter on the metadata columns, e.g. "
-                f"WHERE {alias}.language = 'eng'",
+                f"WHERE {alias}.{TAGS_COLUMN}.language = 'eng'",
+            )
+        if is_array(column_type):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{_ident_name(column.this)}' is the whole tag map, "
+                "not a single value",
+                column,
+                fallback=where,
+                hint=f"name the key: '{alias}.{TAGS_COLUMN}.language'",
             )
         return column_type
 
@@ -4239,7 +4403,7 @@ class _Resolver:
                 side if isinstance(side, exp.Expr) else None,
                 fallback=fallback,
                 hint="cast the number with ::text, quote it, or join text "
-                "columns: 'Audio (' || t.language || ')'",
+                "columns: 'Audio (' || t.tags.language || ')'",
             )
         return "text"
 
@@ -4336,7 +4500,7 @@ class _Resolver:
         """A row predicate's other operand: a literal of the column's own type."""
         alias = _ident_name(column.args.get("table"))
         name = _ident_name(column.this)
-        self._check_literal_type(node, column_type, f"{alias}.{name}", where)
+        self._check_literal_type(node, column_type, f"{alias}.{column_label(name)}", where)
 
     def _check_literal_type(
         self,
