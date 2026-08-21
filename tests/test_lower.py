@@ -1981,7 +1981,7 @@ def test_union_all_branch_with_a_subtitle_column_is_rejected() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_bare_star_expands_every_stream_in_file_order() -> None:
+def test_bare_star_expands_every_stream_of_the_container() -> None:
     g = _lower("SELECT * FROM input('x.mkv') a", {"a": _layout_probe("vasd")})
     assert _outputs(g) == [
         ("src:a:v:0", "video", None),
@@ -1992,13 +1992,13 @@ def test_bare_star_expands_every_stream_in_file_order() -> None:
     assert g.nodes == {}  # a star is pure passthrough
 
 
-def test_star_follows_the_containers_own_stream_order() -> None:
-    """File order, not type order: an audio-first container stays audio-first."""
+def test_star_expands_the_stream_arrays_in_column_order() -> None:
+    """The container's array columns, not file order: audio-first stays v/a/s."""
     g = _lower("SELECT * FROM input('x.mkv') a", {"a": _layout_probe("asv")})
     assert [(o.ref, o.type) for o in g.outputs] == [
+        ("src:a:v:0", "video"),
         ("src:a:a:0", "audio"),
         ("src:a:s:0", "subtitle"),
-        ("src:a:v:0", "video"),
     ]
 
 
@@ -6238,12 +6238,124 @@ def test_unnesting_an_empty_array_selects_nothing() -> None:
     assert "selects nothing" in err.message
 
 
-def test_a_star_cannot_expand_a_row_table() -> None:
+def test_a_star_over_a_row_table_is_not_a_media_column() -> None:
     err = _reject_lower(
         "SELECT t.* FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "cannot expand the track-row table" in err.message
+    assert "expands their fields" in err.message
+    assert err.hint is not None and "the row is the stream: select t" in err.hint
+
+
+def test_star_leaves_chapters_out_of_a_media_query() -> None:
+    """A chapter is not a stream, so the star expands the stream arrays only."""
+    g = _lower(
+        "SELECT * FROM input('x.mkv') a",
+        {
+            "a": ProbeResult(
+                streams=list(_layout_probe("va").streams),
+                chapters=[ChapterMeta(index=1, start_t=0.0, end_t=1.0, title="Intro")],
+            )
+        },
+    )
+    assert [o.type for o in g.outputs] == ["video", "audio"]
+
+
+def test_star_over_a_container_is_every_array_column_in_a_table_query() -> None:
+    sinks = lower_table(
+        resolve(parse("SELECT * FROM input('f.mkv') f")),
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    assert sinks[0].result.columns == ["video", "audio", "subtitle", "data", "chapters"]
+    video, audio, subtitle, data, chapters = sinks[0].result.rows[0]
+    assert video == ArrayCell(elements=(StreamCell(type="video", spec="0:v:0"),))
+    assert audio == ArrayCell(elements=(StreamCell(type="audio", spec="0:a:0"),))
+    assert subtitle == ArrayCell(elements=())
+    assert data == ArrayCell(elements=())
+    assert isinstance(chapters, ArrayCell) and len(chapters.elements) == 2
+
+
+def test_star_over_track_rows_is_the_records_scalar_fields() -> None:
+    """The metadata table: the maps stay out, and are read by name instead."""
+    sinks = lower_table(
+        resolve(parse("SELECT t.* FROM input('f.mkv') f, unnest(f.audio) t")),
+        _row_probes(),
+    )
+    assert sinks[0].result.columns == [
+        "index",
+        "codec",
+        "channels",
+        "channel_layout",
+        "sample_rate",
+        "bitrate",
+        "duration",
+    ]
+    assert sinks[0].result.rows[0] == [1, "aac", 2, "stereo", None, None, None]
+
+
+def test_a_star_over_chapter_rows_names_no_stream_to_select() -> None:
+    err = _reject_lower(
+        "SELECT c.* FROM input('f.mkv') f, unnest(f.chapters) c",
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.hint is not None and "a chapter is not a stream" in err.hint
+
+
+def test_star_over_chapter_rows_is_the_chapter_fields() -> None:
+    sinks = lower_table(
+        resolve(parse("SELECT c.* FROM input('f.mkv') f, unnest(f.chapters) c")),
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    assert sinks[0].result.columns == ["index", "title", "start_t", "end_t"]
+    assert sinks[0].result.rows == [[1, "Intro", 0.0, 1.0], [2, "Credits", 1.0, 2.0]]
+
+
+def test_a_bare_star_covers_container_and_rows_in_a_table_query() -> None:
+    sinks = lower_table(
+        resolve(parse("SELECT * FROM input('f.mkv') f, unnest(f.audio) t")),
+        _row_probes(_track("audio", 0, codec="aac")),
+    )
+    assert sinks[0].result.columns == [
+        "video",
+        "audio",
+        "subtitle",
+        "data",
+        "chapters",
+        "index",
+        "codec",
+        "channels",
+        "channel_layout",
+        "sample_rate",
+        "bitrate",
+        "duration",
+    ]
+
+
+def test_star_over_a_cte_prints_its_columns_in_a_table_query() -> None:
+    sinks = lower_table(
+        resolve(parse(
+            "WITH c AS (SELECT t AS track FROM input('f.mkv') f, unnest(f.audio) t) "
+            "SELECT * FROM c"
+        )),
+        _row_probes(),
+    )
+    assert sinks[0].result.columns == ["track"]
+    assert sinks[0].result.rows == [
+        [StreamCell(type="audio", spec="0:a:0")],
+        [StreamCell(type="audio", spec="0:a:1")],
+        [StreamCell(type="audio", spec="0:a:2")],
+    ]
+
+
+def test_a_bare_star_is_not_a_group_key() -> None:
+    err = _reject_lower_table(
+        "SELECT *, array_agg(t) FROM input('f.mkv') f, unnest(f.audio) t "
+        "GROUP BY t.tags.language",
+        _row_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'*' is neither aggregated nor a GROUP BY key" in err.message
 
 
 def test_a_row_alias_is_an_array_and_subscripts_like_one() -> None:
@@ -6549,6 +6661,61 @@ def test_chapters_values_cte_rejects_an_unescapable_title() -> None:
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "cannot represent unescaped" in err.message
+
+
+def test_chapters_values_cte_rejects_a_chapter_that_ends_before_it_starts() -> None:
+    err = _reject(
+        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (60, 30, 'Intro')) "
+        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters marks)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "ends at 30, which is not after its start 60" in err.message
+
+
+def test_chapters_values_cte_rejects_a_zero_length_chapter() -> None:
+    err = _reject(
+        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 0, 'Intro')) "
+        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters marks)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "is not after its start" in err.message
+
+
+def test_chapters_values_cte_rejects_rows_out_of_order() -> None:
+    err = _reject(
+        "COPY (WITH marks(start_t, end_t, title) AS "
+        "(VALUES (60, 120, 'Two'), (0, 30, 'One')) "
+        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters marks)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "starts at 0, before chapter 1 at 60" in err.message
+    assert "ascending" in (err.hint or "")
+
+
+def test_chapters_values_cte_rejects_overlapping_rows() -> None:
+    err = _reject(
+        "COPY (WITH marks(start_t, end_t, title) AS "
+        "(VALUES (0, 60, 'One'), (30, 90, 'Two')) "
+        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters marks)"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "starts at 30, inside chapter 1 which ends at 60" in err.message
+
+
+def test_chapters_values_cte_accepts_back_to_back_chapters() -> None:
+    """Touching is not overlapping: one ends exactly where the next begins."""
+    g = _lower(
+        "COPY (WITH marks(start_t, end_t, title) AS "
+        "(VALUES (0, 60, 'One'), (60, 120, 'Two')) "
+        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters marks)"
+    )
+    payload = base64.b64decode(g.input_paths[1].split(",", 1)[1]).decode()
+    assert payload.count("[CHAPTER]") == 2
 
 
 # ---------------------------------------------------------------------------
@@ -7390,6 +7557,69 @@ def test_a_case_column_over_literals_is_still_not_a_row_predicate() -> None:
         "FROM input('f.mkv') f"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+# ---------------------------------------------------------------------------
+# read-only fields: an alias that names one is a rejection, not a tag key
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("column", "field"),
+    [("'h264' AS codec", "codec"), ("3 AS index", "index")],
+)
+def test_setting_a_read_only_track_field_is_rejected(column: str, field: str) -> None:
+    err = _reject_lower(
+        f"SELECT t, {column} FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.index = 1",
+        _row_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert f"'{field}' is a probed field of the track row" in err.message
+
+
+def test_setting_a_read_only_field_of_the_rows_own_type_is_rejected() -> None:
+    """The row's type decides: `width` is a video field, so a video row rejects."""
+    err = _reject_lower(
+        "SELECT t, 1920 AS width FROM input('f.mkv') f, unnest(f.video) t",
+        _row_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'width' is a probed field of the track row" in err.message
+
+
+def test_a_free_form_key_is_still_a_tag() -> None:
+    g = _lower(
+        "SELECT t, 'x' AS whatever FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.index = 1",
+        _row_probes(),
+    )
+    assert all(o.metadata.get("whatever") == "x" for o in g.outputs)
+
+
+def test_setting_a_read_only_container_field_is_rejected() -> None:
+    err = _reject("SELECT f.audio[1], 12 AS duration FROM input('f.mkv') f")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'duration' is a probed field of the container" in err.message
+
+
+def test_a_read_only_field_is_rejected_inside_a_cte_body_too() -> None:
+    err = _reject_lower(
+        "WITH c AS (SELECT t, 'h264' AS codec FROM input('f.mkv') f, unnest(f.audio) t) "
+        "SELECT array_agg(c.t) FROM c",
+        _row_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'codec' is a probed field of the track row" in err.message
+
+
+def test_disposition_is_writable_so_its_own_name_still_works() -> None:
+    g = _lower(
+        "SELECT t, 'forced' AS disposition "
+        "FROM input('f.mkv') f, unnest(f.audio) t WHERE t.index = 1",
+        _row_probes(),
+    )
+    assert [o.disposition for o in g.outputs] == [("forced",)]
 
 
 # ---------------------------------------------------------------------------

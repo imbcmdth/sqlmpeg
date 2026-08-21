@@ -783,6 +783,60 @@ def subscript_metadata_shape(node: exp.Expr) -> tuple[exp.Bracket, str] | None:
     return inner, _ident_name(ident)
 
 
+# field access on a filter output: <call>(...).<field>
+def _filter_output_field(node: exp.Expr) -> tuple[exp.Expr, str] | None:
+    """Recognize ``<call>(...).<field>``; return ``(call, dotted path)``.
+
+    The mirror of :func:`subscript_metadata_shape`: same ``exp.Dot`` chain, but
+    the base is a CALL rather than a subscript, so ``scale(v, 640, -2).width``
+    and ``volume(a, 0.2).tags.language`` both land here. A namespaced call
+    (``ffmpeg.sine(...)``) is an ``exp.Dot`` whose expression is the function
+    itself, which ends the walk and IS the base. Returns None for everything
+    else, a bare ``ffmpeg.sine(...)`` with no field after it included.
+    """
+    if not isinstance(node, exp.Dot):
+        return None
+    parts: list[str] = []
+    base: exp.Expr = node
+    while True:
+        if isinstance(base, exp.Paren):
+            base = base.this
+            continue
+        if not isinstance(base, exp.Dot):
+            break
+        ident = base.args.get("expression")
+        if not isinstance(ident, exp.Identifier):
+            break
+        parts.append(_ident_name(ident))
+        base = base.this
+    if not parts or not _is_call(base):
+        return None
+    return base, ".".join(reversed(parts))
+
+
+def _is_call(node: exp.Expr) -> bool:
+    """True for a function call, plain or namespaced (``ffmpeg.sine(...)``)."""
+    if isinstance(node, exp.Func):
+        return True
+    return isinstance(node, exp.Dot) and isinstance(node.args.get("expression"), exp.Func)
+
+
+def _call_label(node: exp.Expr) -> str:
+    """The call's name as the user wrote it, for a message.
+
+    ``exp.Anonymous`` -- every filter call, since none of them is a sqlglot
+    builtin -- carries the written name in ``this``; a builtin sqlglot did
+    recognize (``trim``) answers with its own name instead.
+    """
+    if isinstance(node, exp.Dot):
+        expression = node.args.get("expression")
+        inner = _call_label(expression) if isinstance(expression, exp.Expr) else "?"
+        return f"{_ident_name(node.this)}.{inner}"
+    if isinstance(node, exp.Anonymous):
+        return str(node.name).lower()
+    return node.sql_name().lower() if isinstance(node, exp.Func) else "?"
+
+
 def _subscript_label(bracket: exp.Bracket) -> str:
     """``<alias>.<type>[k]``, written the way a user would paste it."""
     inner = bracket.this
@@ -801,6 +855,18 @@ def _accessor_label(bracket: exp.Bracket, name: str) -> str:
 
 
 # stars
+
+
+def _star_label(qualifier: str) -> str:
+    """A star projection as it was written: ``*`` or ``<alias>.*``."""
+    return f"{qualifier}.*" if qualifier else "*"
+
+
+def _star_covers_rows(qualifier: str, scope: dict[str, str]) -> bool:
+    """True if a star stands for a row table: one named, or any in scope."""
+    if qualifier:
+        return scope.get(qualifier) == "row"
+    return any(kind == "row" for kind in scope.values())
 
 
 def star_qualifier(node: exp.Expr) -> str | None:
@@ -2637,10 +2703,13 @@ class _Resolver:
                 self._check_grouped_expr(
                     _projection_expr(projection), scope, select, key_texts
                 )
-            elif scope.get(qualifier) == "row":
+            elif _star_covers_rows(qualifier, scope):
+                # A star over rows expands their fields, which vary inside a
+                # group; a bare one covers every alias, row tables included.
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"'{qualifier}.*' is neither aggregated nor a GROUP BY key",
+                    f"'{_star_label(qualifier)}' is neither aggregated nor a "
+                    "GROUP BY key",
                     projection,
                     fallback=select,
                     hint=_GROUP_STREAM_HINT,
@@ -2695,6 +2764,9 @@ class _Resolver:
         self, node: exp.Expr, scope: dict[str, str], select: exp.Select
     ) -> None:
         """``TO (<expression>)``: one text value over this query's row columns."""
+        for sub in node.walk():
+            if isinstance(sub, exp.Dot):
+                self._check_filter_output_field(sub, select)
         kind = self._check_value_expr(node, scope, select)
         if kind == "text":
             return
@@ -2795,10 +2867,34 @@ class _Resolver:
                     fallback=select,
                     hint=_STAR_HINT,
                 )
+            if isinstance(sub, exp.Dot):
+                self._check_filter_output_field(sub, select)
             if isinstance(sub, exp.Bracket):
                 self._check_subscript(sub, select)
             if isinstance(sub, exp.Func):
                 self._check_named_arguments(sub, select)
+
+    def _check_filter_output_field(self, sub: exp.Dot, select: exp.Select) -> None:
+        """A field read off a filter output: nothing probed it, so it is empty.
+
+        The output pin is connected to nothing until something maps it, so the
+        stream has no facts to report -- ``scale(v, 640, -2).width`` cannot be
+        known without running the filter, and ``volume(a, 0.2).tags.language``
+        is the input's own tag spelled twice.
+        """
+        found = _filter_output_field(sub)
+        if found is None:
+            return
+        call, path = found
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'.{path}' reads a field of the output of {_call_label(call)}(), "
+            "which was never probed",
+            sub,
+            fallback=select,
+            hint=f"read the field on what goes IN, e.g. t.{path} for "
+            f"{_call_label(call)}(t, ...)",
+        )
 
     def _check_named_arguments(self, call: exp.Func, select: exp.Select) -> None:
         """``name => value`` arguments must TRAIL the positional ones, once each.

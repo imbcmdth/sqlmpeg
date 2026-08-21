@@ -316,6 +316,35 @@ def test_attachment_codec_type_is_still_ignored(
     assert result.streams[0].type == "video"
 
 
+def test_an_attachment_never_becomes_a_data_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`data` is the unclassifiable bucket; an attachment is well-typed.
+
+    The per-type indices are counted over the streams that ARE kept, so the
+    attachment sitting between two data streams does not shift either one.
+    """
+    f = tmp_path / "x.mkv"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    mixed_json = json.dumps(
+        {
+            "streams": [
+                {"codec_type": "video"},
+                {"codec_type": "data"},
+                {"codec_type": "attachment", "codec_name": "ttf"},
+                {"codec_type": "data"},
+            ]
+        }
+    )
+    _fake_run(monkeypatch, stdout=mixed_json)
+
+    result = probe(str(f))
+    assert result is not None
+    assert [s.type for s in result.streams] == ["video", "data", "data"]
+    assert [s.index for s in result.by_type("data")] == [0, 1]
+
+
 def test_per_type_index_counted_in_file_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

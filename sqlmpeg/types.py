@@ -51,13 +51,17 @@ from typing import Literal
 __all__ = [
     "CHAPTERS_COLUMN",
     "COLUMN_TYPES",
+    "CONTAINER_READONLY_FIELDS",
     "DISPOSITION_COLUMN",
     "DISPOSITION_KEYS",
     "INPUT_COLUMNS",
     "INPUT_DURATION_COLUMN",
     "MAP_ELEMENTS",
     "ROW_COMMON",
+    "ROW_READONLY_FIELDS",
     "ROW_SCHEMAS",
+    "ROW_STAR_COLUMNS",
+    "STAR_COLUMNS",
     "STREAM_ARRAY_COLUMNS",
     "STREAM_TAG_COLUMNS",
     "TAGS_COLUMN",
@@ -401,10 +405,38 @@ STREAM_ARRAY_COLUMNS = frozenset(_STREAM_ARRAYS)
 # `t` is a timeline and `duration` is a scalar, and neither is a set of rows.
 UNNEST_COLUMNS = frozenset(_array_columns("stream", "record"))
 
+# What `SELECT *` expands a container into: its array columns, in declaration
+# order -- the four stream arrays, then the record arrays. Never the scalars:
+# `duration` is a value, `t` a seek handle, `tags` a map read by key.
+STAR_COLUMNS: tuple[str, ...] = _array_columns("stream", "record")
+
+# The container fields a query may not assert: probed facts and handles. The
+# reserved set an aliased column is checked against before it counts as a
+# free-form tag key.
+CONTAINER_READONLY_FIELDS = frozenset(f.name for f in _container_fields() if not f.writable)
+
 # The columns each unnest row table exposes, per container array column. The
 # row's own stream is not among them: the row IS the stream.
 ROW_SCHEMAS: dict[str, dict[str, RowColumnType]] = {
     f.name: resolve(f.type).columns() for f in _container_fields() if f.name in UNNEST_COLUMNS
+}
+
+# What `SELECT *` expands a row into, per container array column: the record's
+# scalar fields, in declaration order. The map columns stay out -- one
+# disposition cell is every flag ffmpeg knows -- and are read by name instead.
+ROW_STAR_COLUMNS: dict[str, tuple[str, ...]] = {
+    column: tuple(name for name, type_ in schema.items() if type_ in COLUMN_TYPES)
+    for column, schema in ROW_SCHEMAS.items()
+}
+
+# The fields of each row type a query may not assert, per container array
+# column: probed facts, not assertions.
+ROW_READONLY_FIELDS: dict[str, frozenset[str]] = {
+    f.name: frozenset(
+        entry.name for entry in resolve(f.type).fields if entry.exposed and not entry.writable
+    )
+    for f in _container_fields()
+    if f.name in UNNEST_COLUMNS
 }
 
 # What every stream row carries, whatever its type.

@@ -26,7 +26,7 @@ ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -preset:0 slow -
 
 ## 2. Remux into another container without re-encoding
 
-`SELECT *` means keep everything: every stream, untouched, tags intact. Nothing decodes; this runs as fast as the disk. The one wrinkle is captions - mp4 only carries `mov_text`, so the subtitle track transcodes while video and audio copy:
+`SELECT *` means keep everything: the container's stream arrays - video, audio, subtitle, data, in that order - untouched, tags intact, and chapters riding through as ffmpeg's own default. Nothing decodes; this runs as fast as the disk. The one wrinkle is captions - mp4 only carries `mov_text`, so the subtitle track transcodes while video and audio copy:
 
 ```pgsql
 COPY (
@@ -746,6 +746,8 @@ $ sqlmpeg -f query.sql
  2     | fra      | aac   | mono
 (2 rows)
 ```
+
+`SELECT t.*` prints the row's whole scalar shape instead - `index`, `codec`, and whatever else that stream type carries. The map columns stay out of the star: one `disposition` cell is every flag ffmpeg knows. Name them - `t.tags.language`, `t.disposition.forced` - to print them. `SELECT *` over the input alias `f` prints its array columns, one cell each: `video`, `audio`, `subtitle`, `data`, `chapters`.
 
 ## 31. Inspect a join before you trust it
 

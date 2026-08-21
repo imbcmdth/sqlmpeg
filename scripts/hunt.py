@@ -271,6 +271,9 @@ VIDEO_ROW_COLS = TRACK_COLS + ["width", "height", "fps"]
 AUDIO_ROW_COLS = TRACK_COLS + ["channels", "channel_layout", "sample_rate"]
 CHAPTER_COLS = ["index", "title", "start_t", "end_t"]
 
+# Aliases that name a probed field rather than a tag key.
+TAG_ALIASES = ["codec", "index", "width", "channels", "duration", "sample_rate"]
+
 RESERVED = {
     "limit",
     "order",
@@ -402,6 +405,8 @@ def gen_video(ctx: Ctx, depth: int = 0) -> str:
                 f"{alias}.subtitle[1]",
                 f"{alias}.video",
                 "*",
+                f"scale({alias}.video[1], 640, -2).width",
+                f"hflip({alias}.video[1]).tags.language",
                 f"{alias}.nosuch",
             ]
         )
@@ -654,6 +659,11 @@ def gen_select(ctx: Ctx, depth: int = 0, view: bool = False) -> str:
     grouped = rng.random() < 0.2
     for _ in range(rng.randint(1, 3)):
         r = rng.random()
+        if not view and ctx.items and rng.random() < 0.05:
+            # A star as a WHOLE projection: legal over a container, a rejection
+            # over rows in a media query, every column of both in a table one.
+            cols.append(ctx.pick(["*", f"{ctx.pick(ctx.items).alias}.*"]))
+            continue
         if r < 0.45:
             col = gen_video(ctx)
         elif r < 0.65:
@@ -661,7 +671,10 @@ def gen_select(ctx: Ctx, depth: int = 0, view: bool = False) -> str:
         elif r < 0.75 or grouped:
             col = f"array_agg({gen_video(ctx) if rng.random() < 0.5 else gen_audio(ctx)})"
         else:
-            col = f"{gen_value(ctx)} AS tag{rng.randrange(3)}"
+            # A read-only field name as the alias is a rejection, a free-form
+            # key is a tag: both shapes go through.
+            key = ctx.pick(TAG_ALIASES) if ctx.bad() else f"tag{rng.randrange(3)}"
+            col = f"{gen_value(ctx)} AS {key}"
         if view:
             col += f" AS {'v' if 'audio' not in col else 'a'}"
         elif not col.endswith(")") and " AS " not in col:
@@ -722,9 +735,42 @@ def gen_copy(ctx: Ctx) -> str:
     return text
 
 
+_CHAPTER_BOUNDS = ["0", "30", "60", "120", "-5", "0.5", "NULL", "'x'", "true"]
+
+
+def gen_chapters_copy(ctx: Ctx) -> str:
+    """A VALUES chapter list handed to the sink: the constrained write shape.
+
+    Bounds come out of order, overlapping and mistyped as often as not, so the
+    span checks are exercised alongside the ones that compile.
+    """
+    rng = ctx.rng
+    columns = ["start_t", "end_t", "title"]
+    if ctx.bad():
+        columns = ctx.pick(
+            [["start_t", "end_t"], ["a", "b", "c"], ["title", "start_t", "end_t"]]
+        )
+    rows = []
+    for _ in range(rng.randint(1, 3)):
+        cells = []
+        for name in columns:
+            if name == "title":
+                cells.append(ctx.pick(["'Intro'", "NULL", "'a=b'", "1"]))
+            else:
+                cells.append(ctx.pick(_CHAPTER_BOUNDS))
+        rows.append("(" + ", ".join(cells) + ")")
+    return (
+        f"COPY (\n  WITH marks({', '.join(columns)}) AS (VALUES {', '.join(rows)})\n"
+        "  SELECT a0.video[1] FROM input('in.mp4') a0\n"
+        ") TO 'out.mkv' WITH (chapters marks)"
+    )
+
+
 def gen_query(rng: random.Random, p_bad: float) -> str:
     ctx = Ctx(rng, p_bad)
     r = rng.random()
+    if r < 0.04:
+        return gen_chapters_copy(ctx)
     if r < 0.25:
         return gen_select(ctx)
     if r < 0.75:

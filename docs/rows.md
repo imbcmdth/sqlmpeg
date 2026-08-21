@@ -18,6 +18,10 @@ One row per input: the shape of a container file. Arrays of streams plus the con
 
 Subscripts reach track-row columns without unnest: `f.audio[1].tags.language` (strict-Postgres `(f.audio[1]).tags.language` also parses). In a `WHERE` this is an **assertion** - the subscript names one track, so a false predicate refuses to compile ([recipe 29](examples.md#29-assert-what-youre-shipping)).
 
+Only an input-side read has facts to report. A field read off a FILTER OUTPUT - `scale(f.video[1], 640, -2).width`, `volume(t, 0.2).tags.language` - is a typed rejection: nothing probed that stream, and the hint names the input-side read to write instead.
+
+`SELECT *` over an input alias is its ARRAY columns, never the scalars. In a media query that is the four stream arrays in `video`, `audio`, `subtitle`, `data` order, each a passthrough - the remux shape; chapters ride through as ffmpeg's own default. In a table/CSV query it is every array column including `chapters`, one cell each. `f.*` does one alias, a bare `*` every alias in `FROM` order.
+
 ## Track rows - `unnest(f.audio) t`
 
 One row per track. The argument is an array column of an input declared earlier in the same FROM list; alias mandatory. All five array columns unnest - the four stream arrays here, and `chapters` below. The schema varies by stream type:
@@ -39,6 +43,8 @@ The row IS the stream: a bare `t` where a stream is expected selects it, filters
 
 `index` is 1-based and agrees with the subscript: `WHERE t.index = 1` and `f.audio[1]` name the same track.
 
+`SELECT t.*` is the row's scalar fields, in the order above - the metadata table. The map columns stay out (one `disposition` cell is every flag ffmpeg knows, which no table prints readably); name them to print them. In a media query a star over rows is a typed rejection: fields are not output streams, and the stream is the bare `t`.
+
 `tags` is a map read by path - `t.tags.language`, `t.tags.title`, any key the file carries; absent reads NULL. There is no bare `t.language` spelling. Bare, `t.tags` prints the whole map as one array cell of `(key,value)` records.
 
 `disposition` is the same shape over a CLOSED key set - the flags ffmpeg itself reports: `default`, `dub`, `original`, `comment`, `lyrics`, `karaoke`, `forced`, `hearing_impaired`, `visual_impaired`, `clean_effects`, `attached_pic`, `timed_thumbnails`, `non_diegetic`, `captions`, `descriptions`, `metadata`, `dependent`, `still_image`, `multilayer`. `t.disposition.forced` is a boolean; a key outside the set is a typed rejection. Bare, `t.disposition` prints as one array cell of `(key,set)` records. Writing it is under Tags below.
@@ -56,6 +62,8 @@ The same shape as track rows, over the container's chapter list. A chapter is no
 | `start_t`, `end_t` | number | seconds |
 
 Writing chapters is the reverse shape: a `VALUES` CTE with exactly these columns handed to the sink - `WITH marks(start_t, end_t, title) AS (VALUES ...) ... WITH (chapters marks)` - compiles to one extra self-contained input carrying the list; `chapters_from <alias>` copies an input's chapters through instead. Recipes [39-40](examples.md#39-list-a-files-chapters).
+
+Written chapters are checked at compile time: `start_t` and `end_t` must be numbers (`title` may be `NULL`), each chapter must end after it starts, and the rows must run in ascending order without overlapping. Back-to-back is fine - one may end exactly where the next begins.
 
 ## CTE rows - `WITH x AS (...)`
 
@@ -83,6 +91,8 @@ An aliased non-stream SELECT column is a metadata tag; the alias is the key (fre
 - **Over track rows**: tags that row's stream(s) - `-metadata:s:N`. `CASE WHEN t.tags.language IN ('en', 'english') THEN 'eng' ELSE t.tags.language END AS language` retags a library in one expression. Unselected tags pass through unchanged. Recipes [37-38](examples.md#37-retitle-tracks-from-their-own-metadata).
 - **Over input rows only** (no track rows in the branch): tags the container - `-metadata`. The input's own tags feed the expressions, so `CASE WHEN f.tags.title IS NULL THEN 'Untitled' ELSE f.tags.title END AS title` fills a missing title. [Recipe 52](examples.md#52-read-the-containers-tags-rewrite-them-with-case).
 - **Both in one query**: layer with a CTE - tag columns in the body are per-stream, in the outer SELECT container-level, and the outer SELECT gathers the CTE's rows (`array_agg` + `GROUP BY`, see Combining rows); the outer value wins on a shared key. [Recipe 53](examples.md#53-tag-the-tracks-and-the-container-in-one-query).
+
+The reserved names are the read-only fields of whatever the column sits over - a track row's `codec`, `index`, `width`, ... or the container's `duration` and `t`. Those are probed facts, so `'h264' AS codec` is a typed rejection rather than a tag called `codec`; every other name is a free-form key. A writable field keeps its own meaning: `disposition` writes the flag map.
 
 `disposition` is not a tag but the row's own field: its value is ffmpeg's disposition spec (`'default'`, `'forced'`, `'default+forced'`, `'0'` clears), it says what the whole flag map is, and it emits `-disposition:N` - [recipe 41](examples.md#41-flag-the-default-track). A container has no disposition, so it needs a track row. `metadata_from <alias>` copies an input's global tags, `strip_metadata true` drops them; a tag column overrides either for its key. The same columns in a table/CSV query print as plain data, which previews what a retag will write.
 

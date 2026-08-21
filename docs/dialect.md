@@ -70,6 +70,12 @@ Each column is one of:
   order; must be a whole column ([rows.md](rows.md#combining-rows)).
 - **A metadata column** (table queries): any row column prints as
   data.
+- **`*` / `<alias>.*`**: over an input, its array columns - the four
+  stream arrays in `video`, `audio`, `subtitle`, `data` order in a
+  media query, every array column including `chapters` in a table
+  one. Over rows, the record's scalar fields (`tags` and `disposition`
+  excluded, read them by name), which a table query prints and a media
+  query rejects. Over a CTE, the columns its body named.
 
 Subscripts are positive integer literals, 1-based.
 `(f.audio[1]).codec`-style accessors reach row columns without
@@ -156,6 +162,14 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   own `duration`); selecting chapter rows as streams; a bare
   `f.chapters` in a media query, or subscripting it (`unnest` it); a data/subtitle
   track through any filter (passthrough only).
+- **Fields**: reading one off a filter output (`scale(v, 640, -2).width`,
+  `volume(a, 0.2).tags.language`), since nothing probed it; setting a
+  read-only one (`'h264' AS codec`, `3 AS index`, `12 AS duration`),
+  since it is a probed fact and not an assertion; `SELECT *` over rows
+  in a media query, since a star expands fields and a SELECT column is
+  a stream.
+- **Written chapters**: a chapter that ends at or before it starts, rows
+  out of ascending order, or two chapters covering the same second.
 
 What a specific rejection looks like, with captured JSON for every
 error code: [errors.md](errors.md).

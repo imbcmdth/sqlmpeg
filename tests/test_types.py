@@ -173,6 +173,29 @@ EXPECTED_STREAM_ARRAY_COLUMNS = frozenset({"video", "audio", "subtitle", "data"}
 
 EXPECTED_UNNEST_COLUMNS = EXPECTED_STREAM_ARRAY_COLUMNS | {"chapters"}
 
+EXPECTED_STAR_COLUMNS = ("video", "audio", "subtitle", "data", "chapters")
+
+EXPECTED_ROW_STAR_COLUMNS = {
+    "audio": ("index", "codec", "channels", "channel_layout", "sample_rate",
+              "bitrate", "duration"),
+    "video": ("index", "codec", "width", "height", "fps", "bitrate", "duration",
+              "color_transfer"),
+    "subtitle": ("index", "codec"),
+    "data": ("index", "codec"),
+    "chapters": ("index", "title", "start_t", "end_t"),
+}
+
+EXPECTED_ROW_READONLY_FIELDS = {
+    "audio": frozenset({"index", "codec", "channels", "channel_layout",
+                        "sample_rate", "bitrate", "duration"}),
+    "video": frozenset({"index", "codec", "width", "height", "fps", "bitrate",
+                        "duration", "color_transfer"}),
+    "subtitle": frozenset({"index", "codec"}),
+    "data": frozenset({"index", "codec"}),
+    "chapters": frozenset({"index"}),
+}
+
+
 # The map columns and the record each holds.
 EXPECTED_MAP_ELEMENTS = {"tags": "tag", "disposition": "flag"}
 
@@ -317,6 +340,25 @@ def test_column_set_views() -> None:
     assert types.INPUT_COLUMNS == EXPECTED_INPUT_COLUMNS
     assert types.UNNEST_COLUMNS == EXPECTED_UNNEST_COLUMNS
     assert types.STREAM_ARRAY_COLUMNS == EXPECTED_STREAM_ARRAY_COLUMNS
+
+
+def test_star_column_views() -> None:
+    assert types.STAR_COLUMNS == EXPECTED_STAR_COLUMNS
+    assert types.ROW_STAR_COLUMNS == EXPECTED_ROW_STAR_COLUMNS
+    # A star over a row never carries a map column: those are read by name.
+    for column, names in types.ROW_STAR_COLUMNS.items():
+        schema = types.ROW_SCHEMAS[column]
+        assert names == tuple(n for n in schema if n not in ("tags", "disposition"))
+
+
+def test_read_only_field_views() -> None:
+    assert types.ROW_READONLY_FIELDS == EXPECTED_ROW_READONLY_FIELDS
+    assert types.CONTAINER_READONLY_FIELDS == frozenset({"t", "duration"})
+    # On a STREAM row the writable half is exactly the maps, which have
+    # spellings of their own; a chapter's title and bounds are writable too.
+    for column in types.STREAM_ARRAY_COLUMNS:
+        writable = set(types.ROW_SCHEMAS[column]) - types.ROW_READONLY_FIELDS[column]
+        assert writable == {"tags", "disposition"}
 
 
 def test_named_column_views() -> None:

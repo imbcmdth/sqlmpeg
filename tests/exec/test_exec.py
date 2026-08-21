@@ -723,6 +723,49 @@ def test_qualified_star_mixes_with_an_explicit_column(tmp_path: Path) -> None:
     assert streams[3]["tags"]["language"] == "eng"  # av2's first track
 
 
+def test_an_attached_file_never_lands_in_the_data_array(tmp_path: Path) -> None:
+    """ffprobe calls an attachment its own codec_type, and `data` is not it.
+
+    `data` is the bucket for what ffprobe cannot classify; an attachment is
+    well-typed, so it stays out until it has a column of its own.
+    """
+    _require_fixture(_AVS)
+    attached = tmp_path / "attached.mkv"
+    font = tmp_path / "font.txt"
+    font.write_text("not really a font\n", encoding="utf-8")
+    build = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(_AVS),
+        "-attach",
+        str(font),
+        "-metadata:s:t",
+        "mimetype=application/octet-stream",
+        "-c",
+        "copy",
+        str(attached),
+    ]
+    result = subprocess.run(
+        build, capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT
+    )
+    assert result.returncode == 0, result.stderr
+    assert any(
+        s["codec_type"] == "attachment" for s in _ffprobe_streams(attached)
+    ), "the fixture has no attachment to test with"
+
+    probed = probe(str(attached))
+    assert probed is not None
+    assert [s.type for s in probed.streams] == ["video", "audio", "subtitle"]
+
+    # And the star maps the three real streams, never a fourth.
+    query = f"SELECT * FROM input('{_sql_path(attached)}') a"
+    emitted = emit(compile_sql(query))
+    assert [m.target for m in emitted.maps] == ["0:v:0", "0:a:0", "0:s:0"]
+
+
 def test_vtt_join_muxes_an_external_caption_track_into_an_mkv(tmp_path: Path) -> None:
     """An external WebVTT file joined as a subtitle track.
 

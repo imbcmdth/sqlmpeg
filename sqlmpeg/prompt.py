@@ -160,14 +160,19 @@ _DIALECT_TAIL = """\
   `UNION ALL` branch is `UNSUPPORTED_SQL` (ffmpeg's `concat` has video/audio
   pads only). A caption or data track's `language`/`title` tag rides straight
   through to the output, exactly like an untouched audio track's.
-- `SELECT *` selects every stream of every `FROM` alias, in `FROM` order and
-  file order within each alias, all four types -- each one a plain
-  passthrough column, the same as writing every subscript out by hand.
-  `<alias>.*` does the same for one alias, and mixes freely with other
-  columns: `SELECT a.*, b.audio[1]`. Star over an `input()` alias needs a
-  readable file to size it (same policy as a bare array: `INPUT_NOT_FOUND` if
-  it cannot be probed); star over a CTE name expands that CTE's recorded
-  columns instead, with no probe needed.
+- `SELECT *` expands an alias's ARRAY columns, never its scalars. Over an
+  `input()` alias in a media query that is `video`, `audio`, `subtitle`,
+  `data` -- in THAT order, whatever order the file stores them in -- each one
+  a plain passthrough column, the same as writing every subscript out by
+  hand; `chapters` takes no output position (a chapter is not a stream) and
+  rides through as ffmpeg's own default. A bare `*` does every `FROM` alias
+  in `FROM` order. `<alias>.*` does one, and mixes freely with other columns:
+  `SELECT a.*, b.audio[1]`. Star over an `input()` alias needs a readable
+  file to size it (same policy as a bare array: `INPUT_NOT_FOUND` if it
+  cannot be probed); star over a CTE name expands that CTE's recorded
+  columns instead, with no probe needed. Over a track-row alias in a media
+  query it is a typed rejection: a star over rows expands their FIELDS, and
+  a SELECT column is an output stream -- write the bare alias.
 - Joining an external subtitle file needs no special syntax: add it as
   another `input()` alias and select its `<alias>.subtitle[1]` alongside the
   rest of the columns. Set `subtitle_codec` (see Output options) to transcode
@@ -218,6 +223,15 @@ _DIALECT_TAIL = """\
   probe never reported (or an input this compile never probed) is NULL:
   ordinary three-valued SQL logic, so it equals nothing and never satisfies
   a `WHERE`/`ON` predicate.
+- A field is only readable on what was PROBED. Reading one off a filter's
+  output -- `scale(f.video[1], 640, -2).width`, `volume(t, 0.2).tags.language`
+  -- is a typed rejection: nothing ran, so nothing was measured. Read the
+  field on what goes IN.
+- In a table/csv query, `<row alias>.*` prints the row's scalar fields in
+  schema order -- the metadata table. `tags` and `disposition` are NOT in the
+  star (one disposition cell is every flag ffmpeg knows); name them to print
+  them. `<input alias>.*` there prints every array column as one cell each,
+  `chapters` included.
 - `WHERE` over row columns compares a column against a literal; `ON`
   compares a column against another row's column or a literal: `=`, `!=`,
   `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`. Every
@@ -233,7 +247,11 @@ _DIALECT_TAIL = """\
   `::text` / `CAST(x AS text)` to spell a number for `||`. NULL propagates.
   An aliased expression column is a metadata TAG on that row's tracks, the
   alias being the key: `SELECT t, 'Audio (' || t.tags.language || ')' AS
-  title`. `... AS disposition` is not a tag but the row's disposition FIELD:
+  title`. The keys are free-form EXCEPT the read-only fields of whatever the
+  column sits over -- a track row's `codec`, `index`, `width`, ..., or the
+  container's `duration` -- which are probed facts and cannot be asserted:
+  `'h264' AS codec` is a typed rejection, not a tag called `codec`.
+  `... AS disposition` is not a tag but the row's disposition FIELD:
   its value is ffmpeg's own flag spec (`'default'`, `'default+forced'`,
   `'0'` to clear), it says what the whole flag map is, and it needs a track
   row -- a container has no disposition. In a query with NO track rows the
@@ -303,7 +321,9 @@ _DIALECT_TAIL = """\
   (60, 300, 'Act One')) COPY (...) TO 'out.mkv' WITH (chapters marks)`. The
   CTE needs exactly `start_t`, `end_t` (numbers, seconds) and `title` (text)
   columns, matched by NAME not position; a VALUES CTE is reachable only this
-  way -- selecting `FROM` one directly is rejected. `chapters_from <alias>`
+  way -- selecting `FROM` one directly is rejected. Every chapter must end
+  after it starts, `title` may be `NULL`, and the rows must run in ascending
+  order without overlapping (back-to-back is fine). `chapters_from <alias>`
   copies an input's own chapters through instead; setting both is rejected.
 
 ### Broadcasting
@@ -655,6 +675,13 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   transitions between concatenated branches, motion tracking,
   subtitle/data-stream filtering, and anything requiring more than one pass
   over the stream.
+- A field read off a filter's OUTPUT (`scale(v, 640, -2).width`,
+  `volume(a, 0.2).tags.language`): nothing probed it. Setting a read-only
+  field (`'h264' AS codec`, `3 AS index`, `12 AS duration`): it is a probed
+  fact, not an assertion. `SELECT *` over a track-row alias in a media
+  query: a star expands FIELDS, and a SELECT column is an output stream.
+- A written chapter list that goes backwards: each chapter must end after it
+  starts, and the rows must ascend without overlapping.
 - A `WHERE` window on an alias whose subtitle/data column is ALSO selected in
   the same query (ffmpeg cannot retime captions under an input seek -- see
   Time selection); a subtitle/data column inside a CTE that also carries a

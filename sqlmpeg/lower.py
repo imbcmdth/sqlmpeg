@@ -354,10 +354,15 @@ from sqlmpeg.table import (
 )
 from sqlmpeg.types import (
     CHAPTERS_COLUMN,
+    CONTAINER_READONLY_FIELDS,
     DISPOSITION_COLUMN,
     DISPOSITION_KEYS,
     INPUT_DURATION_COLUMN,
+    ROW_READONLY_FIELDS,
     ROW_SCHEMAS,
+    ROW_STAR_COLUMNS,
+    STAR_COLUMNS,
+    STREAM_ARRAY_COLUMNS,
     STREAM_TAG_COLUMNS,
     TAGS_COLUMN,
     TIME_COLUMN,
@@ -374,6 +379,13 @@ _ARRAY_COLUMNS: dict[str, StreamType] = {
     "subtitle": "subtitle",
     "data": "data",
 }
+
+# The container array columns a MEDIA query's `SELECT *` expands: the stream
+# ones, in declaration order. `chapters` is an array column too, but a chapter
+# is not a stream, so it takes no output position.
+_STREAM_STAR_COLUMNS: tuple[str, ...] = tuple(
+    name for name in STAR_COLUMNS if name in STREAM_ARRAY_COLUMNS
+)
 
 _TYPE_MARKERS: dict[StreamType, str] = {
     "video": "v",
@@ -1163,10 +1175,17 @@ def _chapters_ffmetadata(raw: RawValuesTable) -> str:
         )
     index = {name: position for position, name in enumerate(raw.columns)}
     lines = [";FFMETADATA1"]
-    for row in raw.rows:
-        start = _chapter_number(row[index["start_t"]], raw.alias, "start_t")
-        end = _chapter_number(row[index["end_t"]], raw.alias, "end_t")
+    previous: tuple[int | float, int | float] | None = None
+    for position, row in enumerate(raw.rows, start=1):
+        start_cell = row[index["start_t"]]
+        end_cell = row[index["end_t"]]
+        start = _chapter_number(start_cell, raw.alias, "start_t")
+        end = _chapter_number(end_cell, raw.alias, "end_t")
         title = _chapter_title(row[index["title"]], raw.alias)
+        _check_chapter_span(
+            raw.alias, position, start, end, previous, start_cell, end_cell
+        )
+        previous = (start, end)
         lines.append("[CHAPTER]")
         lines.append("TIMEBASE=1/1")
         lines.append(f"START={start}")
@@ -1174,6 +1193,50 @@ def _chapters_ffmetadata(raw: RawValuesTable) -> str:
         if title is not None:
             lines.append(f"title={title}")
     return "\n".join(lines) + "\n"
+
+
+def _check_chapter_span(
+    alias: str,
+    position: int,
+    start: int | float,
+    end: int | float,
+    previous: tuple[int | float, int | float] | None,
+    start_cell: exp.Expr,
+    end_cell: exp.Expr,
+) -> None:
+    """One written chapter against the three rules a chapter list obeys.
+
+    A chapter runs forward, the list runs forward, and two chapters never cover
+    the same second: a player reads them in written order and has no way to
+    show a span that goes backwards or sits inside its neighbour.
+    """
+    if start >= end:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{alias}' chapter {position} ends at {end}, which is not after "
+            f"its start {start}",
+            end_cell,
+            hint="a chapter runs from start_t to end_t: end_t must be larger",
+        )
+    if previous is None:
+        return
+    previous_start, previous_end = previous
+    if start < previous_start:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{alias}' chapter {position} starts at {start}, before chapter "
+            f"{position - 1} at {previous_start}",
+            start_cell,
+            hint="chapters are written in ascending order; reorder the rows",
+        )
+    if start < previous_end:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{alias}' chapter {position} starts at {start}, inside chapter "
+            f"{position - 1} which ends at {previous_end}",
+            start_cell,
+            hint=f"chapters may not overlap: start this one at or after {previous_end}",
+        )
 
 
 def _chapter_number(cell: exp.Literal | exp.Null, alias: str, column: str) -> int | float:
@@ -1670,6 +1733,32 @@ def _disposition_cell(row: _TrackRow | None) -> CellValue:
     if row is None or row.stream.source is None:
         return None
     return _flags_to_cell(row.stream.source.disposition)
+
+
+def _row_star_error(
+    binding: _RowBinding, anchor: exp.Expr, select: exp.Select
+) -> SqlmpegError:
+    """``*`` over rows in a MEDIA query: fields are not output streams.
+
+    A star over a row table expands the record's fields, the same as it does in
+    a table query. Fields have nowhere to go on an ffmpeg command line; for a
+    track row the stream the query means is the bare alias, and a chapter row
+    has no stream at all.
+    """
+    printed = "a bare SELECT prints the fields as a table"
+    hint = (
+        f"a chapter is not a stream; {printed}"
+        if binding.column == CHAPTERS_COLUMN
+        else f"the row is the stream: select {binding.alias}; {printed}"
+    )
+    return _error(
+        ErrorCode.UNSUPPORTED_SQL,
+        f"'*' over the rows of '{binding.alias}' expands their fields, and a "
+        "SELECT column is an output stream",
+        anchor,
+        fallback=select,
+        hint=hint,
+    )
 
 
 def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
@@ -2552,6 +2641,7 @@ class _Lowerer:
             # no per-row scope: its scalars are group-constants, so they tag
             # the group's container.
             if _is_tag_column(projection, env):
+                self._check_settable_key(projection, env, select)
                 if _projection_name(projection) == DISPOSITION_COLUMN:
                     self._collect_disposition(projection, env, select, scope=tags)
                 elif _has_track_rows(env) and not env.grouped:
@@ -2854,6 +2944,43 @@ class _Lowerer:
             )
         self.container_tags[key] = text
 
+    def _check_settable_key(
+        self, projection: exp.Expr, env: _Env, select: exp.Select
+    ) -> None:
+        """A tag column's alias names a tag KEY, never a read-only field.
+
+        Construction by alias and a free-form tag key share one spelling, so
+        the record's own READ-ONLY field names are the reserved set: `'eng' AS
+        language` writes a tag entry, `'h264' AS codec` claims a probed fact
+        and is rejected. A writable field (`disposition`) keeps its meaning --
+        it is the assertion it looks like.
+        """
+        key = _projection_name(projection)
+        if key is None:
+            return
+        if _has_track_rows(env) and not env.grouped:
+            what = "track row"
+            reserved = frozenset(
+                name
+                for binding in env.bindings.values()
+                if isinstance(binding, _RowBinding)
+                for name in ROW_READONLY_FIELDS[binding.column]
+            )
+        else:
+            what = "container"
+            reserved = CONTAINER_READONLY_FIELDS
+        if key not in reserved:
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{key}' is a probed field of the {what}, not something a query "
+            "can set",
+            projection,
+            fallback=select,
+            hint=f"the file reports {key}; a tag column's alias is a free-form "
+            "key, e.g. 'eng' AS language",
+        )
+
     def _collect_tag(
         self, projection: exp.Expr, env: _Env, select: exp.Select
     ) -> None:
@@ -3023,9 +3150,9 @@ class _Lowerer:
 
         A bare ``*`` takes every alias of the FROM clause in FROM order
         (``_Env.bindings`` is insertion-ordered and built by `_scope` in exactly
-        that order); ``<alias>.*`` takes one. Within an alias: FILE order for an
-        input (probe order, all four stream types interleaved as the container
-        has them), COLUMN order for a CTE, with array columns splatting.
+        that order); ``<alias>.*`` takes one. Within an alias: the container's
+        stream array columns in v/a/s/d order for an input, COLUMN order for a
+        CTE, with array columns splatting.
 
         The WHERE window of each alias still applies: for an input alias it is
         already on the ``-i`` (so ``SELECT *`` under a WHERE seeks every stream
@@ -3033,34 +3160,10 @@ class _Lowerer:
         `_access` splices — which is also where a trimmed CTE caption column is
         rejected.
         """
-        if qualifier:
-            binding = env.bindings.get(qualifier)
-            if binding is None:
-                raise _error(
-                    ErrorCode.UNKNOWN_ALIAS,
-                    f"unknown alias '{qualifier}'",
-                    anchor,
-                    fallback=select,
-                    hint=self._known_hint(),
-                )
-            bindings = [binding]
-        else:
-            bindings = list(env.bindings.values())
-
         columns: list[_Column] = []
-        for binding in bindings:
+        for binding in self._star_bindings(qualifier, anchor, env, select):
             if isinstance(binding, _RowBinding):
-                # A row table's columns are metadata, and a star over them
-                # would have to mean the row's stream -- which the bare alias
-                # already says, unambiguously.
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"'*' cannot expand the track-row table '{binding.alias}': "
-                    "its columns are metadata, not streams",
-                    anchor,
-                    fallback=select,
-                    hint=f"the row is the stream: select {binding.alias}",
-                )
+                raise _row_star_error(binding, anchor, select)
             if isinstance(binding, _InputBinding):
                 columns += self._star_input(binding.alias, anchor, env, select)
             elif isinstance(binding, _SourceBinding):
@@ -3073,18 +3176,16 @@ class _Lowerer:
                 columns += self._star_cte(binding, anchor, env, select)
         return columns
 
-    def _star_input(
-        self, alias: str, anchor: exp.Expr, env: _Env, select: exp.Select
-    ) -> list[_Column]:
-        """Every stream of one input alias, in file order.
+    def _star_probe(self, alias: str, anchor: exp.Expr, select: exp.Select) -> ProbeResult:
+        """The probe a star over an input alias needs, or INPUT_NOT_FOUND.
 
         Splat tier, same policy as a bare ``a.audio``: how many streams a
         file has, and of which types, is a property of the file, so an input
-        that could not be probed is INPUT_NOT_FOUND rather than a guess.
+        that could not be probed is a rejection rather than a guess.
         """
         result = self.probes.get(alias)
-        path = self.res.input_paths[self.graph.sources[alias]]
         if result is None:
+            path = self.res.input_paths[self.graph.sources[alias]]
             raise _error(
                 ErrorCode.INPUT_NOT_FOUND,
                 f"cannot expand '*' over '{path}': file not found or unreadable",
@@ -3093,7 +3194,26 @@ class _Lowerer:
                 hint="'*' is every stream of the input, and only a readable input "
                 f"can list them; name the streams instead, e.g. {alias}.video[1]",
             )
-        if not result.streams:
+        return result
+
+    def _star_input(
+        self, alias: str, anchor: exp.Expr, env: _Env, select: exp.Select
+    ) -> list[_Column]:
+        """Every stream of one input alias: the stream arrays, in v/a/s/d order.
+
+        The container's array columns are what a star stands for, and a media
+        SELECT column is an output stream, so the four stream arrays expand and
+        `chapters` does not -- a chapter is not a stream, and ffmpeg's own
+        default already carries an input's chapters through a remux.
+        """
+        result = self._star_probe(alias, anchor, select)
+        path = self.res.input_paths[self.graph.sources[alias]]
+        streams = [
+            meta
+            for column in _STREAM_STAR_COLUMNS
+            for meta in result.by_type(_ARRAY_COLUMNS[column])
+        ]
+        if not streams:
             raise _error(
                 ErrorCode.STREAM_NOT_FOUND,
                 f"'*' over '{path}' selects nothing: it has no video, audio, "
@@ -3102,7 +3222,7 @@ class _Lowerer:
                 fallback=select,
                 hint="an empty expansion would select nothing; drop the star",
             )
-        for meta in result.streams:
+        for meta in streams:
             self._reject_codecless(
                 meta,
                 f"'{alias}.*' includes '{alias}.{meta.type}[{meta.index + 1}]', which",
@@ -3120,7 +3240,7 @@ class _Lowerer:
                     select,
                 ),
             )
-            for meta in result.streams
+            for meta in streams
         ]
 
     def _star_cte(
@@ -3144,6 +3264,119 @@ class _Lowerer:
                 binding, column, anchor, select
             ).streams
         ]
+
+    def _star_bindings(
+        self, qualifier: str, anchor: exp.Expr, env: _Env, select: exp.Select
+    ) -> list[_Binding]:
+        """What a star stands for: one named alias, or every FROM alias."""
+        if not qualifier:
+            return list(env.bindings.values())
+        binding = env.bindings.get(qualifier)
+        if binding is None:
+            raise _error(
+                ErrorCode.UNKNOWN_ALIAS,
+                f"unknown alias '{qualifier}'",
+                anchor,
+                fallback=select,
+                hint=self._known_hint(),
+            )
+        return [binding]
+
+    def _star_names(
+        self, qualifier: str, anchor: exp.Expr, env: _Env, select: exp.Select
+    ) -> list[str]:
+        """A table star's column headers. Static: no probe is consulted.
+
+        A container names its array columns, a row table its record's scalar
+        fields, a CTE the columns its body named, and a generated source the
+        one array column its output type fills. `_star_cells` walks the very
+        same lists in the same order.
+        """
+        names: list[str] = []
+        for binding in self._star_bindings(qualifier, anchor, env, select):
+            if isinstance(binding, _RowBinding):
+                names += ROW_STAR_COLUMNS[binding.column]
+            elif isinstance(binding, _InputBinding):
+                names += STAR_COLUMNS
+            elif isinstance(binding, _SourceBinding):
+                names.append(binding.output)
+            else:
+                names += [column.name or "column" for column in binding.columns]
+        return names
+
+    def _star_cells(
+        self,
+        qualifier: str,
+        anchor: exp.Expr,
+        env: _Env,
+        select: exp.Select,
+        cardinality: int,
+    ) -> list[list[CellValue]]:
+        """A table star's columns, each already one cell per printed row."""
+        columns: list[list[CellValue]] = []
+        for binding in self._star_bindings(qualifier, anchor, env, select):
+            if isinstance(binding, _RowBinding):
+                columns += [
+                    self._row_metadata_cells(binding, name, anchor, select)
+                    for name in ROW_STAR_COLUMNS[binding.column]
+                ]
+            elif isinstance(binding, _InputBinding):
+                columns += [
+                    self._input_array_cells(
+                        binding.alias, name, anchor, env, select, cardinality
+                    )
+                    for name in STAR_COLUMNS
+                ]
+            elif isinstance(binding, _SourceBinding):
+                cell = ArrayCell(
+                    elements=(self._stream_to_cell(self._source_stream_of(binding)),)
+                )
+                columns.append([cell] * cardinality)
+            else:
+                columns += [
+                    self._value_to_cells(
+                        self._access(
+                            env,
+                            binding.name,
+                            self._cte_column_value(binding, column, anchor, select),
+                            anchor,
+                            select,
+                        ),
+                        cardinality,
+                        splat=column.splat,
+                    )
+                    for column in binding.columns
+                ]
+        return columns
+
+    def _input_array_cells(
+        self,
+        alias: str,
+        column: str,
+        anchor: exp.Expr,
+        env: _Env,
+        select: exp.Select,
+        cardinality: int,
+    ) -> list[CellValue]:
+        """One container array column as ONE array cell, broadcast to each row.
+
+        The same cell a bare ``f.audio`` / ``f.chapters`` prints on its own: an
+        array column is a value inside the input's single row, not a row set.
+        """
+        if column == CHAPTERS_COLUMN:
+            return self._chapters_cells(alias, anchor, select, cardinality)
+        result = self._star_probe(alias, anchor, select)
+        stream_type = _ARRAY_COLUMNS[column]
+        streams = [
+            self._source_stream(alias, stream_type, meta.index)
+            for meta in result.by_type(stream_type)
+        ]
+        if streams:
+            streams = list(
+                self._access(env, alias, _array(stream_type, streams), anchor, select).streams
+            )
+        cell = ArrayCell(elements=tuple(self._stream_to_cell(stream) for stream in streams))
+        return [cell] * cardinality
 
     # -- FROM -------------------------------------------------------------
 
@@ -6790,26 +7023,40 @@ class _Lowerer:
             )
         names: list[str] = []
         for projection in projections:
-            if star_qualifier(projection) is not None:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    "'*' is not supported in a table/csv query",
-                    projection,
-                    fallback=select,
-                    hint="name the columns explicitly",
-                )
-            names.append(_table_column_name(projection))
+            qualifier = star_qualifier(projection)
+            if qualifier is not None:
+                names += self._star_names(qualifier, projection, env, select)
+            else:
+                names.append(_table_column_name(projection))
 
         if env.grouped:
             return self._lower_grouped_table_branch(select, env, projections, names)
 
         cardinality = len(env.relation.tuples) if env.relation is not None else 1
-        per_column = [
-            self._table_projection(projection, env, select, cardinality)
-            for projection in projections
-        ]
+        per_column = self._table_columns(projections, env, select, cardinality)
         rows = [[per_column[c][r] for c in range(len(names))] for r in range(cardinality)]
         return TableResult(columns=names, rows=rows)
+
+    def _table_columns(
+        self,
+        projections: list[exp.Expr],
+        env: _Env,
+        select: exp.Select,
+        cardinality: int,
+    ) -> list[list[CellValue]]:
+        """Every printed column of a branch, in SELECT order, stars expanded."""
+        columns: list[list[CellValue]] = []
+        for projection in projections:
+            qualifier = star_qualifier(projection)
+            if qualifier is not None:
+                columns += self._star_cells(
+                    qualifier, projection, env, select, cardinality
+                )
+            else:
+                columns.append(
+                    self._table_projection(projection, env, select, cardinality)
+                )
+        return columns
 
     def _lower_grouped_table_branch(
         self,
@@ -6838,7 +7085,10 @@ class _Lowerer:
                 for projection in projections:
                     aggregate = isinstance(_projection_expr(projection), exp.ArrayAgg)
                     relation.tuples = list(group) if aggregate else group[:1]
-                    row.append(self._table_projection(projection, env, select, 1)[0])
+                    row += [
+                        cells[0]
+                        for cells in self._table_columns([projection], env, select, 1)
+                    ]
                 rows.append(row)
         finally:
             relation.tuples = original

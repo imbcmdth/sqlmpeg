@@ -618,6 +618,64 @@ def test_subscript_on_unknown_alias_is_unknown_alias() -> None:
 
 
 # ---------------------------------------------------------------------------
+# fields of a filter output: nothing probed them
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("sql", "path", "call"),
+    [
+        ("SELECT scale(a.video[1], 640, -2).width FROM input('x') a", "width", "scale"),
+        (
+            "SELECT volume(t, 0.2).tags.language "
+            "FROM input('x') a, unnest(a.audio) t",
+            "tags.language",
+            "volume",
+        ),
+        (
+            "SELECT volume(t, 0.2).disposition.forced "
+            "FROM input('x') a, unnest(a.audio) t",
+            "disposition.forced",
+            "volume",
+        ),
+        (
+            "SELECT (hflip(a.video[1])).codec FROM input('x') a",
+            "codec",
+            "hflip",
+        ),
+        (
+            "SELECT ffmpeg.sine(duration => 1).codec FROM input('x') a",
+            "codec",
+            "ffmpeg.sine",
+        ),
+    ],
+)
+def test_a_field_of_a_filter_output_is_rejected(sql: str, path: str, call: str) -> None:
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert f"'.{path}' reads a field of the output of {call}()" in err.message
+    assert err.hint is not None and f"t.{path}" in err.hint
+
+
+def test_a_filter_output_field_in_a_where_is_rejected_too() -> None:
+    err = _reject(
+        "SELECT t FROM input('x') a, unnest(a.audio) t WHERE volume(t, 0.2).codec = 'aac'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "was never probed" in err.message
+
+
+def test_a_filter_output_field_rejection_is_line_anchored() -> None:
+    err = _reject("SELECT\n  scale(a.video[1], 640, -2).width\nFROM input('x') a")
+    assert err.line == 2
+
+
+def test_a_bare_namespaced_call_is_not_a_field_read() -> None:
+    """`ffmpeg.sine(...)` is a Dot too; only a field AFTER it is the rejection."""
+    resolve(parse("SELECT ffmpeg.sine(duration => 1) FROM input('x') a"))
+
+
+# ---------------------------------------------------------------------------
 # subscript_index — sqlglot rebases subscripts at parse time (INDEX_OFFSET)
 # ---------------------------------------------------------------------------
 
