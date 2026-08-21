@@ -185,6 +185,7 @@ from sqlmpeg.types import (
     INPUT_COLUMNS,
     INPUT_DURATION_COLUMN,
     MAP_ELEMENTS,
+    RECORD_FIELDS,
     ROW_SCHEMAS,
     STREAM_ARRAY_COLUMNS,
     STREAM_TAG_COLUMNS,
@@ -645,6 +646,23 @@ def is_value_expr(node: exp.Expr | None) -> bool:
     handled where they appear, and a bare column may well be a stream.
     """
     return isinstance(node, exp.Case | exp.DPipe | exp.Cast | _ARITHMETIC)
+
+
+def record_cast_type(node: exp.Expr | None) -> str | None:
+    """The declared record type ``<x>::<name>`` casts to, else None.
+
+    ``ROW('Intro', 0, 60)::chapter`` parses as a cast to a USERDEFINED type
+    whose name sits in the DataType's ``kind``; only the names
+    :data:`RECORD_FIELDS` declares are records.
+    """
+    if not isinstance(node, exp.Cast):
+        return None
+    to = node.args.get("to")
+    if not isinstance(to, exp.DataType):
+        return None
+    kind = to.args.get("kind")
+    name = _ident_name(kind) if isinstance(kind, exp.Expr) else ""
+    return name if name in RECORD_FIELDS else None
 
 
 def _is_input_column(name: str) -> bool:
@@ -1267,18 +1285,24 @@ class RawTrackRows:
 class RawValuesTable:
     """``WITH <alias>(<columns>) AS (VALUES (...), ...)`` -- a literal row table.
 
-    Reachable only as a sink option's value (``chapters <alias>``) in v1;
-    selecting FROM one directly stays rejected (see ``_add_table``). `columns`
-    is the alias's column list, in written order; `rows` is one tuple of
-    literal expressions (or ``NULL``) per VALUES row, each the same length as
-    `columns`. Types are whatever each cell's own literal is -- there is no
-    declared schema, just literals read at face value.
+    A ROW SOURCE like an ``unnest`` table, joined into the branch's relation
+    the same way, except that its rows are written out rather than probed.
+    `columns` is the alias's column list, in written order; `rows` is one tuple
+    of literal expressions (or ``NULL``) per VALUES row, each the same length
+    as `columns`; `types` is the type each column settled on, parallel to
+    `columns` -- ``text`` or ``number``, taken from the literals themselves,
+    with an all-NULL column reading as ``text`` the way Postgres types one.
     """
 
     alias: str
     columns: tuple[str, ...]
     rows: tuple[tuple[exp.Literal | exp.Null, ...], ...]
     node: exp.Expr
+    types: tuple[str, ...]
+
+    def schema(self) -> dict[str, str]:
+        """The row columns this table exposes, in written order."""
+        return dict(zip(self.columns, self.types, strict=True))
 
 
 @dataclass
@@ -2060,6 +2084,10 @@ class _Resolver:
         self.source_filters: dict[str, RawSource] = {}
         self.track_rows: dict[str, RawTrackRows] = {}
         self.values_ctes: dict[str, RawValuesTable] = {}
+        # The VALUES tables THIS branch's FROM clause binds, by the local name
+        # it read them under. Branch-local, so `_collect_scope` clears it: two
+        # branches may each spell their own table `m`.
+        self.values_rows: dict[str, RawValuesTable] = {}
 
     # -- entry point ------------------------------------------------------
 
@@ -2230,7 +2258,7 @@ class _Resolver:
         # UNION ALL branch aggregates like any other: it is one concat segment,
         # and a segment with several rows has to gather them the same way.
         no_aggregate = context
-        visible = set(self.ctes)
+        visible = set(self.ctes) | set(self.values_ctes)
         for branch in branches:
             self._validate_select(
                 branch,
@@ -2454,7 +2482,7 @@ class _Resolver:
                     hint="hoist the CTE to the top-level WITH",
                 )
             # A CTE only sees the CTEs defined before it (no forward refs).
-            visible = set(self.ctes)
+            visible = set(self.ctes) | set(self.values_ctes)
             for branch in union_branches(body):
                 self._validate_select(branch, visible, no_aggregate="a CTE body")
             self.ctes[name] = body
@@ -2476,6 +2504,15 @@ class _Resolver:
                 f"duplicate column name in '{name}({', '.join(column_names)})'",
                 alias,
                 hint="every VALUES column needs its own name",
+            )
+        reserved = [column for column in column_names if column in MAP_COLUMNS]
+        if reserved:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{name}.{reserved[0]}' takes a name a row's maps already use",
+                alias,
+                hint=f"{_listed_columns(MAP_COLUMNS)} name the maps a track row "
+                "carries; pick another column name",
             )
 
         body = _unwrap(cte.this)
@@ -2541,8 +2578,46 @@ class _Resolver:
             rows.append(tuple(checked))
 
         self.values_ctes[name] = RawValuesTable(
-            alias=name, columns=tuple(column_names), rows=tuple(rows), node=cte
+            alias=name,
+            columns=tuple(column_names),
+            rows=tuple(rows),
+            node=cte,
+            types=self._values_types(name, tuple(column_names), tuple(rows), cte),
         )
+
+    def _values_types(
+        self,
+        name: str,
+        columns: tuple[str, ...],
+        rows: tuple[tuple[exp.Literal | exp.Null, ...], ...],
+        cte: exp.CTE,
+    ) -> tuple[str, ...]:
+        """One type per column, read off the literals; disagreement is rejected.
+
+        A column every row leaves NULL types as text, which is what Postgres
+        gives an untyped NULL column of a VALUES list.
+        """
+        types: list[str] = []
+        for position, column in enumerate(columns):
+            settled: str | None = None
+            for row in rows:
+                cell = row[position]
+                written = _literal_type(cell)
+                if written is None:
+                    continue
+                if settled is not None and written != settled:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"column '{name}.{column}' holds both {settled} and "
+                        f"{written}",
+                        cell,
+                        fallback=cte,
+                        hint="every row of a VALUES column writes the same "
+                        "type; NULL fits any of them",
+                    )
+                settled = written
+            types.append(settled or "text")
+        return tuple(types)
 
     def _reserve(self, name: str, node: exp.Expr | None) -> None:
         if not name:
@@ -2994,6 +3069,7 @@ class _Resolver:
             )
 
         scope: dict[str, str] = {}
+        self.values_rows = {}
         self._add_from_item(from_.this, scope, visible)
 
         joins = select.args.get("joins") or []
@@ -3269,14 +3345,22 @@ class _Resolver:
             return
         if isinstance(inner, exp.Identifier):
             name = _ident_name(inner)
-            if name in self.values_ctes:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"'{name}' is a VALUES CTE, and cannot be selected from directly",
-                    inner,
-                    fallback=table,
-                    hint=f"pass it to a sink option instead: WITH (chapters {name})",
-                )
+            values = self.values_ctes.get(name)
+            if values is not None:
+                # A written row source: it binds like a track-row table, so
+                # every rule about rows -- the cross join, GROUP BY,
+                # array_agg -- applies to it unchanged.
+                local = self._local_alias(name, alias_node, table)
+                if local in scope:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"duplicate name '{local}'",
+                        alias_node if alias_node is not None else inner,
+                        fallback=table,
+                    )
+                self.values_rows[local] = values
+                scope[local] = "row"
+                return
             if name not in visible:
                 raise _error(
                     ErrorCode.UNKNOWN_ALIAS,
@@ -3711,6 +3795,9 @@ class _Resolver:
 
     def _check_row_column(self, column: exp.Column, alias: str, select: exp.Expr) -> str:
         """Whitelist one ``<row alias>.<column>`` and return its column type."""
+        values = self.values_rows.get(alias)
+        if values is not None:
+            return self._check_values_column(column, alias, values, select)
         array_column = self.track_rows[alias].column
         schema = ROW_SCHEMAS[array_column]
         name = _ident_name(column.this)
@@ -3755,6 +3842,39 @@ class _Resolver:
                 fallback=select,
                 hint=f"{self.track_rows[alias].column} track rows expose "
                 f"{_listed_columns(schema)}",
+            )
+        return column_type
+
+    def _check_values_column(
+        self,
+        column: exp.Column,
+        alias: str,
+        values: RawValuesTable,
+        select: exp.Expr,
+    ) -> str:
+        """Whitelist one ``<VALUES alias>.<column>`` and return its type.
+
+        A written row carries no stream, so the alias standing on its own is a
+        rejection rather than the stream a track row's alias names.
+        """
+        schema = values.schema()
+        name = _ident_name(column.this)
+        if name == ROW_STREAM and not column.this.args.get("quoted"):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}' is a written row, not a stream",
+                column,
+                fallback=select,
+                hint=f"read its columns instead, e.g. {alias}.{values.columns[0]}",
+            )
+        column_type = schema.get(name)
+        if column_type is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"unknown column '{alias}.{column.name}'",
+                column,
+                fallback=select,
+                hint=f"'{alias}' exposes {_listed_columns(schema)}",
             )
         return column_type
 
@@ -4739,6 +4859,16 @@ class _Resolver:
         to = node.args.get("to")
         target = to.this if isinstance(to, exp.DataType) else None
         if target != exp.DataType.Type.TEXT:
+            record = record_cast_type(node)
+            if record is not None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"a {record} record is not a value on its own",
+                    node,
+                    fallback=fallback,
+                    hint=f"gather records into an array column, e.g. "
+                    f"ARRAY[ROW(...)::{record}, ...] AS {CHAPTERS_COLUMN}",
+                )
             spelled = str(getattr(target, "value", target or "")).lower()
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,

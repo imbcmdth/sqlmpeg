@@ -264,32 +264,6 @@ SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         flag="-movflags",
         per_stream=False,
     ),
-    # `chapters`/`chapters_from` are the one pair whose value is a bare
-    # identifier (a VALUES CTE name, or an input alias), never a str/int/
-    # bool/num literal -- lower resolves either one directly (bypassing
-    # `validate_option`) into `options["chapters"]`, the ffmpeg input index
-    # this entry's flag renders. `chapters_from`'s own flag is never actually
-    # rendered under that name; it is here so it validates, docs, and hints
-    # like every other option.
-    "chapters": SinkOptionSpec(
-        name="chapters",
-        scope="container",
-        type="str",
-        doc="Write chapters from a VALUES CTE (bare name, not quoted): "
-        "WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro'), ...) "
-        "... WITH (chapters marks). Conflicts with chapters_from.",
-        flag="-map_chapters",
-        per_stream=False,
-    ),
-    "chapters_from": SinkOptionSpec(
-        name="chapters_from",
-        scope="container",
-        type="str",
-        doc="Copy chapters through from an input() alias (bare name, not "
-        "quoted), e.g. chapters_from f. Conflicts with chapters.",
-        flag="-map_chapters",
-        per_stream=False,
-    ),
     # `metadata_from`'s value is a bare identifier (an input() alias), never a
     # str/int/bool/num literal -- lower resolves it directly (bypassing
     # `validate_option`) into `options["metadata_from"]`, the input index

@@ -268,6 +268,9 @@ _FORMAT = "format"
 # Pass 1 analyses and throws the muxed result away.
 _ANALYSIS_PATH = "-"
 _ANALYSIS_FORMAT = "null"
+# The chapter list is an output COLUMN, not a sink option, so its flag is not
+# table data. It names the input the chapters come from and renders last.
+MAP_CHAPTERS_FLAG = "-map_chapters"
 
 
 @dataclass
@@ -295,7 +298,9 @@ class OutputGroup:
     `tags` that file's container tags (a None value clears its key).
     `window` is this file's own ``(start, end)`` trim, rendered as ``-ss``/
     ``-to`` ahead of the maps; it re-encodes, so a group carrying one never
-    renders ``-c:<i> copy``.
+    renders ``-c:<i> copy``. `chapters` is the input index the file's chapter
+    list comes from (``ir.NO_CHAPTERS`` for none), rendered last as
+    ``-map_chapters``; None leaves ffmpeg's default alone.
     """
 
     maps: list[OutputMap]
@@ -303,6 +308,7 @@ class OutputGroup:
     options: dict[str, object] = field(default_factory=dict)
     tags: dict[str, str | None] = field(default_factory=dict)
     window: tuple[float | None, float | None] | None = None
+    chapters: int | None = None
 
 
 @dataclass
@@ -381,6 +387,7 @@ def _output_group(g: Graph, unit: SinkUnit, labels: dict[str, str]) -> OutputGro
         options=dict(unit.options),
         tags=dict(unit.tags),
         window=unit.window,
+        chapters=unit.chapters,
     )
 
 
@@ -646,6 +653,8 @@ def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> li
         # `metadata_from`/`strip_metadata` either way.
         args += _render_container_tags(group.tags)
         args += _render_sink_options(group, pass_)
+        if group.chapters is not None:
+            args += [MAP_CHAPTERS_FLAG, str(group.chapters)]
         args.append(path)
     return args
 

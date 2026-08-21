@@ -285,6 +285,7 @@ from sqlmpeg import binaries, loudnorm
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import validate_option as validate_input_option
 from sqlmpeg.ir import (
+    NO_CHAPTERS,
     FrameRef,
     Graph,
     Node,
@@ -326,6 +327,7 @@ from sqlmpeg.parser import (
     map_noun,
     map_path,
     map_ref,
+    record_cast_type,
     references_row_alias,
     star_qualifier,
     subscript_index,
@@ -353,11 +355,13 @@ from sqlmpeg.table import (
     TableSink,
 )
 from sqlmpeg.types import (
+    CHAPTER_TYPE,
     CHAPTERS_COLUMN,
     CONTAINER_READONLY_FIELDS,
     DISPOSITION_COLUMN,
     DISPOSITION_KEYS,
     INPUT_DURATION_COLUMN,
+    RECORD_FIELDS,
     ROW_READONLY_FIELDS,
     ROW_SCHEMAS,
     ROW_STAR_COLUMNS,
@@ -366,6 +370,7 @@ from sqlmpeg.types import (
     STREAM_TAG_COLUMNS,
     TAGS_COLUMN,
     TIME_COLUMN,
+    RowColumnType,
 )
 
 __all__ = ["lower", "lower_table"]
@@ -463,6 +468,19 @@ _CHAPTER_ROW_HINT = (
     "a chapter row has no stream column at all — a chapter is not a track — "
     "so it can only be read as a metadata query, e.g. no COPY, or COPY ... "
     "WITH (FORMAT csv)"
+)
+_CHAPTER_LITERAL = f"ROW(title, start_t, end_t)::{CHAPTER_TYPE}"
+_CHAPTER_EXAMPLE = f"ROW('Intro', 0, 60)::{CHAPTER_TYPE}"
+_CHAPTERS_COLUMN_HINT = (
+    f"a {CHAPTERS_COLUMN} column is an array of chapter records, e.g. "
+    f"ARRAY[{_CHAPTER_EXAMPLE}] AS {CHAPTERS_COLUMN}, or "
+    f"array_agg(ROW(c.title, c.start_t, c.end_t)::{CHAPTER_TYPE}) AS "
+    f"{CHAPTERS_COLUMN} over rows"
+)
+_WRITTEN_ROW_HINT = (
+    "a written row carries values, never a stream: filter, group and aggregate "
+    "by its columns, e.g. array_agg(ROW(m.title, m.start_t, m.end_t)::chapter) "
+    "AS chapters"
 )
 _CAPTION_TRIM_HINT = (
     "trim the video/audio without selecting the subtitle/data columns, or select "
@@ -1140,65 +1158,78 @@ def _sink_value(node: exp.Expr) -> object:
 def _bare_name(node: exp.Expr) -> str | None:
     """`node` as a bare, unqualified identifier name, else None.
 
-    What ``chapters <cte>`` and ``chapters_from <alias>`` take: an
-    ``exp.Var`` (VERIFIED under sqlglot 30.17 -- a sink option's bare-word
-    value always parses as one), never a quoted string or a qualified name.
+    What ``metadata_from <alias>`` takes: an ``exp.Var`` (VERIFIED under
+    sqlglot 30.17 -- a sink option's bare-word value always parses as one),
+    never a quoted string or a qualified name.
     """
     if isinstance(node, exp.Var) and not node.args.get("table"):
         return _fold(node)
     return None
 
 
-# A chapter needs a span; `title` is nullable and defaults to NULL, so a
-# VALUES CTE may leave the column out entirely.
-_CHAPTER_REQUIRED_COLUMNS = frozenset({"start_t", "end_t"})
-_CHAPTER_COLUMNS = frozenset({"start_t", "end_t", "title"})
 # Characters ffmetadata's own escaping would need (`\`, `=`, `;`, `#`, a
 # newline) -- rejected outright rather than silently writing a file ffmpeg
 # cannot parse back.
 _UNSAFE_CHAPTER_TITLE = frozenset("\\=;#\n\r")
 
 
-def _chapters_ffmetadata(raw: RawValuesTable) -> str:
-    """`raw` (a VALUES CTE) as an ffmetadata document's text, chapters only.
+def _record_args(node: exp.Expr) -> list[exp.Expr] | None:
+    """The values a ``ROW(...)`` record constructor lists, else None.
 
-    ``;FFMETADATA1`` plus one ``[CHAPTER]`` block per row, in written order,
-    ``TIMEBASE=1/1`` so ``START``/``END`` are plain seconds -- exactly what
-    the cookbook's pinned recipe expects, byte for byte. `raw.columns` are
-    matched by NAME, not position: ``marks(title, start_t, end_t)`` works the
-    same as ``marks(start_t, end_t, title)``. `title` may be omitted; it
-    defaults to NULL like any nullable field.
+    ``ROW(a, b, c)`` parses as a plain call and the bare ``(a, b, c)`` form as
+    a tuple; both are the same constructor, so both are read here.
     """
-    written = frozenset(raw.columns)
-    if not _CHAPTER_REQUIRED_COLUMNS <= written or not written <= _CHAPTER_COLUMNS:
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            f"'{raw.alias}' must define start_t and end_t, and nothing but "
-            f"title besides, got {', '.join(raw.columns)}",
-            raw.node,
-            hint=f"WITH {raw.alias}(start_t, end_t, title) AS (VALUES ...), "
-            "or leave title out",
-        )
-    index = {name: position for position, name in enumerate(raw.columns)}
+    inner = _unwrap(node.this) if isinstance(node.this, exp.Expr) else None
+    if isinstance(inner, exp.Tuple):
+        return [item for item in inner.expressions if isinstance(item, exp.Expr)]
+    if isinstance(inner, exp.Anonymous) and str(inner.this).lower() == "row":
+        return [item for item in inner.expressions if isinstance(item, exp.Expr)]
+    return None
+
+
+@dataclass(frozen=True)
+class _Chapter:
+    """One written chapter: its span, its title, and where they were written.
+
+    `start_node` / `end_node` are the expressions the bounds came from, so a
+    span rejection anchors on the number the query typed.
+    """
+
+    start: int | float
+    end: int | float
+    title: str | None
+    start_node: exp.Expr
+    end_node: exp.Expr
+
+
+def _chapters_ffmetadata(chapters: Sequence[_Chapter]) -> str:
+    """One evaluated ``chapter[]`` as an ffmetadata document's text.
+
+    ``;FFMETADATA1`` plus one ``[CHAPTER]`` block per record, in written order,
+    ``TIMEBASE=1/1`` so ``START``/``END`` are plain seconds -- exactly what
+    the cookbook's pinned recipe expects, byte for byte. A number written as
+    an integer renders as one. `title` is nullable, and a NULL one omits the
+    line entirely.
+    """
     lines = [";FFMETADATA1"]
     previous: tuple[int | float, int | float] | None = None
-    for position, row in enumerate(raw.rows, start=1):
-        start_cell = row[index["start_t"]]
-        end_cell = row[index["end_t"]]
-        start = _chapter_number(start_cell, raw.alias, "start_t")
-        end = _chapter_number(end_cell, raw.alias, "end_t")
-        title_cell = row[index["title"]] if "title" in index else None
-        title = _chapter_title(title_cell, raw.alias) if title_cell is not None else None
+    for position, chapter in enumerate(chapters, start=1):
         _check_chapter_span(
-            raw.alias, position, start, end, previous, start_cell, end_cell
+            CHAPTERS_COLUMN,
+            position,
+            chapter.start,
+            chapter.end,
+            previous,
+            chapter.start_node,
+            chapter.end_node,
         )
-        previous = (start, end)
+        previous = (chapter.start, chapter.end)
         lines.append("[CHAPTER]")
         lines.append("TIMEBASE=1/1")
-        lines.append(f"START={start}")
-        lines.append(f"END={end}")
-        if title is not None:
-            lines.append(f"title={title}")
+        lines.append(f"START={chapter.start}")
+        lines.append(f"END={chapter.end}")
+        if chapter.title is not None:
+            lines.append(f"title={chapter.title}")
     return "\n".join(lines) + "\n"
 
 
@@ -1246,47 +1277,36 @@ def _check_chapter_span(
         )
 
 
-def _chapter_number(cell: exp.Literal | exp.Null, alias: str, column: str) -> int | float:
-    """One ``start_t``/``end_t`` cell as the number it must be (never NULL)."""
-    hint = f"{column} is seconds, e.g. {column} 60"
-    if isinstance(cell, exp.Null):
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            f"'{alias}.{column}' must be a number, got NULL",
-            cell,
-            hint=hint,
-        )
-    value = _sink_value(cell)
+def _chapter_number(value: RowValue, column: str, node: exp.Expr) -> int | float:
+    """One evaluated ``start_t``/``end_t`` as the number it must be, never NULL."""
     if isinstance(value, bool) or not isinstance(value, int | float):
+        got = "NULL" if value is None else repr(value)
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            f"'{alias}.{column}' must be a number, got {value!r}",
-            cell,
-            hint=hint,
+            f"'{CHAPTERS_COLUMN}.{column}' must be a number, got {got}",
+            node,
+            hint=f"{column} is a number of seconds, e.g. {_CHAPTER_EXAMPLE}",
         )
     return value
 
 
-def _chapter_title(cell: exp.Literal | exp.Null, alias: str) -> str | None:
-    """One ``title`` cell as text, or None for NULL (ffmetadata omits it)."""
-    if isinstance(cell, exp.Null):
-        return None
-    value = _sink_value(cell)
+def _chapter_title(value: RowValue, node: exp.Expr) -> str | None:
+    """One evaluated ``title`` as text, or None for NULL (ffmetadata omits it)."""
     if value is None:
         return None
     if not isinstance(value, str):
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            f"'{alias}.title' must be a string or NULL, got {value!r}",
-            cell,
-            hint="title takes a single-quoted string literal, e.g. 'Intro'",
+            f"'{CHAPTERS_COLUMN}.title' must be a string or NULL, got {value!r}",
+            node,
+            hint=f"title is text or NULL, e.g. {_CHAPTER_EXAMPLE}",
         )
     if any(char in _UNSAFE_CHAPTER_TITLE for char in value):
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            f"'{alias}.title' {value!r} contains a character ffmetadata "
-            "cannot represent unescaped",
-            cell,
+            f"'{CHAPTERS_COLUMN}.title' {value!r} contains a character "
+            "ffmetadata cannot represent unescaped",
+            node,
             hint=r"avoid \ = ; # and newlines in a chapter title",
         )
     return value
@@ -1572,13 +1592,13 @@ class _SourceBinding:
 # Never a stream — the row IS that.
 RowValue = str | int | float | bool | None
 
-# `_TrackRow.stream` for a chapter row: never a real stream (chapter
-# rows have no `track` column at all, so `ROW_SCHEMAS["chapters"]` never
-# resolves this), only a dataclass filler. Its ref deliberately fails
-# `is_src()` (no "src:" prefix) and is not a node id either, so anything that
-# somehow did try to render it fails fast with "unknown node" rather than
-# silently wiring up the wrong stream.
-_NO_CHAPTER_STREAM = _Stream(ref="chapters:no-stream", type="data", source=None)
+# `_TrackRow.stream` for a row that carries no track -- a chapter row, or a
+# written VALUES row. Never a real stream (neither exposes a stream column at
+# all), only a dataclass filler. Its ref deliberately fails `is_src()` (no
+# "src:" prefix) and is not a node id either, so anything that somehow did try
+# to render it fails fast with "unknown node" rather than silently wiring up
+# the wrong stream.
+_STREAMLESS_ROW = _Stream(ref="rows:no-stream", type="data", source=None)
 
 
 @dataclass(frozen=True)
@@ -1649,7 +1669,9 @@ class _RowBinding:
 
     `source` is the INPUT alias the tracks belong to. Everything downstream
     (the ``-i``, its WHERE window, provenance) keys off THAT alias, not the row
-    one: a row table takes no input slot of its own.
+    one: a row table takes no input slot of its own. `values` is set instead
+    for a WRITTEN row source (a VALUES CTE in FROM), whose rows come from the
+    query rather than from a probe; it has no input alias and no streams.
     """
 
     alias: str
@@ -1657,10 +1679,45 @@ class _RowBinding:
     column: str  # the array that was unnested: video/audio/subtitle/data
     type: StreamType
     relation: _RowRelation
+    values: RawValuesTable | None = None
 
     @property
     def rows(self) -> tuple[_TrackRow | None, ...]:
         return tuple(_track_of(row, self.alias) for row in self.relation.tuples)
+
+    @property
+    def streamless(self) -> bool:
+        """True for rows that carry no track: chapters, and written rows."""
+        return self.values is not None or self.column == CHAPTERS_COLUMN
+
+    @property
+    def schema(self) -> dict[str, RowColumnType]:
+        """The columns these rows expose, in declaration (or written) order."""
+        return (
+            self.values.schema() if self.values is not None else ROW_SCHEMAS[self.column]
+        )
+
+    @property
+    def star(self) -> tuple[str, ...]:
+        """What ``<alias>.*`` expands to: the scalar columns, in order."""
+        if self.values is not None:
+            return self.values.columns
+        return ROW_STAR_COLUMNS[self.column]
+
+    @property
+    def readonly(self) -> frozenset[str]:
+        """The columns a query may not assert. A written row has none."""
+        if self.values is not None:
+            return frozenset()
+        return ROW_READONLY_FIELDS[self.column]
+
+    @property
+    def exposes(self) -> str:
+        """How a rejection names this row source's column list."""
+        listed = ", ".join(sorted(self.schema))
+        if self.values is not None:
+            return f"'{self.alias}' exposes {listed}"
+        return f"{self.column} track rows expose {listed}"
 
 
 _Binding = _InputBinding | _CteBinding | _SourceBinding | _RowBinding
@@ -1754,8 +1811,8 @@ def _row_star_error(
     """
     printed = "a bare SELECT prints the fields as a table"
     hint = (
-        f"a chapter is not a stream; {printed}"
-        if binding.column == CHAPTERS_COLUMN
+        f"these rows carry no stream; {printed}"
+        if binding.streamless
         else f"the row is the stream: select {binding.alias}; {printed}"
     )
     return _error(
@@ -2024,6 +2081,10 @@ class _Lowerer:
         # The same for the CONTAINER tags of the file being written, key ->
         # value, None meaning "clear this key".
         self.container_tags: dict[str, str | None] = {}
+        # The chapter list of the file being written: the ffmpeg input index
+        # its chapters come from, `ir.NO_CHAPTERS` for a written NULL, and None
+        # while no `chapters` column has been read. Reset per COPY.
+        self.chapters: int | None = None
         # Output fan-out: which row of the sink's relation THIS run binds, the
         # sink's TO expression once it is known to reference a row column, and
         # the pinned row / its branch environment once `_pin_fanout_row` runs.
@@ -2098,6 +2159,7 @@ class _Lowerer:
                         columns, self._layered_tags(), self._layered_dispositions()
                     ),
                     tags=dict(self.container_tags),
+                    chapters=self.chapters,
                 )
             ]
         self._check_loudnorm2()
@@ -2189,13 +2251,10 @@ class _Lowerer:
         node to the value node to the path literal — which at least keeps
         every rejection on (or just above) the ``WITH`` block.
 
-        ``chapters``/``chapters_from`` are pulled out of the ordinary
-        name/value loop and resolved separately: their value is a bare
-        identifier (a VALUES CTE name, or an input alias), never a literal,
-        so ``SINK_OPTIONS``' str/int/bool/num machinery does not apply to
-        them. Both resolve into the SAME rendered option, ``options
-        ["chapters"]`` -- the ffmpeg input index ``-map_chapters`` names --
-        which is why at most one of them may be set.
+        ``metadata_from`` is pulled out of the ordinary name/value loop and
+        resolved separately: its value is a bare identifier (an input alias),
+        never a literal, so ``SINK_OPTIONS``' str/int/bool/num machinery does
+        not apply to it.
 
         A ``TO (<expression>)`` reaching here is a fan-out sink exactly when it
         reads a track-row column; that decision is made FIRST, since it changes
@@ -2211,19 +2270,12 @@ class _Lowerer:
         self.sink_anchor = raw.path_expr if raw.path_expr is not None else raw.path_node
         self.sink_path = raw.path
         self.fanout_windows = {}
+        self.chapters = None
         columns = self._lower_query(list(raw.branches), raw.query, tags="sink")
         options: dict[str, object] = {}
         option_nodes: dict[str, exp.Expr] = {}
-        chapters_opt: RawSinkOption | None = None
-        chapters_from_opt: RawSinkOption | None = None
         metadata_from_opt: RawSinkOption | None = None
         for option in raw.options:
-            if option.name == "chapters":
-                chapters_opt = option
-                continue
-            if option.name == "chapters_from":
-                chapters_from_opt = option
-                continue
             if option.name == "metadata_from":
                 metadata_from_opt = option
                 continue
@@ -2232,21 +2284,6 @@ class _Lowerer:
                 option.name, _sink_value(option.value), line=line, col=col
             )
             option_nodes[option.name] = option.value
-        if chapters_opt is not None and chapters_from_opt is not None:
-            raise _error(
-                ErrorCode.SINK_OPTION_TYPE,
-                "'chapters' and 'chapters_from' cannot both be set",
-                chapters_from_opt.value,
-                fallback=raw.path_node,
-                hint="'chapters' writes new chapters from a VALUES CTE; "
-                "'chapters_from' copies an input's own -- pick one",
-            )
-        if chapters_opt is not None:
-            options["chapters"] = self._lower_chapters_values(chapters_opt, raw.path_node)
-            option_nodes["chapters"] = chapters_opt.value
-        elif chapters_from_opt is not None:
-            options["chapters"] = self._lower_chapters_from(chapters_from_opt, raw.path_node)
-            option_nodes["chapters"] = chapters_from_opt.value
         if metadata_from_opt is not None:
             options["metadata_from"] = self._lower_metadata_from(
                 metadata_from_opt, raw.path_node
@@ -2265,6 +2302,7 @@ class _Lowerer:
             options=options,
             tags=dict(self.container_tags),
             window=self._fanout_window(),
+            chapters=self.chapters,
         )
 
     # -- the fan-out TO expression ------------------------------------
@@ -2288,15 +2326,15 @@ class _Lowerer:
     def _check_fanout_options(self, options: dict[str, object], raw: RawSink) -> None:
         """The sink options a fan-out COPY does not take, v1.
 
-        ``two_pass`` already compiles to a command SEQUENCE of its own, and the
-        chapter/metadata options name one input per file; both are small
-        matrices left closed rather than guessed at.
+        ``two_pass`` already compiles to a command SEQUENCE of its own, and
+        ``metadata_from`` names one input per file; both are small matrices
+        left closed rather than guessed at.
         """
         if self.fanout_expr is None:
             return
-        # `chapters`/`metadata_from` carry an input INDEX, so 0 is a set value;
-        # only `two_pass false` is a set option that asks for nothing.
-        for name in ("two_pass", "chapters", "metadata_from"):
+        # `metadata_from` carries an input INDEX, so 0 is a set value; only
+        # `two_pass false` is a set option that asks for nothing.
+        for name in ("two_pass", "metadata_from"):
             if name not in options or options[name] is False:
                 continue
             raise _error(
@@ -2378,45 +2416,168 @@ class _Lowerer:
                 return f"'{prefix}{column_label(_fold(sub.this))}' was never probed"
         return "no column of it has a value"
 
-    # -- chapters sink options ----------------------------------------
+    # -- the chapters output column ------------------------------------
 
-    def _lower_chapters_values(self, option: RawSinkOption, path_node: exp.Expr) -> int:
-        """``chapters <cte>``: mint an ffmetadata input from a VALUES CTE.
+    def _collect_chapters(
+        self, projection: exp.Expr, env: _Env, select: exp.Select, *, scope: _TagScope
+    ) -> None:
+        """``... AS chapters``: the file's chapter list, from one of three sources.
 
-        Returns the minted input's ffmpeg index, the value ``options
-        ["chapters"]`` carries through to ``-map_chapters``.
+        A literal ``ARRAY[ROW(...)::chapter, ...]`` and an ``array_agg`` over
+        rows both become one self-contained ffmetadata ``data:`` input;
+        ``<input>.chapters`` names that input's own list; NULL writes none.
+        The value is the FILE's, not a row's, so it is read once per COPY and
+        two branches of a UNION ALL have to agree on it.
         """
-        node = option.value
-        name = _bare_name(node)
-        values_table = self.res.values_ctes.get(name) if name is not None else None
-        if values_table is None:
+        if scope != "sink":
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'chapters' names a VALUES CTE, got {_sink_describe(node)}",
-                node,
-                fallback=path_node,
-                hint="define chapter rows first: WITH marks(start_t, end_t, "
-                "title) AS (VALUES (0, 60, 'Intro'), ...), then chapters marks",
+                f"'{CHAPTERS_COLUMN}' is the file's chapter list, and a CTE "
+                "body writes no file",
+                projection,
+                fallback=select,
+                hint="build the chapter list in the outer SELECT, e.g. "
+                "array_agg(ROW(c.title, c.start_t, c.end_t)::chapter) AS chapters",
             )
-        text = _chapters_ffmetadata(values_table)
+        if self.fanout_expr is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{CHAPTERS_COLUMN}' and a fan-out TO cannot both be set",
+                projection,
+                fallback=select,
+                hint="a TO expression writes one file per row; drop the "
+                "chapters column, or write a quoted TO path",
+            )
+        index = self._chapters_input(_unwrap(projection), env, select)
+        if self.chapters is not None and self.chapters != index:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{CHAPTERS_COLUMN}' takes two different chapter lists",
+                projection,
+                fallback=select,
+                hint="a file has one chapter list, so write the column once; "
+                "the branches of a UNION ALL write one file between them",
+            )
+        self.chapters = index
+
+    def _chapters_input(self, value: exp.Expr, env: _Env, select: exp.Select) -> int:
+        """The ffmpeg input index a ``chapters`` column resolves to."""
+        if isinstance(value, exp.Null):
+            return NO_CHAPTERS
+        copied = self._copied_chapters(value, env)
+        if copied is not None:
+            return copied
+        records = self._chapter_records(value, env, select)
+        if not records:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{CHAPTERS_COLUMN}' is an empty list",
+                value,
+                fallback=select,
+                hint=f"write at least one chapter, or NULL AS {CHAPTERS_COLUMN} "
+                "for a file with none",
+            )
+        text = _chapters_ffmetadata(records)
         uri = "data:text/plain;base64," + base64.b64encode(text.encode()).decode()
         return self._mint_chapters_input(uri)
 
-    def _lower_chapters_from(self, option: RawSinkOption, path_node: exp.Expr) -> int:
-        """``chapters_from <alias>``: reuse an existing input's own chapters."""
-        node = option.value
-        name = _bare_name(node)
-        index = self.graph.sources.get(name) if name is not None else None
-        if index is None:
+    def _copied_chapters(self, value: exp.Expr, env: _Env) -> int | None:
+        """The input index behind ``<input>.chapters``, else None."""
+        if not isinstance(value, exp.Column) or isinstance(value.this, exp.Star):
+            return None
+        table_node = value.args.get("table")
+        if table_node is None or _fold(value.this) != CHAPTERS_COLUMN:
+            return None
+        binding = env.bindings.get(_fold(table_node))
+        if not isinstance(binding, _InputBinding):
+            return None
+        return self.graph.sources.get(binding.alias)
+
+    def _chapter_records(
+        self, value: exp.Expr, env: _Env, select: exp.Select
+    ) -> list[_Chapter]:
+        """The chapter records a ``chapters`` column lists, in written order.
+
+        A literal array is evaluated ONCE, over the branch's first row -- the
+        list belongs to the file, not to a row -- so it may read an input's
+        ``duration`` or a variable. ``array_agg`` is the per-row form: one
+        record per surviving row, in row order.
+        """
+        if isinstance(value, exp.ArrayAgg):
+            inner = value.this
+            relation = env.relation
+            if not isinstance(inner, exp.Expr) or relation is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "array_agg() aggregates rows, and this query has none",
+                    value,
+                    fallback=select,
+                    hint=_CHAPTERS_COLUMN_HINT,
+                )
+            return [
+                self._chapter_record(inner, env, row, select) for row in relation.tuples
+            ]
+        if isinstance(value, exp.Array):
+            row = _group_row(env)
+            return [
+                self._chapter_record(element, env, row, select)
+                for element in value.expressions
+                if isinstance(element, exp.Expr)
+            ]
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{CHAPTERS_COLUMN}' takes an array of chapter records, got "
+            f"{_describe(value)}",
+            value,
+            fallback=select,
+            hint=_CHAPTERS_COLUMN_HINT,
+        )
+
+    def _chapter_record(
+        self, node: exp.Expr, env: _Env, row: _RowTuple, select: exp.Select
+    ) -> _Chapter:
+        """One ``ROW(title, start_t, end_t)::chapter``, evaluated and checked.
+
+        The positional signature is the declared one
+        (:data:`~sqlmpeg.types.RECORD_FIELDS`): a query supplies the writable
+        fields, in declaration order, and never the probed ``index``. Each
+        value takes the ordinary compile-time value grammar.
+        """
+        node = _unwrap(node)
+        record = record_cast_type(node)
+        fields = RECORD_FIELDS[CHAPTER_TYPE]
+        written = _record_args(node) if record == CHAPTER_TYPE else None
+        if written is None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'chapters_from' names an input() alias, got {_sink_describe(node)}",
+                f"a chapter is written as {_CHAPTER_LITERAL}, got "
+                f"{_describe(node)}",
                 node,
-                fallback=path_node,
-                hint="chapters_from copies an input's chapters through, e.g. "
-                "chapters_from f for FROM input(:'source') f",
+                fallback=select,
+                hint=_CHAPTERS_COLUMN_HINT,
             )
-        return index
+        if len(written) != len(fields):
+            named = ", ".join(field.name for field in fields)
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"a chapter takes {len(fields)} values ({named}), got "
+                f"{len(written)}",
+                node,
+                fallback=select,
+                hint=_CHAPTERS_COLUMN_HINT,
+            )
+        cells = dict(zip((field.name for field in fields), written, strict=True))
+        values = {
+            name: self._eval_value(cell, env, row, select)
+            for name, cell in cells.items()
+        }
+        return _Chapter(
+            start=_chapter_number(values["start_t"], "start_t", cells["start_t"]),
+            end=_chapter_number(values["end_t"], "end_t", cells["end_t"]),
+            title=_chapter_title(values["title"], cells["title"]),
+            start_node=cells["start_t"],
+            end_node=cells["end_t"],
+        )
 
     def _lower_metadata_from(self, option: RawSinkOption, path_node: exp.Expr) -> int:
         """``metadata_from <alias>``: copy an existing input's own global tags."""
@@ -2640,6 +2801,11 @@ class _Lowerer:
             qualifier = star_qualifier(projection)
             if qualifier is not None:
                 columns += self._expand_star(qualifier, projection, env, select)
+                continue
+            # The chapter list is a column of the FILE, not a stream and not a
+            # tag: one array of chapter records, whatever the branch's rows.
+            if _projection_name(projection) == CHAPTERS_COLUMN:
+                self._collect_chapters(projection, env, select, scope=tags)
                 continue
             # A tag column produces no stream, so it never becomes an output.
             # With track rows the tag is per-stream, without them it is a
@@ -2971,7 +3137,7 @@ class _Lowerer:
                 name
                 for binding in env.bindings.values()
                 if isinstance(binding, _RowBinding)
-                for name in ROW_READONLY_FIELDS[binding.column]
+                for name in binding.readonly
             )
         else:
             what = "container"
@@ -3302,7 +3468,7 @@ class _Lowerer:
         names: list[str] = []
         for binding in self._star_bindings(qualifier, anchor, env, select):
             if isinstance(binding, _RowBinding):
-                names += ROW_STAR_COLUMNS[binding.column]
+                names += binding.star
             elif isinstance(binding, _InputBinding):
                 names += STAR_COLUMNS
             elif isinstance(binding, _SourceBinding):
@@ -3325,7 +3491,7 @@ class _Lowerer:
             if isinstance(binding, _RowBinding):
                 columns += [
                     self._row_metadata_cells(binding, name, anchor, select)
-                    for name in ROW_STAR_COLUMNS[binding.column]
+                    for name in binding.star
                 ]
             elif isinstance(binding, _InputBinding):
                 columns += [
@@ -3556,7 +3722,7 @@ class _Lowerer:
         """The rows of ``unnest(<input>.chapters)``: one per probed chapter.
 
         The one array column whose elements are not streams, so every row
-        carries `_NO_CHAPTER_STREAM` in place of a track and only the
+        carries `_STREAMLESS_ROW` in place of a track and only the
         `ROW_SCHEMAS["chapters"]` metadata columns are ever read.
         """
         result = self.probes.get(raw.source)
@@ -3572,7 +3738,7 @@ class _Lowerer:
             )
         return [
             _TrackRow(
-                stream=_NO_CHAPTER_STREAM,
+                stream=_STREAMLESS_ROW,
                 columns={
                     "index": chapter.index,
                     "title": chapter.title,
@@ -3617,6 +3783,13 @@ class _Lowerer:
             return
         if isinstance(inner, exp.Identifier):
             name = _fold(inner)
+            values = self.res.values_ctes.get(name)
+            if values is not None:
+                local = name
+                if isinstance(alias_node, exp.TableAlias) and alias_node.this is not None:
+                    local = _fold(alias_node.this)
+                self._add_values_rows(local, values, env, select)
+                return
             columns = self.cte_columns.get(name)
             if columns is None:
                 raise _error(
@@ -3643,6 +3816,40 @@ class _Lowerer:
             table,
             fallback=select,
         )
+
+    def _add_values_rows(
+        self, local: str, values: RawValuesTable, env: _Env, select: exp.Select
+    ) -> None:
+        """Bind one VALUES table: its written rows join the branch's relation.
+
+        The same join :meth:`_add_track_rows` builds, with the rows read off
+        the query instead of a probe -- so a comma between a VALUES table and
+        anything else is the ordinary cross join, and ``array_agg`` over it
+        aggregates the same way. No stream and no ``-i``: the rows are values.
+        """
+        if env.relation is None:
+            env.relation = _RowRelation()
+        rows = [
+            _TrackRow(
+                stream=_STREAMLESS_ROW,
+                columns={
+                    name: None
+                    if isinstance(cell, exp.Null)
+                    else self._literal_of(cell, select)
+                    for name, cell in zip(values.columns, row, strict=True)
+                },
+            )
+            for row in values.rows
+        ]
+        env.bindings[local] = _RowBinding(
+            alias=local,
+            source="",
+            column=local,
+            type="data",  # filler: a written row has no track
+            relation=env.relation,
+            values=values,
+        )
+        self._join_rows(env.relation, local, rows, None, env, select)
 
     def _add_cte_rows(
         self, local: str, columns: tuple[_Column, ...], env: _Env, select: exp.Select
@@ -4169,14 +4376,13 @@ class _Lowerer:
                 fallback=select,
                 hint=f"name the key: '{binding.alias}.{name}.{map_example(name)}'",
             )
-        if name not in ROW_SCHEMAS[binding.column] and map_ref(name) is None:
+        if name not in binding.schema and map_ref(name) is None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"unknown column '{binding.alias}.{column.name}'",
                 column,
                 fallback=select,
-                hint=f"{binding.column} track rows expose "
-                f"{', '.join(sorted(ROW_SCHEMAS[binding.column]))}",
+                hint=binding.exposes,
             )
         row = _track_of(rows, binding.alias)
         return None if row is None else row.columns.get(name)
@@ -4889,6 +5095,16 @@ class _Lowerer:
                 fallback=select,
                 hint="a stream has exactly one type",
             )
+        if isinstance(node, exp.Array):
+            # The one array LITERAL the language has is a chapter list, and
+            # that is a column of the file rather than a stream.
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "an array literal is not a stream expression",
+                node,
+                fallback=select,
+                hint=_CHAPTERS_COLUMN_HINT,
+            )
         if isinstance(node, exp.Coalesce):
             # Not a call: COALESCE resolves against the ROW model, not the
             # registry -- it is how a nullable track column is spelled.
@@ -5051,7 +5267,7 @@ class _Lowerer:
         rejection rather than a stringly-typed output, and its hint says what
         metadata columns ARE for.
         """
-        schema = ROW_SCHEMAS[binding.column]
+        schema = binding.schema
         if name != ROW_STREAM:
             if name not in schema and map_ref(name) is None:
                 raise _error(
@@ -5059,8 +5275,7 @@ class _Lowerer:
                     f"unknown column '{binding.alias}.{column_label(name)}'",
                     anchor,
                     fallback=select,
-                    hint=f"{binding.column} track rows expose "
-                    f"{', '.join(sorted(schema))}",
+                    hint=binding.exposes,
                 )
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -5068,9 +5283,19 @@ class _Lowerer:
                 "a stream, and a SELECT column is an output stream",
                 anchor,
                 fallback=select,
-                hint=_CHAPTER_ROW_HINT
-                if binding.column == CHAPTERS_COLUMN
+                hint=_WRITTEN_ROW_HINT
+                if binding.values is not None
+                else _CHAPTER_ROW_HINT
+                if binding.streamless
                 else _ROW_METADATA_HINT,
+            )
+        if binding.values is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{binding.alias}' is a written row, not a stream",
+                anchor,
+                fallback=select,
+                hint=_WRITTEN_ROW_HINT,
             )
         if binding.column == CHAPTERS_COLUMN:
             raise _error(
@@ -7197,7 +7422,7 @@ class _Lowerer:
         self, binding: _RowBinding, name: str, anchor: exp.Expr, select: exp.Select
     ) -> list[CellValue]:
         """A row alias's metadata column, one value per row (NULL for a gap)."""
-        schema = ROW_SCHEMAS[binding.column]
+        schema = binding.schema
         if name == TAGS_COLUMN:
             return [_tag_cell(row) for row in binding.rows]
         if name == DISPOSITION_COLUMN and name in schema:
@@ -7208,7 +7433,7 @@ class _Lowerer:
                 f"unknown column '{binding.alias}.{column_label(name)}'",
                 anchor,
                 fallback=select,
-                hint=f"{binding.column} track rows expose {', '.join(sorted(schema))}",
+                hint=binding.exposes,
             )
         return [None if row is None else row.columns.get(name) for row in binding.rows]
 
@@ -7483,15 +7708,29 @@ def _reads_row_source(node: exp.Expr, env: _Env) -> bool:
 
 
 def _has_track_rows(env: _Env) -> bool:
-    """True when the branch has track (or chapter) rows to tag per stream."""
-    return any(isinstance(binding, _RowBinding) for binding in env.bindings.values())
+    """True when the branch has rows carrying a track to tag per stream.
+
+    Chapter rows and written rows carry none, so a branch holding only those
+    tags the CONTAINER, exactly as one with no rows at all does.
+    """
+    return any(
+        isinstance(binding, _RowBinding) and not binding.streamless
+        for binding in env.bindings.values()
+    )
 
 
 def _group_row(env: _Env) -> _RowTuple:
-    """The tuple a grouped branch's group-constant values read, else no row."""
-    if not env.grouped or env.relation is None or not env.relation.tuples:
+    """The one tuple a FILE-level value reads, or no row at all.
+
+    A container tag and a chapter list belong to the file, not to a row, so
+    they are evaluated over a single representative tuple: the group's first
+    where the branch groups, the relation's first otherwise (an ungrouped
+    branch that survives the one-row rule has exactly one).
+    """
+    relation = env.relation
+    if relation is None or not relation.tuples:
         return {}
-    return env.relation.tuples[0]
+    return relation.tuples[0]
 
 
 def _is_tag_column(projection: exp.Expr, env: _Env) -> bool:
@@ -7540,7 +7779,7 @@ def _row_metadata_column(node: exp.Expr, env: _Env) -> str | None:
     if table_node is None:
         return None
     binding = env.bindings.get(_fold(table_node))
-    if not isinstance(binding, _RowBinding) or binding.column == CHAPTERS_COLUMN:
+    if not isinstance(binding, _RowBinding) or binding.streamless:
         return None
     name = _fold(node.this)
     return None if name == ROW_STREAM else name

@@ -244,6 +244,20 @@ def test_sink_unit_round_trip() -> None:
     }
 
 
+def test_sink_unit_chapters_round_trip() -> None:
+    """The chapter list stays out of the serialized shape when the query
+    named none, so a unit that writes no chapters keeps the smaller shape."""
+    unit = SinkUnit(
+        outputs=[Output(ref="n2", type="video", name=None, metadata={})],
+        path="out.mkv",
+        chapters=1,
+    )
+    d = unit.to_dict()
+    assert d["chapters"] == 1
+    assert SinkUnit.from_dict(d) == unit
+    assert "chapters" not in SinkUnit(outputs=[], path="out.mkv").to_dict()
+
+
 def test_output_disposition_round_trips() -> None:
     """The flags are their own field, so they stay out of the metadata dict --
     and out of the serialized shape entirely when the query asserted none."""

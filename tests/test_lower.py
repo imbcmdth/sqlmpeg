@@ -47,7 +47,7 @@ from sqlmpeg import registry as registry_module
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.emit import build_ffmpeg_args, emit
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import Graph, StreamType
+from sqlmpeg.ir import NO_CHAPTERS, Graph, StreamType
 from sqlmpeg.lower import lower, lower_table
 from sqlmpeg.parser import parse, resolve
 from sqlmpeg.probe import ChapterMeta, ProbeResult, StreamMeta
@@ -6299,7 +6299,7 @@ def test_a_star_over_chapter_rows_names_no_stream_to_select() -> None:
         _chapter_probes(*_TWO_CHAPTERS),
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert err.hint is not None and "a chapter is not a stream" in err.hint
+    assert err.hint is not None and "these rows carry no stream" in err.hint
 
 
 def test_star_over_chapter_rows_is_the_chapter_fields() -> None:
@@ -6450,7 +6450,7 @@ def test_a_track_row_query_runs_end_to_end(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# unnest(f.chapters) read, and the `chapters`/`chapters_from` sink options
+# unnest(f.chapters) read, and the `chapters` output column
 # ---------------------------------------------------------------------------
 
 
@@ -6580,142 +6580,323 @@ def test_chapter_rows_cross_join_track_rows() -> None:
     assert sinks[0].result.rows == [[1, "Intro"], [1, "Credits"]]
 
 
-def test_chapters_write_mints_an_ffmetadata_input_and_sets_map_chapters() -> None:
+def test_a_chapters_column_mints_an_ffmetadata_input_and_sets_map_chapters() -> None:
     g = _lower(
-        "COPY (WITH marks(start_t, end_t, title) AS "
-        "(VALUES (0, 60, 'Intro'), (60, 300, 'Act One')) "
-        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (chapters marks)"
+        "COPY (SELECT f.video[1], f.audio[1], "
+        "ARRAY[ROW('Intro', 0, 60)::chapter, ROW('Act One', 60, 300)::chapter] "
+        "AS chapters FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert len(g.input_paths) == 2
     assert g.input_paths[1].startswith("data:text/plain;base64,")
-    assert g.sinks[0].options["chapters"] == 1
+    assert g.sinks[0].chapters == 1
     minted_alias = next(alias for alias, index in g.sources.items() if index == 1)
     assert g.input_options[minted_alias] == {"format": "ffmetadata"}
 
 
-def test_chapters_from_reuses_an_existing_inputs_index_with_no_extra_i() -> None:
+def test_a_copied_chapters_column_reuses_that_inputs_index_with_no_extra_i() -> None:
     g = _lower(
-        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (chapters_from f)"
+        "COPY (SELECT f.video[1], f.audio[1], f.chapters AS chapters "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert len(g.input_paths) == 1
-    assert g.sinks[0].options["chapters"] == 0
+    assert g.sinks[0].chapters == 0
 
 
-def test_chapters_and_chapters_from_together_are_rejected() -> None:
+def test_a_copied_chapters_column_names_the_second_inputs_index() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], f.audio[1], g.chapters AS chapters "
+        "FROM input('film.mkv') f, input('extra.mkv') g) TO 'out.mkv'"
+    )
+    assert g.sinks[0].chapters == 1
+
+
+def test_a_null_chapters_column_writes_no_chapter_list() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], f.audio[1], NULL AS chapters "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    assert len(g.input_paths) == 1
+    assert g.sinks[0].chapters == NO_CHAPTERS
+
+
+def test_no_chapters_column_leaves_ffmpegs_own_default_alone() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    assert g.sinks[0].chapters is None
+
+
+def test_the_chapters_sink_option_is_gone() -> None:
     err = _reject(
         "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro')) "
-        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (chapters marks, chapters_from f)"
-    )
-    assert err.code is ErrorCode.SINK_OPTION_TYPE
-    assert "cannot both be set" in err.message
-
-
-def test_chapters_option_must_name_a_real_values_cte() -> None:
-    err = _reject(
-        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (chapters nope)"
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "names a VALUES CTE" in err.message
-
-
-def test_chapters_values_cte_names_its_columns_start_t_end_t_title() -> None:
-    err = _reject(
-        "COPY (WITH marks(a, b, c) AS (VALUES (0, 60, 'Intro')) "
-        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
+        "SELECT f.video[1] FROM input('film.mkv') f) "
         "TO 'out.mkv' WITH (chapters marks)"
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "must define start_t and end_t" in err.message
+    assert err.code is ErrorCode.UNKNOWN_SINK_OPTION
 
 
-def test_chapters_values_cte_rejects_a_non_numeric_start_t() -> None:
+def test_the_chapters_from_sink_option_is_gone() -> None:
     err = _reject(
-        "COPY (WITH marks(start_t, end_t, title) AS (VALUES ('x', 60, 'Intro')) "
-        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (chapters marks)"
+        "COPY (SELECT f.video[1] FROM input('film.mkv') f) "
+        "TO 'out.mkv' WITH (chapters_from f)"
+    )
+    assert err.code is ErrorCode.UNKNOWN_SINK_OPTION
+
+
+def test_a_chapters_column_must_be_an_array_of_records() -> None:
+    err = _reject(
+        "COPY (SELECT f.video[1], 'Intro' AS chapters FROM input('film.mkv') f) "
+        "TO 'out.mkv'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "takes an array of chapter records" in err.message
+
+
+def test_a_chapter_record_takes_the_declared_field_count() -> None:
+    err = _reject(
+        "COPY (SELECT f.video[1], ARRAY[ROW('Intro', 0)::chapter] AS chapters "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a chapter takes 3 values (title, start_t, end_t), got 2" in err.message
+
+
+def test_a_chapters_element_must_be_a_chapter_record() -> None:
+    err = _reject(
+        "COPY (SELECT f.video[1], ARRAY['Intro'] AS chapters "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a chapter is written as ROW(title, start_t, end_t)::chapter" in err.message
+
+
+def test_a_chapters_column_in_a_cte_body_is_rejected() -> None:
+    err = _reject(
+        "COPY (WITH gathered AS (SELECT f.video[1] AS v, "
+        "ARRAY[ROW('Intro', 0, 60)::chapter] AS chapters "
+        "FROM input('film.mkv') f) "
+        "SELECT gathered.v FROM gathered) TO 'out.mkv'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a CTE body writes no file" in err.message
+
+
+def test_a_chapter_records_values_take_the_value_grammar() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], "
+        "ARRAY[ROW('Part ' || 'One', 0, 30 + 30)::chapter] AS chapters "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    payload = base64.b64decode(g.input_paths[1].split(",", 1)[1]).decode()
+    assert "title=Part One" in payload
+    assert "END=60" in payload
+
+
+def test_a_chapter_records_bounds_may_read_an_inputs_duration() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], ARRAY[ROW('All', 0, f.duration)::chapter] "
+        "AS chapters FROM input('film.mkv') f) TO 'out.mkv'",
+        {"f": ProbeResult(streams=[_track("video", 0)], duration=12.5)},
+    )
+    payload = base64.b64decode(g.input_paths[1].split(",", 1)[1]).decode()
+    assert "END=12.5" in payload
+
+
+def test_array_agg_over_a_values_table_builds_the_same_document() -> None:
+    """The two spellings of recipes 40 and 63: one file, one set of bytes."""
+    literal = _lower(
+        "COPY (SELECT f.video[1], "
+        "ARRAY[ROW('Intro', 0, 60)::chapter, ROW('Act One', 60, 300)::chapter] "
+        "AS chapters FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    gathered = _lower(
+        "COPY (WITH marks(start_t, end_t, title) AS "
+        "(VALUES (0, 60, 'Intro'), (60, 300, 'Act One')) "
+        "SELECT f.video[1], "
+        "array_agg(ROW(m.title, m.start_t, m.end_t)::chapter) AS chapters "
+        "FROM input('film.mkv') f, marks m GROUP BY f.video[1]) TO 'out.mkv'"
+    )
+    assert gathered.input_paths == literal.input_paths
+
+
+def test_array_agg_over_chapter_rows_copies_a_list_relationally() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], "
+        "array_agg(ROW(c.title, c.start_t, c.end_t)::chapter) AS chapters "
+        "FROM input('f.mkv') f, unnest(f.chapters) c GROUP BY f.video[1]) "
+        "TO 'out.mkv'",
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    payload = base64.b64decode(g.input_paths[1].split(",", 1)[1]).decode()
+    assert payload.count("[CHAPTER]") == 2
+    assert "title=Intro" in payload and "title=Credits" in payload
+
+
+def test_a_chapters_column_groups_with_the_stream_columns() -> None:
+    """The chapter list is a GROUP-level value, so the rows it aggregates do
+    not each become a file of their own."""
+    g = _lower(
+        "COPY (SELECT f.video[1], f.audio[1], "
+        "array_agg(ROW(c.title, c.start_t, c.end_t)::chapter) AS chapters "
+        "FROM input('f.mkv') f, unnest(f.chapters) c "
+        "GROUP BY f.video[1], f.audio[1]) TO 'out.mkv'",
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    assert len(g.sinks) == 1
+    assert [o.type for o in g.sinks[0].outputs] == ["video", "audio"]
+
+
+def test_a_chapters_column_rejects_a_non_numeric_start_t() -> None:
+    err = _reject(
+        "COPY (SELECT f.video[1], ARRAY[ROW('Intro', 'x', 60)::chapter] AS chapters "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "start_t' must be a number" in err.message
 
 
-def test_chapters_values_cte_null_title_omits_the_title_line() -> None:
+def test_a_chapters_column_null_title_omits_the_title_line() -> None:
     g = _lower(
-        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 60, NULL)) "
-        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (chapters marks)"
+        "COPY (SELECT f.video[1], ARRAY[ROW(NULL, 0, 60)::chapter] AS chapters "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     payload = base64.b64decode(g.input_paths[1].split(",", 1)[1]).decode()
     assert "title=" not in payload
-    assert "START=0\nEND=60\n" in payload
+    assert "START=0" in payload and "END=60" in payload
 
 
-def test_chapters_values_cte_rejects_an_unescapable_title() -> None:
+def test_a_chapters_column_rejects_an_unescapable_title() -> None:
     err = _reject(
-        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'a=b')) "
-        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (chapters marks)"
+        "COPY (SELECT f.video[1], ARRAY[ROW('a=b', 0, 60)::chapter] AS chapters "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "cannot represent unescaped" in err.message
 
 
-def test_chapters_values_cte_rejects_a_chapter_that_ends_before_it_starts() -> None:
+def test_a_chapters_column_rejects_a_chapter_that_ends_before_it_starts() -> None:
     err = _reject(
-        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (60, 30, 'Intro')) "
-        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (chapters marks)"
+        "COPY (SELECT f.video[1], ARRAY[ROW('Intro', 60, 30)::chapter] AS chapters "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "ends at 30, which is not after its start 60" in err.message
 
 
-def test_chapters_values_cte_rejects_a_zero_length_chapter() -> None:
+def test_a_chapters_column_rejects_a_zero_length_chapter() -> None:
     err = _reject(
-        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 0, 'Intro')) "
-        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (chapters marks)"
+        "COPY (SELECT f.video[1], ARRAY[ROW('Intro', 0, 0)::chapter] AS chapters "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "is not after its start" in err.message
 
 
-def test_chapters_values_cte_rejects_rows_out_of_order() -> None:
+def test_a_chapters_column_rejects_records_out_of_order() -> None:
     err = _reject(
-        "COPY (WITH marks(start_t, end_t, title) AS "
-        "(VALUES (60, 120, 'Two'), (0, 30, 'One')) "
-        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (chapters marks)"
+        "COPY (SELECT f.video[1], "
+        "ARRAY[ROW('Two', 60, 120)::chapter, ROW('One', 0, 30)::chapter] AS chapters "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "starts at 0, before chapter 1 at 60" in err.message
     assert "ascending" in (err.hint or "")
 
 
-def test_chapters_values_cte_rejects_overlapping_rows() -> None:
+def test_a_chapters_column_rejects_overlapping_records() -> None:
     err = _reject(
-        "COPY (WITH marks(start_t, end_t, title) AS "
-        "(VALUES (0, 60, 'One'), (30, 90, 'Two')) "
-        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (chapters marks)"
+        "COPY (SELECT f.video[1], "
+        "ARRAY[ROW('One', 0, 60)::chapter, ROW('Two', 30, 90)::chapter] AS chapters "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "starts at 30, inside chapter 1 which ends at 60" in err.message
 
 
-def test_chapters_values_cte_accepts_back_to_back_chapters() -> None:
+def test_a_chapters_column_accepts_back_to_back_records() -> None:
     """Touching is not overlapping: one ends exactly where the next begins."""
     g = _lower(
-        "COPY (WITH marks(start_t, end_t, title) AS "
-        "(VALUES (0, 60, 'One'), (60, 120, 'Two')) "
-        "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (chapters marks)"
+        "COPY (SELECT f.video[1], "
+        "ARRAY[ROW('One', 0, 60)::chapter, ROW('Two', 60, 120)::chapter] AS chapters "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     payload = base64.b64decode(g.input_paths[1].split(",", 1)[1]).decode()
     assert payload.count("[CHAPTER]") == 2
+
+
+def test_a_tag_column_over_chapter_rows_tags_the_container() -> None:
+    """A chapter row carries no track, so the value goes on the file itself."""
+    g = _lower(
+        "COPY (SELECT f.video[1], 'Ch: ' || c.title AS title "
+        "FROM input('f.mkv') f, unnest(f.chapters) c WHERE c.index = 1) TO 'o.mkv'",
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    assert g.sinks[0].tags == {"title": "Ch: Intro"}
+
+
+# ---------------------------------------------------------------------------
+# a VALUES CTE as a row source
+# ---------------------------------------------------------------------------
+
+_MARKS = (
+    "WITH marks(start_t, end_t, title) AS "
+    "(VALUES (0, 60, 'Intro'), (60, 300, 'Act One')) "
+)
+
+
+def test_a_values_table_prints_its_written_rows() -> None:
+    sinks = lower_table(
+        resolve(parse(_MARKS + "SELECT m.title, m.start_t FROM input('f.mkv') f, marks m")),
+        {"f": ProbeResult(streams=[_track("video", 0)])},
+    )
+    assert sinks[0].result.columns == ["title", "start_t"]
+    assert sinks[0].result.rows == [["Intro", 0], ["Act One", 60]]
+
+
+def test_a_values_table_star_is_its_written_columns() -> None:
+    sinks = lower_table(
+        resolve(parse(_MARKS + "SELECT m.* FROM input('f.mkv') f, marks m")),
+        {"f": ProbeResult(streams=[_track("video", 0)])},
+    )
+    assert sinks[0].result.columns == ["start_t", "end_t", "title"]
+
+
+def test_a_values_table_cross_joins_track_rows() -> None:
+    sinks = lower_table(
+        resolve(parse(
+            _MARKS + "SELECT t.index, m.title "
+            "FROM input('f.mkv') f, unnest(f.audio) t, marks m"
+        )),
+        {"f": ProbeResult(streams=[_track("audio", 0)])},
+    )
+    assert sinks[0].result.rows == [[1, "Intro"], [1, "Act One"]]
+
+
+def test_a_values_column_filters_and_sorts_like_any_row_column() -> None:
+    sinks = lower_table(
+        resolve(parse(
+            _MARKS + "SELECT m.title FROM input('f.mkv') f, marks m "
+            "WHERE m.start_t >= 60 ORDER BY m.title"
+        )),
+        {"f": ProbeResult(streams=[_track("video", 0)])},
+    )
+    assert sinks[0].result.rows == [["Act One"]]
+
+
+def test_a_tag_column_over_written_rows_tags_the_container() -> None:
+    """Rows with no track have nothing to tag per stream, so the file gets it."""
+    g = _lower(
+        "COPY (WITH marks(name) AS (VALUES ('Doc')) "
+        "SELECT f.video[1], 'T: ' || m.name AS title "
+        "FROM input('f.mkv') f, marks m) TO 'o.mkv'",
+        {"f": ProbeResult(streams=[_track("video", 0)])},
+    )
+    assert g.sinks[0].tags == {"title": "T: Doc"}
+
+
+def test_a_values_row_is_not_an_output_stream() -> None:
+    err = _reject("COPY (" + _MARKS + "SELECT m FROM input('f.mkv') f, marks m) TO 'o.mkv'")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
 # ---------------------------------------------------------------------------
@@ -9523,12 +9704,12 @@ def test_a_disposition_survives_a_filter_the_way_a_tag_does() -> None:
 
 
 def test_a_chapter_list_may_leave_title_out() -> None:
-    """title is nullable, so the VALUES CTE need not carry the column -
-    the same rule any nullable field follows at construction."""
+    """title is nullable, so a record may write NULL for it - the same rule
+    any nullable field follows at construction."""
     query = (
-        "COPY (WITH marks(start_t, end_t) AS (VALUES (0, 30), (30, 90)) "
-        "SELECT f.video[1] FROM input('x.mp4') f) "
-        "TO 'o.mkv' WITH (chapters marks)"
+        "COPY (SELECT f.video[1], "
+        "ARRAY[ROW(NULL, 0, 30)::chapter, ROW(NULL, 30, 90)::chapter] AS chapters "
+        "FROM input('x.mp4') f) TO 'o.mkv'"
     )
     graph = compile_sql(query)
     document = base64.b64decode(graph.input_paths[1].split(",", 1)[1]).decode()
@@ -9538,10 +9719,9 @@ def test_a_chapter_list_may_leave_title_out() -> None:
 
 def test_a_chapter_list_still_needs_its_span() -> None:
     query = (
-        "COPY (WITH marks(start_t, title) AS (VALUES (0, 'Intro')) "
-        "SELECT f.video[1] FROM input('x.mp4') f) "
-        "TO 'o.mkv' WITH (chapters marks)"
+        "COPY (SELECT f.video[1], ARRAY[ROW('Intro', 0, NULL)::chapter] AS chapters "
+        "FROM input('x.mp4') f) TO 'o.mkv'"
     )
     with pytest.raises(SqlmpegError) as excinfo:
         compile_sql(query)
-    assert "must define start_t and end_t" in excinfo.value.message
+    assert "'chapters.end_t' must be a number, got NULL" in excinfo.value.message

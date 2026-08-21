@@ -53,6 +53,10 @@ FrameRef = str  # a Node.id, "<node-id>:<pad>", or "src:<alias>:v|a:<k>"
 
 _SRC_PREFIX = "src:"
 
+# `SinkUnit.chapters` for a file that writes NO chapter list: ffmpeg's own
+# spelling for it. Any other value is an input index the chapters come from.
+NO_CHAPTERS = -1
+
 
 def is_src(ref: FrameRef) -> bool:
     """True if `ref` points at a raw input stream rather than a Node."""
@@ -206,6 +210,12 @@ class SinkUnit:
       subcommand invents a destination for it.
     * ``options`` is insertion-ordered with values already validated against
       `sqlmpeg.sink.SINK_OPTIONS` by lower.
+    * ``chapters`` is the ffmpeg INPUT index this file's chapter list comes
+      from, rendered as ``-map_chapters``. None means the query named no
+      chapter list, so ffmpeg's own default stands; :data:`NO_CHAPTERS` is a
+      written ``NULL AS chapters`` and writes none. A list built from
+      ``chapter`` records is one extra ``data:`` ffmetadata input, and this is
+      its index.
     * ``tags`` are the file's CONTAINER tags, key -> value, rendered as
       ``-metadata key=value``. A None value CLEARS the key and still renders
       (``-metadata key=``): ffmpeg copies an input's globals by default.
@@ -227,6 +237,7 @@ class SinkUnit:
     options: dict[str, object] = field(default_factory=dict)
     tags: dict[str, str | None] = field(default_factory=dict)
     window: tuple[float | None, float | None] | None = None
+    chapters: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         d: dict[str, object] = {
@@ -240,6 +251,8 @@ class SinkUnit:
             d["tags"] = dict(self.tags)
         if self.window is not None:
             d["window"] = [self.window[0], self.window[1]]
+        if self.chapters is not None:
+            d["chapters"] = self.chapters
         return d
 
     @classmethod
@@ -249,6 +262,8 @@ class SinkUnit:
         raw_options = d["options"]
         raw_tags = d.get("tags")
         raw_window = d.get("window")
+        raw_chapters = d.get("chapters")
+        assert raw_chapters is None or isinstance(raw_chapters, int)
         assert isinstance(raw_outputs, list)
         assert raw_path is None or isinstance(raw_path, str)
         assert isinstance(raw_options, dict)
@@ -276,6 +291,7 @@ class SinkUnit:
             options=dict(raw_options),
             tags=tags,
             window=window,
+            chapters=raw_chapters,
         )
 
 

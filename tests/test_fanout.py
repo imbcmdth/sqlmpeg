@@ -371,10 +371,10 @@ def test_a_fan_out_copy_may_not_share_a_script() -> None:
     assert "cannot share a script" in err.message
 
 
-def test_chapters_from_and_a_fan_out_to_are_rejected() -> None:
+def test_a_chapters_column_and_a_fan_out_to_are_rejected() -> None:
     sql = (
-        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
-        "TO (t.tags.language || '.m4a') WITH (chapters_from f)"
+        f"COPY (SELECT t, f.chapters AS chapters FROM input('{SRC}') f, "
+        "unnest(f.audio) t) TO (t.tags.language || '.m4a')"
     )
     assert "'chapters' and a fan-out TO cannot both be set" in _rejects(sql).message
 

@@ -1640,20 +1640,22 @@ def test_a_bare_chapters_column_prints_the_whole_list_as_one_cell(
     assert "(1 row)" in printed
 
 
-def test_values_cte_chapters_are_written_and_read_back(tmp_path: Path) -> None:
-    """The whole round trip plan 077 exists for: define chapter rows with
-    VALUES, compile them into a real ffmetadata `-i`, run it, and read the
-    titles and times back with ffprobe -- proving the extra input actually
-    carries chapters, not just that the command has the right shape."""
+def test_a_written_chapters_column_is_read_back_off_the_output(
+    tmp_path: Path,
+) -> None:
+    """The whole round trip: write chapter records, compile them into a real
+    ffmetadata `-i`, run it, and read the titles and times back with ffprobe
+    -- proving the extra input actually carries chapters, not just that the
+    command has the right shape."""
     _require_fixture(_AV)
     out_path = tmp_path / "chaptered.mkv"
     query = (
         "COPY (\n"
-        "  WITH marks(start_t, end_t, title) AS (\n"
-        "    VALUES (0, 1, 'Intro'), (1, 2, 'Credits')\n"
-        "  )\n"
-        f"  SELECT f.video[1], f.audio[1] FROM input('{_sql_path(_AV)}') f\n"
-        f") TO '{_sql_path(out_path)}' WITH (chapters marks);"
+        f"  SELECT f.video[1], f.audio[1],\n"
+        "         ARRAY[ROW('Intro', 0, 1)::chapter,\n"
+        "               ROW('Credits', 1, 2)::chapter] AS chapters\n"
+        f"  FROM input('{_sql_path(_AV)}') f\n"
+        f") TO '{_sql_path(out_path)}';"
     )
 
     _run_sink_query(query, out_path)
@@ -1664,16 +1666,42 @@ def test_values_cte_chapters_are_written_and_read_back(tmp_path: Path) -> None:
     assert [float(c["end_time"]) for c in chapters] == [1.0, 2.0]
 
 
-def test_chapters_from_copies_an_inputs_own_chapters_through(tmp_path: Path) -> None:
-    """`chapters_from` needs no VALUES CTE at all: it just re-maps an
+def test_a_gathered_chapters_column_writes_the_same_file(tmp_path: Path) -> None:
+    """`array_agg` over a VALUES row source is the relational spelling of the
+    same list, so the file it writes carries the same chapters."""
+    _require_fixture(_AV)
+    out_path = tmp_path / "gathered.mkv"
+    query = (
+        "COPY (\n"
+        "  WITH marks(start_t, end_t, title) AS (\n"
+        "    VALUES (0, 1, 'Intro'), (1, 2, 'Credits')\n"
+        "  )\n"
+        f"  SELECT f.video[1], f.audio[1],\n"
+        "         array_agg(ROW(m.title, m.start_t, m.end_t)::chapter) AS chapters\n"
+        f"  FROM input('{_sql_path(_AV)}') f, marks m\n"
+        "  GROUP BY f.video[1], f.audio[1]\n"
+        f") TO '{_sql_path(out_path)}';"
+    )
+
+    _run_sink_query(query, out_path)
+
+    chapters = _ffprobe_chapters(out_path)
+    assert [c["tags"]["title"] for c in chapters] == ["Intro", "Credits"]
+    assert [float(c["start_time"]) for c in chapters] == [0.0, 1.0]
+
+
+def test_a_copied_chapters_column_carries_an_inputs_own_list_through(
+    tmp_path: Path,
+) -> None:
+    """`f.chapters AS chapters` needs no records at all: it just re-maps an
     existing input's chapters onto the output, unchanged."""
     _require_fixture(_FIXTURES_DIR / "av-chapters.mkv")
     source = _FIXTURES_DIR / "av-chapters.mkv"
     out_path = tmp_path / "recopied.mkv"
     query = (
-        "COPY (SELECT f.video[1], f.audio[1] "
+        "COPY (SELECT f.video[1], f.audio[1], f.chapters AS chapters "
         f"FROM input('{_sql_path(source)}') f) "
-        f"TO '{_sql_path(out_path)}' WITH (chapters_from f);"
+        f"TO '{_sql_path(out_path)}';"
     )
 
     _run_sink_query(query, out_path)
@@ -1685,6 +1713,23 @@ def test_chapters_from_copies_an_inputs_own_chapters_through(tmp_path: Path) -> 
         "Chapter 2",
         "Credits",
     ]
+
+
+def test_a_null_chapters_column_writes_a_file_with_none(tmp_path: Path) -> None:
+    """The clear, run for real: the source has four chapters and the output
+    has none, which only `-map_chapters -1` produces."""
+    source = _FIXTURES_DIR / "av-chapters.mkv"
+    _require_fixture(source)
+    out_path = tmp_path / "stripped.mkv"
+    query = (
+        "COPY (SELECT f.video[1], f.audio[1], NULL AS chapters "
+        f"FROM input('{_sql_path(source)}') f) "
+        f"TO '{_sql_path(out_path)}';"
+    )
+
+    _run_sink_query(query, out_path)
+
+    assert _ffprobe_chapters(out_path) == []
 
 
 # ---------------------------------------------------------------------------

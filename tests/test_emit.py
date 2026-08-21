@@ -28,7 +28,7 @@ from sqlmpeg.emit import (
     emit,
 )
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import Graph, Node, Output, SinkUnit, StreamType
+from sqlmpeg.ir import NO_CHAPTERS, Graph, Node, Output, SinkUnit, StreamType
 
 
 def _node(
@@ -62,6 +62,7 @@ def _sink(
     options: dict[str, object] | None = None,
     tags: dict[str, str | None] | None = None,
     window: tuple[float | None, float | None] | None = None,
+    chapters: int | None = None,
 ) -> SinkUnit:
     """A destination with no outputs yet -- `_graph` fills them in."""
     return SinkUnit(
@@ -70,6 +71,7 @@ def _sink(
         options=dict(options or {}),
         tags=dict(tags or {}),
         window=window,
+        chapters=chapters,
     )
 
 
@@ -99,6 +101,7 @@ def _graph(
                 options=dict(sink.options),
                 tags=dict(sink.tags),
                 window=sink.window,
+                chapters=sink.chapters,
             )
         ]
     else:
@@ -1308,6 +1311,25 @@ def test_sink_strip_metadata_false_emits_nothing() -> None:
     g = _graph([], [_out("src:a:v:0")], sink=sink)
     args = build_ffmpeg_args(emit(g))
     assert "-map_metadata" not in args
+
+
+def test_a_chapter_list_renders_map_chapters_with_its_input_index() -> None:
+    sink = _sink(path="out.mp4", chapters=1)
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-map_chapters") :] == ["-map_chapters", "1", "out.mp4"]
+
+
+def test_a_cleared_chapter_list_renders_map_chapters_negative_one() -> None:
+    sink = _sink(path="out.mp4", chapters=NO_CHAPTERS)
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-map_chapters") :] == ["-map_chapters", "-1", "out.mp4"]
+
+
+def test_no_chapter_list_renders_no_map_chapters_at_all() -> None:
+    g = _graph([], [_out("src:a:v:0")], sink=_sink(path="out.mp4"))
+    assert "-map_chapters" not in build_ffmpeg_args(emit(g))
 
 
 def test_sink_codec_params_derives_its_flag_from_video_codec() -> None:

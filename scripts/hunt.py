@@ -736,33 +736,50 @@ def gen_copy(ctx: Ctx) -> str:
 
 
 _CHAPTER_BOUNDS = ["0", "30", "60", "120", "-5", "0.5", "NULL", "'x'", "true"]
+_CHAPTER_TITLES = ["'Intro'", "NULL", "'a=b'", "1", "'x' || 'y'"]
 
 
 def gen_chapters_copy(ctx: Ctx) -> str:
-    """A VALUES chapter list handed to the sink: the constrained write shape.
+    """A `chapters` output column, written as a literal array or gathered.
 
     Bounds come out of order, overlapping and mistyped as often as not, so the
     span checks are exercised alongside the ones that compile.
     """
     rng = ctx.rng
+    records = []
+    for _ in range(rng.randint(1, 3)):
+        cells = [
+            ctx.pick(_CHAPTER_TITLES),
+            ctx.pick(_CHAPTER_BOUNDS),
+            ctx.pick(_CHAPTER_BOUNDS),
+        ]
+        if ctx.bad():
+            cells = cells[: rng.randint(0, 4)]
+        records.append(f"ROW({', '.join(cells)})::chapter")
+    if rng.random() < 0.5:
+        column = f"ARRAY[{', '.join(records)}] AS chapters"
+        if ctx.bad():
+            column = ctx.pick(["NULL AS chapters", "'x' AS chapters", "ARRAY[] AS chapters"])
+        return (
+            f"COPY (\n  SELECT a0.video[1], {column} FROM input('in.mp4') a0\n"
+            ") TO 'out.mkv'"
+        )
     columns = ["start_t", "end_t", "title"]
     if ctx.bad():
-        columns = ctx.pick(
-            [["start_t", "end_t"], ["a", "b", "c"], ["title", "start_t", "end_t"]]
-        )
+        columns = ctx.pick([["start_t", "end_t"], ["a", "b", "c"]])
     rows = []
     for _ in range(rng.randint(1, 3)):
-        cells = []
-        for name in columns:
-            if name == "title":
-                cells.append(ctx.pick(["'Intro'", "NULL", "'a=b'", "1"]))
-            else:
-                cells.append(ctx.pick(_CHAPTER_BOUNDS))
+        cells = [
+            ctx.pick(_CHAPTER_TITLES) if name == "title" else ctx.pick(_CHAPTER_BOUNDS)
+            for name in columns
+        ]
         rows.append("(" + ", ".join(cells) + ")")
     return (
         f"COPY (\n  WITH marks({', '.join(columns)}) AS (VALUES {', '.join(rows)})\n"
-        "  SELECT a0.video[1] FROM input('in.mp4') a0\n"
-        ") TO 'out.mkv' WITH (chapters marks)"
+        "  SELECT a0.video[1], "
+        "array_agg(ROW(m.title, m.start_t, m.end_t)::chapter) AS chapters\n"
+        "  FROM input('in.mp4') a0, marks m GROUP BY a0.video[1]\n"
+        ") TO 'out.mkv'"
     )
 
 

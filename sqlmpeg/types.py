@@ -50,6 +50,7 @@ from typing import Literal
 
 __all__ = [
     "CHAPTERS_COLUMN",
+    "CHAPTER_TYPE",
     "COLUMN_TYPES",
     "CONTAINER_READONLY_FIELDS",
     "DISPOSITION_COLUMN",
@@ -57,6 +58,7 @@ __all__ = [
     "INPUT_COLUMNS",
     "INPUT_DURATION_COLUMN",
     "MAP_ELEMENTS",
+    "RECORD_FIELDS",
     "ROW_COMMON",
     "ROW_READONLY_FIELDS",
     "ROW_SCHEMAS",
@@ -346,6 +348,14 @@ CHAPTERS_COLUMN = _sole(
     "the chapter array column",
 )
 
+# The record type that column holds, and the one a written chapter casts to.
+CHAPTER_TYPE = element_type(
+    _sole(
+        tuple(f.type for f in _CONTAINER.fields if f.name == CHAPTERS_COLUMN),
+        "the chapter array column's element",
+    )
+)
+
 # The scalar pseudo-column every INPUT alias carries.
 INPUT_DURATION_COLUMN = _sole(
     tuple(f.name for f in _container_fields() if f.type == "number"),
@@ -394,6 +404,17 @@ MAP_ELEMENTS: dict[str, str] = {
     if declared.kind in {"stream", "container"}
     for f in declared.fields
     if f.exposed and is_array(f.type) and resolve(f.type).kind == "map"
+}
+
+# The fields a record LITERAL names, positionally, per record type: the
+# writable ones, in declaration order. A read-only field is ffprobe's own
+# (`chapter.index` is the order the container already lists), so a query never
+# supplies it. A record type with nothing exposed yet has no entry at all.
+RECORD_FIELDS: dict[str, tuple[Field, ...]] = {
+    declared.name: written
+    for declared in _DECLARED
+    if declared.kind == "record"
+    and (written := tuple(f for f in declared.fields if f.exposed and f.writable))
 }
 
 # The array columns whose elements are STREAMS: the only ones a subscript or

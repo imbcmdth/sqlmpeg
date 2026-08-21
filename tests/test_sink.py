@@ -45,15 +45,13 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "codec_params": ("video", "str"),
     "two_pass": ("container", "bool"),
     "movflags": ("container", "str"),
-    "chapters": ("container", "str"),
-    "chapters_from": ("container", "str"),
     "metadata_from": ("container", "str"),
     "strip_metadata": ("container", "bool"),
 }
 
 
-def test_table_has_exactly_twenty_eight_entries() -> None:
-    assert len(SINK_OPTIONS) == 28
+def test_table_has_exactly_twenty_six_entries() -> None:
+    assert len(SINK_OPTIONS) == 26
     assert set(SINK_OPTIONS) == set(_EXPECTED)
 
 

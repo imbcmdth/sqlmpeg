@@ -165,8 +165,9 @@ _DIALECT_TAIL = """\
   `data` -- in THAT order, whatever order the file stores them in -- each one
   a plain passthrough column, the same as writing every subscript out by
   hand; `chapters` takes no output position (a chapter is not a stream) and
-  rides through as ffmpeg's own default. A bare `*` does every `FROM` alias
-  in `FROM` order. `<alias>.*` does one, and mixes freely with other columns:
+  rides through as ffmpeg's own default unless a `chapters` column says
+  otherwise. A bare `*` does every `FROM` alias in `FROM` order.
+  `<alias>.*` does one, and mixes freely with other columns:
   `SELECT a.*, b.audio[1]`. Star over an `input()` alias needs a readable
   file to size it (same policy as a bare array: `INPUT_NOT_FOUND` if it
   cannot be probed); star over a CTE name expands that CTE's recorded
@@ -316,15 +317,27 @@ _DIALECT_TAIL = """\
   typed rejection; the columns feed `WHERE`/`ORDER BY`, trim windows
   (`WHERE f.t BETWEEN c.start_t AND c.end_t`), fan-out destinations, and
   tag columns, exactly like a track row's.
-- To WRITE chapters, define them with a VALUES CTE and hand it to a sink
-  option: `WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro'),
-  (60, 300, 'Act One')) COPY (...) TO 'out.mkv' WITH (chapters marks)`. The
-  CTE needs exactly `start_t`, `end_t` (numbers, seconds) and `title` (text)
-  columns, matched by NAME not position; a VALUES CTE is reachable only this
-  way -- selecting `FROM` one directly is rejected. Every chapter must end
-  after it starts, `title` may be `NULL`, and the rows must run in ascending
-  order without overlapping (back-to-back is fine). `chapters_from <alias>`
-  copies an input's own chapters through instead; setting both is rejected.
+- To WRITE chapters, give the COPY's SELECT a column aliased `chapters`
+  holding an array of `chapter` records: `SELECT f.video[1], f.audio[1],
+  ARRAY[ROW('Intro', 0, 60)::chapter, ROW('Act One', 60, 300)::chapter] AS
+  chapters FROM input('film.mkv') f`. A record names the writable fields
+  positionally, in declaration order -- `ROW(title, start_t, end_t)` -- and
+  its values take the compile-time value grammar (literals, `-v` variables,
+  `||`, arithmetic, `f.duration`). `title` may be `NULL`; `start_t` and
+  `end_t` are numbers in seconds. Every chapter must end after it starts,
+  and the list must run in ascending order without overlapping (back-to-back
+  is fine).
+- The same column takes two other sources. `g.chapters AS chapters` copies
+  another input's list wholesale, and `NULL AS chapters` writes none;
+  omitting the column leaves ffmpeg's own passthrough alone.
+  `array_agg(ROW(m.title, m.start_t, m.end_t)::chapter) AS chapters` builds
+  one from any row source -- chapter rows, track rows, or a `VALUES` CTE in
+  `FROM` -- with the stream columns in the `GROUP BY`. The chapter list is a
+  value of the FILE, so one COPY writes one of them.
+- A `VALUES` CTE is an ordinary row source: `WITH marks(start_t, end_t,
+  title) AS (VALUES (0, 60, 'Intro'), (60, 300, 'Act One')) ... FROM
+  input('film.mkv') f, marks m`. Its columns take the type their literals
+  wrote, and a column written with two types is rejected.
 
 ### Broadcasting
 - Passing a bare array where a function expects one stream applies the call
@@ -624,8 +637,8 @@ path, and a quoted `TO 'path'` is unchanged -- every track still lands in
 that one file. `WITH (...)` applies to every file identically. Rejected:
 a computed segment holding `/`, `\\` or `..`; two rows naming one file; zero
 surviving rows; a NULL name; and, in this version, fan-out with `two_pass`,
-`chapters`/`chapters_from`/`metadata_from`, `FORMAT csv`, `UNION ALL`, or
-another `COPY` in the same script.
+`metadata_from`, a `chapters` column, `FORMAT csv`, `UNION ALL`, or another
+`COPY` in the same script.
 
 ### Options
 
