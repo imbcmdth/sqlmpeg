@@ -3,7 +3,7 @@
 -- variables: source (input media path), ext (output container extension, e.g. m4a)
 -- example: sqlmpeg compile -f queries/extract-languages.sql -v source=in.mp4 -v ext=m4a
 COPY (
-  SELECT array_agg(t.track)
+  SELECT array_agg(t)
   FROM input(:'source') f, unnest(f.audio) t
   GROUP BY t.language
 ) TO (t.language || '.' || :'ext')

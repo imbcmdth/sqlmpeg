@@ -100,7 +100,7 @@ _CHAPTER_SPLIT = (
     "WHERE f.t BETWEEN c.start_t AND c.end_t) TO ('ch' || c.index::text || '.mkv')"
 )
 _PER_LANGUAGE = (
-    f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
+    f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
     "TO (t.language || '.m4a')"
 )
 
@@ -129,7 +129,7 @@ def test_a_constant_to_over_a_row_table_gathers_into_one_file() -> None:
     """Both tracks land in ONE file when the TO names no row column -- and the
     aggregate is what says so."""
     sql = (
-        f"COPY (SELECT array_agg(t.track) FROM input('{SRC}') f, unnest(f.audio) t) "
+        f"COPY (SELECT array_agg(t) FROM input('{SRC}') f, unnest(f.audio) t) "
         "TO 'both.mka'"
     )
     graphs = compile_commands(sql)
@@ -259,7 +259,7 @@ def test_a_filtered_stream_the_files_share_is_split_across_them() -> None:
     sql = (
         "COPY ("
         "  WITH pic AS (SELECT hflip(g.video[1]) AS frame FROM input('v.mkv') g)"
-        f"  SELECT pic.frame, t.track FROM pic, input('{SRC}') f, unnest(f.audio) t"
+        f"  SELECT pic.frame, t FROM pic, input('{SRC}') f, unnest(f.audio) t"
         ") TO (t.language || '.mkv')"
     )
     graph = compile_commands(sql)[0]
@@ -274,7 +274,7 @@ def test_a_filtered_stream_the_files_share_is_split_across_them() -> None:
 
 def test_a_row_tag_column_tags_only_its_own_file() -> None:
     sql = (
-        f"COPY (SELECT t.track, 'Audio (' || t.language || ')' AS title "
+        f"COPY (SELECT t, 'Audio (' || t.language || ')' AS title "
         f"FROM input('{SRC}') f, unnest(f.audio) t) TO (t.language || '.m4a')"
     )
     assert [unit.outputs[0].metadata["title"] for unit in _units(sql)] == [
@@ -293,11 +293,11 @@ def test_a_tagged_ctes_tags_reach_every_file() -> None:
     sql = (
         "COPY ("
         "  WITH capt AS ("
-        "    SELECT s.track AS track, 'Subs' AS title"
+        "    SELECT s AS track, 'Subs' AS title"
         f"    FROM input('{SRC}') g, unnest(g.subtitle) s"
         "  )"
-        f"  SELECT t.track, array_agg(capt.track) FROM input('{SRC}') f, "
-        "  unnest(f.audio) t, capt GROUP BY t.track, t.language"
+        f"  SELECT t, array_agg(capt.track) FROM input('{SRC}') f, "
+        "  unnest(f.audio) t, capt GROUP BY t, t.language"
         ") TO (t.language || '.mkv')"
     )
     units = _units(sql)
@@ -312,7 +312,7 @@ def test_a_tagged_ctes_tags_reach_every_file() -> None:
 
 def test_with_options_apply_to_every_file() -> None:
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
         "TO (t.language || '.m4a') WITH (audio_codec 'aac', audio_bitrate '192k')"
     )
     assert [unit.options for unit in _units(sql)] == [
@@ -322,7 +322,7 @@ def test_with_options_apply_to_every_file() -> None:
 
 def test_a_where_row_predicate_still_filters_before_the_fan_out() -> None:
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t "
         "WHERE t.language = 'fra') TO (t.language || '.m4a')"
     )
     assert _paths(sql) == ["fra.m4a"]
@@ -330,7 +330,7 @@ def test_a_where_row_predicate_still_filters_before_the_fan_out() -> None:
 
 def test_order_by_reorders_the_files() -> None:
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t "
         "ORDER BY t.language DESC) TO (t.language || '.m4a')"
     )
     assert _paths(sql) == ["fra.m4a", "eng.m4a"]
@@ -338,7 +338,7 @@ def test_order_by_reorders_the_files() -> None:
 
 def test_a_cross_product_of_two_row_tables_fans_out_over_every_pair() -> None:
     sql = (
-        f"COPY (SELECT a.track FROM input('{SRC}') f, unnest(f.audio) a, "
+        f"COPY (SELECT a FROM input('{SRC}') f, unnest(f.audio) a, "
         "unnest(f.subtitle) s) TO (a.language || '-' || s.language || '.mka')"
     )
     assert _paths(sql) == [
@@ -364,7 +364,7 @@ def test_two_pass_and_a_fan_out_to_are_rejected() -> None:
 def test_a_fan_out_copy_may_not_share_a_script() -> None:
     sql = (
         f"COPY (SELECT f.video[1] FROM input('{SRC}') f) TO 'v.mkv'; "
-        f"COPY (SELECT t.track FROM input('{SRC}') g, unnest(g.audio) t) "
+        f"COPY (SELECT t FROM input('{SRC}') g, unnest(g.audio) t) "
         "TO (t.language || '.m4a')"
     )
     err = _rejects(sql)
@@ -373,7 +373,7 @@ def test_a_fan_out_copy_may_not_share_a_script() -> None:
 
 def test_chapters_from_and_a_fan_out_to_are_rejected() -> None:
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
         "TO (t.language || '.m4a') WITH (chapters_from f)"
     )
     assert "'chapters' and a fan-out TO cannot both be set" in _rejects(sql).message
@@ -381,7 +381,7 @@ def test_chapters_from_and_a_fan_out_to_are_rejected() -> None:
 
 def test_metadata_from_and_a_fan_out_to_are_rejected() -> None:
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
         "TO (t.language || '.m4a') WITH (metadata_from f)"
     )
     assert "'metadata_from' and a fan-out TO cannot both be set" in _rejects(sql).message
@@ -398,8 +398,8 @@ def test_a_csv_copy_takes_no_to_expression() -> None:
 
 def test_union_all_and_a_fan_out_to_are_rejected() -> None:
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t "
-        f"UNION ALL SELECT u.track FROM input('{SRC}') g, unnest(g.audio) u) "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t "
+        f"UNION ALL SELECT u FROM input('{SRC}') g, unnest(g.audio) u) "
         "TO (t.language || '.m4a')"
     )
     assert "one row set per branch" in _rejects(sql).message
@@ -408,13 +408,13 @@ def test_union_all_and_a_fan_out_to_are_rejected() -> None:
 def test_a_computed_path_segment_may_not_hold_a_separator() -> None:
     """A language tag of ``a/b`` would otherwise choose a directory."""
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
         "TO (t.language || '/' || t.codec || '.m4a')"
     )
     graphs = compile_commands(sql)  # a LITERAL separator is fine
     assert graphs[0].sinks[0].path == "eng/aac.m4a"
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
         "TO ('x' || t.language || '.m4a')"
     )
     assert compile_commands(sql)[0].sinks[0].path == "xeng.m4a"
@@ -425,7 +425,7 @@ def test_a_separator_inside_a_computed_segment_is_rejected(
 ) -> None:
     _probe_with_language(monkeypatch, "../etc")
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
         "TO (t.language || '.m4a')"
     )
     err = _rejects(sql)
@@ -438,7 +438,7 @@ def test_a_dot_dot_inside_a_computed_segment_is_rejected(
 ) -> None:
     _probe_with_language(monkeypatch, "..")
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
         "TO (t.language || '.m4a')"
     )
     assert "'..'" in _rejects(sql).message
@@ -446,7 +446,7 @@ def test_a_dot_dot_inside_a_computed_segment_is_rejected(
 
 def test_two_rows_naming_one_file_are_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
         "TO (t.codec || '.m4a')"
     )
     err = _rejects(sql)
@@ -455,7 +455,7 @@ def test_two_rows_naming_one_file_are_rejected(monkeypatch: pytest.MonkeyPatch) 
 
 def test_zero_surviving_rows_is_rejected() -> None:
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t "
         "WHERE t.language = 'deu') TO (t.language || '.m4a')"
     )
     assert "no row survives the WHERE clause" in _rejects(sql).message
@@ -464,7 +464,7 @@ def test_zero_surviving_rows_is_rejected() -> None:
 def test_a_null_path_names_the_field(monkeypatch: pytest.MonkeyPatch) -> None:
     _probe_with_language(monkeypatch, None)
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
         "TO (t.title || '.m4a')"
     )
     err = _rejects(sql)
@@ -474,7 +474,7 @@ def test_a_null_path_names_the_field(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_a_numeric_to_expression_is_rejected() -> None:
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
         "TO (t.index + 1)"
     )
     assert "a TO expression must be text, got number" in _rejects(sql).message
@@ -687,7 +687,7 @@ def test_extract_every_language_runs(
     monkeypatch.chdir(tmp_path)
     source = (FIXTURES_DIR / "av2.mp4").as_posix()
     sql = (
-        f"COPY (SELECT t.track FROM input('{source}') f, unnest(f.audio) t) "
+        f"COPY (SELECT t FROM input('{source}') f, unnest(f.audio) t) "
         "TO (t.language || '.m4a')"
     )
     assert cli.main(["run", sql, "-y"]) == 0
@@ -719,7 +719,7 @@ def _two_eng(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 _GROUPED = (
-    f"COPY (SELECT array_agg(t.track), t.language AS title FROM input('{SRC}') f, "
+    f"COPY (SELECT array_agg(t), t.language AS title FROM input('{SRC}') f, "
     "unnest(f.audio) t GROUP BY t.language) TO (t.language || '.mka')"
 )
 
@@ -773,7 +773,7 @@ def test_a_multi_key_group_by_partitions_on_the_tuple(
     )
     monkeypatch.setattr(compiler, "probe_path", lambda path: result)
     sql = (
-        f"COPY (SELECT array_agg(t.track) FROM input('{SRC}') f, unnest(f.audio) t "
+        f"COPY (SELECT array_agg(t) FROM input('{SRC}') f, unnest(f.audio) t "
         "GROUP BY t.language, t.codec) TO (t.language || '-' || t.codec || '.mka')"
     )
     units = _units(sql)
@@ -783,7 +783,7 @@ def test_a_multi_key_group_by_partitions_on_the_tuple(
 
 def test_two_groups_naming_one_file_are_rejected() -> None:
     sql = (
-        f"COPY (SELECT array_agg(t.track) FROM input('{SRC}') f, unnest(f.audio) t "
+        f"COPY (SELECT array_agg(t) FROM input('{SRC}') f, unnest(f.audio) t "
         "GROUP BY t.language) TO (t.codec || '.mka')"
     )
     err = _rejects(sql)
@@ -803,7 +803,7 @@ def test_distinct_groups_colliding_on_one_path_are_rejected(
     )
     monkeypatch.setattr(compiler, "probe_path", lambda path: result)
     sql = (
-        f"COPY (SELECT array_agg(t.track) FROM input('{SRC}') f, unnest(f.audio) t "
+        f"COPY (SELECT array_agg(t) FROM input('{SRC}') f, unnest(f.audio) t "
         "GROUP BY t.language, t.codec) TO (t.codec || '.mka')"
     )
     err = _rejects(sql)
@@ -813,7 +813,7 @@ def test_distinct_groups_colliding_on_one_path_are_rejected(
 
 def test_the_ungrouped_collision_now_points_at_group_by() -> None:
     sql = (
-        f"COPY (SELECT t.track FROM input('{SRC}') f, unnest(f.audio) t) "
+        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
         "TO (t.codec || '.m4a')"
     )
     err = _rejects(sql)
@@ -830,7 +830,7 @@ def test_one_file_per_language_with_all_its_tracks_runs(
     monkeypatch.chdir(tmp_path)
     source = (FIXTURES_DIR / "av-2eng.mp4").as_posix()
     sql = (
-        f"COPY (SELECT array_agg(t.track), t.language AS title FROM input('{source}') f, "
+        f"COPY (SELECT array_agg(t), t.language AS title FROM input('{source}') f, "
         "unnest(f.audio) t GROUP BY t.language) TO (t.language || '.mka')"
     )
     assert cli.main(["run", sql, "-y"]) == 0

@@ -23,8 +23,8 @@ import pytest
 from sqlmpeg import cli
 from sqlmpeg.ir import Graph, Output, SinkUnit
 
-VALID_QUERY = "SELECT scale(a.frame, 640, 480) FROM input('x.mp4') a"
-BAD_QUERY = "SELECT nope(a.frame) FROM input('x.mp4') a"
+VALID_QUERY = "SELECT scale(a.video[1], 640, 480) FROM input('x.mp4') a"
+BAD_QUERY = "SELECT nope(a.video[1]) FROM input('x.mp4') a"
 # `compile` refuses a bare SELECT outright (no COPY, no destination to
 # invent), so any test that wants a compile happy path wraps VALID_QUERY in
 # a COPY ... TO like this one.
@@ -550,7 +550,7 @@ def test_hint_on_validate_json_goes_to_stderr_stdout_stays_pure_json(
 
 
 def test_inline_query_with_single_quotes_compiles(capsys: pytest.CaptureFixture[str]) -> None:
-    query = "COPY (SELECT scale(a.frame, 0.5) FROM input('a clip''s name.mp4') a) TO 'out.mp4'"
+    query = "COPY (SELECT scale(a.video[1], 0.5) FROM input('a clip''s name.mp4') a) TO 'out.mp4'"
     code = cli.main(["compile", query])
     out = capsys.readouterr().out
     assert code == 0
@@ -1048,7 +1048,7 @@ def test_explicit_run_and_default_dispatch_agree(
 # -v/--set CLI variables
 # ---------------------------------------------------------------------------
 
-VAR_QUERY = "SELECT scale(a.frame, 640, 480) FROM input(:'path') a"
+VAR_QUERY = "SELECT scale(a.video[1], 640, 480) FROM input(:'path') a"
 MEDIA_VAR_QUERY = f"COPY ({VAR_QUERY}) TO 'out.mp4'"
 
 

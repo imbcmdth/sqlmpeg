@@ -256,7 +256,7 @@ SOURCES = REG.source_names()
 SINK_NAMES = sorted(SINK_OPTIONS)
 INPUT_NAMES = sorted(INPUT_OPTIONS)
 
-TRACK_COLS = ["track", "language", "codec", "index"]
+TRACK_COLS = ["language", "codec", "index"]
 VIDEO_ROW_COLS = TRACK_COLS + ["width", "height", "fps"]
 AUDIO_ROW_COLS = TRACK_COLS + ["channels", "channel_layout", "sample_rate"]
 CHAPTER_COLS = ["index", "title", "start_t", "end_t"]
@@ -355,11 +355,11 @@ def video_streams(ctx: Ctx) -> list[str]:
     out = []
     for it in ctx.items:
         if it.kind == "input":
-            out += [f"{it.alias}.frame", f"{it.alias}.video[1]"]
+            out.append(f"{it.alias}.video[1]")
         elif it.kind == "vrow":
-            out.append(f"{it.alias}.track")
+            out.append(it.alias)
         elif it.kind == "source-v":
-            out.append(f"{it.alias}.frame")
+            out.append(f"{it.alias}.video[1]")
         elif it.kind == "rel":
             out.append(f"{it.alias}.v")
     return out
@@ -371,9 +371,9 @@ def audio_streams(ctx: Ctx) -> list[str]:
         if it.kind == "input":
             out.append(f"{it.alias}.audio[1]")
         elif it.kind == "arow":
-            out.append(f"{it.alias}.track")
+            out.append(it.alias)
         elif it.kind == "source-a":
-            out.append(f"{it.alias}.track")
+            out.append(f"{it.alias}.audio[1]")
         elif it.kind == "rel":
             out.append(f"{it.alias}.a")
     return out
@@ -396,7 +396,7 @@ def gen_video(ctx: Ctx, depth: int = 0) -> str:
             ]
         )
     if not base or depth > 2 or rng.random() < 0.45:
-        return ctx.pick(base) if base else "a0.frame"
+        return ctx.pick(base) if base else "a0.video[1]"
     return gen_call(ctx, "video", depth)
 
 
@@ -806,13 +806,14 @@ def main() -> None:
         "--mutate", action="store_true", help="also apply textual mutations to 40%% of queries"
     )
     args = ap.parse_args()
-    count, seed, out, p_bad, mutate = args.count, args.seed, args.out, args.p_bad, args.mutate
+    count, seed, out, p_bad = args.count, args.seed, args.out, args.p_bad
+    do_mutate = args.mutate
     rng = random.Random(seed)
     findings: dict[str, dict] = {}
     compiled = rejected = parse_err = 0
     for _ in range(count):
         text = gen_query(rng, p_bad)
-        if mutate and rng.random() < 0.4:
+        if do_mutate and rng.random() < 0.4:
             for _ in range(rng.randint(1, 2)):
                 text = mutate(text, rng)
         probe = rand_probe(rng) if rng.random() < 0.6 else (_PROBE if rng.random() < 0.9 else None)

@@ -1,2 +1,2 @@
-SELECT sqlmpeg.blur_regions(a.frame, 100, 100, 200, 150, 5)
+SELECT sqlmpeg.blur_regions(a.video[1], 100, 100, 200, 150, 5)
 FROM input('clip.mp4') a

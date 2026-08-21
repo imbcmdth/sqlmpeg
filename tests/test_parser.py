@@ -18,15 +18,15 @@ from sqlmpeg.parser import (
 )
 
 README_SQL = """WITH pip AS (
-  SELECT scale(crop(b.frame, 1200, 50, 600, 200), 0.5) AS frame
+  SELECT scale(crop(b.video[1], 1200, 50, 600, 200), 0.5) AS frame
   FROM input('game.mp4') b
 )
-SELECT overlay(a.frame, pip.frame, 20, 20)
+SELECT overlay(a.video[1], pip.frame, 20, 20)
 FROM input('game.mp4') a, pip
 """
 
 # The simplest query that resolves cleanly, for wrapping in a COPY sink.
-SINK_QUERY = "SELECT a.frame FROM input('x.mp4') a"
+SINK_QUERY = "SELECT a.video[1] FROM input('x.mp4') a"
 
 
 def _resolve(sql: str) -> Resolved:
@@ -56,12 +56,14 @@ def _projection(sql: str, index: int = 0) -> exp.Expr:
 
 
 def test_parse_returns_select() -> None:
-    tree = parse("SELECT a.frame FROM input('x.mp4') a")
+    tree = parse("SELECT a.video[1] FROM input('x.mp4') a")
     assert isinstance(tree, exp.Select)
 
 
 def test_parse_returns_union_for_union_all() -> None:
-    tree = parse("SELECT a.frame FROM input('x') a UNION ALL SELECT b.frame FROM input('y') b")
+    tree = parse(
+        "SELECT a.video[1] FROM input('x') a UNION ALL SELECT b.video[1] FROM input('y') b"
+    )
     assert isinstance(tree, exp.Union)
 
 
@@ -81,7 +83,7 @@ def test_parse_empty_is_parse_error(text: str) -> None:
         "SELECT 'unterminated",
         "(((",
         "@@@ not sql @@@",
-        "SELECT a.frame FROM input('x') a WHERE",
+        "SELECT a.video[1] FROM input('x') a WHERE",
     ],
 )
 def test_parse_garbage_is_parse_error(text: str) -> None:
@@ -94,7 +96,7 @@ def test_parse_garbage_is_parse_error(text: str) -> None:
 
 def test_parse_error_is_line_anchored() -> None:
     with pytest.raises(SqlmpegError) as excinfo:
-        parse("SELECT a.frame\nFROM input('x') a\nWHERE a.t BETWEEN AND 2")
+        parse("SELECT a.video[1]\nFROM input('x') a\nWHERE a.t BETWEEN AND 2")
     assert excinfo.value.code is ErrorCode.PARSE_ERROR
     assert excinfo.value.line == 3
 
@@ -105,7 +107,7 @@ def test_parse_error_is_line_anchored() -> None:
 
 
 def test_single_input() -> None:
-    res = _resolve("SELECT a.frame FROM input('clip.mp4') a")
+    res = _resolve("SELECT a.video[1] FROM input('clip.mp4') a")
     assert isinstance(res.select, exp.Select)
     assert res.input_paths == ["clip.mp4"]
     assert res.sources == {"a": 0}
@@ -124,14 +126,17 @@ def test_readme_example_maps_one_file_to_two_inputs() -> None:
 
 
 def test_two_aliases_same_file_without_cte() -> None:
-    res = _resolve("SELECT overlay(a.frame, b.frame, 0, 0) FROM input('g.mp4') a, input('g.mp4') b")
+    res = _resolve(
+        "SELECT overlay(a.video[1], b.video[1], 0, 0) "
+        "FROM input('g.mp4') a, input('g.mp4') b"
+    )
     assert res.input_paths == ["g.mp4", "g.mp4"]
     assert res.sources == {"a": 0, "b": 1}
 
 
 def test_cte_names_are_not_inputs() -> None:
     res = _resolve(
-        "WITH c AS (SELECT hflip(a.frame) AS frame FROM input('x.mp4') a) SELECT c.frame FROM c"
+        "WITH c AS (SELECT hflip(a.video[1]) AS frame FROM input('x.mp4') a) SELECT c.frame FROM c"
     )
     assert res.input_paths == ["x.mp4"]
     assert res.sources == {"a": 0}
@@ -141,7 +146,7 @@ def test_cte_names_are_not_inputs() -> None:
 
 def test_ctes_in_definition_order() -> None:
     sql = (
-        "WITH one AS (SELECT a.frame FROM input('a.mp4') a), "
+        "WITH one AS (SELECT a.video[1] FROM input('a.mp4') a), "
         "two AS (SELECT hflip(one.frame) AS frame FROM one) "
         "SELECT two.frame FROM two"
     )
@@ -152,24 +157,24 @@ def test_ctes_in_definition_order() -> None:
 
 def test_union_all_branches() -> None:
     sql = (
-        "SELECT a.frame FROM input('x.mp4') a "
-        "UNION ALL SELECT b.frame FROM input('y.mp4') b "
-        "UNION ALL SELECT c.frame FROM input('z.mp4') c"
+        "SELECT a.video[1] FROM input('x.mp4') a "
+        "UNION ALL SELECT b.video[1] FROM input('y.mp4') b "
+        "UNION ALL SELECT c.video[1] FROM input('z.mp4') c"
     )
     res = _resolve(sql)
     assert isinstance(res.select, exp.Union)
     assert res.input_paths == ["x.mp4", "y.mp4", "z.mp4"]
     assert res.sources == {"a": 0, "b": 1, "c": 2}
     assert len(res.branches) == 3
-    assert [b.expressions[0].table for b in res.branches] == ["a", "b", "c"]
+    assert [b.expressions[0].this.table for b in res.branches] == ["a", "b", "c"]
 
 
 def test_union_all_inside_cte() -> None:
     sql = (
         "WITH c AS ("
-        "  SELECT a.frame FROM input('x.mp4') a "
-        "  UNION ALL SELECT b.frame FROM input('y.mp4') b"
-        ") SELECT c.frame FROM c"
+        "  SELECT a.video[1] AS v FROM input('x.mp4') a "
+        "  UNION ALL SELECT b.video[1] AS v FROM input('y.mp4') b"
+        ") SELECT c.v FROM c"
     )
     res = _resolve(sql)
     assert list(res.ctes) == ["c"]
@@ -179,7 +184,7 @@ def test_union_all_inside_cte() -> None:
 
 
 def test_where_between_is_accepted() -> None:
-    res = _resolve("SELECT a.frame FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2.5")
+    res = _resolve("SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2.5")
     assert res.sources == {"a": 0}
     where = res.select.args.get("where")
     assert isinstance(where, exp.Where)
@@ -187,7 +192,7 @@ def test_where_between_is_accepted() -> None:
 
 def test_where_conjunction_per_alias_is_accepted() -> None:
     sql = (
-        "SELECT overlay(a.frame, b.frame, 0, 0) FROM input('x.mp4') a, input('y.mp4') b "
+        "SELECT overlay(a.video[1], b.video[1], 0, 0) FROM input('x.mp4') a, input('y.mp4') b "
         "WHERE a.t BETWEEN 0 AND 1 AND b.t BETWEEN 2 AND 3"
     )
     res = _resolve(sql)
@@ -200,12 +205,12 @@ def test_where_conjunction_per_alias_is_accepted() -> None:
 
 
 def test_where_gte_open_lower_bound_is_accepted() -> None:
-    res = _resolve("SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 5")
+    res = _resolve("SELECT a.video[1] FROM input('x.mp4') a WHERE a.t >= 5")
     assert res.sources == {"a": 0}
 
 
 def test_where_lte_open_upper_bound_is_accepted() -> None:
-    res = _resolve("SELECT a.frame FROM input('x.mp4') a WHERE a.t <= 60")
+    res = _resolve("SELECT a.video[1] FROM input('x.mp4') a WHERE a.t <= 60")
     assert res.sources == {"a": 0}
 
 
@@ -217,25 +222,25 @@ def test_where_flipped_gte_operand_order_is_accepted() -> None:
     ``parser._time_bounds`` for real, not the same code path as the
     unflipped form.
     """
-    res = _resolve("SELECT a.frame FROM input('x.mp4') a WHERE 120 <= a.t")
+    res = _resolve("SELECT a.video[1] FROM input('x.mp4') a WHERE 120 <= a.t")
     assert res.sources == {"a": 0}
 
 
 def test_where_flipped_lte_operand_order_is_accepted() -> None:
     """``60 >= a.t`` is the exact mirror of ``a.t <= 60``, same upper bound."""
-    res = _resolve("SELECT a.frame FROM input('x.mp4') a WHERE 60 >= a.t")
+    res = _resolve("SELECT a.video[1] FROM input('x.mp4') a WHERE 60 >= a.t")
     assert res.sources == {"a": 0}
 
 
 def test_where_gte_and_lte_merge_into_one_window() -> None:
     """``t >= 1 AND t <= 2`` is accepted exactly like ``t BETWEEN 1 AND 2``."""
-    res = _resolve("SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 1 AND a.t <= 2")
+    res = _resolve("SELECT a.video[1] FROM input('x.mp4') a WHERE a.t >= 1 AND a.t <= 2")
     assert res.sources == {"a": 0}
 
 
 def test_where_open_bound_mixes_with_between_on_another_alias() -> None:
     sql = (
-        "SELECT overlay(a.frame, b.frame, 0, 0) FROM input('x.mp4') a, input('y.mp4') b "
+        "SELECT overlay(a.video[1], b.video[1], 0, 0) FROM input('x.mp4') a, input('y.mp4') b "
         "WHERE a.t >= 1 AND b.t BETWEEN 0 AND 5"
     )
     res = _resolve(sql)
@@ -245,10 +250,10 @@ def test_where_open_bound_mixes_with_between_on_another_alias() -> None:
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT a.frame FROM input('x.mp4') a WHERE a.t > 5",
-        "SELECT a.frame FROM input('x.mp4') a WHERE 5 < a.t",
-        "SELECT a.frame FROM input('x.mp4') a WHERE a.t < 60",
-        "SELECT a.frame FROM input('x.mp4') a WHERE 60 > a.t",
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t > 5",
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE 5 < a.t",
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t < 60",
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE 60 > a.t",
     ],
 )
 def test_strict_inequality_is_rejected_with_dedicated_hint(sql: str) -> None:
@@ -261,10 +266,10 @@ def test_strict_inequality_is_rejected_with_dedicated_hint(sql: str) -> None:
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 1 AND a.t >= 2",
-        "SELECT a.frame FROM input('x.mp4') a WHERE a.t <= 1 AND a.t <= 2",
-        "SELECT a.frame FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2 AND a.t >= 3",
-        "SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 1 AND a.t BETWEEN 2 AND 3",
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t >= 1 AND a.t >= 2",
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t <= 1 AND a.t <= 2",
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2 AND a.t >= 3",
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t >= 1 AND a.t BETWEEN 2 AND 3",
     ],
 )
 def test_a_second_bound_of_the_same_kind_is_rejected(sql: str) -> None:
@@ -276,7 +281,7 @@ def test_a_second_bound_of_the_same_kind_is_rejected(sql: str) -> None:
 
 
 def test_non_literal_inequality_bound_is_rejected() -> None:
-    sql = "SELECT a.frame FROM input('x.mp4') a, input('y.mp4') b WHERE a.t >= b.t"
+    sql = "SELECT a.video[1] FROM input('x.mp4') a, input('y.mp4') b WHERE a.t >= b.t"
     err = _reject(sql)
     assert err.code is ErrorCode.UNSUPPORTED_SQL
 
@@ -284,9 +289,9 @@ def test_non_literal_inequality_bound_is_rejected() -> None:
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 5 AND a.t <= 2",
-        "SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 5 AND a.t <= 5",
-        "SELECT a.frame FROM input('x.mp4') a WHERE a.t BETWEEN 5 AND 2",
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t >= 5 AND a.t <= 2",
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t >= 5 AND a.t <= 5",
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 5 AND 2",
     ],
 )
 def test_empty_time_window_is_rejected_at_compile_time(sql: str) -> None:
@@ -296,20 +301,21 @@ def test_empty_time_window_is_rejected_at_compile_time(sql: str) -> None:
 
 
 def test_alias_case_is_folded_like_postgres() -> None:
-    res = _resolve("SELECT A.frame FROM input('x.mp4') A WHERE a.t BETWEEN 1 AND 2")
+    res = _resolve("SELECT A.video[1] FROM input('x.mp4') A WHERE a.t BETWEEN 1 AND 2")
     assert res.sources == {"a": 0}
 
 
 def test_parenthesized_union_branches() -> None:
     res = _resolve(
-        "(SELECT a.frame FROM input('x.mp4') a) UNION ALL (SELECT b.frame FROM input('y.mp4') b)"
+        "(SELECT a.video[1] FROM input('x.mp4') a) "
+        "UNION ALL (SELECT b.video[1] FROM input('y.mp4') b)"
     )
     assert len(res.branches) == 2
     assert res.sources == {"a": 0, "b": 1}
 
 
 def test_union_branches_helper_on_plain_select() -> None:
-    res = _resolve("SELECT a.frame FROM input('x.mp4') a")
+    res = _resolve("SELECT a.video[1] FROM input('x.mp4') a")
     assert union_branches(res.select) == [res.select]
 
 
@@ -321,17 +327,17 @@ def test_union_branches_helper_on_plain_select() -> None:
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT a.frame FROM input('x') a GROUP BY a.frame",
-        "SELECT a.frame FROM input('x') a HAVING count(*) > 1",
-        "SELECT a.frame FROM input('x') a ORDER BY a.t",
-        "SELECT a.frame FROM input('x') a LIMIT 1",
-        "SELECT a.frame FROM input('x') a OFFSET 1",
-        "SELECT DISTINCT a.frame FROM input('x') a",
+        "SELECT a.video[1] FROM input('x') a GROUP BY a.video[1]",
+        "SELECT a.video[1] FROM input('x') a HAVING count(*) > 1",
+        "SELECT a.video[1] FROM input('x') a ORDER BY a.t",
+        "SELECT a.video[1] FROM input('x') a LIMIT 1",
+        "SELECT a.video[1] FROM input('x') a OFFSET 1",
+        "SELECT DISTINCT a.video[1] FROM input('x') a",
         "SELECT row_number() OVER (ORDER BY a.t) FROM input('x') a",
-        "SELECT count(a.frame) FROM input('x') a",
+        "SELECT count(a.video[1]) FROM input('x') a",
         "SELECT max(a.t) FROM input('x') a",
-        "SELECT a.frame FROM input('x') a WHERE a.t IN (SELECT b.t FROM input('y') b)",
-        "SELECT a.frame FROM input('x') a WHERE EXISTS (SELECT 1)",
+        "SELECT a.video[1] FROM input('x') a WHERE a.t IN (SELECT b.t FROM input('y') b)",
+        "SELECT a.video[1] FROM input('x') a WHERE EXISTS (SELECT 1)",
     ],
 )
 def test_no_streaming_equivalent(sql: str) -> None:
@@ -339,7 +345,7 @@ def test_no_streaming_equivalent(sql: str) -> None:
 
 
 def test_union_without_all_suggests_union_all() -> None:
-    err = _reject("SELECT a.frame FROM input('x') a UNION SELECT b.frame FROM input('y') b")
+    err = _reject("SELECT a.video[1] FROM input('x') a UNION SELECT b.video[1] FROM input('y') b")
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
     assert err.hint is not None and "UNION ALL" in err.hint
 
@@ -366,7 +372,7 @@ def test_two_output_columns_in_cte_are_legal() -> None:
 
 def test_many_output_columns_are_legal() -> None:
     res = _resolve(
-        "SELECT a.video[1], a.audio[1], a.audio[2], hflip(a.frame) FROM input('x') a"
+        "SELECT a.video[1], a.audio[1], a.audio[2], hflip(a.video[1]) FROM input('x') a"
     )
     assert len(res.branches[0].expressions) == 4
 
@@ -403,7 +409,7 @@ def test_select_with_no_output_column_is_rejected() -> None:
         "SELECT a.video[1], b.* FROM input('x') a, input('y') b",
         "SELECT *, a.audio[1] FROM input('x') a",
         'SELECT "A".* FROM input(\'x\') "A"',
-        "WITH c AS (SELECT a.frame AS f FROM input('x') a) SELECT c.* FROM c",
+        "WITH c AS (SELECT a.video[1] AS f FROM input('x') a) SELECT c.* FROM c",
         "WITH c AS (SELECT * FROM input('x') a) SELECT * FROM c",
         "COPY (SELECT * FROM input('x.mp4') a) TO 'out.mkv'",
     ],
@@ -460,7 +466,7 @@ def test_star_projection_is_column_anchored() -> None:
 
 
 def test_star_in_where_is_still_rejected() -> None:
-    err = _reject("SELECT a.frame FROM input('x') a WHERE * BETWEEN 1 AND 2")
+    err = _reject("SELECT a.video[1] FROM input('x') a WHERE * BETWEEN 1 AND 2")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
@@ -506,7 +512,7 @@ def test_subtitle_and_data_columns_are_accepted(sql: str) -> None:
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT a.frame FROM input('x') a",
+        "SELECT a.video[1] FROM input('x') a",
         "SELECT a.video FROM input('x') a",
         "SELECT a.audio FROM input('x') a",
         "SELECT a.video[1] FROM input('x') a",
@@ -665,28 +671,28 @@ def test_constant_folded_subscript_is_accepted_as_its_value() -> None:
 
 
 def test_unknown_alias_in_select() -> None:
-    assert _reject("SELECT z.frame FROM input('x') a").code is ErrorCode.UNKNOWN_ALIAS
+    assert _reject("SELECT z.video[1] FROM input('x') a").code is ErrorCode.UNKNOWN_ALIAS
 
 
 def test_unknown_alias_in_where() -> None:
-    sql = "SELECT a.frame FROM input('x') a WHERE z.t BETWEEN 1 AND 2"
+    sql = "SELECT a.video[1] FROM input('x') a WHERE z.t BETWEEN 1 AND 2"
     assert _reject(sql).code is ErrorCode.UNKNOWN_ALIAS
 
 
 def test_unknown_table_in_from() -> None:
-    assert _reject("SELECT c.frame FROM c").code is ErrorCode.UNKNOWN_ALIAS
+    assert _reject("SELECT c.v FROM c").code is ErrorCode.UNKNOWN_ALIAS
 
 
 def test_cte_cannot_forward_reference() -> None:
     sql = (
-        "WITH c AS (SELECT d.frame FROM d), "
-        "d AS (SELECT a.frame FROM input('x') a) SELECT c.frame FROM c"
+        "WITH c AS (SELECT d.v FROM d), "
+        "d AS (SELECT a.video[1] AS v FROM input('x') a) SELECT c.v FROM c"
     )
     assert _reject(sql).code is ErrorCode.UNKNOWN_ALIAS
 
 
 def test_unknown_alias_is_line_anchored() -> None:
-    sql = "SELECT\n  z.frame\nFROM input('x') a"
+    sql = "SELECT\n  z.video[1]\nFROM input('x') a"
     err = _reject(sql)
     assert err.code is ErrorCode.UNKNOWN_ALIAS
     assert err.line == 2
@@ -700,10 +706,10 @@ def test_unknown_alias_is_line_anchored() -> None:
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT a.frame FROM input('x') a JOIN input('y') b ON a.t = b.t",
-        "SELECT a.frame FROM input('x') a INNER JOIN input('y') b ON a.t = b.t",
-        "SELECT a.frame FROM input('x') a LEFT JOIN input('y') b ON a.t = b.t",
-        "SELECT a.frame FROM input('x') a CROSS JOIN input('y') b",
+        "SELECT a.video[1] FROM input('x') a JOIN input('y') b ON a.t = b.t",
+        "SELECT a.video[1] FROM input('x') a INNER JOIN input('y') b ON a.t = b.t",
+        "SELECT a.video[1] FROM input('x') a LEFT JOIN input('y') b ON a.t = b.t",
+        "SELECT a.video[1] FROM input('x') a CROSS JOIN input('y') b",
     ],
 )
 def test_explicit_join_syntax(sql: str) -> None:
@@ -721,9 +727,9 @@ def test_input_without_alias() -> None:
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT a.frame FROM input() a",
-        "SELECT a.frame FROM input('x', 'y') a",
-        "SELECT a.frame FROM input(1) a",
+        "SELECT a.video[1] FROM input() a",
+        "SELECT a.video[1] FROM input('x', 'y') a",
+        "SELECT a.video[1] FROM input(1) a",
     ],
 )
 def test_input_requires_one_string_literal(sql: str) -> None:
@@ -731,7 +737,7 @@ def test_input_requires_one_string_literal(sql: str) -> None:
 
 
 def test_unknown_table_function() -> None:
-    assert _reject("SELECT a.frame FROM stream('x') a").code is ErrorCode.UNSUPPORTED_SQL
+    assert _reject("SELECT a.video[1] FROM stream('x') a").code is ErrorCode.UNSUPPORTED_SQL
 
 
 # ---------------------------------------------------------------------------
@@ -740,12 +746,12 @@ def test_unknown_table_function() -> None:
 
 
 def test_input_with_no_named_options_has_no_input_options_entry() -> None:
-    res = _resolve("SELECT a.frame FROM input('x.mp4') a")
+    res = _resolve("SELECT a.video[1] FROM input('x.mp4') a")
     assert res.input_options == {}
 
 
 def test_input_named_option_is_collected() -> None:
-    res = _resolve("SELECT a.frame FROM input('x.png', loop => true) a")
+    res = _resolve("SELECT a.video[1] FROM input('x.png', loop => true) a")
     assert list(res.input_options) == ["a"]
     options = res.input_options["a"]
     assert len(options) == 1
@@ -757,20 +763,20 @@ def test_input_named_option_is_collected() -> None:
 
 def test_input_multiple_named_options_keep_written_order() -> None:
     res = _resolve(
-        "SELECT a.frame FROM input('x.png', loop => true, framerate => 15) a"
+        "SELECT a.video[1] FROM input('x.png', loop => true, framerate => 15) a"
     )
     assert [o.name for o in res.input_options["a"]] == ["loop", "framerate"]
 
 
 def test_input_option_name_is_verbatim_not_folded() -> None:
     """Unlike a sink option, input options reuse Kwarg's case-sensitive name."""
-    res = _resolve("SELECT a.frame FROM input('x.mp4', HwAccel => 'cuda') a")
+    res = _resolve("SELECT a.video[1] FROM input('x.mp4', HwAccel => 'cuda') a")
     assert res.input_options["a"][0].name == "HwAccel"
 
 
 def test_two_input_aliases_keep_separate_option_sets() -> None:
     res = _resolve(
-        "SELECT a.frame, b.frame FROM input('x.png', loop => true) a, "
+        "SELECT a.video[1], b.video[1] FROM input('x.png', loop => true) a, "
         "input('y.mp4', hwaccel => 'cuda') b"
     )
     assert [o.name for o in res.input_options["a"]] == ["loop"]
@@ -779,24 +785,24 @@ def test_two_input_aliases_keep_separate_option_sets() -> None:
 
 def test_input_duplicate_named_option_is_rejected() -> None:
     err = _reject(
-        "SELECT a.frame FROM input('x.png', loop => true, loop => false) a"
+        "SELECT a.video[1] FROM input('x.png', loop => true, loop => false) a"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
 def test_input_positional_after_named_option_is_rejected() -> None:
-    err = _reject("SELECT a.frame FROM input('x.png', loop => true, 5) a")
+    err = _reject("SELECT a.video[1] FROM input('x.png', loop => true, 5) a")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
 def test_input_second_positional_before_any_named_option_is_rejected() -> None:
-    err = _reject("SELECT a.frame FROM input('x.png', 5, loop => true) a")
+    err = _reject("SELECT a.video[1] FROM input('x.png', 5, loop => true) a")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
 def test_input_named_option_with_no_value_is_rejected() -> None:
     # sqlglot itself rejects a valueless `=>` -- never reaches the resolver.
-    err = _reject("SELECT a.frame FROM input('x.png', loop =>) a")
+    err = _reject("SELECT a.video[1] FROM input('x.png', loop =>) a")
     assert err.code is ErrorCode.PARSE_ERROR
 
 
@@ -816,7 +822,7 @@ def test_input_named_option_with_no_value_is_rejected() -> None:
 
 
 def test_a_source_parses_as_a_table_with_a_db_qualifier() -> None:
-    table = _resolve("SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t").branches[
+    table = _resolve("SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2) t").branches[
         0
     ].args["from_"].this
     assert isinstance(table, exp.Table)
@@ -829,7 +835,7 @@ def test_a_source_parses_as_a_table_with_a_db_qualifier() -> None:
 
 def test_source_is_collected_with_its_raw_options() -> None:
     res = _resolve(
-        "SELECT t.frame FROM ffmpeg.testsrc(duration => 2, size => '320x240') t"
+        "SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2, size => '320x240') t"
     )
     assert list(res.source_filters) == ["t"]
     raw = res.source_filters["t"]
@@ -842,34 +848,34 @@ def test_source_is_collected_with_its_raw_options() -> None:
 
 def test_a_source_takes_no_input_index() -> None:
     """No `-i`: a source is a zero-input filter, so it is in neither table."""
-    res = _resolve("SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t")
+    res = _resolve("SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2) t")
     assert res.input_paths == []
     assert res.sources == {}
 
 
 def test_a_source_with_empty_parens_is_accepted() -> None:
-    res = _resolve("SELECT t.frame FROM ffmpeg.testsrc() t")
+    res = _resolve("SELECT t.video[1] FROM ffmpeg.testsrc() t")
     assert res.source_filters["t"].options == ()
 
 
 def test_a_source_without_parens_is_rejected_with_a_hint() -> None:
-    err = _reject("SELECT t.frame FROM ffmpeg.testsrc t")
+    err = _reject("SELECT t.video[1] FROM ffmpeg.testsrc t")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'ffmpeg.testsrc' is not a table" in err.message
     assert err.hint is not None and "is a CALL" in err.hint
 
 
 def test_a_source_requires_an_alias() -> None:
-    err = _reject("SELECT t.frame FROM ffmpeg.testsrc(duration => 2)")
+    err = _reject("SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2)")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "ffmpeg.testsrc() requires an alias" in err.message
 
 
 def test_a_source_takes_no_positional_arguments() -> None:
     for sql in (
-        "SELECT t.frame FROM ffmpeg.testsrc(2) t",
-        "SELECT t.frame FROM ffmpeg.testsrc(2, duration => 1) t",
-        "SELECT t.frame FROM ffmpeg.testsrc(duration => 1, 2) t",
+        "SELECT t.video[1] FROM ffmpeg.testsrc(2) t",
+        "SELECT t.video[1] FROM ffmpeg.testsrc(2, duration => 1) t",
+        "SELECT t.video[1] FROM ffmpeg.testsrc(duration => 1, 2) t",
     ):
         err = _reject(sql)
         assert err.code is ErrorCode.UNSUPPORTED_SQL, sql
@@ -877,21 +883,21 @@ def test_a_source_takes_no_positional_arguments() -> None:
 
 
 def test_a_source_rejects_a_duplicate_option() -> None:
-    err = _reject("SELECT t.frame FROM ffmpeg.testsrc(duration => 1, duration => 2) t")
+    err = _reject("SELECT t.video[1] FROM ffmpeg.testsrc(duration => 1, duration => 2) t")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "duplicate named argument 'duration'" in err.message
 
 
 def test_a_source_option_name_is_verbatim_and_its_own_name_is_folded() -> None:
     """Function names are case-insensitive; ffmpeg AVOption names are not."""
-    res = _resolve("SELECT t.frame FROM FFMPEG.TestSrc(Duration => 2) t")
+    res = _resolve("SELECT t.video[1] FROM FFMPEG.TestSrc(Duration => 2) t")
     raw = res.source_filters["t"]
     assert raw.name == "testsrc"
     assert raw.options[0].name == "Duration"
 
 
 def test_a_source_alias_may_use_as() -> None:
-    res = _resolve("SELECT t.frame FROM ffmpeg.testsrc(duration => 2) AS t")
+    res = _resolve("SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2) AS t")
     assert list(res.source_filters) == ["t"]
 
 
@@ -907,22 +913,22 @@ def test_a_source_joins_an_input_with_a_comma() -> None:
 
 def test_a_source_is_legal_in_a_cte_body_and_a_union_branch() -> None:
     res = _resolve(
-        "WITH bg AS (SELECT t.frame AS v FROM ffmpeg.testsrc(duration => 2) t) "
+        "WITH bg AS (SELECT t.video[1] AS v FROM ffmpeg.testsrc(duration => 2) t) "
         "SELECT bg.v FROM bg"
     )
     assert list(res.source_filters) == ["t"]
     res = _resolve(
-        "SELECT f.frame FROM input('a.mp4') f UNION ALL "
-        "SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t"
+        "SELECT f.video[1] FROM input('a.mp4') f UNION ALL "
+        "SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2) t"
     )
     assert list(res.source_filters) == ["t"]
 
 
 def test_a_source_alias_is_unique_across_the_whole_query() -> None:
     for sql in (
-        "SELECT t.frame FROM ffmpeg.testsrc() t, ffmpeg.testsrc() t",
-        "SELECT t.frame FROM input('x.mp4') t, ffmpeg.testsrc() t",
-        "SELECT t.frame FROM ffmpeg.testsrc() t, input('x.mp4') t",
+        "SELECT t.video[1] FROM ffmpeg.testsrc() t, ffmpeg.testsrc() t",
+        "SELECT t.video[1] FROM input('x.mp4') t, ffmpeg.testsrc() t",
+        "SELECT t.video[1] FROM ffmpeg.testsrc() t, input('x.mp4') t",
     ):
         err = _reject(sql)
         assert err.code is ErrorCode.UNSUPPORTED_SQL, sql
@@ -931,26 +937,26 @@ def test_a_source_alias_is_unique_across_the_whole_query() -> None:
 
 def test_a_source_may_not_be_aliased_ffmpeg() -> None:
     """The namespace name stays reserved in FROM position too."""
-    err = _reject("SELECT ffmpeg.frame FROM ffmpeg.testsrc(duration => 2) ffmpeg")
+    err = _reject("SELECT ffmpeg.video[1] FROM ffmpeg.testsrc(duration => 2) ffmpeg")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'ffmpeg' is reserved for the filter namespace" in err.message
 
 
 def test_a_three_part_name_is_not_the_namespace() -> None:
-    err = _reject("SELECT t.frame FROM x.ffmpeg.testsrc(duration => 2) t")
+    err = _reject("SELECT t.video[1] FROM x.ffmpeg.testsrc(duration => 2) t")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "qualified table names are not supported" in err.message
 
 
 def test_a_non_namespace_qualifier_is_still_rejected() -> None:
-    err = _reject("SELECT a.frame FROM public.clips a")
+    err = _reject("SELECT a.video[1] FROM public.clips a")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "qualified table names are not supported" in err.message
 
 
 def test_a_bare_source_name_in_from_is_not_a_table_function() -> None:
     """The namespace is mandatory (`random` etc. collide bare)."""
-    err = _reject("SELECT t.frame FROM testsrc(duration => 2) t")
+    err = _reject("SELECT t.video[1] FROM testsrc(duration => 2) t")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unsupported table function testsrc()" in err.message
 
@@ -964,21 +970,21 @@ def test_a_source_column_is_not_whitelisted_by_the_parser() -> None:
 
 
 def test_a_source_rejection_is_line_anchored() -> None:
-    err = _reject("SELECT t.frame\nFROM ffmpeg.testsrc(2) t")
+    err = _reject("SELECT t.video[1]\nFROM ffmpeg.testsrc(2) t")
     assert err.line == 2
 
 
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT a.frame FROM input('x') a WHERE a.t = 1",
-        "SELECT a.frame FROM input('x') a WHERE a.t > 1",
-        "SELECT a.frame FROM input('x') a WHERE a.t BETWEEN 1 AND 2 OR a.t BETWEEN 3 AND 4",
-        "SELECT a.frame FROM input('x') a WHERE NOT a.t BETWEEN 1 AND 2",
-        "SELECT a.frame FROM input('x') a WHERE a.x BETWEEN 1 AND 2",
-        "SELECT a.frame FROM input('x') a WHERE a.t BETWEEN 1 AND 'two'",
-        "SELECT a.frame FROM input('x') a WHERE t BETWEEN 1 AND 2",
-        "SELECT a.frame FROM input('x') a WHERE a.t BETWEEN 1 AND 2 AND a.t BETWEEN 3 AND 4",
+        "SELECT a.video[1] FROM input('x') a WHERE a.t = 1",
+        "SELECT a.video[1] FROM input('x') a WHERE a.t > 1",
+        "SELECT a.video[1] FROM input('x') a WHERE a.t BETWEEN 1 AND 2 OR a.t BETWEEN 3 AND 4",
+        "SELECT a.video[1] FROM input('x') a WHERE NOT a.t BETWEEN 1 AND 2",
+        "SELECT a.video[1] FROM input('x') a WHERE a.x BETWEEN 1 AND 2",
+        "SELECT a.video[1] FROM input('x') a WHERE a.t BETWEEN 1 AND 'two'",
+        "SELECT a.video[1] FROM input('x') a WHERE t BETWEEN 1 AND 2",
+        "SELECT a.video[1] FROM input('x') a WHERE a.t BETWEEN 1 AND 2 AND a.t BETWEEN 3 AND 4",
     ],
 )
 def test_unsupported_where_forms(sql: str) -> None:
@@ -989,21 +995,21 @@ def test_unsupported_where_forms(sql: str) -> None:
 
 def test_duplicate_cte_name() -> None:
     sql = (
-        "WITH c AS (SELECT a.frame FROM input('x') a), "
-        "c AS (SELECT b.frame FROM input('y') b) SELECT c.frame FROM c"
+        "WITH c AS (SELECT a.video[1] FROM input('x') a), "
+        "c AS (SELECT b.video[1] AS v FROM input('y') b) SELECT c.v FROM c"
     )
     assert _reject(sql).code is ErrorCode.UNSUPPORTED_SQL
 
 
 def test_duplicate_alias() -> None:
     assert (
-        _reject("SELECT a.frame FROM input('x') a, input('y') a").code
+        _reject("SELECT a.video[1] FROM input('x') a, input('y') a").code
         is ErrorCode.UNSUPPORTED_SQL
     )
 
 
 def test_alias_colliding_with_cte_name() -> None:
-    sql = "WITH c AS (SELECT a.frame FROM input('x') a) SELECT c.frame FROM input('y') c, c"
+    sql = "WITH c AS (SELECT a.video[1] FROM input('x') a) SELECT c.video[1] FROM input('y') c, c"
     assert _reject(sql).code is ErrorCode.UNSUPPORTED_SQL
 
 
@@ -1016,15 +1022,15 @@ def test_alias_colliding_with_cte_name() -> None:
         "CREATE TABLE t (x INT)",
         "SELECT 1; SELECT 2",
         "SELECT 1",
-        "SELECT a.frame FROM (SELECT b.frame FROM input('x') b) a",
-        "SELECT a.frame FROM input('x') a EXCEPT SELECT b.frame FROM input('y') b",
-        "SELECT a.frame FROM input('x') a INTERSECT SELECT b.frame FROM input('y') b",
-        "WITH RECURSIVE c AS (SELECT a.frame FROM input('x') a) SELECT c.frame FROM c",
-        "WITH c AS (WITH d AS (SELECT a.frame FROM input('x') a) SELECT d.frame FROM d) "
-        "SELECT c.frame FROM c",
-        "SELECT a.frame FROM input('x') a(c)",
-        "SELECT frame FROM input('x') a",
-        "SELECT a.frame FROM sch.tbl a",
+        "SELECT a.video[1] FROM (SELECT b.video[1] FROM input('x') b) a",
+        "SELECT a.video[1] FROM input('x') a EXCEPT SELECT b.video[1] FROM input('y') b",
+        "SELECT a.video[1] FROM input('x') a INTERSECT SELECT b.video[1] FROM input('y') b",
+        "WITH RECURSIVE c AS (SELECT a.video[1] AS v FROM input('x') a) SELECT c.v FROM c",
+        "WITH c AS (WITH d AS (SELECT a.video[1] AS v FROM input('x') a) SELECT d.v FROM d) "
+        "SELECT c.v FROM c",
+        "SELECT a.video[1] FROM input('x') a(c)",
+        "SELECT video FROM input('x') a",
+        "SELECT a.video[1] FROM sch.tbl a",
     ],
 )
 def test_outside_the_surface(sql: str) -> None:
@@ -1032,7 +1038,7 @@ def test_outside_the_surface(sql: str) -> None:
 
 
 def test_cte_body_must_be_a_select() -> None:
-    err = _reject("WITH c AS (INSERT INTO t VALUES (1)) SELECT c.frame FROM c")
+    err = _reject("WITH c AS (INSERT INTO t VALUES (1)) SELECT c.v FROM c")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
@@ -1048,7 +1054,7 @@ def test_cte_body_must_be_a_select() -> None:
 def test_named_arguments_resolve() -> None:
     """The resolver accepts them structurally: `sigma` is not an alias, not a
     column, and not checked against anything here."""
-    projection = _projection("SELECT gblur(a.frame, sigma => 5) FROM input('x.mp4') a")
+    projection = _projection("SELECT gblur(a.video[1], sigma => 5) FROM input('x.mp4') a")
     assert isinstance(projection, exp.Anonymous)
     kwarg = projection.expressions[1]
     assert isinstance(kwarg, exp.Kwarg)
@@ -1060,7 +1066,7 @@ def test_named_argument_names_keep_their_case() -> None:
     an ffmpeg AVOption, not an identifier: gblur's sigmaV must survive."""
     from sqlmpeg.parser import kwarg_name
 
-    projection = _projection("SELECT gblur(a.frame, sigmaV => 5) FROM input('x.mp4') a")
+    projection = _projection("SELECT gblur(a.video[1], sigmaV => 5) FROM input('x.mp4') a")
     assert isinstance(projection, exp.Anonymous)
     kwarg = projection.expressions[1]
     assert isinstance(kwarg, exp.Kwarg)
@@ -1069,43 +1075,43 @@ def test_named_argument_names_keep_their_case() -> None:
 
 def test_named_arguments_may_be_nested_and_repeated_across_calls() -> None:
     _resolve(
-        "SELECT gblur(unsharp(a.frame, lx => 7), sigma => 2), gblur(a.frame, sigma => 3) "
+        "SELECT gblur(unsharp(a.video[1], lx => 7), sigma => 2), gblur(a.video[1], sigma => 3) "
         "FROM input('x.mp4') a"
     )
 
 
 def test_a_positional_argument_after_a_named_one_is_rejected() -> None:
-    err = _reject("SELECT blur(a.frame, planes => 1, 5) FROM input('x.mp4') a")
+    err = _reject("SELECT blur(a.video[1], planes => 1, 5) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "must come before named arguments" in err.message
 
 
 def test_a_duplicate_named_argument_is_rejected() -> None:
-    err = _reject("SELECT blur(a.frame, 5, planes => 1, planes => 2) FROM input('x.mp4') a")
+    err = _reject("SELECT blur(a.video[1], 5, planes => 1, planes => 2) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "duplicate named argument 'planes'" in err.message
 
 
 def test_a_duplicate_named_argument_is_anchored_on_the_second_one() -> None:
     err = _reject(
-        "SELECT blur(a.frame, 5,\n  planes => 1,\n  planes => 2)\nFROM input('x.mp4') a"
+        "SELECT blur(a.video[1], 5,\n  planes => 1,\n  planes => 2)\nFROM input('x.mp4') a"
     )
     assert err.line == 3
 
 
 def test_named_arguments_are_checked_inside_a_cte_and_a_union() -> None:
     for sql in (
-        "WITH c AS (SELECT blur(a.frame, planes => 1, 5) AS f FROM input('x.mp4') a) "
+        "WITH c AS (SELECT blur(a.video[1], planes => 1, 5) AS f FROM input('x.mp4') a) "
         "SELECT c.f FROM c",
-        "SELECT a.frame FROM input('x.mp4') a UNION ALL "
-        "SELECT blur(b.frame, planes => 1, 5) FROM input('y.mp4') b",
+        "SELECT a.video[1] FROM input('x.mp4') a UNION ALL "
+        "SELECT blur(b.video[1], planes => 1, 5) FROM input('y.mp4') b",
     ):
         assert _reject(sql).code is ErrorCode.UNSUPPORTED_SQL
 
 
 def test_a_named_argument_does_not_smuggle_in_a_column() -> None:
     """The value goes through the same column whitelist everything else does."""
-    err = _reject("SELECT gblur(a.frame, sigma => b.frame) FROM input('x.mp4') a")
+    err = _reject("SELECT gblur(a.video[1], sigma => b.video[1]) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UNKNOWN_ALIAS
 
 
@@ -1115,7 +1121,7 @@ def test_overlay_cannot_take_named_arguments() -> None:
     even tokenize as a named argument -- a documented dead end, not a silent
     mis-parse."""
     err = _reject(
-        "SELECT overlay(a.frame, b.frame, 0, 0, eof_action => 'pass') "
+        "SELECT overlay(a.video[1], b.video[1], 0, 0, eof_action => 'pass') "
         "FROM input('x.mp4') a, input('y.mp4') b"
     )
     assert err.code is ErrorCode.PARSE_ERROR
@@ -1171,7 +1177,7 @@ def test_copy_option_names_are_folded_lowercase() -> None:
 
 def test_copy_wraps_a_cte_query() -> None:
     sql = (
-        "COPY (WITH c AS (SELECT a.frame AS f FROM input('x.mp4') a) "
+        "COPY (WITH c AS (SELECT a.video[1] AS f FROM input('x.mp4') a) "
         "SELECT c.f FROM c) TO 'out.mkv'"
     )
     res = _resolve(sql)
@@ -1181,8 +1187,8 @@ def test_copy_wraps_a_cte_query() -> None:
 
 def test_copy_wraps_a_union_all() -> None:
     res = _resolve(
-        "COPY (SELECT a.frame FROM input('x') a UNION ALL "
-        "SELECT b.frame FROM input('y') b) TO 'out.mkv'"
+        "COPY (SELECT a.video[1] FROM input('x') a UNION ALL "
+        "SELECT b.video[1] FROM input('y') b) TO 'out.mkv'"
     )
     assert len(res.branches) == 2
     assert len(res.sinks) == 1
@@ -1191,8 +1197,8 @@ def test_copy_wraps_a_union_all() -> None:
 def test_a_sink_carries_its_own_validated_query() -> None:
     """One COPY is one output group, so a sink owns a whole query."""
     res = _resolve(
-        "COPY (SELECT a.frame FROM input('x') a UNION ALL "
-        "SELECT b.frame FROM input('y') b) TO 'out.mkv'"
+        "COPY (SELECT a.video[1] FROM input('x') a UNION ALL "
+        "SELECT b.video[1] FROM input('y') b) TO 'out.mkv'"
     )
     sink = res.sinks[0]
     assert sink.query is res.select
@@ -1202,7 +1208,7 @@ def test_a_sink_carries_its_own_validated_query() -> None:
 def test_copy_keeps_no_streaming_equivalent_of_the_inner_query() -> None:
     """A COPY wrapper never widens the surface: the inner error still wins."""
     err = _reject(
-        "COPY (SELECT a.frame FROM input('x.mp4') a GROUP BY a.frame) "
+        "COPY (SELECT a.video[1] FROM input('x.mp4') a GROUP BY a.video[1]) "
         "TO 'out.mkv' WITH (crf 20)"
     )
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
@@ -1212,9 +1218,9 @@ def test_copy_keeps_no_streaming_equivalent_of_the_inner_query() -> None:
     "sql",
     [
         "COPY (SELECT frame FROM input('x.mp4') a) TO 'out.mkv'",
-        "COPY (SELECT a.frame FROM input('x.mp4')) TO 'out.mkv'",
+        "COPY (SELECT a.video[1] FROM input('x.mp4')) TO 'out.mkv'",
         "COPY (SELECT scale(a.*, 0.5) FROM input('x.mp4') a) TO 'out.mkv'",
-        "COPY (SELECT a.frame FROM input('x.mp4') a LIMIT 1) TO 'out.mkv'",
+        "COPY (SELECT a.video[1] FROM input('x.mp4') a LIMIT 1) TO 'out.mkv'",
     ],
 )
 def test_copy_does_not_relax_inner_validation(sql: str) -> None:
@@ -1339,7 +1345,7 @@ def test_duplicate_option_is_anchored_on_the_second_one() -> None:
     "sql",
     [
         # sqlglot refuses a CTE in front of COPY outright ...
-        f"WITH c AS ({SINK_QUERY}) COPY (SELECT c.frame FROM c) TO 'o.mkv'",
+        f"WITH c AS ({SINK_QUERY}) COPY (SELECT c.v FROM c) TO 'o.mkv'",
         # ... and a nested COPY, and a parenthesized one.
         f"COPY (COPY ({SINK_QUERY}) TO 'a.mkv') TO 'b.mkv'",
         f"(COPY ({SINK_QUERY}) TO 'o.mkv')",
@@ -1361,7 +1367,7 @@ def test_copy_shapes_sqlglot_itself_refuses(sql: str) -> None:
 # TEMPORARY rejection of a second one lives in `sqlmpeg.lower`.
 
 VIEW_SCRIPT = """CREATE VIEW master AS
-  SELECT scale(a.frame, 1280, -2) AS v FROM input('film.mkv') a;
+  SELECT scale(a.video[1], 1280, -2) AS v FROM input('film.mkv') a;
 
 COPY (SELECT master.v FROM master) TO 'out.mp4' WITH (crf 20);
 """
@@ -1399,7 +1405,7 @@ def test_a_view_is_bound_exactly_like_a_cte() -> None:
 
 def test_a_view_may_reference_an_earlier_view() -> None:
     res = _resolve(
-        "CREATE VIEW one AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
+        "CREATE VIEW one AS SELECT a.video[1] AS v FROM input('x.mp4') a;\n"
         "CREATE VIEW two AS SELECT scale(one.v, 0.5) AS v FROM one;\n"
         "COPY (SELECT two.v FROM two) TO 'out.mp4';"
     )
@@ -1410,7 +1416,7 @@ def test_a_view_may_reference_an_earlier_view() -> None:
 def test_a_view_may_not_reference_a_later_view() -> None:
     err = _reject(
         "CREATE VIEW one AS SELECT two.v AS v FROM two;\n"
-        "CREATE VIEW two AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
+        "CREATE VIEW two AS SELECT a.video[1] AS v FROM input('x.mp4') a;\n"
         "COPY (SELECT one.v FROM one) TO 'out.mp4';"
     )
     assert err.code is ErrorCode.UNKNOWN_ALIAS
@@ -1421,7 +1427,7 @@ def test_a_view_body_may_have_its_own_with() -> None:
     is CTE-body-only) does not apply to it. Its CTEs are hoisted into the flat
     binding table AHEAD of the view, which is the order lower needs."""
     res = _resolve(
-        "CREATE VIEW v AS WITH c AS (SELECT a.frame AS f FROM input('x.mp4') a) "
+        "CREATE VIEW v AS WITH c AS (SELECT a.video[1] AS f FROM input('x.mp4') a) "
         "SELECT c.f AS v FROM c;\n"
         "COPY (SELECT v.v FROM v) TO 'out.mp4';"
     )
@@ -1431,7 +1437,7 @@ def test_a_view_body_may_have_its_own_with() -> None:
 
 def test_a_cte_body_still_may_not_have_its_own_with() -> None:
     err = _reject(
-        "CREATE VIEW v AS WITH c AS (WITH d AS (SELECT a.frame AS f "
+        "CREATE VIEW v AS WITH c AS (WITH d AS (SELECT a.video[1] AS f "
         "FROM input('x.mp4') a) SELECT d.f AS f FROM d) SELECT c.f AS v FROM c;\n"
         "COPY (SELECT v.v FROM v) TO 'out.mp4';"
     )
@@ -1441,8 +1447,8 @@ def test_a_cte_body_still_may_not_have_its_own_with() -> None:
 
 def test_a_view_body_may_be_a_union_all() -> None:
     res = _resolve(
-        "CREATE VIEW v AS SELECT a.frame AS f FROM input('x') a UNION ALL "
-        "SELECT b.frame AS f FROM input('y') b;\n"
+        "CREATE VIEW v AS SELECT a.video[1] AS f FROM input('x') a UNION ALL "
+        "SELECT b.video[1] AS f FROM input('y') b;\n"
         "COPY (SELECT v.f FROM v) TO 'out.mp4';"
     )
     assert isinstance(res.views["v"], exp.Union)
@@ -1451,7 +1457,7 @@ def test_a_view_body_may_be_a_union_all() -> None:
 
 def test_a_copy_may_still_carry_its_own_with_in_a_script() -> None:
     res = _resolve(
-        "CREATE VIEW v AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "CREATE VIEW v AS SELECT a.video[1] AS f FROM input('x.mp4') a;\n"
         "COPY (WITH c AS (SELECT v.f AS g FROM v) SELECT c.g FROM c) TO 'out.mp4';"
     )
     assert list(res.ctes) == ["v", "c"]
@@ -1460,7 +1466,7 @@ def test_a_copy_may_still_carry_its_own_with_in_a_script() -> None:
 def test_several_copies_resolve_cleanly() -> None:
     """Resolve is already multi-sink; only lowering is not."""
     res = _resolve(
-        "CREATE VIEW m AS SELECT a.frame AS v FROM input('film.mkv') a;\n"
+        "CREATE VIEW m AS SELECT a.video[1] AS v FROM input('film.mkv') a;\n"
         "COPY (SELECT scale(m.v, 1280, -2) FROM m) TO '720.mp4';\n"
         "COPY (SELECT scale(m.v, 640, -2) FROM m) TO '360.mp4' WITH (crf 30);"
     )
@@ -1473,8 +1479,8 @@ def test_several_copies_resolve_cleanly() -> None:
 
 def test_a_view_must_precede_every_copy() -> None:
     err = _reject(
-        "COPY (SELECT a.frame FROM input('x.mp4') a) TO 'out.mp4';\n"
-        "CREATE VIEW v AS SELECT b.frame AS f FROM input('y.mp4') b;"
+        "COPY (SELECT a.video[1] FROM input('x.mp4') a) TO 'out.mp4';\n"
+        "CREATE VIEW v AS SELECT b.video[1] AS f FROM input('y.mp4') b;"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "may not follow a COPY" in err.message
@@ -1483,7 +1489,7 @@ def test_a_view_must_precede_every_copy() -> None:
 
 def test_a_bare_select_in_a_script_is_rejected() -> None:
     err = _reject(
-        "CREATE VIEW v AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "CREATE VIEW v AS SELECT a.video[1] AS f FROM input('x.mp4') a;\n"
         "SELECT v.f FROM v;"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -1491,15 +1497,15 @@ def test_a_bare_select_in_a_script_is_rejected() -> None:
 
 
 def test_a_script_with_no_copy_is_rejected() -> None:
-    err = _reject("CREATE VIEW v AS SELECT a.frame AS f FROM input('x.mp4') a;")
+    err = _reject("CREATE VIEW v AS SELECT a.video[1] AS f FROM input('x.mp4') a;")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "must write its output with COPY" in err.message
 
 
 def test_an_unused_view_is_rejected_at_its_create() -> None:
     err = _reject(
-        "CREATE VIEW used AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
-        "CREATE VIEW spare AS SELECT b.frame AS f FROM input('y.mp4') b;\n"
+        "CREATE VIEW used AS SELECT a.video[1] AS f FROM input('x.mp4') a;\n"
+        "CREATE VIEW spare AS SELECT b.video[1] AS f FROM input('y.mp4') b;\n"
         "COPY (SELECT used.f FROM used) TO 'out.mp4';"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -1509,7 +1515,7 @@ def test_an_unused_view_is_rejected_at_its_create() -> None:
 
 def test_a_view_used_only_by_another_view_counts_as_used() -> None:
     _resolve(
-        "CREATE VIEW one AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
+        "CREATE VIEW one AS SELECT a.video[1] AS v FROM input('x.mp4') a;\n"
         "CREATE VIEW two AS SELECT scale(one.v, 0.5) AS v FROM one;\n"
         "COPY (SELECT two.v FROM two) TO 'out.mp4';"
     )
@@ -1518,23 +1524,23 @@ def test_a_view_used_only_by_another_view_counts_as_used() -> None:
 def test_view_names_share_the_flat_namespace() -> None:
     for sql in (
         # view vs view
-        "CREATE VIEW v AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
-        "CREATE VIEW v AS SELECT b.frame AS f FROM input('y.mp4') b;\n"
+        "CREATE VIEW v AS SELECT a.video[1] AS f FROM input('x.mp4') a;\n"
+        "CREATE VIEW v AS SELECT b.video[1] AS f FROM input('y.mp4') b;\n"
         "COPY (SELECT v.f FROM v) TO 'out.mp4';",
         # view vs an input alias declared inside it
-        "CREATE VIEW a AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "CREATE VIEW a AS SELECT a.video[1] AS f FROM input('x.mp4') a;\n"
         "COPY (SELECT a.f FROM a) TO 'out.mp4';",
         # view vs a CTE of its own body
-        "CREATE VIEW c AS WITH c AS (SELECT a.frame AS f FROM input('x.mp4') a) "
+        "CREATE VIEW c AS WITH c AS (SELECT a.video[1] AS f FROM input('x.mp4') a) "
         "SELECT c.f AS f FROM c;\n"
         "COPY (SELECT c.f FROM c) TO 'out.mp4';",
         # view vs a CTE of a later COPY
-        "CREATE VIEW v AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
-        "COPY (WITH v AS (SELECT b.frame AS f FROM input('y.mp4') b) "
+        "CREATE VIEW v AS SELECT a.video[1] AS f FROM input('x.mp4') a;\n"
+        "COPY (WITH v AS (SELECT b.video[1] AS f FROM input('y.mp4') b) "
         "SELECT v.f FROM v) TO 'out.mp4';",
         # view vs a later input alias
-        "CREATE VIEW b AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
-        "COPY (SELECT b.frame FROM b, input('y.mp4') b) TO 'out.mp4';",
+        "CREATE VIEW b AS SELECT a.video[1] AS f FROM input('x.mp4') a;\n"
+        "COPY (SELECT b.video[1] FROM b, input('y.mp4') b) TO 'out.mp4';",
     ):
         err = _reject(sql)
         assert err.code is ErrorCode.UNSUPPORTED_SQL, sql
@@ -1542,7 +1548,7 @@ def test_view_names_share_the_flat_namespace() -> None:
 
 def test_ffmpeg_is_reserved_as_a_view_name() -> None:
     err = _reject(
-        "CREATE VIEW ffmpeg AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "CREATE VIEW ffmpeg AS SELECT a.video[1] AS f FROM input('x.mp4') a;\n"
         "COPY (SELECT ffmpeg.f FROM ffmpeg) TO 'out.mp4';"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -1551,13 +1557,13 @@ def test_ffmpeg_is_reserved_as_a_view_name() -> None:
 
 def test_view_names_fold_the_postgres_way() -> None:
     res = _resolve(
-        "CREATE VIEW Master AS SELECT a.frame AS f FROM input('x.mp4') a;\n"
+        "CREATE VIEW Master AS SELECT a.video[1] AS f FROM input('x.mp4') a;\n"
         "COPY (SELECT MASTER.f FROM mAsTeR) TO 'out.mp4';"
     )
     assert list(res.views) == ["master"]
 
 
-_VIEW_BODY = "SELECT a.frame AS f FROM input('x.mp4') a"
+_VIEW_BODY = "SELECT a.video[1] AS f FROM input('x.mp4') a"
 _VIEW_COPY = "COPY (SELECT v.f FROM v) TO 'out.mp4';"
 
 
@@ -1589,7 +1595,7 @@ def test_rejected_create_variants(label: str, create: str) -> None:
 def test_a_bad_view_body_is_rejected_like_any_other_query() -> None:
     """A view never widens the surface."""
     err = _reject(
-        "CREATE VIEW v AS SELECT a.frame AS f FROM input('x.mp4') a GROUP BY a.frame;\n"
+        "CREATE VIEW v AS SELECT a.video[1] AS f FROM input('x.mp4') a GROUP BY a.video[1];\n"
         f"{_VIEW_COPY}"
     )
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
@@ -1635,16 +1641,16 @@ def test_a_view_alias_may_not_be_the_filter_namespace() -> None:
 def test_a_cte_may_be_aliased_too() -> None:
     """The relaxation is on the binding, not on how it was defined."""
     res = _resolve(
-        "WITH c AS (SELECT a.frame FROM input('x') a) SELECT z.frame FROM c z"
+        "WITH c AS (SELECT a.video[1] FROM input('x') a) SELECT z.video[1] FROM c z"
     )
     assert list(res.ctes) == ["c"]
 
 
 def test_an_aliased_name_may_not_collide_with_another_from_entry() -> None:
     err = _reject(
-        "WITH c AS (SELECT a.frame FROM input('x') a), "
-        "d AS (SELECT b.frame FROM input('y') b) "
-        "SELECT z.frame FROM c z, d z"
+        "WITH c AS (SELECT a.video[1] FROM input('x') a), "
+        "d AS (SELECT b.video[1] FROM input('y') b) "
+        "SELECT z.video[1] FROM c z, d z"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "duplicate name 'z'" in err.message
@@ -1657,7 +1663,7 @@ def test_an_aliased_name_may_not_collide_with_another_from_entry() -> None:
 
 def test_unnest_binds_a_track_row_table() -> None:
     res = _resolve(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
         "WHERE t.language = 'eng'"
     )
     assert list(res.track_rows) == ["t"]
@@ -1671,20 +1677,20 @@ def test_unnest_binds_a_track_row_table() -> None:
 @pytest.mark.parametrize("column", ["video", "audio", "subtitle", "data"])
 def test_every_stream_array_unnests(column: str) -> None:
     res = _resolve(
-        f"SELECT t.track FROM input('f.mkv') f, unnest(f.{column}) t"
+        f"SELECT t FROM input('f.mkv') f, unnest(f.{column}) t"
     )
     assert res.track_rows["t"].column == column
 
 
 def test_unnest_accepts_the_as_spelling_and_folds_the_alias() -> None:
-    res = _resolve("SELECT T.track FROM input('f.mkv') f, unnest(f.AUDIO) AS T")
+    res = _resolve("SELECT T FROM input('f.mkv') f, unnest(f.AUDIO) AS T")
     assert list(res.track_rows) == ["t"]
     assert res.track_rows["t"].column == "audio"
 
 
 def test_two_unnests_of_one_input_are_two_row_tables() -> None:
     res = _resolve(
-        "SELECT a.track, b.track FROM input('f.mkv') f, "
+        "SELECT a, b FROM input('f.mkv') f, "
         "unnest(f.audio) a, unnest(f.video) b"
     )
     assert [(name, rows.column) for name, rows in res.track_rows.items()] == [
@@ -1695,44 +1701,44 @@ def test_two_unnests_of_one_input_are_two_row_tables() -> None:
 
 def test_unnest_binds_inside_a_cte_body_and_a_union_branch() -> None:
     res = _resolve(
-        "WITH x AS (SELECT t.track AS a FROM input('f.mkv') f, unnest(f.audio) t) "
+        "WITH x AS (SELECT t AS a FROM input('f.mkv') f, unnest(f.audio) t) "
         "SELECT x.a FROM x"
     )
     assert res.track_rows["t"].source == "f"
     res = _resolve(
-        "SELECT t.track FROM input('a.mkv') f, unnest(f.audio) t "
+        "SELECT t FROM input('a.mkv') f, unnest(f.audio) t "
         "UNION ALL "
-        "SELECT u.track FROM input('b.mkv') g, unnest(g.audio) u"
+        "SELECT u FROM input('b.mkv') g, unnest(g.audio) u"
     )
     assert sorted(res.track_rows) == ["t", "u"]
 
 
 def test_a_row_alias_shares_the_one_flat_namespace() -> None:
     err = _reject(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t, unnest(f.video) t"
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t, unnest(f.video) t"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "duplicate name 't'" in err.message
-    err = _reject("SELECT t.track FROM input('f.mkv') t, unnest(t.audio) t")
+    err = _reject("SELECT t.language FROM input('f.mkv') t, unnest(t.audio) t")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "duplicate name 't'" in err.message
 
 
 def test_unnest_requires_an_alias() -> None:
-    err = _reject("SELECT t.track FROM input('f.mkv') f, unnest(f.audio)")
+    err = _reject("SELECT t FROM input('f.mkv') f, unnest(f.audio)")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "requires an alias" in err.message
 
 
 def test_unnest_rejects_a_column_alias_list() -> None:
-    err = _reject("SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t(x)")
+    err = _reject("SELECT t FROM input('f.mkv') f, unnest(f.audio) t(x)")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "column aliases" in err.message
 
 
 def test_unnest_rejects_with_ordinality() -> None:
     err = _reject(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) WITH ORDINALITY t"
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) WITH ORDINALITY t"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "ORDINALITY" in err.message
@@ -1741,16 +1747,16 @@ def test_unnest_rejects_with_ordinality() -> None:
 
 @pytest.mark.parametrize(
     "argument",
-    ["f.audio[1]", "f.frame", "f.t", "'audio'", "f.*", "unnest(f.audio)"],
+    ["f.audio[1]", "f.video[1]", "f.t", "'audio'", "f.*", "unnest(f.audio)"],
 )
 def test_unnest_takes_a_bare_stream_array_and_nothing_else(argument: str) -> None:
-    err = _reject(f"SELECT t.track FROM input('f.mkv') f, unnest({argument}) t")
+    err = _reject(f"SELECT t FROM input('f.mkv') f, unnest({argument}) t")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
 def test_unnest_rejects_more_than_one_argument() -> None:
     err = _reject(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio, f.video) t"
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio, f.video) t"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "exactly one array column" in err.message
@@ -1759,7 +1765,7 @@ def test_unnest_rejects_more_than_one_argument() -> None:
 def test_unnest_only_sees_comma_sources_written_before_it() -> None:
     # Postgres scopes an implicit-LATERAL function call to the FROM items
     # written before it, so this genuinely does not see `f`.
-    err = _reject("SELECT t.track FROM unnest(f.audio) t, input('f.mkv') f")
+    err = _reject("SELECT t FROM unnest(f.audio) t, input('f.mkv') f")
     assert err.code is ErrorCode.UNKNOWN_ALIAS
     assert "unknown alias 'f'" in err.message
 
@@ -1767,12 +1773,12 @@ def test_unnest_only_sees_comma_sources_written_before_it() -> None:
 def test_unnest_needs_an_input_not_a_cte_or_a_generated_source() -> None:
     err = _reject(
         "WITH c AS (SELECT a.audio AS tracks FROM input('f.mkv') a) "
-        "SELECT t.track FROM c, unnest(c.tracks) t"
+        "SELECT t FROM c, unnest(c.tracks) t"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "only an input's array column can be unnested" in err.message
     err = _reject(
-        "SELECT t.track FROM ffmpeg.anullsrc(duration => 2) s, unnest(s.audio) t"
+        "SELECT t FROM ffmpeg.anullsrc(duration => 2) s, unnest(s.audio) t"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "only an input's array column can be unnested" in err.message
@@ -1783,7 +1789,7 @@ def test_unnest_needs_an_input_not_a_cte_or_a_generated_source() -> None:
 
 def _joined(join: str = "JOIN", on: str = "ON a.language = b.language") -> str:
     return (
-        "SELECT a.track FROM input('a.mkv') f, input('b.mkv') g, "
+        "SELECT a FROM input('a.mkv') f, input('b.mkv') g, "
         f"unnest(f.audio) a {join} unnest(g.audio) b {on}"
     )
 
@@ -1823,8 +1829,8 @@ def test_a_join_on_columns_of_different_types_is_rejected() -> None:
     assert "so they can never match" in err.message
 
 
-def test_a_join_cannot_match_on_the_track_column() -> None:
-    err = _reject(_joined(on="ON a.track = b.track"))
+def test_a_join_cannot_match_on_the_row_stream() -> None:
+    err = _reject(_joined(on="ON a = b"))
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "is a stream, not a value to compare" in err.message
 
@@ -1881,7 +1887,7 @@ def test_join_is_still_rejected_between_stream_level_sources() -> None:
 
 def test_join_is_rejected_when_its_left_side_is_not_a_row_table() -> None:
     err = _reject(
-        "SELECT a.track FROM input('a.mkv') f, input('b.mkv') g "
+        "SELECT a FROM input('a.mkv') f, input('b.mkv') g "
         "JOIN unnest(g.audio) a ON a.language = 'eng'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -1894,21 +1900,54 @@ def test_join_is_rejected_when_its_left_side_is_not_a_row_table() -> None:
 @pytest.mark.parametrize(
     "column",
     [
-        "track", "index", "language", "title", "codec", "channels",
+        "index", "language", "title", "codec", "channels",
         "channel_layout", "sample_rate", "bitrate", "duration",
     ],
 )
 def test_audio_row_columns_resolve(column: str) -> None:
     sql = (
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
         f"WHERE t.{column} IS NOT NULL"
     )
-    if column == "track":
-        err = _reject(sql)
-        assert err.code is ErrorCode.UNSUPPORTED_SQL
-        assert "is a stream, not a value to compare" in err.message
-    else:
-        assert _resolve(sql).track_rows["t"].column == "audio"
+    assert _resolve(sql).track_rows["t"].column == "audio"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t",
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE t.track IS NOT NULL",
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t ORDER BY t.track",
+    ],
+)
+def test_the_track_column_left_the_language(sql: str) -> None:
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.message == "'t.track' is not a column"
+    assert err.hint == "the row is the stream: use 't'"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT f.frame FROM input('x.mp4') f",
+        "COPY (SELECT t FROM input('x.mp4') f, unnest(f.audio) t) "
+        "TO (f.frame || '.mka')",
+    ],
+)
+def test_the_frame_column_left_the_language(sql: str) -> None:
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.message == "'f.frame' is not a column"
+    assert err.hint == "the first video stream is 'f.video[1]'"
+
+
+def test_a_bare_row_alias_is_a_stream_not_a_where_value() -> None:
+    err = _reject(
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE t IS NOT NULL"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t' is a stream, not a value to compare" in err.message
 
 
 @pytest.mark.parametrize(
@@ -1916,7 +1955,7 @@ def test_audio_row_columns_resolve(column: str) -> None:
 )
 def test_video_row_columns_resolve(column: str) -> None:
     _resolve(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.video) t "
+        "SELECT t FROM input('f.mkv') f, unnest(f.video) t "
         f"WHERE t.{column} IS NOT NULL"
     )
 
@@ -1924,14 +1963,14 @@ def test_video_row_columns_resolve(column: str) -> None:
 def test_a_row_column_is_checked_against_its_stream_types_schema() -> None:
     # `channels` is an audio column; a video row has no such thing.
     err = _reject(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.video) t WHERE t.channels = 2"
+        "SELECT t FROM input('f.mkv') f, unnest(f.video) t WHERE t.channels = 2"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unknown column 't.channels'" in err.message
     assert err.hint is not None and "video track rows expose" in err.hint
     # ... and a subtitle row carries only the five common ones.
     err = _reject(
-        "SELECT s.track FROM input('f.mkv') f, unnest(f.subtitle) s WHERE s.width = 1"
+        "SELECT s FROM input('f.mkv') f, unnest(f.subtitle) s WHERE s.width = 1"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unknown column 's.width'" in err.message
@@ -1968,7 +2007,7 @@ def test_an_unknown_row_column_in_the_select_list_is_rejected() -> None:
 )
 def test_row_predicates_are_admitted(predicate: str) -> None:
     _resolve(
-        f"SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t WHERE {predicate}"
+        f"SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE {predicate}"
     )
 
 
@@ -1984,20 +2023,20 @@ def test_row_predicates_are_admitted(predicate: str) -> None:
 )
 def test_unsupported_row_predicates_are_rejected(predicate: str) -> None:
     err = _reject(
-        f"SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t WHERE {predicate}"
+        f"SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE {predicate}"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
 def test_a_row_predicate_is_typed_against_the_static_column_type() -> None:
     err = _reject(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
         "WHERE t.channels = 'stereo'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'t.channels' is number" in err.message
     err = _reject(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t WHERE t.language = 5"
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE t.language = 5"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'t.language' is text" in err.message
@@ -2005,7 +2044,7 @@ def test_a_row_predicate_is_typed_against_the_static_column_type() -> None:
 
 def test_a_row_predicate_may_not_compare_the_stream_column() -> None:
     err = _reject(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t WHERE t.track = 1"
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE t = 1"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "is a stream, not a value to compare" in err.message
@@ -2013,7 +2052,7 @@ def test_a_row_predicate_may_not_compare_the_stream_column() -> None:
 
 def test_a_time_window_and_a_row_predicate_coexist_as_separate_conjuncts() -> None:
     res = _resolve(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
         "WHERE f.t BETWEEN 1 AND 2 AND t.language = 'eng'"
     )
     assert res.track_rows["t"].source == "f"
@@ -2021,7 +2060,7 @@ def test_a_time_window_and_a_row_predicate_coexist_as_separate_conjuncts() -> No
 
 def test_a_conjunct_may_not_mix_a_row_column_with_another_alias() -> None:
     err = _reject(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
         "WHERE t.language = 'eng' OR f.t >= 1"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -2030,7 +2069,7 @@ def test_a_conjunct_may_not_mix_a_row_column_with_another_alias() -> None:
 
 def test_a_conjunct_may_reference_only_one_row_table() -> None:
     err = _reject(
-        "SELECT a.track FROM input('f.mkv') f, unnest(f.audio) a, unnest(f.video) b "
+        "SELECT a FROM input('f.mkv') f, unnest(f.audio) a, unnest(f.video) b "
         "WHERE a.language = b.language"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -2040,7 +2079,7 @@ def test_a_conjunct_may_reference_only_one_row_table() -> None:
 def test_a_time_window_over_an_input_still_rejects_a_non_t_column() -> None:
     # The time half of the WHERE clause is untouched by the row half.
     err = _reject(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t WHERE f.video >= 1"
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE f.video >= 1"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "only the time column 'f.t' can be filtered" in err.message
@@ -2051,7 +2090,7 @@ def test_a_time_window_over_an_input_still_rejects_a_non_t_column() -> None:
 
 def test_order_by_is_admitted_over_track_row_columns() -> None:
     res = _resolve(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
         "ORDER BY t.language, t.channels DESC"
     )
     order = res.branches[0].args["order"]
@@ -2068,10 +2107,10 @@ def test_order_by_without_any_unnest_is_still_rejected() -> None:
     assert err.hint == "remove the ORDER BY clause"
 
 
-@pytest.mark.parametrize("key", ["f.t", "1", "t.track"])
+@pytest.mark.parametrize("key", ["f.t", "1", "t"])
 def test_order_by_a_non_row_column_is_rejected_even_in_a_row_query(key: str) -> None:
     err = _reject(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
         f"ORDER BY {key}"
     )
     assert err.code in (
@@ -2081,7 +2120,7 @@ def test_order_by_a_non_row_column_is_rejected_even_in_a_row_query(key: str) -> 
 
 
 def test_the_other_streaming_rejections_are_untouched_by_the_carve_out() -> None:
-    err = _reject("SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t LIMIT 1")
+    err = _reject("SELECT t FROM input('f.mkv') f, unnest(f.audio) t LIMIT 1")
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
 
 
@@ -2101,28 +2140,25 @@ def test_both_subscript_metadata_spellings_are_admitted(spelling: str) -> None:
     _resolve(f"SELECT f.audio[1] FROM input('f.mkv') f WHERE {spelling} = 'eng'")
 
 
-def test_dot_track_is_sugar_for_the_bare_bracket_in_select() -> None:
-    res = _resolve("SELECT f.audio[1].track FROM input('f.mkv') f")
-    projection = res.branches[0].expressions[0]
-    assert isinstance(projection, exp.Dot)
-
-
-def test_dot_track_is_still_a_stream_not_a_where_value() -> None:
-    # `.track` parses fine in WHERE position too -- it is simply rejected for
-    # the same reason a row table's bare `t.track` is: a stream is not
-    # something to compare.
-    err = _reject(
-        "SELECT f.audio[1] FROM input('f.mkv') f WHERE f.audio[1].track = 1"
-    )
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT f.audio[1].track FROM input('f.mkv') f",
+        "SELECT f.audio[1] FROM input('f.mkv') f WHERE f.audio[1].track = 1",
+    ],
+)
+def test_a_subscript_has_no_track_accessor_left(sql: str) -> None:
+    err = _reject(sql)
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "is a stream, not a value to compare" in err.message
+    assert "'f.audio[1].track' is not a column" in err.message
+    assert err.hint is not None and "use 'f.audio[1]'" in err.hint
 
 
 @pytest.mark.parametrize(
     "column",
     ["language", "title", "codec", "channels", "channel_layout", "index"],
 )
-def test_a_non_track_accessor_is_rejected_as_a_select_output_in_a_media_query(
+def test_a_metadata_accessor_is_rejected_as_a_select_output_in_a_media_query(
     column: str,
 ) -> None:
     # this rejection is MEDIA-only -- a bare SELECT (no
@@ -2233,8 +2269,8 @@ def test_video_subtitle_and_data_subscript_accessors_resolve(
 
 def test_a_subscript_accessor_over_a_cte_is_rejected() -> None:
     err = _reject(
-        "WITH c AS (SELECT a.frame FROM input('a.mkv') a) "
-        "SELECT c.frame FROM c WHERE c.frame[1].language = 'eng'"
+        "WITH c AS (SELECT a.video[1] AS v FROM input('a.mkv') a) "
+        "SELECT c.v FROM c WHERE c.v[1].language = 'eng'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "is a CTE" in err.message
@@ -2253,7 +2289,7 @@ def test_a_subscript_accessor_over_a_row_alias_is_rejected() -> None:
     # In SELECT position, so the row-language WHERE grammar (which claims
     # anything mentioning a row alias first) is not what intercepts this.
     err = _reject(
-        "SELECT t.track[1].language FROM input('f.mkv') f, unnest(f.audio) t"
+        "SELECT t[1].language FROM input('f.mkv') f, unnest(f.audio) t"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "already a track-row table" in err.message
@@ -2270,13 +2306,13 @@ def test_a_subscript_accessor_over_a_row_alias_is_rejected() -> None:
         "SELECT",
         "WITH",
         "WITH c AS () SELECT 1",
-        "SELECT a.frame FROM input('x') a WHERE a.t BETWEEN AND 2",
-        "SELECT scale(a.frame,) FROM input('x') a",
-        "SELECT a.frame FROM input('x') a,",
+        "SELECT a.video[1] FROM input('x') a WHERE a.t BETWEEN AND 2",
+        "SELECT scale(a.video[1],) FROM input('x') a",
+        "SELECT a.video[1] FROM input('x') a,",
         "select 'x' from input('x')",
         "-- just a comment",
         "/* block */",
-        "SELECT a.frame FROM input('x') a UNION ALL",
+        "SELECT a.video[1] FROM input('x') a UNION ALL",
         "\x00\x01",
         "SELECT a.video[ FROM input('x') a",
         "SELECT a.video[] FROM input('x') a",
@@ -2284,7 +2320,7 @@ def test_a_subscript_accessor_over_a_row_alias_is_rejected() -> None:
         "SELECT a.video[1 FROM input('x') a",
         "SELECT a.video[" + "1," * 200 + "1] FROM input('x') a",
         "SELECT " + "a.video[1], " * 200 + "a.audio[1] FROM input('x') a",
-        "SELECT " + "f(" * 60 + "a.frame" + ")" * 60 + " FROM input('x') a",
+        "SELECT " + "f(" * 60 + "a.video[1]" + ")" * 60 + " FROM input('x') a",
     ],
 )
 def test_never_raises_anything_but_sqlmpeg_error(sql: str) -> None:
@@ -2388,10 +2424,10 @@ def test_chapters_column_list_is_rejected() -> None:
     assert "table column aliases are not supported" in err.message
 
 
-def test_chapters_row_columns_are_the_fixed_schema() -> None:
-    err = _reject("SELECT c.track FROM input('f.mkv') f, unnest(f.chapters) c")
+def test_a_chapter_row_is_not_a_stream() -> None:
+    err = _reject("SELECT c FROM input('f.mkv') f, unnest(f.chapters) c")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "unknown column 'c.track'" in err.message
+    assert "'c' is a chapter row, not a stream" in err.message
 
 
 def test_values_cte_binds_a_row_table_not_a_normal_cte() -> None:
@@ -2464,44 +2500,44 @@ _ROWS = "FROM input('x.mp4') f, unnest(f.audio) t"
 
 
 def test_arithmetic_over_row_columns_types_as_a_number() -> None:
-    _resolve(f"SELECT t.track, t.channels * 2 AS chans {_ROWS}")
+    _resolve(f"SELECT t, t.channels * 2 AS chans {_ROWS}")
 
 
 def test_arithmetic_needs_numbers_on_both_sides() -> None:
-    err = _reject(f"SELECT t.track, t.language + 1 AS x {_ROWS}")
+    err = _reject(f"SELECT t, t.language + 1 AS x {_ROWS}")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'+' needs numbers, but one side is text" in err.message
 
 
 def test_arithmetic_result_does_not_join_text() -> None:
-    err = _reject(f"SELECT t.track, 'n=' || t.channels + 1 AS x {_ROWS}")
+    err = _reject(f"SELECT t, 'n=' || t.channels + 1 AS x {_ROWS}")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'||' joins text" in err.message
 
 
 def test_cast_to_text_bridges_a_number_into_concatenation() -> None:
-    _resolve(f"SELECT t.track, 'n=' || t.channels::text AS title {_ROWS}")
+    _resolve(f"SELECT t, 'n=' || t.channels::text AS title {_ROWS}")
 
 
 def test_cast_function_spelling_is_the_same_cast() -> None:
-    _resolve(f"SELECT t.track, 'n=' || CAST(t.channels AS text) AS title {_ROWS}")
+    _resolve(f"SELECT t, 'n=' || CAST(t.channels AS text) AS title {_ROWS}")
 
 
 def test_only_text_is_a_supported_cast_target() -> None:
-    err = _reject(f"SELECT t.track, t.language::int + 1 AS x {_ROWS}")
+    err = _reject(f"SELECT t, t.language::int + 1 AS x {_ROWS}")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "cast to int is not supported" in err.message
     assert "::text is the only cast" in (err.hint or "")
 
 
 def test_a_comparison_still_needs_one_type_across_a_cast() -> None:
-    err = _reject(f"SELECT t.track {_ROWS} WHERE t.channels::text = 2")
+    err = _reject(f"SELECT t {_ROWS} WHERE t.channels::text = 2")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "a comparison needs one type" in err.message
 
 
 def test_arithmetic_is_allowed_in_a_row_between_bound() -> None:
-    _resolve(f"SELECT t.track {_ROWS} WHERE t.channels BETWEEN 1 AND 4 * 2")
+    _resolve(f"SELECT t {_ROWS} WHERE t.channels BETWEEN 1 AND 4 * 2")
 
 
 def test_a_trim_bound_may_be_an_expression_over_duration() -> None:
@@ -2519,13 +2555,13 @@ def test_a_text_trim_bound_is_still_rejected() -> None:
 
 
 def test_a_trim_bound_cannot_read_a_track_row_column() -> None:
-    err = _reject(f"SELECT t.track {_ROWS} WHERE f.t <= t.channels")
+    err = _reject(f"SELECT t {_ROWS} WHERE f.t <= t.channels")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "cannot mix track-row columns" in err.message
 
 
 def test_a_row_column_the_schema_never_had_is_still_unknown() -> None:
-    err = _reject(f"SELECT t.track, t.nope * 2 AS x {_ROWS}")
+    err = _reject(f"SELECT t, t.nope * 2 AS x {_ROWS}")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unknown column 't.nope'" in err.message
 

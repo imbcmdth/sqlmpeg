@@ -7,10 +7,10 @@ A standalone CLI that compiles SQL into an ffmpeg `-filter_complex` invocation. 
 ```sql
 COPY (
   WITH pip AS (
-    SELECT scale(crop(b.frame, 1200, 50, 600, 200), 0.5) AS frame
+    SELECT scale(crop(b.video[1], 1200, 50, 600, 200), 0.5) AS frame
     FROM input('game.mp4') b
   )
-  SELECT overlay(a.frame, pip.frame, 20, 20)
+  SELECT overlay(a.video[1], pip.frame, 20, 20)
   FROM input('game.mp4') a, pip
 ) TO 'out.mp4'
 ```

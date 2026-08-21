@@ -206,7 +206,7 @@ def test_track_row_fills_documented() -> None:
     assert "ffmpeg.anullsrc(...)" in PROMPT
     assert "ffmpeg.color(...)" in PROMPT
     assert "sqlmpeg.empty_captions()" in PROMPT
-    assert "COALESCE(<alias>.track, <fill>)" in PROMPT
+    assert "COALESCE(<alias>, <fill>)" in PROMPT
     assert "Nothing generates a `data` track" in PROMPT
 
 

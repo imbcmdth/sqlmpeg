@@ -14,7 +14,7 @@
 
 Usage::
 
-    graph = compile_sql("SELECT a.frame FROM input('clip.mp4') a")
+    graph = compile_sql("SELECT a.video[1] FROM input('clip.mp4') a")
     emitted = emit(graph)
     argv = build_ffmpeg_commands(emitted)[0]
 """

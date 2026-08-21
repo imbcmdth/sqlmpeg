@@ -95,7 +95,7 @@ ffmpeg -ss 5 -to 60 -i clip.mp4 -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 18 -c:
 
 ```pgsql
 COPY (
-  SELECT scale(f.frame, 1280, -2), f.audio[1]
+  SELECT scale(f.video[1], 1280, -2), f.audio[1]
   FROM input(:'source') f
 ) TO :'dest'
 ```
@@ -110,7 +110,7 @@ Or express the width relative to the input - any string-typed option takes an ff
 
 ```pgsql
 COPY (
-  SELECT scale(f.frame, 'iw/2', -2), f.audio[1]
+  SELECT scale(f.video[1], 'iw/2', -2), f.audio[1]
   FROM input(:'source') f
 ) TO :'dest'
 ```
@@ -123,11 +123,11 @@ ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=width=iw/2:height=-2[out0]' -ma
 
 ## 6. Rotate a phone video 90 degrees
 
-For quarter turns, ffmpeg's `transpose` is the right tool (it swaps the axes rather than resampling). For arbitrary angles there's `rotate`, whose angle is an expression in radians - `rotate(f.frame, '7*PI/180')` leans a clip seven degrees:
+For quarter turns, ffmpeg's `transpose` is the right tool (it swaps the axes rather than resampling). For arbitrary angles there's `rotate`, whose angle is an expression in radians - `rotate(f.video[1], '7*PI/180')` leans a clip seven degrees:
 
 ```pgsql
 COPY (
-  SELECT transpose(v.frame, dir => 'clock'), v.audio[1]
+  SELECT transpose(v.video[1], dir => 'clock'), v.audio[1]
   FROM input(:'source') v
 ) TO :'dest'
 ```
@@ -140,11 +140,11 @@ ffmpeg -i phone.mp4 -filter_complex '[0:v:0]transpose=dir=clock[out0]' -map '[ou
 
 ## 7. Sharpen a soft-looking video
 
-Any of your ffmpeg's filters is callable directly, options by name, checked against what the binary actually supports. (The one-knob version, if you don't need the fine control: `unsharp(f.frame, 5, 5, 1.5)`, matrix sizes then amount, positionally in unsharp's own order.)
+Any of your ffmpeg's filters is callable directly, options by name, checked against what the binary actually supports. (The one-knob version, if you don't need the fine control: `unsharp(f.video[1], 5, 5, 1.5)`, matrix sizes then amount, positionally in unsharp's own order.)
 
 ```pgsql
 COPY (
-  SELECT unsharp(a.frame, luma_msize_x => 7, luma_amount => 1.5), a.audio[1]
+  SELECT unsharp(a.video[1], luma_msize_x => 7, luma_amount => 1.5), a.audio[1]
   FROM input(:'source') a
 ) TO 'out.mp4'
 ```
@@ -178,9 +178,9 @@ And it scales to files you'd rather not count streams in: splat the whole audio 
 
 ```pgsql
 COPY (
-  SELECT a.frame, a.audio FROM input('tests/fixtures/av2.mp4') a
+  SELECT a.video[1], a.audio FROM input('tests/fixtures/av2.mp4') a
   UNION ALL
-  SELECT b.frame, b.audio FROM input('tests/fixtures/av3.mp4') b
+  SELECT b.video[1], b.audio FROM input('tests/fixtures/av3.mp4') b
 ) TO 'season.mkv'
 ```
 
@@ -198,7 +198,7 @@ ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av3.mp4 -filter_complex \
 
 ```pgsql
 COPY (
-  SELECT overlay(f.frame, logo.frame, '(W-w)/2', '(H-h)/2'), f.audio[1]
+  SELECT overlay(f.video[1], logo.video[1], '(W-w)/2', '(H-h)/2'), f.audio[1]
   FROM input(:'main') f, input(:'overlay', loop => true) logo
 ) TO :'dest'
 ```
@@ -247,7 +247,7 @@ Different from muxing a track: `subtitles()` is a video filter that renders the 
 
 ```pgsql
 COPY (
-  SELECT subtitles(f.frame, 'subs.en.srt'), f.audio[1]
+  SELECT subtitles(f.video[1], 'subs.en.srt'), f.audio[1]
   FROM input(:'source') f
 ) TO :'dest'
 ```
@@ -264,7 +264,7 @@ Two functions because the two stream types speed up differently: `sqlmpeg.speed`
 
 ```pgsql
 COPY (
-  SELECT sqlmpeg.speed(f.frame, :factor), atempo(f.audio[1], :factor)
+  SELECT sqlmpeg.speed(f.video[1], :factor), atempo(f.audio[1], :factor)
   FROM input(:'source') f
 ) TO :'dest'
 ```
@@ -282,7 +282,7 @@ ffmpeg -i film.mp4 -filter_complex \
 
 ```pgsql
 COPY (
-  SELECT xfade(a.frame, b.frame, duration => 1, offset => 9),
+  SELECT xfade(a.video[1], b.video[1], duration => 1, offset => 9),
          acrossfade(a.audio[1], b.audio[1], duration => 1)
   FROM input(:'first') a, input(:'second') b
 ) TO :'dest'
@@ -302,7 +302,7 @@ The good-looking way needs two passes over the frames - one to build a palette, 
 ```pgsql
 COPY (
   WITH small AS (
-    SELECT fps(scale(v.frame, 480, -2), 12) AS frame
+    SELECT fps(scale(v.video[1], 480, -2), 12) AS frame
     FROM input(:'source') v
   )
   SELECT paletteuse(small.frame, palettegen(small.frame))
@@ -373,7 +373,7 @@ A quarter-size camera in the bottom-right corner, 20 pixels off each edge - the 
 
 ```pgsql
 COPY (
-  SELECT overlay(f.frame, scale(c.frame, 'iw/4', -2), 'W-w-20', 'H-h-20'), f.audio[1]
+  SELECT overlay(f.video[1], scale(c.video[1], 'iw/4', -2), 'W-w-20', 'H-h-20'), f.audio[1]
   FROM input(:'main') f, input(:'overlay') c
 ) TO :'dest'
 ```
@@ -410,7 +410,7 @@ Or keep the main video playing and overlay the insert on top: a delayed video st
 
 ```pgsql
 COPY (
-  SELECT overlay(f.frame, sqlmpeg.delay(promo.frame, 120), 20, 20), f.audio[1]
+  SELECT overlay(f.video[1], sqlmpeg.delay(promo.video[1], 120), 20, 20), f.audio[1]
   FROM input(:'main') f, input(:'insert') promo
 ) TO :'dest'
 ```
@@ -447,7 +447,7 @@ ffmpeg -i tests/fixtures/av2.mp4 -filter_complex \
 
 ```pgsql
 COPY (
-  SELECT sqlmpeg.blur_regions(f.frame, 900, 60, 320, 180, 20), f.audio[1]
+  SELECT sqlmpeg.blur_regions(f.video[1], 900, 60, 320, 180, 20), f.audio[1]
   FROM input(:'source') f
 ) TO :'dest'
 ```
@@ -465,7 +465,7 @@ To apply an effect only during a time window, `enable` is the switch - no trimmi
 
 ```pgsql
 COPY (
-  SELECT gblur(a.frame, 12, enable => 'between(t,0.5,1.5)')
+  SELECT gblur(a.video[1], 12, enable => 'between(t,0.5,1.5)')
   FROM input(:'source') a
 ) TO 'out.mp4'
 ```
@@ -482,7 +482,7 @@ Sources live in FROM and consume no input file at all - note the command below h
 
 ```pgsql
 COPY (
-  SELECT t.frame, s.audio[1]
+  SELECT t.video[1], s.audio[1]
   FROM ffmpeg.testsrc2(duration => 10, size => '1280x720', rate => 30) t,
        ffmpeg.sine(frequency => 440, duration => 10) s
 ) TO 'bars.mp4'
@@ -563,7 +563,7 @@ A `CREATE VIEW` is a named, shared piece of the graph, and each `COPY` after it 
 
 ```pgsql
 CREATE VIEW branded AS
-  SELECT overlay(f.frame, logo.frame, 'W-w-20', 20) AS v, f.audio[1] AS a
+  SELECT overlay(f.video[1], logo.video[1], 'W-w-20', 20) AS v, f.audio[1] AS a
   FROM input(:'main') f, input(:'overlay', loop => true) logo;
 
 COPY (SELECT scale(b.v, 1280, -2) AS v, b.a FROM branded b)
@@ -583,11 +583,11 @@ ffmpeg -i film.mp4 -loop 1 -i watermark.png -filter_complex \
 
 ## 23. Pick a track by what it is, not where it sits
 
-`unnest` turns a track array into rows - one per track, with the probed metadata as real columns - and a `WHERE` over those columns is track selection that says what you mean. No more counting streams in ffprobe output to learn that English is `[2]` this time:
+`unnest` turns a track array into rows - one per track, with the probed metadata as real columns - and a `WHERE` over those columns is track selection that says what you mean. The row IS the track: a bare `t` where a stream is expected selects it, filters it, or gathers it, and the columns are the metadata about it. No more counting streams in ffprobe output to learn that English is `[2]` this time:
 
 ```pgsql
 COPY (
-  SELECT t.track
+  SELECT t
   FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
   WHERE t.language = 'eng'
 ) TO 'eng.m4a'
@@ -606,7 +606,7 @@ Caption arrays unnest the same way (columns: `language`, `title`, `codec`), so p
 
 ```pgsql
 COPY (
-  SELECT s.track
+  SELECT s
   FROM input('tests/fixtures/avs.mkv') f, unnest(f.subtitle) s
   WHERE s.language = 'eng'
 ) TO 'subs.srt'
@@ -624,7 +624,7 @@ Two multi-language files, and every track should mix with its counterpart - Engl
 
 ```pgsql
 COPY (
-  SELECT array_agg(amix(a.track, b.track))
+  SELECT array_agg(amix(a, b))
   FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av3.mp4') g,
        unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language
 ) TO 'mixed.mka'
@@ -645,7 +645,7 @@ An outer join keeps the rows only one side has, and `COALESCE` fills the gap - f
 
 ```pgsql
 COPY (
-  SELECT array_agg(amix(a.track, COALESCE(b.track, ffmpeg.anullsrc(duration => 4))))
+  SELECT array_agg(amix(a, COALESCE(b, ffmpeg.anullsrc(duration => 4))))
   FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
        unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.language = b.language
 ) TO 'full.mka'
@@ -667,12 +667,12 @@ The founding case. `concat` demands identical segment shapes, so the file that l
 
 ```pgsql
 COPY (
-  SELECT f.video[1], array_agg(a.track)
+  SELECT f.video[1], array_agg(a)
   FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
        unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.language = b.language
   GROUP BY f.video[1]
   UNION ALL
-  SELECT g2.video[1], array_agg(COALESCE(b2.track, ffmpeg.anullsrc(duration => 4)))
+  SELECT g2.video[1], array_agg(COALESCE(b2, ffmpeg.anullsrc(duration => 4)))
   FROM input('tests/fixtures/av2.mp4') f2, input('tests/fixtures/av-eng.mp4') g2,
        unnest(f2.audio) a2 FULL OUTER JOIN unnest(g2.audio) b2 ON a2.language = b2.language
   GROUP BY g2.video[1]
@@ -696,7 +696,7 @@ Video arrays unnest too - `width`, `height`, `fps`, `codec`, `bitrate` are the c
 
 ```pgsql
 COPY (
-  SELECT hstack(a.track, b.track)
+  SELECT hstack(a, b)
   FROM input('tests/fixtures/testsrc.mp4') f, input('tests/fixtures/smptebars.mp4') g,
        unnest(f.video) a JOIN unnest(g.video) b
          ON a.width = b.width AND a.height = b.height
@@ -709,11 +709,11 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -i tests/fixtures/smptebars.mp4 -filter_com
   '[0:v:0][1:v:0]hstack=inputs=2[out0]' -map '[out0]' sxs.mp4
 ```
 
-A video gap in an outer join fills with `COALESCE(b.track, ffmpeg.color())` - black by default, size, rate and duration inherited from the paired row. A caption gap fills with `COALESCE(b.track, sqlmpeg.empty_captions())`: the track exists and takes its language tag, it just contains zero cues - nobody generates your subtitles for you.
+A video gap in an outer join fills with `COALESCE(b, ffmpeg.color())` - black by default, size, rate and duration inherited from the paired row. A caption gap fills with `COALESCE(b, sqlmpeg.empty_captions())`: the track exists and takes its language tag, it just contains zero cues - nobody generates your subtitles for you.
 
 ## 29. Assert what you're shipping
 
-A subscripted track has the same metadata columns a row does: `f.audio[1].language` is the first track's tag, right there in a `WHERE`. Since the predicate evaluates at compile time, this is an assertion - if track 1 isn't English, the script refuses to compile instead of quietly shipping the wrong language. (`f.audio[1]` itself is sugar for `f.audio[1].track`; the strictly-Postgres spelling `(f.audio[1]).language` works too.)
+A subscripted track has the same metadata columns a row does: `f.audio[1].language` is the first track's tag, right there in a `WHERE`. Since the predicate evaluates at compile time, this is an assertion - if track 1 isn't English, the script refuses to compile instead of quietly shipping the wrong language. (The strictly-Postgres spelling `(f.audio[1]).language` works too.)
 
 ```pgsql
 COPY (
@@ -752,7 +752,7 @@ $ sqlmpeg -f query.sql
 Stream-valued cells print as placeholders carrying the stream spec, so a table query over a join shows exactly which track paired with which - and an empty cell is an outer join's gap, before you've committed to a fill:
 
 ```pgsql
-SELECT a.language, a.track AS film, b.track AS promo
+SELECT a.language, a AS film, b AS promo
 FROM input('tests/fixtures/av2.mp4') f, input('tests/fixtures/av-eng.mp4') g,
      unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b ON a.language = b.language
 ```
@@ -856,7 +856,7 @@ A non-stream column in a media query sets a tag on that row's output. The alias 
 
 ```pgsql
 COPY (
-  SELECT t.track, 'Audio (' || t.language || ')' AS title
+  SELECT t, 'Audio (' || t.language || ')' AS title
   FROM input('tests/fixtures/av-eng.mp4') f, unnest(f.audio) t
 ) TO 'titled.mka'
 ```
@@ -874,7 +874,7 @@ CASE makes the edit conditional, and it runs over every row - one expression fix
 ```pgsql
 COPY (
   WITH retagged AS (
-    SELECT t.track AS track,
+    SELECT t AS track,
            CASE WHEN t.language = 'fra' THEN 'fre' ELSE t.language END AS language
     FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
   )
@@ -937,7 +937,7 @@ ffmpeg -i film.mkv -f ffmetadata -i \
 ```pgsql
 COPY (
   WITH flagged AS (
-    SELECT t.track AS track,
+    SELECT t AS track,
            CASE WHEN t.language = 'eng' THEN 'default' ELSE '0' END AS disposition
     FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
   )
@@ -1008,7 +1008,7 @@ A filter argument over a row table's columns is computed per row, at compile tim
 
 ```pgsql
 COPY (
-  SELECT scale(t.track, t.width / 2, -2)
+  SELECT scale(t, t.width / 2, -2)
   FROM input('tests/fixtures/av2.mp4') f, unnest(f.video) t
 ) TO 'half.mp4'
 ```
@@ -1095,7 +1095,7 @@ The chain is the exception, not the rule: it survives only while EVERY stream of
 The same rule over track rows: each row's stream goes to a filename built from its own metadata:
 
 ```pgsql
-COPY (SELECT t.track FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t)
+COPY (SELECT t FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t)
 TO (t.language || '.m4a')
 ```
 
@@ -1183,7 +1183,7 @@ Two levels, two scopes, visible in the query text: inside the `WITH`, rows are t
 ```pgsql
 COPY (
   WITH tagged AS (
-    SELECT a.track AS track, 'Audio (' || a.language || ')' AS title
+    SELECT a AS track, 'Audio (' || a.language || ')' AS title
     FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) a
   )
   SELECT g.video, array_agg(tagged.track), 'Director Cut' AS title
@@ -1205,7 +1205,7 @@ A single destination takes exactly one row, so a multi-row query says how its ro
 
 ```pgsql
 COPY (
-  SELECT f.video, array_agg(a.track)
+  SELECT f.video, array_agg(a)
   FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) a
   GROUP BY f.video
 ) TO 'out.mp4'
@@ -1223,7 +1223,7 @@ Explicit grouping unlocks what the plain fan-out rejects as a collision: rows th
 
 ```pgsql
 COPY (
-  SELECT array_agg(a.track), a.language AS title
+  SELECT array_agg(a), a.language AS title
   FROM input('tests/fixtures/av-2eng.mp4') f, unnest(f.audio) a
   GROUP BY a.language
 ) TO (a.language || '.mka')
@@ -1241,7 +1241,7 @@ ffmpeg -i tests/fixtures/av-2eng.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language
 Grouping works in table queries too - drop the COPY and the same relation prints instead of writing, one row per group, arrays in braces. The single-group form shows what a one-file COPY would carry:
 
 ```pgsql
-SELECT f.video, array_agg(a.track)
+SELECT f.video, array_agg(a)
 FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) a
 GROUP BY f.video
 ```
@@ -1257,7 +1257,7 @@ $ sqlmpeg -f query.sql
 And grouping by a row column previews a fan-out's partitions before any file is written - here, recipe 55's per-language split:
 
 ```pgsql
-SELECT a.language, array_agg(a.track)
+SELECT a.language, array_agg(a)
 FROM input('tests/fixtures/av-2eng.mp4') f, unnest(f.audio) a
 GROUP BY a.language
 ```
@@ -1277,10 +1277,10 @@ Each CTE picks its tracks with its own WHERE; the outer query is plain SQL over 
 
 ```pgsql
 WITH vid AS (
-  SELECT v.track AS track FROM input('tests/fixtures/av-2eng.mp4') i1, unnest(i1.video) v
+  SELECT v AS track FROM input('tests/fixtures/av-2eng.mp4') i1, unnest(i1.video) v
 ),
 aud AS (
-  SELECT a.track AS track FROM input('tests/fixtures/av-2eng.mp4') i2, unnest(i2.audio) a
+  SELECT a AS track FROM input('tests/fixtures/av-2eng.mp4') i2, unnest(i2.audio) a
   WHERE a.language = 'eng'
 )
 SELECT vid.track, array_agg(aud.track) FROM vid, aud GROUP BY vid.track
@@ -1299,10 +1299,10 @@ The same SELECT inside `COPY (...) TO 'combo.mkv'` compiles to:
 ```pgsql
 COPY (
   WITH vid AS (
-    SELECT v.track AS track FROM input('tests/fixtures/av-2eng.mp4') i1, unnest(i1.video) v
+    SELECT v AS track FROM input('tests/fixtures/av-2eng.mp4') i1, unnest(i1.video) v
   ),
   aud AS (
-    SELECT a.track AS track FROM input('tests/fixtures/av-2eng.mp4') i2, unnest(i2.audio) a
+    SELECT a AS track FROM input('tests/fixtures/av-2eng.mp4') i2, unnest(i2.audio) a
     WHERE a.language = 'eng'
   )
   SELECT vid.track, array_agg(aud.track) FROM vid, aud GROUP BY vid.track
@@ -1321,7 +1321,7 @@ ffmpeg -i tests/fixtures/av-2eng.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy \
 
 ```pgsql
 COPY (
-  SELECT drawtext(f.frame, text => :'text', fontfile => :'font', fontsize => 48, x => 20, y => 20, fontcolor => 'white'),
+  SELECT drawtext(f.video[1], text => :'text', fontfile => :'font', fontsize => 48, x => 20, y => 20, fontcolor => 'white'),
          f.audio[1]
   FROM input(:'source') f
 ) TO :'dest'
@@ -1339,7 +1339,7 @@ ffmpeg -i film.mkv -filter_complex \
 An image sequence is an input like any other - ffmpeg's `%04d` pattern names the files, and `framerate` says how fast to play them:
 
 ```sql
-COPY (SELECT f.frame FROM input(:'frames', framerate => 24) f)
+COPY (SELECT f.video[1] FROM input(:'frames', framerate => 24) f)
 TO :'dest' WITH (video_codec 'libx264', crf 18)
 ```
 
@@ -1351,7 +1351,7 @@ ffmpeg -framerate 24 -i frames/%04d.png -map 0:v:0 -c:0 libx264 -crf:0 18 out.mp
 The reverse is a pattern in the destination - here one frame per second:
 
 ```pgsql
-COPY (SELECT fps(f.frame, 1) FROM input(:'source') f) TO :'dest'
+COPY (SELECT fps(f.video[1], 1) FROM input(:'source') f) TO :'dest'
 ```
 
 ```
@@ -1400,7 +1400,7 @@ Add `WITH (duration 60)` to stop after a minute; per-protocol options (headers, 
 
 ```pgsql
 COPY (
-  SELECT frei0r(f.frame, filter_name => 'glow', filter_params => '0.5'), f.audio[1]
+  SELECT frei0r(f.video[1], filter_name => 'glow', filter_params => '0.5'), f.audio[1]
   FROM input(:'source') f
 ) TO :'dest'
 ```

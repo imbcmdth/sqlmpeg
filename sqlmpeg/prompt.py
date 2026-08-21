@@ -103,7 +103,7 @@ statement is not. `--` and `/* */` comments are allowed.
   `anullsrc` (silence), `sine`, `aevalsrc`. Which ones exist is
   machine-dependent, like everything else under `ffmpeg.`.
 - A source alias exposes exactly ONE stream, of a type fixed by the source:
-  `t.frame` / `t.video[1]` for a video source, `s.audio[1]` for an audio one,
+  `t.video[1]` for a video source, `s.audio[1]` for an audio one,
   the bare `t.video` / `s.audio` as a length-1 array, `t.*` as that one
   column. The other type, or any subscript but `[1]`, is `STREAM_NOT_FOUND`.
   `WHERE <alias>.t` is rejected -- there is nothing to seek; give the source a
@@ -142,7 +142,7 @@ _DIALECT_TAIL = """\
   array-typed pseudo-columns, one entry per stream of that type in the file,
   in file order. `<alias>.video[k]` / `<alias>.audio[k]` / `<alias>.subtitle[k]`
   / `<alias>.data[k]` picks the k-th stream, 1-based (`<alias>.video[1]` is
-  the first video stream). `<alias>.frame` is sugar for `<alias>.video[1]`.
+  the first video stream).
 - Subscripts are positive integer literals only -- `0`, negative numbers, and
   computed subscripts are rejected.
 - A bare `<alias>.video` / `<alias>.audio` / `<alias>.subtitle` / `<alias>.data`
@@ -201,9 +201,11 @@ _DIALECT_TAIL = """\
   is rejected. A row alias shares the one flat namespace every other name in
   the query does -- it may not collide with an input alias, a CTE, a view,
   or `ffmpeg`/`sqlmpeg`.
-- Every row carries `track` (the stream itself -- the only row column that
-  can appear in the SELECT list), `index` (1-based, the same numbering as
-  `<alias>.audio[k]`), `language`, `title`, `codec`. Audio rows add
+- The ROW IS the stream: a bare `<alias>` where a stream is expected --
+  `SELECT t`, `array_agg(t)`, `volume(t, 0.5)`, `GROUP BY t` -- is that
+  stream, and it is the only thing on a row that can appear in the SELECT
+  list of a media query. Every row also carries `index` (1-based, the same
+  numbering as `<alias>.audio[k]`), `language`, `title`, `codec`. Audio rows add
   `channels`, `channel_layout`, `sample_rate`, `bitrate`, `duration`. Video
   rows add `width`, `height`, `fps` (verbatim, e.g. `'30000/1001'`),
   `bitrate`, `duration`, `color_transfer`. Subtitle and data rows carry only
@@ -225,13 +227,13 @@ _DIALECT_TAIL = """\
   float; dividing by a known zero is rejected), `CASE`, `||` (text only), and
   `::text` / `CAST(x AS text)` to spell a number for `||`. NULL propagates.
   An aliased expression column is a metadata TAG on that row's tracks, the
-  alias being the key: `SELECT t.track, 'Audio (' || t.language || ')' AS
+  alias being the key: `SELECT t, 'Audio (' || t.language || ')' AS
   title`. In a query with NO track rows the same aliased column tags the
   CONTAINER instead (`SELECT f.video[1], 'Remastered' AS title`), and `NULL
   AS artist` clears that key in the output. To set both scopes in one query,
   tag the tracks inside a CTE and the container in the outer SELECT (the
   outer value wins on a shared key). Same grammar in a filter option
-  over a row table, evaluated per row: `SELECT scale(t.track, t.width / 2,
+  over a row table, evaluated per row: `SELECT scale(t, t.width / 2,
   -2)`.
 - Several rows and one destination is a rejection, never a silent gather.
   `array_agg(<per-row stream expression>)` as a whole SELECT column gathers
@@ -241,7 +243,7 @@ _DIALECT_TAIL = """\
   input-level key is the one-file shape; `GROUP BY` a row column partitions
   rows into one output file per group -- it requires a fan-out `TO
   (expression over the group keys)`, and group keys double as container tag
-  columns: `SELECT array_agg(a.track), a.language AS title ... GROUP BY
+  columns: `SELECT array_agg(a), a.language AS title ... GROUP BY
   a.language) TO (a.language || '.mka')`. `ORDER BY` inside `array_agg` is
   rejected; `ORDER BY` before the aggregate defines the order.
 - `unnest(...) a JOIN unnest(...) b ON <predicate>` matches ROWS between two
@@ -257,8 +259,8 @@ _DIALECT_TAIL = """\
   matches two rows on the other side pairs with both -- real join
   semantics, not an error; widen the `ON` key if that is not what you want,
   e.g. `ON a.language = b.language AND a.channel_layout = b.channel_layout`.
-- Selecting a NULL `track` (an outer join's gap) bare is a typed rejection
-  naming the row that failed to match. `COALESCE(<alias>.track, <fill>)` is
+- Selecting a NULL row (an outer join's gap) bare is a typed rejection
+  naming the row that failed to match. `COALESCE(<alias>, <fill>)` is
   the only accepted spelling, and `<fill>` is a generated stand-in sized for
   that row's stream type: `ffmpeg.anullsrc(...)` for audio (`duration`
   inherits the paired row's probed duration when omitted; give it
@@ -281,8 +283,8 @@ _DIALECT_TAIL = """\
   in a metadata query; in a media `COPY`, or subscripted, it is a typed
   rejection (unnest it).
 - Every row carries `index` (1-based, ffprobe's own chapter order), `title`,
-  `start_t`, `end_t` (seconds). There is no `track` column -- a chapter is
-  not a stream -- so selecting one of its columns into a media `COPY` is a
+  `start_t`, `end_t` (seconds). A chapter is not a stream, so a bare `c`
+  selects nothing and putting one of its columns into a media `COPY` is a
   typed rejection; the columns feed `WHERE`/`ORDER BY`, trim windows
   (`WHERE f.t BETWEEN c.start_t AND c.end_t`), fan-out destinations, and
   tag columns, exactly like a track row's.
@@ -323,8 +325,8 @@ _DIALECT_TAIL = """\
 - A CTE sees only the CTEs defined BEFORE it. No forward references, no
   `RECURSIVE`, no `WITH` nested inside a CTE body, no CTE column lists.
 - A name may appear at most once in a single `FROM` clause. To consume the
-  same stream twice in one expression, just write `c.frame` (or
-  `c.<name>`) twice -- the compiler inserts the `split`/`asplit` for you.
+  same stream twice in one expression, just write `c.<name>` twice -- the
+  compiler inserts the `split`/`asplit` for you.
   Reuse is automatic; never duplicate the CTE.
 
 ### Scripts, views and multiple outputs
@@ -425,8 +427,8 @@ ffmpeg itself (except the four `sqlmpeg.*` macros, which are sqlmpeg's own).
    one per the filter's own input pad, in the filter's declared pad order
    (one for a `V->V` filter like `gblur`, two for a `VV->V` one like
    `overlay` or `xfade`). After the streams, that filter's OWN options bind
-   positionally in ffmpeg's own declared order -- `gblur(a.frame, 5)` sets
-   its first option, `sigma`; `crop(a.frame, 640, 360, 100, 50)` sets
+   positionally in ffmpeg's own declared order -- `gblur(a.video[1], 5)` sets
+   its first option, `sigma`; `crop(a.video[1], 640, 360, 100, 50)` sets
    `out_w`, `out_h`, `x`, `y` in that order, because that is `crop`'s real
    option order. Any option not given positionally can instead be given by
    name, `<name> => <value>`, in any order, after every positional argument;
@@ -438,8 +440,8 @@ ffmpeg itself (except the four `sqlmpeg.*` macros, which are sqlmpeg's own).
    `random`, `corr`, `copy`, `null` -- where the bare spelling either means
    something else to Postgres or (for `overlay`, which is a Postgres
    builtin) cannot even parse a `=>` argument at all (`PARSE_ERROR`):
-   `ffmpeg.overlay(base, top, x => 20, y => 20)`. `ffmpeg.trim(a.frame,
-   start => 1)` is the filter; bare `trim(a.frame)` is Postgres's string
+   `ffmpeg.overlay(base, top, x => 20, y => 20)`. `ffmpeg.trim(a.video[1],
+   start => 1)` is the filter; bare `trim(a.video[1])` is Postgres's string
    `TRIM` and silently loses the argument. `ffmpeg` is a reserved name:
    never use it as an alias or a CTE name.
 3. **`sqlmpeg.<name>(...)`** -- four fixed macros, each doing what no single
@@ -490,7 +492,7 @@ silently overridden.
 
 `enable => '<expression>'` is the one named argument that is not an option of
 the filter behind it: it is ffmpeg's TIMELINE switch, turning the filter on
-and off as the stream plays. `gblur(a.frame, 5, enable =>
+and off as the stream plays. `gblur(a.video[1], 5, enable =>
 'between(t,0.5,1.5)')` blurs only that one second; outside it the frames pass
 through untouched. The expression is over `t` (seconds), `n` (frame number)
 or `pos`, checked by ffmpeg at RUN time, not compile time. Only filters your
@@ -710,31 +712,31 @@ def _function_reference(registry: Registry) -> str:
 _EXAMPLES: tuple[tuple[str, str], ...] = (
     (
         "Make clip.mp4 half size.",
-        "SELECT scale(a.frame, 'iw/2', 'ih/2')\nFROM input('clip.mp4') a",
+        "SELECT scale(a.video[1], 'iw/2', 'ih/2')\nFROM input('clip.mp4') a",
     ),
     (
         "Crop the 640x360 region at (100, 50) out of clip.mp4 and double it.",
-        "SELECT scale(crop(a.frame, 640, 360, 100, 50), 'iw*2', 'ih*2')\n"
+        "SELECT scale(crop(a.video[1], 640, 360, 100, 50), 'iw*2', 'ih*2')\n"
         "FROM input('clip.mp4') a",
     ),
     (
         "Keep only the part of clip.mp4 from 5s to 12.5s.",
-        "SELECT a.frame\nFROM input('clip.mp4') a\nWHERE a.t BETWEEN 5 AND 12.5",
+        "SELECT a.video[1]\nFROM input('clip.mp4') a\nWHERE a.t BETWEEN 5 AND 12.5",
     ),
     (
         "Drop everything before the 90 second mark in clip.mp4; keep the rest.",
-        "SELECT a.frame\nFROM input('clip.mp4') a\nWHERE a.t >= 90",
+        "SELECT a.video[1]\nFROM input('clip.mp4') a\nWHERE a.t >= 90",
     ),
     (
         "Put a half-size copy of the scoreboard (the 600x200 box at 1200,50) "
         "in the top-left corner of game.mp4, and mix its audio under the main "
         "feed's at 65/35.",
         "WITH pip AS (\n"
-        "  SELECT scale(crop(b.frame, 600, 200, 1200, 50), 'iw/2', 'ih/2') AS frame,\n"
+        "  SELECT scale(crop(b.video[1], 600, 200, 1200, 50), 'iw/2', 'ih/2') AS frame,\n"
         "         b.audio[1] AS sound\n"
         "  FROM input('game.mp4') b\n"
         ")\n"
-        "SELECT overlay(a.frame, pip.frame, 20, 20),\n"
+        "SELECT overlay(a.video[1], pip.frame, 20, 20),\n"
         "       amix(volume(a.audio[1], 0.65), volume(pip.sound, 0.35))\n"
         "FROM input('game.mp4') a, pip",
     ),
@@ -750,13 +752,13 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
     ),
     (
         "Blur the 160x120 area at (220, 90) in clip.mp4.",
-        "SELECT sqlmpeg.blur_regions(a.frame, 220, 90, 160, 120, 20)\n"
+        "SELECT sqlmpeg.blur_regions(a.video[1], 220, 90, 160, 120, 20)\n"
         "FROM input('clip.mp4') a",
     ),
     (
         "Outline a red 300x120 box at (40, 40) on clip.mp4 and label it "
         "TAKE 3 at (60, 70) in 36pt.",
-        "SELECT drawtext(drawbox(a.frame, 40, 40, 300, 120, 'red'), "
+        "SELECT drawtext(drawbox(a.video[1], 40, 40, 300, 120, 'red'), "
         "text => 'TAKE 3', x => 60, y => 70, fontsize => 36)\n"
         "FROM input('clip.mp4') a",
     ),
@@ -764,20 +766,20 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
         "Center watermark.png over film.mp4, whatever size either of them is.",
         # An expr argument: ffmpeg evaluates (W-w)/2 against the real frame
         # sizes, so this needs no probe and works for any pair of inputs.
-        "SELECT overlay(f.frame, logo.frame, '(W-w)/2', '(H-h)/2')\n"
+        "SELECT overlay(f.video[1], logo.video[1], '(W-w)/2', '(H-h)/2')\n"
         "FROM input('film.mp4') f, input('watermark.png') logo",
     ),
     (
         "Play intro.mp4 and then main.mp4 as one video.",
-        "SELECT a.frame FROM input('intro.mp4') a\n"
+        "SELECT a.video[1] FROM input('intro.mp4') a\n"
         "UNION ALL\n"
-        "SELECT b.frame FROM input('main.mp4') b",
+        "SELECT b.video[1] FROM input('main.mp4') b",
     ),
     (
         "Double-speed the 20-second clip.mp4 with a 1 second fade in and a "
         "1.5 second fade out at the end.",
         # 20s source at 2x -> 10s output; the fade-out window starts at 10 - 1.5.
-        "SELECT fade(fade(sqlmpeg.speed(a.frame, 2), 'in', duration => 1), "
+        "SELECT fade(fade(sqlmpeg.speed(a.video[1], 2), 'in', duration => 1), "
         "'out', start_time => 8.5, duration => 1.5)\n"
         "FROM input('clip.mp4') a",
     ),
@@ -821,19 +823,19 @@ _PROBED_EXAMPLES: tuple[tuple[str, str], ...] = (
     (
         "Play episode1.mkv then episode2.mkv as one file, keeping every "
         "language track of both.",
-        "SELECT a.frame, a.audio FROM input('episode1.mkv') a\n"
+        "SELECT a.video[1], a.audio FROM input('episode1.mkv') a\n"
         "UNION ALL\n"
-        "SELECT b.frame, b.audio FROM input('episode2.mkv') b",
+        "SELECT b.video[1], b.audio FROM input('episode2.mkv') b",
     ),
     (
         "Put a quarter-size picture-in-picture copy of commentary.mkv in the "
         "corner of film.mkv, and mix every language track of both under it, "
         "the film at 65% and the commentary at 35%.",
         "WITH pip AS (\n"
-        "  SELECT scale(c.frame, 'iw/4', 'ih/4') AS frame, c.audio AS sound\n"
+        "  SELECT scale(c.video[1], 'iw/4', 'ih/4') AS frame, c.audio AS sound\n"
         "  FROM input('commentary.mkv') c\n"
         ")\n"
-        "SELECT overlay(f.frame, pip.frame, 20, 20),\n"
+        "SELECT overlay(f.video[1], pip.frame, 20, 20),\n"
         "       amix(volume(f.audio, 0.65), volume(pip.sound, 0.35))\n"
         "FROM input('film.mkv') f, pip",
     ),
@@ -845,7 +847,7 @@ _PROBED_EXAMPLES: tuple[tuple[str, str], ...] = (
     (
         "Pull every English audio track out of film.mkv, whatever subscript "
         "each one happens to sit at.",
-        "SELECT array_agg(t.track)\nFROM input('film.mkv') f, unnest(f.audio) t\n"
+        "SELECT array_agg(t)\nFROM input('film.mkv') f, unnest(f.audio) t\n"
         "WHERE t.language = 'eng'",
     ),
     (
@@ -853,7 +855,7 @@ _PROBED_EXAMPLES: tuple[tuple[str, str], ...] = (
         "where commentary.mkv has no matching language, fill with 2 "
         "seconds of silence instead.",
         "SELECT array_agg(\n"
-        "         amix(a.track, COALESCE(b.track, ffmpeg.anullsrc(duration => 2)))\n"
+        "         amix(a, COALESCE(b, ffmpeg.anullsrc(duration => 2)))\n"
         "       )\n"
         "FROM input('film.mkv') f, input('commentary.mkv') g,\n"
         "     unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b\n"

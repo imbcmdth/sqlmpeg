@@ -1,2 +1,2 @@
-SELECT a.frame, 42
+SELECT a.video[1], 42
 FROM input('x.mp4') a

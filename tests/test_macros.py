@@ -100,7 +100,7 @@ def _probe_result(videos: int = 1, audios: int = 1) -> ProbeResult:
 
 def test_blur_regions_expands_to_crop_gblur_overlay() -> None:
     g = _lower(
-        "SELECT sqlmpeg.blur_regions(a.frame, 10, 20, 100, 50, 5) FROM input('x.mp4') a"
+        "SELECT sqlmpeg.blur_regions(a.video[1], 10, 20, 100, 50, 5) FROM input('x.mp4') a"
     )
     assert _filters(g) == ["crop", "gblur", "overlay"]
     crop, gblur, overlay = (g.nodes[f"n{i}"] for i in (1, 2, 3))
@@ -118,7 +118,7 @@ def test_blur_regions_expands_to_crop_gblur_overlay() -> None:
 
 
 def test_speed_expands_to_setpts() -> None:
-    g = _lower("SELECT sqlmpeg.speed(a.frame, 2) FROM input('x.mp4') a")
+    g = _lower("SELECT sqlmpeg.speed(a.video[1], 2) FROM input('x.mp4') a")
     assert _filters(g) == ["setpts"]
     node = g.nodes["n1"]
     assert node.args == {"expr": "PTS/2"}
@@ -127,7 +127,7 @@ def test_speed_expands_to_setpts() -> None:
 
 
 def test_delay_expands_to_format_tpad() -> None:
-    g = _lower("SELECT sqlmpeg.delay(a.frame, 3) FROM input('x.mp4') a")
+    g = _lower("SELECT sqlmpeg.delay(a.video[1], 3) FROM input('x.mp4') a")
     assert _filters(g) == ["format", "tpad"]
     fmt, tpad = g.nodes["n1"], g.nodes["n2"]
     assert fmt.args == {"pix_fmts": "yuva420p"}
@@ -138,7 +138,7 @@ def test_delay_expands_to_format_tpad() -> None:
 
 
 def test_delay_seconds_may_be_a_float() -> None:
-    g = _lower("SELECT sqlmpeg.delay(a.frame, 1.5) FROM input('x.mp4') a")
+    g = _lower("SELECT sqlmpeg.delay(a.video[1], 1.5) FROM input('x.mp4') a")
     assert g.nodes["n2"].args["start_duration"] == 1.5
 
 
@@ -175,7 +175,7 @@ def _snapshot_registry() -> Registry:
 
 def test_ad_insert_composition_compiles() -> None:
     g = _lower(
-        "SELECT overlay(f.frame, sqlmpeg.delay(p.frame, 120), 20, 20) "
+        "SELECT overlay(f.video[1], sqlmpeg.delay(p.video[1], 120), 20, 20) "
         "FROM input('f.mp4') f, input('p.mp4') p",
         registry=_snapshot_registry(),
     )
@@ -191,19 +191,19 @@ def test_ad_insert_composition_compiles() -> None:
 
 
 def test_named_argument_is_rejected() -> None:
-    err = _reject("SELECT sqlmpeg.speed(a.frame, factor => 2) FROM input('x.mp4') a")
+    err = _reject("SELECT sqlmpeg.speed(a.video[1], factor => 2) FROM input('x.mp4') a")
     assert err.code == ErrorCode.UNSUPPORTED_SQL
     assert "positional" in err.message
 
 
 def test_wrong_arity_is_udf_arg_type() -> None:
-    err = _reject("SELECT sqlmpeg.speed(a.frame) FROM input('x.mp4') a")
+    err = _reject("SELECT sqlmpeg.speed(a.video[1]) FROM input('x.mp4') a")
     assert err.code == ErrorCode.UDF_ARG_TYPE
     assert "sqlmpeg.speed(f, factor)" in (err.hint or "")
 
 
 def test_wrong_arity_too_many_is_udf_arg_type() -> None:
-    err = _reject("SELECT sqlmpeg.speed(a.frame, 2, 3) FROM input('x.mp4') a")
+    err = _reject("SELECT sqlmpeg.speed(a.video[1], 2, 3) FROM input('x.mp4') a")
     assert err.code == ErrorCode.UDF_ARG_TYPE
 
 
@@ -213,7 +213,7 @@ def test_literal_where_stream_expected_is_udf_arg_type() -> None:
 
 
 def test_stream_where_literal_expected_is_udf_arg_type() -> None:
-    err = _reject("SELECT sqlmpeg.speed(a.frame, a.frame) FROM input('x.mp4') a")
+    err = _reject("SELECT sqlmpeg.speed(a.video[1], a.video[1]) FROM input('x.mp4') a")
     assert err.code == ErrorCode.UDF_ARG_TYPE
 
 
@@ -224,13 +224,13 @@ def test_delay_on_an_audio_stream_hints_bare_adelay() -> None:
 
 
 def test_unknown_macro_did_you_mean() -> None:
-    err = _reject("SELECT sqlmpeg.spede(a.frame, 2) FROM input('x.mp4') a")
+    err = _reject("SELECT sqlmpeg.spede(a.video[1], 2) FROM input('x.mp4') a")
     assert err.code == ErrorCode.UNKNOWN_FUNCTION
     assert "sqlmpeg.speed()" in (err.hint or "")
 
 
 def test_unknown_macro_with_no_close_match_names_the_trio() -> None:
-    err = _reject("SELECT sqlmpeg.zzz(a.frame, 2) FROM input('x.mp4') a")
+    err = _reject("SELECT sqlmpeg.zzz(a.video[1], 2) FROM input('x.mp4') a")
     assert err.code == ErrorCode.UNKNOWN_FUNCTION
     hint = err.hint or ""
     assert "blur_regions" in hint and "speed" in hint and "delay" in hint
@@ -312,7 +312,7 @@ def test_loudnorm2_rejects_a_positional_option() -> None:
 
 
 def test_loudnorm2_rejects_a_video_stream() -> None:
-    err = _reject("SELECT sqlmpeg.loudnorm2(a.frame) FROM input('x.mp4') a")
+    err = _reject("SELECT sqlmpeg.loudnorm2(a.video[1]) FROM input('x.mp4') a")
     assert err.code == ErrorCode.UDF_ARG_TYPE
     assert "audio stream" in err.message
 
@@ -352,7 +352,7 @@ def test_loudnorm2_correction_phase_splices_the_measurements() -> None:
 
 
 def test_a_graph_without_loudnorm2_has_no_measuring_filtergraph() -> None:
-    e = emit(_lower("SELECT sqlmpeg.speed(a.frame, 2) FROM input('x.mp4') a"))
+    e = emit(_lower("SELECT sqlmpeg.speed(a.video[1], 2) FROM input('x.mp4') a"))
     assert e.measure_filter_complex == ""
 
 
@@ -431,7 +431,7 @@ def test_loudnorm2_with_two_pass_is_rejected() -> None:
 def test_loudnorm2_in_a_fanout_copy_is_rejected() -> None:
     probes: dict[str, ProbeResult | None] = {"a": _probe_result(videos=0, audios=2)}
     err = _reject(
-        "COPY (SELECT sqlmpeg.loudnorm2(t.track) FROM input('x.mp4') a, "
+        "COPY (SELECT sqlmpeg.loudnorm2(t) FROM input('x.mp4') a, "
         "unnest(a.audio) t) TO (t.index::text || '.m4a')",
         probes,
     )
@@ -464,7 +464,7 @@ def test_sqlmpeg_alias_is_reserved() -> None:
 
 def test_sqlmpeg_cte_name_is_reserved() -> None:
     err = _reject_resolve(
-        "WITH sqlmpeg AS (SELECT a.frame FROM input('x.mp4') a) "
+        "WITH sqlmpeg AS (SELECT a.video[1] FROM input('x.mp4') a) "
         "SELECT frame FROM sqlmpeg"
     )
     assert err.code == ErrorCode.UNSUPPORTED_SQL
@@ -483,13 +483,13 @@ def test_bare_sqlmpeg_dot_column_hints_it_is_a_call() -> None:
 
 
 def test_macros_compile_with_no_registry() -> None:
-    g = _lower("SELECT sqlmpeg.speed(a.frame, 2) FROM input('x.mp4') a", registry=None)
+    g = _lower("SELECT sqlmpeg.speed(a.video[1], 2) FROM input('x.mp4') a", registry=None)
     assert _filters(g) == ["setpts"]
 
 
 def test_blur_regions_compiles_with_no_registry() -> None:
     g = _lower(
-        "SELECT sqlmpeg.blur_regions(a.frame, 0, 0, 10, 10, 2) FROM input('x.mp4') a",
+        "SELECT sqlmpeg.blur_regions(a.video[1], 0, 0, 10, 10, 2) FROM input('x.mp4') a",
         registry=None,
     )
     assert _filters(g) == ["crop", "gblur", "overlay"]
@@ -525,7 +525,7 @@ def test_ad_insert_composition_execs(tmp_path: Path) -> None:
         pytest.skip("fixtures missing (run scripts/gen_fixtures.py first)")
     out_path = tmp_path / "ad_insert.mp4"
     query = (
-        "SELECT overlay(f.frame, sqlmpeg.delay(p.frame, 1), 20, 20) "
+        "SELECT overlay(f.video[1], sqlmpeg.delay(p.video[1], 1), 20, 20) "
         f"FROM input('{_sql_path(base)}') f, input('{_sql_path(ad)}') p"
     )
     graph = compile_sql(query)
@@ -570,7 +570,7 @@ def test_empty_captions_takes_no_arguments() -> None:
 
 
 def test_the_macro_namespace_hint_names_the_input_macro_too() -> None:
-    err = _reject("SELECT sqlmpeg.zzz(a.frame, 2) FROM input('x.mp4') a")
+    err = _reject("SELECT sqlmpeg.zzz(a.video[1], 2) FROM input('x.mp4') a")
     assert "empty_captions" in (err.hint or "")
 
 
@@ -580,5 +580,5 @@ def test_format_is_both_the_minted_flag_and_a_user_facing_option() -> None:
     plan 075, also legal for a user to write on an ordinary input()."""
     assert "format" in INPUT_OPTIONS
     assert option_spec("format") is INPUT_OPTIONS["format"]
-    g = _lower("SELECT a.frame FROM input('x.mp4', format => 'webvtt') a")
+    g = _lower("SELECT a.video[1] FROM input('x.mp4', format => 'webvtt') a")
     assert g.input_options == {"a": {"format": "webvtt"}}

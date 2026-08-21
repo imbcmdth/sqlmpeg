@@ -40,7 +40,7 @@ Notes for downstream passes (lower):
   ALIASED in FROM (``FROM master m``): the alias is branch-local — two
   branches, or two COPYs, may both spell it ``m`` — but may not shadow the flat
   namespace (:meth:`_Resolver._local_alias`).
-* Named function arguments (``gblur(a.frame, sigma => 5)``) are native Postgres
+* Named function arguments (``gblur(a.video[1], sigma => 5)``) are native Postgres
   syntax: sqlglot parses each into an ``exp.Kwarg(this=Var(name),
   expression=<value>)`` inside the call's ``expressions`` list. The resolver
   checks their SHAPE only — named args must TRAIL the positional ones and may
@@ -183,7 +183,6 @@ from sqlmpeg.types import (
     INPUT_DURATION_COLUMN,
     INPUT_TAG_COLUMNS,
     ROW_SCHEMAS,
-    ROW_STREAM_COLUMN,
     STREAM_ARRAY_COLUMNS,
     UNNEST_COLUMNS,
 )
@@ -194,7 +193,7 @@ __all__ = [
     "INPUT_TAG_COLUMNS",
     "MACRO_NAMESPACE",
     "ROW_SCHEMAS",
-    "ROW_STREAM_COLUMN",
+    "ROW_STREAM",
     "RawInputOption",
     "RawSink",
     "RawSinkOption",
@@ -227,6 +226,19 @@ FILTER_NAMESPACE = "ffmpeg"
 # second reserved alias/CTE name; the macro table (`sqlmpeg.macros.MACROS`) is
 # lower's business, not this pass's.
 MACRO_NAMESPACE = "sqlmpeg"
+
+# The row IS the stream, so the stream has no column name to write. A bare row
+# alias is rewritten to a column of that alias under this internal name
+# (`_normalize_row_aliases`), and every later pass reads a stream column
+# exactly as it always did. The angle brackets keep it out of the surface: no
+# unquoted identifier spells it, and the quoted spelling is turned away where
+# row columns are checked.
+ROW_STREAM = "<stream>"
+
+# The two spellings that left the language. Each keeps a rejection of its own
+# naming its replacement, so an old query says what to write instead.
+_REMOVED_ROW_STREAM = "track"
+_REMOVED_FRAME = "frame"
 
 # A top-level (or CTE-level) query: a plain SELECT, or a UNION ALL of them.
 QueryExpr = exp.Select | exp.Union
@@ -306,7 +318,7 @@ _VIEW_HINT = "write CREATE VIEW <name> AS <query>"
 _OPTION_HINT = "sink options are name/value pairs, e.g. crf 20 or video_codec 'libx264'"
 _KWARG_HINT = (
     "named arguments are written <name> => <value> and come last, "
-    "e.g. gblur(a.frame, sigma => 5)"
+    "e.g. gblur(a.video[1], sigma => 5)"
 )
 _UNNEST_HINT = (
     "unnest takes one bare array column of an input alias and needs a name for "
@@ -342,12 +354,12 @@ _SUBSCRIPT_WHERE_HINT = (
 )
 _AGG_HINT = (
     "array_agg(<track expression>) gathers a branch's track rows into one "
-    "file, e.g. SELECT array_agg(t.track) FROM input('f.mkv') f, "
+    "file, e.g. SELECT array_agg(t) FROM input('f.mkv') f, "
     "unnest(f.audio) t"
 )
 _ARRAY_AGG_PLACE_HINT = (
-    "array_agg(...) is a whole SELECT column: write array_agg(volume(t.track, "
-    "0.5)), not volume(array_agg(t.track), 0.5)"
+    "array_agg(...) is a whole SELECT column: write array_agg(volume(t, "
+    "0.5)), not volume(array_agg(t), 0.5)"
 )
 _GROUP_STREAM_HINT = (
     "a grouped query aggregates its streams: wrap it in array_agg(...), or "
@@ -356,6 +368,10 @@ _GROUP_STREAM_HINT = (
 _GROUP_VALUE_HINT = (
     "add it to the GROUP BY to make it the group's key, or tag the tracks "
     "inside a CTE and aggregate the CTE's streams outside it"
+)
+_CHAPTER_NOT_STREAM_HINT = (
+    "a chapter is not a track, so a chapter row has no stream to select; read "
+    "its metadata columns instead, e.g. {alias}.title"
 )
 _GROUP_FANOUT_HINT = (
     "one group is one file, so the destination has to name the group, "
@@ -415,6 +431,17 @@ def _error(
 ) -> SqlmpegError:
     line, col = _pos(node, fallback)
     return SqlmpegError(code, message, line=line, col=col, hint=hint)
+
+
+def _frame_error(node: exp.Expr, alias: str, fallback: exp.Expr | None) -> SqlmpegError:
+    """``<alias>.frame`` left the language; it was always ``<alias>.video[1]``."""
+    return _error(
+        ErrorCode.UNSUPPORTED_SQL,
+        f"'{alias}.{_REMOVED_FRAME}' is not a column",
+        node,
+        fallback=fallback,
+        hint=f"the first video stream is '{alias}.video[1]'",
+    )
 
 
 def _ident_name(node: exp.Expr | None) -> str:
@@ -569,8 +596,8 @@ def subscript_metadata_shape(node: exp.Expr) -> tuple[exp.Bracket, str] | None:
     return inner, _ident_name(ident)
 
 
-def _accessor_label(bracket: exp.Bracket, name: str) -> str:
-    """``<alias>.<type>[k].<name>``, written the way a user would paste it."""
+def _subscript_label(bracket: exp.Bracket) -> str:
+    """``<alias>.<type>[k]``, written the way a user would paste it."""
     inner = bracket.this
     alias = "?"
     array_column = "?"
@@ -578,7 +605,12 @@ def _accessor_label(bracket: exp.Bracket, name: str) -> str:
         alias = _ident_name(inner.args.get("table"))
         array_column = _ident_name(inner.this)
     index = subscript_index(bracket)
-    return f"{alias}.{array_column}[{index}].{name}"
+    return f"{alias}.{array_column}[{index}]"
+
+
+def _accessor_label(bracket: exp.Bracket, name: str) -> str:
+    """``<alias>.<type>[k].<name>``, written the way a user would paste it."""
+    return f"{_subscript_label(bracket)}.{name}"
 
 
 # stars
@@ -956,8 +988,8 @@ class RawRowJoin:
 class RawTrackRows:
     """``unnest(<source>.<column>) <alias>`` in FROM.
 
-    A track-row TABLE: one row per stream of that array, with the stream
-    itself in the ``track`` column and each piece of probed metadata in a
+    A track-row TABLE: one row per stream of that array — the row IS the
+    stream, and each piece of probed metadata is in a
     column of its own (``ROW_SCHEMAS[column]``). Shape only, as everywhere
     else in this pass — how many rows there are, and what is in them, is a
     property of the FILE, so lower (the pass with the probes) builds them.
@@ -968,8 +1000,8 @@ class RawTrackRows:
     schema. `node` is the ``exp.Unnest`` itself, the anchor for anything lower
     rejects about the table rather than about a column of it.
 
-    ``chapters`` is the one non-stream array: its rows carry no ``track``
-    column (its own ``ROW_SCHEMAS`` entry), only chapter metadata.
+    ``chapters`` is the one non-stream array: its rows are not streams, so
+    they carry chapter metadata and nothing selectable.
     """
 
     alias: str
@@ -1200,6 +1232,65 @@ def from_entries(select: exp.Select) -> list[tuple[exp.Expr, RawRowJoin | None]]
 def from_items(select: exp.Select) -> list[exp.Expr]:
     """The FROM items of one branch, in written order (join specs dropped)."""
     return [item for item, _ in from_entries(select)]
+
+
+def _unnest_aliases(select: exp.Select) -> set[str]:
+    """The row-table names this branch's FROM clause binds with ``unnest``."""
+    names: set[str] = set()
+    for item in from_items(select):
+        if not isinstance(item, exp.Unnest):
+            continue
+        alias_node = item.args.get("alias")
+        if isinstance(alias_node, exp.TableAlias) and isinstance(alias_node.this, exp.Expr):
+            names.add(_ident_name(alias_node.this))
+    return names
+
+
+def _name_the_stream(part: exp.Expr, names: set[str]) -> None:
+    """Rewrite the bare row aliases inside one expression, in place."""
+    for sub in part.walk():
+        if not isinstance(sub, exp.Column) or sub.args.get("table") is not None:
+            continue
+        identifier = sub.this
+        if not isinstance(identifier, exp.Identifier):
+            continue
+        if _ident_name(identifier) not in names:
+            continue
+        sub.set("this", exp.to_identifier(ROW_STREAM, quoted=False))
+        sub.set("table", identifier)
+
+
+def _normalize_row_aliases(select: exp.Select, path_expr: exp.Expr | None = None) -> None:
+    """Rewrite every bare row alias into that row's stream column, in place.
+
+    A row record used where a stream is expected IS that stream, so ``SELECT
+    a``, ``array_agg(a)``, ``scale(a, ...)``, ``COALESCE(a, ...)`` and ``GROUP
+    BY a`` all name the row's stream. The alias standing alone becomes
+    ``a.<ROW_STREAM>`` here, once, and every pass after this one reads the
+    stream column it has always read. The written identifier moves to the
+    qualifier, so an error still anchors on the line and column the user
+    typed.
+
+    The FROM clause and any CTE bodies are left alone: an alias is only bare
+    where a value goes. A fan-out ``TO`` expression is included, so a stream
+    written there is rejected as a stream rather than as an unknown name.
+    """
+    names = _unnest_aliases(select)
+    if not names:
+        return
+    parts: list[exp.Expr] = [p for p in select.expressions if isinstance(p, exp.Expr)]
+    if path_expr is not None:
+        parts.append(path_expr)
+    for key in ("where", "group", "order"):
+        part = select.args.get(key)
+        if isinstance(part, exp.Expr):
+            parts.append(part)
+    for join in select.args.get("joins") or []:
+        on = join.args.get("on") if isinstance(join, exp.Join) else None
+        if isinstance(on, exp.Expr):
+            parts.append(on)
+    for part in parts:
+        _name_the_stream(part, names)
 
 
 def _has_row_source(select: exp.Select, visible: set[str]) -> bool:
@@ -2192,6 +2283,7 @@ class _Resolver:
         # nowhere else. The carve-out is decided from the FROM clause alone,
         # before any of it is validated, so a branch with no rows keeps the
         # NO_STREAMING_EQUIVALENT rejection byte for byte.
+        _normalize_row_aliases(select, path_expr)
         rows = _has_row_source(select, visible)
         if rows:
             self._check_aggregate_context(select, no_aggregate)
@@ -2339,14 +2431,14 @@ class _Resolver:
             if scope.get(alias) != "row":
                 return
             name = _ident_name(node.this)
+            stream = name == ROW_STREAM
+            label = alias if stream else f"{alias}.{name}"
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{alias}.{name}' is neither aggregated nor a GROUP BY key",
+                f"'{label}' is neither aggregated nor a GROUP BY key",
                 node,
                 fallback=select,
-                hint=_GROUP_STREAM_HINT
-                if name == ROW_STREAM_COLUMN
-                else _GROUP_VALUE_HINT,
+                hint=_GROUP_STREAM_HINT if stream else _GROUP_VALUE_HINT,
             )
         for value in node.args.values():
             items = value if isinstance(value, list) else [value]
@@ -2863,7 +2955,7 @@ class _Resolver:
                     alias_node if alias_node is not None else inner,
                     fallback=table,
                     hint="a name can appear only once per FROM clause; to consume "
-                    "it twice, reference <name>.frame twice — reuse is automatic",
+                    "it twice, reference <name>.video[1] twice — reuse is automatic",
                 )
             scope[local] = "cte"
             return
@@ -3191,9 +3283,9 @@ class _Resolver:
     ) -> None:
         for sub in node.walk():
             if isinstance(sub, exp.Dot):
-                # `<alias>.<type>[k].<column>`: only `.track` is a legal SELECT
-                # output in a MEDIA query, since streams are the only outputs
-                # one has. A table/csv query also accepts the metadata columns.
+                # `<alias>.<type>[k].<column>` reads metadata, which is no
+                # SELECT output in a MEDIA query: streams are the only outputs
+                # one has. A table/csv query prints the metadata columns.
                 shape = subscript_metadata_shape(sub)
                 if shape is not None:
                     self._check_output_accessor(sub, shape, scope, select, table_mode=table_mode)
@@ -3217,7 +3309,7 @@ class _Resolver:
                     f"unqualified column '{sub.name}'",
                     sub,
                     fallback=select,
-                    hint="qualify the column with its alias, e.g. a.frame",
+                    hint="qualify the column with its alias, e.g. a.video[1]",
                 )
             name = _ident_name(table_node)
             kind = scope.get(name)
@@ -3255,6 +3347,8 @@ class _Resolver:
             # whatever its body named with AS, and a generated source exposes
             # exactly one stream of a type only the registry knows, so only
             # lower can check either of those.
+            if kind == "input" and _ident_name(sub.this) == _REMOVED_FRAME:
+                raise _frame_error(sub, name, select)
             if kind == "input" and not _is_input_column(_ident_name(sub.this)):
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -3272,8 +3366,27 @@ class _Resolver:
 
     def _check_row_column(self, column: exp.Column, alias: str, select: exp.Expr) -> str:
         """Whitelist one ``<row alias>.<column>`` and return its column type."""
-        schema = ROW_SCHEMAS[self.track_rows[alias].column]
+        array_column = self.track_rows[alias].column
+        schema = ROW_SCHEMAS[array_column]
         name = _ident_name(column.this)
+        if name == ROW_STREAM and not column.this.args.get("quoted"):
+            if array_column == CHAPTERS_COLUMN:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{alias}' is a chapter row, not a stream",
+                    column,
+                    fallback=select,
+                    hint=_CHAPTER_NOT_STREAM_HINT.format(alias=alias),
+                )
+            return "stream"
+        if name == _REMOVED_ROW_STREAM and array_column != CHAPTERS_COLUMN:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{_REMOVED_ROW_STREAM}' is not a column",
+                column,
+                fallback=select,
+                hint=f"the row is the stream: use '{alias}'",
+            )
         column_type = schema.get(name)
         if column_type is None:
             raise _error(
@@ -3298,12 +3411,12 @@ class _Resolver:
     ) -> str:
         """Validate one ``<alias>.<type>[k].<name>`` accessor; return its type.
 
-        Returns ``"stream"`` for ``.track`` (sugar for the bracket alone) or
-        one of :data:`ROW_SCHEMAS`'s column types otherwise. Shared by every
-        context an accessor can appear in -- SELECT (only ``.track`` survives
-        there) and WHERE (061's row grammar, reused rather than reinvented
-        for a plain input alias's subscript) -- so the alias/array/subscript/
-        column checks are written exactly once.
+        Returns one of :data:`ROW_SCHEMAS`'s column types. Shared by every
+        context an accessor can appear in -- SELECT (where no metadata
+        accessor survives, since a SELECT column is an output stream) and
+        WHERE (the row grammar, reused rather than reinvented for a plain
+        input alias's subscript) -- so the alias/array/subscript/column checks
+        are written exactly once.
         """
         inner = bracket.this
         if not isinstance(inner, exp.Column):  # defensive: _check_subscript checked it
@@ -3355,6 +3468,15 @@ class _Resolver:
                 bracket,
                 fallback=fallback,
                 hint=_SUBSCRIPT_HINT,
+            )
+        if name == _REMOVED_ROW_STREAM:
+            label = _subscript_label(bracket)
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{label}.{_REMOVED_ROW_STREAM}' is not a column",
+                anchor,
+                fallback=fallback,
+                hint=f"the subscript is already the stream: use '{label}'",
             )
         schema = ROW_SCHEMAS[array_column]
         column_type = schema.get(name)
@@ -3434,28 +3556,26 @@ class _Resolver:
         *,
         table_mode: bool = False,
     ) -> None:
-        """A ``<alias>.<type>[k].<column>`` in SELECT position: only ``.track``.
+        """A ``<alias>.<type>[k].<column>`` in SELECT position: never a stream.
 
-        Streams are the only SELECT output a MEDIA query has;
-        ``.track`` is sugar for the bracket alone and lowers
-        exactly like it, but every other accessor names a piece of metadata
-        -- a string or a number -- which has nowhere to go on an ffmpeg
-        command line. A table/csv query is the one
-        exception: its whole point is printing that metadata, so
+        Streams are the only SELECT output a MEDIA query has, and every
+        accessor names a piece of metadata -- a string or a number -- which
+        has nowhere to go on an ffmpeg command line. A table/csv query is the
+        one exception: its whole point is printing that metadata, so
         ``table_mode`` skips this rejection there.
         """
         bracket, name = shape
-        column_type = self._check_accessor(bracket, name, dot, scope, select)
-        if column_type != "stream" and not table_mode:
+        self._check_accessor(bracket, name, dot, scope, select)
+        if not table_mode:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"'.{name}' is track metadata, not a stream, and a SELECT "
                 "column is an output stream",
                 dot,
                 fallback=select,
-                hint=f"streams are the only output: select '.{ROW_STREAM_COLUMN}' "
-                "(or drop the accessor, it is the default) and filter on "
-                "metadata in WHERE instead",
+                hint="streams are the only output: drop the accessor, the "
+                "subscript is already the stream, and filter on metadata in "
+                "WHERE instead",
             )
 
     def _subscript_operand(
@@ -3466,19 +3586,8 @@ class _Resolver:
         scope: dict[str, str],
         where: exp.Where,
     ) -> str:
-        """Check one WHERE accessor operand and return its type; reject ``.track``."""
-        column_type = self._check_accessor(bracket, name, anchor, scope, where)
-        if column_type == "stream":
-            label = _accessor_label(bracket, name)
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"'{label}' is a stream, not a value to compare",
-                anchor,
-                fallback=where,
-                hint="filter on the metadata columns, e.g. WHERE "
-                f"{_accessor_label(bracket, 'language')} = 'eng'",
-            )
-        return column_type
+        """Check one WHERE accessor operand and return its type."""
+        return self._check_accessor(bracket, name, anchor, scope, where)
 
     def _check_subscript_conjunct(
         self, conjunct: exp.Expr, scope: dict[str, str], where: exp.Where
@@ -3960,7 +4069,7 @@ class _Resolver:
         """Check one value-expression column operand and return its type.
 
         A track-row column, or an input alias's ``duration`` / container tag;
-        ``track`` is a stream and is rejected as one.
+        the row itself is a stream and is rejected as one.
         """
         table_node = column.args.get("table")
         if table_node is None:
@@ -3990,6 +4099,8 @@ class _Resolver:
                     fallback=where,
                     hint=self._known_hint(scope),
                 )
+            if scope[alias] == "input" and _ident_name(column.this) == _REMOVED_FRAME:
+                raise _frame_error(column, alias, where)
             if scope[alias] == "input" and _ident_name(column.this) == CHAPTERS_COLUMN:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -4012,7 +4123,7 @@ class _Resolver:
         if column_type == "stream":
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{alias}.{ROW_STREAM_COLUMN}' is a stream, not a value to compare",
+                f"'{alias}' is a stream, not a value to compare",
                 column,
                 fallback=where,
                 hint="filter on the metadata columns, e.g. "
@@ -4330,8 +4441,8 @@ class _Resolver:
             if self._check_row_column(key, alias, order) == "stream":
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"'{alias}.{ROW_STREAM_COLUMN}' is a stream, and streams have "
-                    "no order to sort by",
+                    f"'{alias}' is a stream, and streams have no order to "
+                    "sort by",
                     key,
                     fallback=order,
                     hint=_ROW_ORDER_HINT,

@@ -74,10 +74,10 @@ Imagine you wanted to shrink `commentary.mkv` into the corner of `film.mkv`, and
 ```sql
 COPY(
 WITH pip AS (
-  SELECT scale(c.frame, 'iw/4', -2) AS frame, c.audio AS sound
+  SELECT scale(c.video[1], 'iw/4', -2) AS frame, c.audio AS sound
   FROM input('commentary.mkv') c
 )
-SELECT overlay(f.frame, pip.frame, 20, 20),
+SELECT overlay(f.video[1], pip.frame, 20, 20),
        amix(volume(f.audio, 0.65), volume(pip.sound, 0.35))
 FROM input('film.mkv') f, pip
 ) TO ('pip.mkv')
@@ -107,10 +107,10 @@ The query above describes the edit and says nothing about codecs, so ffmpeg pick
 ```sql
 COPY (
   WITH pip AS (
-    SELECT scale(c.frame, 'iw/4', -2) AS frame, c.audio AS sound
+    SELECT scale(c.video[1], 'iw/4', -2) AS frame, c.audio AS sound
     FROM input('commentary.mkv') c
   )
-  SELECT overlay(f.frame, pip.frame, 20, 20),
+  SELECT overlay(f.video[1], pip.frame, 20, 20),
          amix(volume(f.audio, 0.65), volume(pip.sound, 0.35))
   FROM input('film.mkv') f, pip
 ) TO 'pip.mkv' WITH (
@@ -188,14 +188,14 @@ sqlmpeg <command> [-h] [-f FILE] [-v NAME=VALUE] [--timeout TIMEOUT] [-y] [query
 
 ## The ideas, briefly
 
-- **Streams are columns.** Every input exposes `<alias>.video`, `<alias>.audio`, `<alias>.subtitle`, `<alias>.data` (1-based subscripts; `<alias>.frame` is sugar for `video[1]`), and **the SELECT list is the result set** - in a media query (one with a `COPY` destination), one column is one `-map`, in order, nothing implicit. A bare subscript no function touches stays a stream copy. `input()` takes per-input options (`loop => true` keeps a still image alive). `SELECT *` keeps everything.
+- **Streams are columns.** Every input exposes `<alias>.video`, `<alias>.audio`, `<alias>.subtitle`, `<alias>.data` (1-based subscripts), and **the SELECT list is the result set** - in a media query (one with a `COPY` destination), one column is one `-map`, in order, nothing implicit. A bare subscript no function touches stays a stream copy. `input()` takes per-input options (`loop => true` keeps a still image alive). `SELECT *` keeps everything.
 - **Bare arrays broadcast.** `atempo(v.audio, 1.25)` fans out one node per track, each output keeping its language tag. Two arrays in one call zip elementwise.
 - **Tracks are rows when you need them.** `unnest(f.audio)` turns a track array into a compile-time table whose columns are the probed metadata, so picking a track is `WHERE t.language = 'eng'` and aligning two files' tracks is a real SQL `JOIN` - inner, left, or full outer, with generated silence (or an empty caption track) standing in for what a file lacks. Selecting a computed column next to a track *edits its tags* (`CASE ... END AS language` retags a whole library in one expression), and `chapters` is just another array column - `unnest(f.chapters)` reads them, a `VALUES` list writes them. Rows combine only when written: `array_agg` gathers them into one file, a `TO (expression)` writes one file per row, and a multi-row query into a single path is a compile error - what the table preview shows is exactly what a COPY serializes. Every join is decided at compile time; ffmpeg only sees the wiring. [docs/rows.md](docs/rows.md) has the whole story.
 - **A SELECT with no COPY prints a table.** The result set was fully known at compile time, so `sqlmpeg "SELECT * FROM input('film.mkv') f, unnest(f.audio) t"` prints the tracks as rows - ffprobe you can read, joins included - and `COPY (...) TO STDOUT WITH (FORMAT csv)` makes it scriptable. ffmpeg only runs when a `COPY` names a media destination.
 - **Trims are seeks.** `WHERE a.t BETWEEN 5 AND 60` (or either bound alone, open-ended) becomes `-ss`/`-to` on that alias's `-i`: fast, all stream types at once, stream-copy still possible. Decoded streams cut frame-accurate; copied ones snap to a keyframe. The measurements, and the caption caveat, are in [docs/trimming.md](docs/trimming.md).
-- **Every filter, one convention.** All ~450 filters in your ffmpeg build are callable: streams first, then options - positionally in the exact order `ffmpeg -help filter=<name>` prints them, by name (`unsharp(a.frame, luma_amount => 1.5)`), or both. Every option is type-checked against what the binary reports. `ffmpeg.<name>(...)` always means the raw filter, including the eleven names Postgres grammar would otherwise eat; `sqlmpeg.<name>(...)` holds exactly four macros for jobs no single filter does (`delay`, `speed`, `blur_regions`, and `loudnorm2`, which measures a stream's loudness and corrects it in a second pass). A few multi-output filters (`channelsplit`, `acrossover`, `extractplanes`) return arrays. [docs/filters.md](docs/filters.md) has the whole story.
+- **Every filter, one convention.** All ~450 filters in your ffmpeg build are callable: streams first, then options - positionally in the exact order `ffmpeg -help filter=<name>` prints them, by name (`unsharp(a.video[1], luma_amount => 1.5)`), or both. Every option is type-checked against what the binary reports. `ffmpeg.<name>(...)` always means the raw filter, including the eleven names Postgres grammar would otherwise eat; `sqlmpeg.<name>(...)` holds exactly four macros for jobs no single filter does (`delay`, `speed`, `blur_regions`, and `loudnorm2`, which measures a stream's loudness and corrects it in a second pass). A few multi-output filters (`channelsplit`, `acrossover`, `extractplanes`) return arrays. [docs/filters.md](docs/filters.md) has the whole story.
 - **Generated sources live in FROM.** `ffmpeg.sine(frequency => 440, duration => 1) s` is a table function, not a file - the compiled command has no `-i` at all.
-- **`enable` and expressions.** `gblur(a.frame, 12, enable => 'between(t,10,20)')` windows an effect in time; expression strings like `'(W-w)/2'` do per-frame geometry in any string-typed option.
+- **`enable` and expressions.** `gblur(a.video[1], 12, enable => 'between(t,10,20)')` windows an effect in time; expression strings like `'(W-w)/2'` do per-frame geometry in any string-typed option.
 - **Captions ride along, untouched.** Subtitle and data streams select, extract and mux like anything else, but they're passthrough-only - a filtergraph has no subtitle pads.
 - **Errors are a feature.** Every rejection is a typed, line-anchored JSON object with a hint, documented with captured examples in [docs/errors.md](docs/errors.md).
 

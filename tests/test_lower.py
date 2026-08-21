@@ -273,7 +273,7 @@ def test_readme_flagship_lowers_to_expected_nodes(_fixtures: None) -> None:
     ]
     # CTEs are traversed first, so the CTE's alias `c` takes input 0.
     assert g.sources == {"c": 0, "f": 1}
-    assert g.nodes["n2"].inputs == ["src:f:v:0", "n1"]  # overlay(f.frame, pip.frame, ...)
+    assert g.nodes["n2"].inputs == ["src:f:v:0", "n1"]  # overlay(f.video[1], pip.frame)
     # amix zips f.audio[k]*0.65 with c.audio[k]*0.35, one pair per language
     assert g.nodes["n7"].inputs == ["n3", "n5"]
     assert g.nodes["n8"].inputs == ["n4", "n6"]
@@ -444,7 +444,7 @@ def test_readme_ladder_example_command_is_the_real_compilation() -> None:
 
 def test_readme_flagship_scale_factor_is_not_a_decimal() -> None:
     """``Literal.to_py()`` yields Decimal for 0.5; the IR must carry float."""
-    g = _lower("SELECT scale(a.frame, 0.5, 0.25) FROM input('x.mp4') a")
+    g = _lower("SELECT scale(a.video[1], 0.5, 0.25) FROM input('x.mp4') a")
     args = g.nodes["n1"].args
     assert args == {"width": 0.5, "height": 0.25}
     assert all(type(v) is float for v in args.values())
@@ -455,17 +455,11 @@ def test_readme_flagship_scale_factor_is_not_a_decimal() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_frame_sugar_is_the_first_video_stream() -> None:
-    g = compile_sql("SELECT a.frame FROM input('x.mp4') a")
+def test_a_video_subscript_is_the_first_video_stream() -> None:
+    g = compile_sql("SELECT a.video[1] FROM input('x.mp4') a")
     assert g.nodes == {}
     assert _outputs(g) == [("src:a:v:0", "video", None)]
     assert g.sources == {"a": 0}
-
-
-def test_frame_and_video_subscript_one_agree() -> None:
-    assert _outputs(compile_sql("SELECT a.frame FROM input('x.mp4') a")) == _outputs(
-        compile_sql("SELECT a.video[1] FROM input('x.mp4') a")
-    )
 
 
 def test_sql_subscripts_are_one_based() -> None:
@@ -539,12 +533,6 @@ def test_arithmetic_projection_is_rejected() -> None:
     err = _reject("SELECT 1 + 2 FROM input('x.mp4') a")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "every SELECT column must be a stream expression" in err.message
-
-
-def test_frame_cannot_be_subscripted() -> None:
-    err = _reject("SELECT a.frame[1] FROM input('x.mp4') a")
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "a.frame" in err.message
 
 
 # ---------------------------------------------------------------------------
@@ -995,7 +983,7 @@ def test_concat_after_agreeing_amix_keeps_the_shared_language() -> None:
 
 
 def test_where_between_seeks_the_input_and_leaves_the_video_ref_alone() -> None:
-    g = _lower("SELECT hflip(a.frame) FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2.5")
+    g = _lower("SELECT hflip(a.video[1]) FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2.5")
     assert g.to_dict()["nodes"] == [
         {
             "id": "n1",
@@ -1056,7 +1044,7 @@ def test_one_predicate_seeks_video_and_audio_in_sync() -> None:
 
 def test_one_window_serves_every_consumer_of_that_input() -> None:
     g = _lower(
-        "SELECT overlay(a.frame, a.frame, 5, 5) FROM input('x.mp4') a "
+        "SELECT overlay(a.video[1], a.video[1], 5, 5) FROM input('x.mp4') a "
         "WHERE a.t BETWEEN 0 AND 3"
     )
     assert _filters(g) == ["overlay"]
@@ -1066,7 +1054,7 @@ def test_one_window_serves_every_consumer_of_that_input() -> None:
 
 def test_where_seeks_only_the_named_alias() -> None:
     g = _lower(
-        "SELECT overlay(a.frame, b.frame, 0, 0) "
+        "SELECT overlay(a.video[1], b.video[1], 0, 0) "
         "FROM input('x.mp4') a, input('y.mp4') b WHERE b.t BETWEEN 2 AND 4"
     )
     assert g.input_trims == {"b": (2, 4)}
@@ -1075,7 +1063,7 @@ def test_where_seeks_only_the_named_alias() -> None:
 
 def test_two_between_clauses_seek_both_inputs() -> None:
     g = _lower(
-        "SELECT overlay(a.frame, b.frame, 0, 0) FROM input('x.mp4') a, input('y.mp4') b "
+        "SELECT overlay(a.video[1], b.video[1], 0, 0) FROM input('x.mp4') a, input('y.mp4') b "
         "WHERE a.t BETWEEN 0 AND 1 AND b.t BETWEEN 2 AND 3"
     )
     assert _filters(g) == ["overlay"]
@@ -1087,7 +1075,7 @@ def test_each_windowed_alias_gets_its_own_i_in_the_argv() -> None:
     """Two inputs, two windows: each -ss/-to sits in front of its own -i."""
     emitted = emit(
         compile_sql(
-            "SELECT overlay(a.frame, b.frame, 0, 0) "
+            "SELECT overlay(a.video[1], b.video[1], 0, 0) "
             "FROM input('x.mp4') a, input('y.mp4') b "
             "WHERE a.t BETWEEN 0 AND 1 AND b.t BETWEEN 2.5 AND 3"
         )
@@ -1113,9 +1101,9 @@ def test_each_windowed_alias_gets_its_own_i_in_the_argv() -> None:
 def test_union_all_branches_seek_their_own_inputs() -> None:
     """Per-alias windows survive a UNION ALL: one -i each, concat unchanged."""
     g = compile_sql(
-        "SELECT a.frame FROM input('x.mp4') a WHERE a.t BETWEEN 0 AND 1 "
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 0 AND 1 "
         "UNION ALL "
-        "SELECT b.frame FROM input('y.mp4') b WHERE b.t BETWEEN 2 AND 3"
+        "SELECT b.video[1] FROM input('y.mp4') b WHERE b.t BETWEEN 2 AND 3"
     )
     assert _filters(g) == ["concat"]
     assert g.nodes["n1"].inputs == ["src:a:v:0", "src:b:v:0"]
@@ -1147,7 +1135,7 @@ def test_the_seek_covers_the_whole_input_selected_or_not() -> None:
 
 
 def test_tail_only_where_seeks_with_no_upper_bound() -> None:
-    g = _lower("SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 5")
+    g = _lower("SELECT a.video[1] FROM input('x.mp4') a WHERE a.t >= 5")
     assert g.input_trims == {"a": (5, None)}
     emitted = emit(g)
     assert emitted.input_trims == [(5, None)]
@@ -1155,7 +1143,7 @@ def test_tail_only_where_seeks_with_no_upper_bound() -> None:
 
 
 def test_head_only_where_seeks_with_no_lower_bound() -> None:
-    g = _lower("SELECT a.frame FROM input('x.mp4') a WHERE a.t <= 60")
+    g = _lower("SELECT a.video[1] FROM input('x.mp4') a WHERE a.t <= 60")
     assert g.input_trims == {"a": (None, 60)}
     emitted = emit(g)
     assert emitted.input_trims == [(None, 60)]
@@ -1164,22 +1152,22 @@ def test_head_only_where_seeks_with_no_lower_bound() -> None:
 
 def test_flipped_operand_order_produces_the_same_window() -> None:
     """``120 <= a.t`` is the mirror of ``a.t >= 120`` -- exact, not approximate."""
-    g_unflipped = _lower("SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 120")
-    g_flipped = _lower("SELECT a.frame FROM input('x.mp4') a WHERE 120 <= a.t")
+    g_unflipped = _lower("SELECT a.video[1] FROM input('x.mp4') a WHERE a.t >= 120")
+    g_flipped = _lower("SELECT a.video[1] FROM input('x.mp4') a WHERE 120 <= a.t")
     assert g_unflipped.input_trims == g_flipped.input_trims == {"a": (120, None)}
 
 
 def test_gte_and_lte_merge_into_the_same_window_as_between() -> None:
-    g_inequalities = _lower("SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 1 AND a.t <= 2")
-    g_between = _lower("SELECT a.frame FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2")
+    g_inequalities = _lower("SELECT a.video[1] FROM input('x.mp4') a WHERE a.t >= 1 AND a.t <= 2")
+    g_between = _lower("SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2")
     assert g_inequalities.input_trims == g_between.input_trims == {"a": (1, 2)}
 
 
 @pytest.mark.parametrize(
     "sql",
     [
-        "SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 5 AND a.t <= 2",
-        "SELECT a.frame FROM input('x.mp4') a WHERE a.t BETWEEN 5 AND 2",
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t >= 5 AND a.t <= 2",
+        "SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 5 AND 2",
     ],
 )
 def test_empty_time_window_is_rejected(sql: str) -> None:
@@ -1191,15 +1179,6 @@ def test_empty_time_window_is_rejected(sql: str) -> None:
 # ---------------------------------------------------------------------------
 # CTEs
 # ---------------------------------------------------------------------------
-
-
-def test_unnamed_single_video_cte_column_is_reachable_as_frame() -> None:
-    g = _lower(
-        "WITH c AS (SELECT hflip(a.frame) FROM input('x.mp4') a) "
-        "SELECT vflip(c.frame) FROM c"
-    )
-    assert _filters(g) == ["hflip", "vflip"]
-    assert g.nodes["n2"].inputs == ["n1"]
 
 
 def test_cte_columns_are_reachable_by_their_as_names() -> None:
@@ -1297,14 +1276,15 @@ def test_cte_array_column_provenance_reaches_the_outer_output() -> None:
     assert [o.metadata for o in g.outputs] == [{"language": "eng"}, {"language": "fra"}]
 
 
-def test_a_single_array_video_cte_column_is_not_frame_sugar() -> None:
-    """`<cte>.frame` is singular sugar; an array column does not answer to it."""
+def test_an_unnamed_cte_column_has_no_name_to_read() -> None:
+    """A CTE exposes what its body named with AS, and nothing else."""
     err = _reject_lower(
-        "WITH c AS (SELECT a.video FROM input('x.mp4') a) SELECT hflip(c.frame) FROM c",
+        "WITH c AS (SELECT a.video FROM input('x.mp4') a) SELECT hflip(c.v) FROM c",
         {"a": _probe_result(videos=2)},
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "c.frame" in err.message
+    assert "c.v" in err.message
+    assert err.hint is not None and "no named columns" in err.hint
 
 
 def test_where_trims_a_cte_column_by_its_type() -> None:
@@ -1323,7 +1303,7 @@ def test_where_trims_a_cte_column_by_its_type() -> None:
 def test_cte_open_lower_trim_node_carries_only_start() -> None:
     """A CTE trim with only one bound omits the other's arg entirely."""
     g = _lower(
-        "WITH c AS (SELECT hflip(a.frame) AS pic FROM input('x.mp4') a) "
+        "WITH c AS (SELECT hflip(a.video[1]) AS pic FROM input('x.mp4') a) "
         "SELECT c.pic FROM c WHERE c.t >= 3"
     )
     assert _filters(g) == ["hflip", "trim", "setpts"]
@@ -1345,7 +1325,7 @@ def test_a_where_inside_a_cte_body_still_seeks_the_input() -> None:
     CTE body -- aliases are globally unique, so the seek is a graph property."""
     g = _lower(
         "WITH c AS ("
-        "  SELECT hflip(a.frame) AS pic FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2"
+        "  SELECT hflip(a.video[1]) AS pic FROM input('x.mp4') a WHERE a.t BETWEEN 1 AND 2"
         ") SELECT vflip(c.pic) FROM c"
     )
     assert _filters(g) == ["hflip", "vflip"]
@@ -1355,9 +1335,9 @@ def test_a_where_inside_a_cte_body_still_seeks_the_input() -> None:
 def test_cte_union_all_gets_its_own_concat() -> None:
     g = _lower(
         "WITH u AS ("
-        "  SELECT a.frame FROM input('x.mp4') a"
-        "  UNION ALL SELECT b.frame FROM input('y.mp4') b"
-        ") SELECT hflip(u.frame) FROM u"
+        "  SELECT a.video[1] AS v FROM input('x.mp4') a"
+        "  UNION ALL SELECT b.video[1] AS v FROM input('y.mp4') b"
+        ") SELECT hflip(u.v) FROM u"
     )
     assert _filters(g) == ["concat", "hflip"]
     assert g.nodes["n1"].inputs == ["src:a:v:0", "src:b:v:0"]
@@ -1370,7 +1350,7 @@ def test_a_cte_body_unnests_its_input_and_filters_the_rows() -> None:
     the survivors are the streams the outer SELECT maps."""
     g = _lower(
         "WITH tracks AS ("
-        "  SELECT t.track AS track FROM input('x.mp4') f, unnest(f.audio) t"
+        "  SELECT t AS track FROM input('x.mp4') f, unnest(f.audio) t"
         "  WHERE t.language = 'fra'"
         ") SELECT tracks.track FROM tracks",
         {
@@ -1390,9 +1370,9 @@ def test_a_cte_body_unnests_its_input_and_filters_the_rows() -> None:
 
 def test_union_all_video_only_lowers_to_one_concat() -> None:
     g = compile_sql(
-        "SELECT a.frame FROM input('x.mp4') a "
-        "UNION ALL SELECT hflip(b.frame) FROM input('y.mp4') b "
-        "UNION ALL SELECT c.frame FROM input('z.mp4') c"
+        "SELECT a.video[1] FROM input('x.mp4') a "
+        "UNION ALL SELECT hflip(b.video[1]) FROM input('y.mp4') b "
+        "UNION ALL SELECT c.video[1] FROM input('z.mp4') c"
     )
     concat = g.nodes["n2"]
     assert concat.filter == "concat"
@@ -1493,7 +1473,7 @@ def test_union_all_column_order_mismatch_is_a_concat_mismatch() -> None:
 
 
 def test_nested_calls_chain_bottom_up() -> None:
-    g = _lower("SELECT gblur(hflip(vflip(a.frame)), 4) FROM input('x.mp4') a")
+    g = _lower("SELECT gblur(hflip(vflip(a.video[1])), 4) FROM input('x.mp4') a")
     assert _filters(g) == ["vflip", "hflip", "gblur"]
     assert g.nodes["n1"].inputs == ["src:a:v:0"]
     assert g.nodes["n2"].inputs == ["n1"]
@@ -1510,29 +1490,29 @@ def test_audio_calls_chain_bottom_up() -> None:
 
 
 def test_function_lookup_is_case_insensitive() -> None:
-    g = _lower("SELECT SCALE(a.frame, 0.5) FROM input('x.mp4') a")
+    g = _lower("SELECT SCALE(a.video[1], 0.5) FROM input('x.mp4') a")
     assert _filters(g) == ["scale"]
 
 
 def test_negative_numeric_literals_survive() -> None:
-    g = _lower("SELECT scale(a.frame, -2, 720) FROM input('x.mp4') a")
+    g = _lower("SELECT scale(a.video[1], -2, 720) FROM input('x.mp4') a")
     assert g.nodes["n1"].args == {"width": -2, "height": 720}
 
 
 def test_string_literal_argument() -> None:
-    g = _lower("SELECT drawbox(a.frame, 1, 2, 3, 4, 'red') FROM input('x.mp4') a")
+    g = _lower("SELECT drawbox(a.video[1], 1, 2, 3, 4, 'red') FROM input('x.mp4') a")
     assert g.nodes["n1"].args["color"] == "red"
 
 
 def test_unknown_function_suggests_a_close_match() -> None:
-    err = _reject("SELECT scal(a.frame, 0.5) FROM input('x.mp4') a")
+    err = _reject("SELECT scal(a.video[1], 0.5) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert "scal()" in err.message
     assert err.hint is not None and "scale()" in err.hint
 
 
 def test_unknown_function_without_a_match_names_the_filter_set() -> None:
-    err = _reject("SELECT zzzz(a.frame) FROM input('x.mp4') a")
+    err = _reject("SELECT zzzz(a.video[1]) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert err.hint is not None and "filter of your installed ffmpeg" in err.hint
 
@@ -1541,7 +1521,7 @@ def test_unknown_function_without_a_match_names_the_filter_set() -> None:
 def test_a_call_with_no_options_at_all_is_legal() -> None:
     """Every option has an ffmpeg default, so passing none is a complete call
     -- there is no arity to satisfy beyond the pad signature."""
-    g = _lower("SELECT scale(a.frame) FROM input('x.mp4') a")
+    g = _lower("SELECT scale(a.video[1]) FROM input('x.mp4') a")
     assert g.nodes["n1"].filter == "scale"
     assert g.nodes["n1"].args == {}
 
@@ -1549,7 +1529,7 @@ def test_a_call_with_no_options_at_all_is_legal() -> None:
 def test_argument_kind_mismatch_is_the_options_own_rejection() -> None:
     """A badly-typed POSITIONAL is an option problem,
     reported against the option it landed on -- not a signature mismatch."""
-    err = _reject("SELECT gblur(a.frame, 'lots') FROM input('x.mp4') a")
+    err = _reject("SELECT gblur(a.video[1], 'lots') FROM input('x.mp4') a")
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "'sigma' of filter 'gblur' expects a number, got 'lots'" in err.message
 
@@ -1570,51 +1550,51 @@ def test_video_stream_where_audio_is_expected() -> None:
 
 def test_video_result_where_audio_is_expected() -> None:
     """The kind of a nested call comes from its output PAD type."""
-    err = _reject("SELECT volume(hflip(a.frame), 2) FROM input('x.mp4') a")
+    err = _reject("SELECT volume(hflip(a.video[1]), 2) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "it takes audio as its stream input, got (video)" in err.message
 
 
 def test_stream_argument_where_an_option_value_is_expected() -> None:
-    err = _reject("SELECT gblur(a.frame, hflip(a.frame)) FROM input('x.mp4') a")
+    err = _reject("SELECT gblur(a.video[1], hflip(a.video[1])) FROM input('x.mp4') a")
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "'sigma' of filter 'gblur' takes a value, got a video stream" in err.message
 
 
 def test_an_unknown_nested_call_in_an_option_slot_still_names_it() -> None:
     """Classifying the argument first is what keeps the typo readable."""
-    err = _reject("SELECT gblur(a.frame, nope(a.frame)) FROM input('x.mp4') a")
+    err = _reject("SELECT gblur(a.video[1], nope(a.video[1])) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert "nope()" in err.message
 
 
 def test_non_literal_scalar_argument_is_rejected() -> None:
-    err = _reject("SELECT gblur(a.frame, NULL) FROM input('x.mp4') a")
+    err = _reject("SELECT gblur(a.video[1], NULL) FROM input('x.mp4') a")
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "'sigma' of filter 'gblur' expects a number" in err.message
 
 
 def test_arithmetic_scalar_argument_is_folded() -> None:
-    g = _lower("SELECT gblur(a.frame, 1 + 2) FROM input('x.mp4') a")
+    g = _lower("SELECT gblur(a.video[1], 1 + 2) FROM input('x.mp4') a")
     assert g.nodes["n1"].args["sigma"] == 3
 
 
 def test_malformed_numeric_literal_is_a_typed_rejection() -> None:
     """sqlglot tokenizes `1e` as a number but ``to_py()`` raises on it."""
-    err = _reject("SELECT gblur(a.frame, 1e) FROM input('x.mp4') a")
+    err = _reject("SELECT gblur(a.video[1], 1e) FROM input('x.mp4') a")
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "1e" in err.message
 
 
 def test_malformed_between_bound_is_a_typed_rejection() -> None:
-    err = _reject("SELECT a.frame FROM input('x.mp4') a WHERE a.t BETWEEN 1e AND 2")
+    err = _reject("SELECT a.video[1] FROM input('x.mp4') a WHERE a.t BETWEEN 1e AND 2")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
 def test_overlay_keeps_its_four_positional_arguments() -> None:
     """Postgres has a builtin OVERLAY, so sqlglot hands lower named args."""
     g = _lower(
-        "SELECT overlay(a.frame, b.frame, 20, 30) FROM input('x.mp4') a, input('y.mp4') b"
+        "SELECT overlay(a.video[1], b.video[1], 20, 30) FROM input('x.mp4') a, input('y.mp4') b"
     )
     node = g.nodes["n1"]
     assert node.filter == "overlay"
@@ -1626,14 +1606,14 @@ def test_overlay_takes_its_options_positionally_despite_the_builtin() -> None:
     """Postgres claims the NAME `overlay`, so `=>` inside it is a parse error --
     but positional options work, and x/y are ffmpeg's first two."""
     g = _lower(
-        "SELECT overlay(a.frame, b.frame, 20, 30) FROM input('x.mp4') a, input('y.mp4') b"
+        "SELECT overlay(a.video[1], b.video[1], 20, 30) FROM input('x.mp4') a, input('y.mp4') b"
     )
     assert g.nodes["n1"].args == {"x": 20, "y": 30}
 
 
 def test_a_partial_overlay_option_list_is_still_legal() -> None:
     g = _lower(
-        "SELECT overlay(a.frame, b.frame, 20) FROM input('x.mp4') a, input('y.mp4') b"
+        "SELECT overlay(a.video[1], b.video[1], 20) FROM input('x.mp4') a, input('y.mp4') b"
     )
     assert g.nodes["n1"].args == {"x": 20}
 
@@ -1643,7 +1623,7 @@ def test_overlay_keeps_the_agreed_video_tag() -> None:
     probed video streams it composites agree on a tag, the composite keeps
     it. (Use the same file under two aliases, same as the README headline.)"""
     g = _lower(
-        "SELECT overlay(a.frame, b.frame, 0, 0) FROM input('x.mp4') a, input('y.mp4') b",
+        "SELECT overlay(a.video[1], b.video[1], 0, 0) FROM input('x.mp4') a, input('y.mp4') b",
         {
             "a": _probe_result(video_tags={"language": "eng"}),
             "b": _probe_result(video_tags={"language": "eng"}),
@@ -1654,7 +1634,7 @@ def test_overlay_keeps_the_agreed_video_tag() -> None:
 
 def test_overlay_drops_provenance_its_two_inputs_disagree_on() -> None:
     g = _lower(
-        "SELECT overlay(a.frame, b.frame, 0, 0) FROM input('x.mp4') a, input('y.mp4') b",
+        "SELECT overlay(a.video[1], b.video[1], 0, 0) FROM input('x.mp4') a, input('y.mp4') b",
         {
             "a": _probe_result(video_tags={"language": "eng"}),
             "b": _probe_result(video_tags={"language": "fra"}),
@@ -1667,7 +1647,7 @@ def test_overlay_drops_provenance_when_one_side_is_unprobed() -> None:
     """One input could not be probed at all, so it has no source to agree
     with the other -- same rule an unprobed concat segment follows."""
     g = _lower(
-        "SELECT overlay(a.frame, b.frame, 0, 0) FROM input('x.mp4') a, input('y.mp4') b",
+        "SELECT overlay(a.video[1], b.video[1], 0, 0) FROM input('x.mp4') a, input('y.mp4') b",
         {"a": _probe_result(video_tags={"language": "eng"}), "b": None},
     )
     assert g.outputs[0].metadata == {}
@@ -1676,7 +1656,7 @@ def test_overlay_drops_provenance_when_one_side_is_unprobed() -> None:
 def test_a_colliding_builtin_is_an_unknown_function() -> None:
     """`lower` is a Postgres builtin sqlglot parses into its own Func class, and
     it is neither a stdlib function nor (in any ffmpeg) a filter name."""
-    err = _reject("SELECT lower(a.frame) FROM input('x.mp4') a")
+    err = _reject("SELECT lower(a.video[1]) FROM input('x.mp4') a")
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
 
 
@@ -1698,9 +1678,9 @@ def test_probed_subscript_out_of_range_is_stream_not_found() -> None:
     assert "x.mp4" in err.message
 
 
-def test_probed_frame_sugar_is_bounds_checked_too() -> None:
+def test_a_probed_video_subscript_is_bounds_checked_too() -> None:
     with pytest.raises(SqlmpegError) as excinfo:
-        _lower("SELECT a.frame FROM input('x.mp4') a", {"a": _probe_result(videos=0)})
+        _lower("SELECT a.video[1] FROM input('x.mp4') a", {"a": _probe_result(videos=0)})
     assert excinfo.value.code is ErrorCode.STREAM_NOT_FOUND
 
 
@@ -2171,8 +2151,8 @@ def test_compile_sql_probes_each_distinct_path_once(
 
     monkeypatch.setattr(compiler, "probe_path", counting_probe)
     compile_sql(
-        "WITH pip AS (SELECT b.frame FROM input('game.mp4') b) "
-        "SELECT overlay(a.frame, pip.frame, 0, 0) FROM input('game.mp4') a, pip"
+        "WITH pip AS (SELECT b.video[1] AS v FROM input('game.mp4') b) "
+        "SELECT overlay(a.video[1], pip.v, 0, 0) FROM input('game.mp4') a, pip"
     )
     assert calls == ["game.mp4"]  # two aliases, one file, one probe
 
@@ -2192,16 +2172,16 @@ def test_compile_sql_uses_probe_results_for_bounds(
 
 def test_node_ids_are_sequential_across_ctes_and_branches() -> None:
     g = _lower(
-        "WITH c AS (SELECT hflip(a.frame) FROM input('x.mp4') a) "
-        "SELECT vflip(c.frame) FROM c "
-        "UNION ALL SELECT gblur(b.frame, 2) FROM input('y.mp4') b"
+        "WITH c AS (SELECT hflip(a.video[1]) AS v FROM input('x.mp4') a) "
+        "SELECT vflip(c.v) FROM c "
+        "UNION ALL SELECT gblur(b.video[1], 2) FROM input('y.mp4') b"
     )
     assert list(g.nodes) == ["n1", "n2", "n3", "n4"]
     assert _filters(g) == ["hflip", "vflip", "gblur", "concat"]
 
 
 def test_compile_sql_runs_the_split_pass() -> None:
-    sql = "SELECT overlay(a.frame, a.frame, 5, 5) FROM input('x.mp4') a"
+    sql = "SELECT overlay(a.video[1], a.video[1], 5, 5) FROM input('x.mp4') a"
     assert "split" not in _filters(_lower(sql))
     assert "split" in _filters(compile_sql(sql))
 
@@ -2219,7 +2199,7 @@ def test_compile_sql_wraps_unexpected_exceptions_as_internal(
 
     monkeypatch.setattr(compiler, "lower_commands", boom)
     with pytest.raises(SqlmpegError) as excinfo:
-        compile_sql("SELECT a.frame FROM input('x.mp4') a")
+        compile_sql("SELECT a.video[1] FROM input('x.mp4') a")
     assert excinfo.value.code is ErrorCode.INTERNAL
     assert "kaboom" in excinfo.value.message
 
@@ -2232,7 +2212,7 @@ def test_lower_wraps_unexpected_exceptions_as_internal(
 
     monkeypatch.setattr(lower_module._Lowerer, "run", boom)
     with pytest.raises(SqlmpegError) as excinfo:
-        _lower("SELECT a.frame FROM input('x.mp4') a")
+        _lower("SELECT a.video[1] FROM input('x.mp4') a")
     assert excinfo.value.code is ErrorCode.INTERNAL
 
 
@@ -2246,7 +2226,7 @@ def test_pipeline_output_survives_a_round_trip_through_dicts(_fixtures: None) ->
 # COPY ... TO ... WITH (...) -- the sink
 # ---------------------------------------------------------------------------
 
-SINK_QUERY = "SELECT a.frame FROM input('x.mp4') a"
+SINK_QUERY = "SELECT a.video[1] FROM input('x.mp4') a"
 
 
 def _sink_of(options: str) -> dict[str, object]:
@@ -2299,7 +2279,7 @@ def test_sink_option_values_are_normalized_python_scalars() -> None:
 
 def test_sink_survives_the_split_pass_and_serializes() -> None:
     g = compile_sql(
-        "COPY (SELECT a.frame, a.frame FROM input('x.mp4') a) "
+        "COPY (SELECT a.video[1], a.video[1] FROM input('x.mp4') a) "
         "TO 'out.mp4' WITH (video_codec 'libx264', crf 18, faststart true)"
     )
     # the projection is used twice, so the split pass rebuilt the graph
@@ -2356,13 +2336,13 @@ def test_bad_sink_option_value_is_a_type_error(options: str, message: str) -> No
 def test_an_invalid_inner_query_beats_the_sink_options() -> None:
     """The COPY wrapper never masks (or is masked by) the query's own errors."""
     err = _reject(
-        "COPY (SELECT a.frame FROM input('x.mp4') a GROUP BY a.frame) "
+        "COPY (SELECT a.video[1] FROM input('x.mp4') a GROUP BY a.video[1]) "
         "TO 'out.mkv' WITH (bogus_option 1)"
     )
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
 
     err = _reject(
-        "COPY (SELECT nosuchfilter(a.frame) FROM input('x.mp4') a) "
+        "COPY (SELECT nosuchfilter(a.video[1]) FROM input('x.mp4') a) "
         "TO 'out.mkv' WITH (bogus_option 1)"
     )
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
@@ -2485,7 +2465,7 @@ def test_two_pass_in_a_multi_copy_script_is_rejected() -> None:
     err = _reject(
         f"COPY ({SINK_QUERY}) TO 'one.mkv' WITH "
         "(video_codec 'libx264', video_bitrate '2500k', two_pass true); "
-        "COPY (SELECT b.frame FROM input('x.mp4') b) TO 'two.mkv'"
+        "COPY (SELECT b.video[1] FROM input('x.mp4') b) TO 'two.mkv'"
     )
     assert err.code is ErrorCode.SINK_OPTION_TYPE
     assert "two_pass" in err.message
@@ -2531,7 +2511,7 @@ def test_input_with_no_options_has_no_input_options_entry() -> None:
 
 def test_input_options_lower_to_normalized_scalars() -> None:
     g = _lower(
-        "SELECT p.frame FROM input('logo.png', loop => true, framerate => 15) p"
+        "SELECT p.video[1] FROM input('logo.png', loop => true, framerate => 15) p"
     )
     assert g.input_options == {"p": {"loop": True, "framerate": 15}}
     assert [type(v) for v in g.input_options["p"].values()] == [bool, int]
@@ -2539,7 +2519,7 @@ def test_input_options_lower_to_normalized_scalars() -> None:
 
 def test_input_options_keep_their_written_order() -> None:
     g = _lower(
-        "SELECT p.frame FROM input("
+        "SELECT p.video[1] FROM input("
         "'logo.png', framerate => 15, hwaccel => 'cuda', loop => true"
         ") p"
     )
@@ -2547,18 +2527,18 @@ def test_input_options_keep_their_written_order() -> None:
 
 
 def test_itsoffset_accepts_a_negative_number() -> None:
-    g = _lower("SELECT a.frame FROM input('x.mp4', itsoffset => -1.5) a")
+    g = _lower("SELECT a.video[1] FROM input('x.mp4', itsoffset => -1.5) a")
     assert g.input_options == {"a": {"itsoffset": -1.5}}
 
 
 def test_stream_loop_accepts_a_negative_int() -> None:
-    g = _lower("SELECT a.frame FROM input('x.mp4', stream_loop => -1) a")
+    g = _lower("SELECT a.video[1] FROM input('x.mp4', stream_loop => -1) a")
     assert g.input_options == {"a": {"stream_loop": -1}}
 
 
 def test_two_input_aliases_get_independent_option_dicts() -> None:
     g = _lower(
-        "SELECT a.frame, b.frame FROM input('x.png', loop => true) a, "
+        "SELECT a.video[1], b.video[1] FROM input('x.png', loop => true) a, "
         "input('y.mp4', hwaccel => 'cuda') b"
     )
     assert g.input_options == {"a": {"loop": True}, "b": {"hwaccel": "cuda"}}
@@ -2566,7 +2546,7 @@ def test_two_input_aliases_get_independent_option_dicts() -> None:
 
 def test_input_options_survive_the_split_pass_and_serialize() -> None:
     g = compile_sql(
-        "SELECT p.frame, p.frame FROM input('logo.png', loop => true) p"
+        "SELECT p.video[1], p.video[1] FROM input('logo.png', loop => true) p"
     )
     # the projection is used twice, so the split pass rebuilt the graph
     assert "split" in _filters(g)
@@ -2575,13 +2555,13 @@ def test_input_options_survive_the_split_pass_and_serialize() -> None:
 
 
 def test_unknown_input_option_is_anchored_on_its_value() -> None:
-    err = _reject("SELECT a.frame FROM input('x.mp4', bogus_option => 1) a")
+    err = _reject("SELECT a.video[1] FROM input('x.mp4', bogus_option => 1) a")
     assert err.code is ErrorCode.UNKNOWN_INPUT_OPTION
     assert "unknown input option 'bogus_option'" in err.message
 
 
 def test_unknown_input_option_suggests_the_near_miss() -> None:
-    err = _reject("SELECT a.frame FROM input('x.png', loob => true) a")
+    err = _reject("SELECT a.video[1] FROM input('x.png', loob => true) a")
     assert err.code is ErrorCode.UNKNOWN_INPUT_OPTION
     assert err.hint == "did you mean 'loop'?"
 
@@ -2600,7 +2580,7 @@ def test_unknown_input_option_suggests_the_near_miss() -> None:
     ],
 )
 def test_bad_input_option_value_is_a_type_error(option: str, message: str) -> None:
-    err = _reject(f"SELECT a.frame FROM input('x.mp4', {option}) a")
+    err = _reject(f"SELECT a.video[1] FROM input('x.mp4', {option}) a")
     assert err.code is ErrorCode.INPUT_OPTION_TYPE
     assert message in err.message
     assert err.hint is not None
@@ -2608,14 +2588,14 @@ def test_bad_input_option_value_is_a_type_error(option: str, message: str) -> No
 
 def test_input_option_name_is_case_sensitive() -> None:
     """Unlike a sink option (folded), an input option is Kwarg-verbatim."""
-    err = _reject("SELECT a.frame FROM input('x.mp4', Loop => true) a")
+    err = _reject("SELECT a.video[1] FROM input('x.mp4', Loop => true) a")
     assert err.code is ErrorCode.UNKNOWN_INPUT_OPTION
 
 
 def test_itsoffset_compiles_to_a_negative_argv_flag() -> None:
     """Compile-level, not hand-built IR: a negative itsoffset survives the
     whole pipeline (parser -> lower -> emit -> build_ffmpeg_args)."""
-    graph = compile_sql("SELECT a.frame FROM input('x.mp4', itsoffset => -1.5) a")
+    graph = compile_sql("SELECT a.video[1] FROM input('x.mp4', itsoffset => -1.5) a")
     assert graph.input_options == {"a": {"itsoffset": -1.5}}
     emitted = emit(graph)
     args = build_ffmpeg_args(emitted, "out.mp4")
@@ -2624,7 +2604,7 @@ def test_itsoffset_compiles_to_a_negative_argv_flag() -> None:
 
 def test_new_input_option_batch_lowers_in_written_order() -> None:
     g = _lower(
-        "SELECT a.frame FROM input("
+        "SELECT a.video[1] FROM input("
         "'x.mp4', seek_end => 60, format => 'v4l2', realtime => true, "
         "sub_charenc => 'CP1250', start_number => 3, subtitle_decoder => 'webvtt'"
         ") a"
@@ -2642,26 +2622,26 @@ def test_new_input_option_batch_lowers_in_written_order() -> None:
 
 
 def test_seek_end_compiles_to_a_negated_sseof_flag() -> None:
-    graph = compile_sql("SELECT a.frame FROM input('x.mp4', seek_end => 60) a")
+    graph = compile_sql("SELECT a.video[1] FROM input('x.mp4', seek_end => 60) a")
     args = build_ffmpeg_args(emit(graph), "out.mp4")
     assert args[:4] == ["ffmpeg", "-sseof", "-60", "-i"]
 
 
 def test_realtime_compiles_to_a_bare_re_flag() -> None:
-    graph = compile_sql("SELECT a.frame FROM input('x.mp4', realtime => true) a")
+    graph = compile_sql("SELECT a.video[1] FROM input('x.mp4', realtime => true) a")
     args = build_ffmpeg_args(emit(graph), "out.mp4")
     assert args[:3] == ["ffmpeg", "-re", "-i"]
 
 
 def test_realtime_false_emits_no_flag_at_all() -> None:
-    graph = compile_sql("SELECT a.frame FROM input('x.mp4', realtime => false) a")
+    graph = compile_sql("SELECT a.video[1] FROM input('x.mp4', realtime => false) a")
     args = build_ffmpeg_args(emit(graph), "out.mp4")
     assert "-re" not in args
 
 
 def test_seek_end_together_with_a_where_window_is_rejected() -> None:
     err = _reject(
-        "SELECT a.frame FROM input('x.mp4', seek_end => 60) a WHERE a.t >= 1"
+        "SELECT a.video[1] FROM input('x.mp4', seek_end => 60) a WHERE a.t >= 1"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "seek_end" in err.message
@@ -2669,13 +2649,13 @@ def test_seek_end_together_with_a_where_window_is_rejected() -> None:
 
 
 def test_seek_end_alone_with_no_where_is_fine() -> None:
-    g = _lower("SELECT a.frame FROM input('x.mp4', seek_end => 60) a")
+    g = _lower("SELECT a.video[1] FROM input('x.mp4', seek_end => 60) a")
     assert g.input_options == {"a": {"seek_end": 60}}
     assert g.input_trims == {}
 
 
 def test_where_alone_with_no_seek_end_is_still_fine() -> None:
-    g = _lower("SELECT a.frame FROM input('x.mp4') a WHERE a.t >= 1")
+    g = _lower("SELECT a.video[1] FROM input('x.mp4') a WHERE a.t >= 1")
     assert g.input_trims == {"a": (1, None)}
 
 
@@ -3024,7 +3004,7 @@ def _reject_dyn(
 
 
 def test_dynamic_filter_lowers_to_a_plain_node(_registry: Registry) -> None:
-    g = _dyn("SELECT gblur(a.frame, sigma => 5) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT gblur(a.video[1], sigma => 5) FROM input('x.mp4') a", _registry)
     node = g.nodes["n1"]
     assert node.filter == "gblur"
     assert node.args == {"sigma": 5}
@@ -3034,7 +3014,7 @@ def test_dynamic_filter_lowers_to_a_plain_node(_registry: Registry) -> None:
 
 
 def test_dynamic_filter_without_options_sets_no_args(_registry: Registry) -> None:
-    g = _dyn("SELECT gblur(a.frame) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT gblur(a.video[1]) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].args == {}
 
 
@@ -3042,7 +3022,7 @@ def test_dynamic_options_keep_their_written_order(_registry: Registry) -> None:
     """emit renders args in insertion order, so written order is the rendered
     order -- both directions are checked here."""
     g = _dyn(
-        "SELECT unsharp(a.frame, luma_amount => 1.5, luma_msize_x => 7) "
+        "SELECT unsharp(a.video[1], luma_amount => 1.5, luma_msize_x => 7) "
         "FROM input('x.mp4') a",
         _registry,
     )
@@ -3055,14 +3035,14 @@ def test_a_positional_after_the_pads_binds_to_the_first_option(
 ) -> None:
     """`gblur(f, 5)` IS `gblur=5`, because `sigma` is the
     option ffmpeg declares first."""
-    g = _dyn("SELECT gblur(a.frame, 5) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT gblur(a.video[1], 5) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].args == {"sigma": 5}
 
 
 def test_positionals_bind_in_the_filters_own_option_order(
     _registry: Registry,
 ) -> None:
-    g = _dyn("SELECT gblur(a.frame, 5, 2, 1) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT gblur(a.video[1], 5, 2, 1) FROM input('x.mp4') a", _registry)
     assert list(g.nodes["n1"].args.items()) == [("sigma", 5), ("steps", 2), ("planes", 1)]
 
 
@@ -3070,7 +3050,7 @@ def test_crops_positionals_are_ffmpegs_order_not_the_old_stdlibs(
     _registry: Registry,
 ) -> None:
     """The documented ARG-ORDER CHANGE: ffmpeg declares out_w, out_h, x, y."""
-    g = _dyn("SELECT crop(a.frame, 100, 50, 10, 20) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT crop(a.video[1], 100, 50, 10, 20) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].args == {"out_w": 100, "out_h": 50, "x": 10, "y": 20}
 
 
@@ -3079,7 +3059,7 @@ def test_a_positional_option_is_validated_as_the_option_it_lands_on(
 ) -> None:
     """Slot 2 of gblur is `steps`, an int from 1 to 6 -- so 99 is that option's
     own range rejection, not a generic arity complaint."""
-    err = _reject_dyn("SELECT gblur(a.frame, 5, 99) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT gblur(a.video[1], 5, 99) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "'steps' of filter 'gblur'" in err.message
     assert "from 1 to 6" in err.message
@@ -3089,7 +3069,7 @@ def test_a_positional_enum_option_takes_its_constant_names(
     _registry: Registry,
 ) -> None:
     g = _dyn(
-        "SELECT xfade(a.frame, b.frame, 'wipeleft', 1) "
+        "SELECT xfade(a.video[1], b.video[1], 'wipeleft', 1) "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
@@ -3100,7 +3080,7 @@ def test_a_bad_positional_enum_value_is_the_options_own_rejection(
     _registry: Registry,
 ) -> None:
     err = _reject_dyn(
-        "SELECT xfade(a.frame, b.frame, 'nope') FROM input('x.mp4') a, input('y.mp4') b",
+        "SELECT xfade(a.video[1], b.video[1], 'nope') FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
@@ -3109,7 +3089,7 @@ def test_a_bad_positional_enum_value_is_the_options_own_rejection(
 
 def test_more_positionals_than_the_filter_has_options(_registry: Registry) -> None:
     err = _reject_dyn(
-        "SELECT gblur(a.frame, 1, 1, 1, 1, 1) FROM input('x.mp4') a", _registry
+        "SELECT gblur(a.video[1], 1, 1, 1, 1, 1) FROM input('x.mp4') a", _registry
     )
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "got 5 positional options" in err.message
@@ -3120,20 +3100,20 @@ def test_more_positionals_than_the_filter_has_options(_registry: Registry) -> No
 def test_positionals_on_a_filter_with_no_options_at_all(_registry: Registry) -> None:
     """`trim` has no -help block in this fixture, so its option table is empty
     -- every positional past its pad is one too many."""
-    err = _reject_dyn("SELECT ffmpeg.trim(a.frame, 1) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT ffmpeg.trim(a.video[1], 1) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "has 0" in err.message
     assert err.hint is not None and "no options sqlmpeg can set" in err.hint
 
 
 def test_positionals_then_named_is_the_documented_mix(_registry: Registry) -> None:
-    g = _dyn("SELECT gblur(a.frame, 5, planes => 1) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT gblur(a.video[1], 5, planes => 1) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].args == {"sigma": 5, "planes": 1}
 
 
 def test_a_positional_after_a_named_is_unsupported_sql(_registry: Registry) -> None:
     err = _reject_dyn(
-        "SELECT gblur(a.frame, sigma => 5, 2) FROM input('x.mp4') a", _registry
+        "SELECT gblur(a.video[1], sigma => 5, 2) FROM input('x.mp4') a", _registry
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "positional arguments must come before named arguments" in err.message
@@ -3143,7 +3123,7 @@ def test_a_named_option_already_bound_positionally_conflicts(
     _registry: Registry,
 ) -> None:
     err = _reject_dyn(
-        "SELECT gblur(a.frame, 5, sigma => 2) FROM input('x.mp4') a", _registry
+        "SELECT gblur(a.video[1], 5, sigma => 2) FROM input('x.mp4') a", _registry
     )
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "'sigma' of filter 'gblur' is already set positionally" in err.message
@@ -3153,14 +3133,14 @@ def test_a_named_option_already_bound_positionally_conflicts(
 def test_a_named_option_that_no_positional_claimed_is_fine(
     _registry: Registry,
 ) -> None:
-    g = _dyn("SELECT gblur(a.frame, 5, 2, sigmaV => 3) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT gblur(a.video[1], 5, 2, sigmaV => 3) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].args == {"sigma": 5, "steps": 2, "sigmaV": 3}
 
 
 def test_enable_can_never_be_reached_positionally(_registry: Registry) -> None:
     """`enable` is framework-level and in no option table, so nothing binds to
     it by position -- gblur's four slots are sigma, steps, planes, sigmaV."""
-    g = _dyn("SELECT gblur(a.frame, 1, 1, 1, 1) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT gblur(a.video[1], 1, 1, 1, 1) FROM input('x.mp4') a", _registry)
     assert "enable" not in g.nodes["n1"].args
 
 
@@ -3171,14 +3151,14 @@ def test_dynamic_filter_checks_its_pad_types(_registry: Registry) -> None:
 
 
 def test_two_pad_dynamic_filter_needs_both_inputs(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT xfade(a.frame) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT xfade(a.video[1]) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "it takes video, video as its stream inputs, got (video)" in err.message
 
 
 def test_two_pad_dynamic_filter_lowers_both_inputs(_registry: Registry) -> None:
     g = _dyn(
-        "SELECT xfade(a.frame, b.frame, transition => 'wipeleft', duration => 1) "
+        "SELECT xfade(a.video[1], b.video[1], transition => 'wipeleft', duration => 1) "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
@@ -3196,8 +3176,8 @@ def test_excluded_filters_are_not_callable(_registry: Registry) -> None:
     resolves exactly as it always did, which is not at all."""
     for sql in (
         "SELECT acrossover(a.audio[1]) FROM input('x.mp4') a",
-        "SELECT feedback(a.frame, a.frame) FROM input('x.mp4') a",
-        "SELECT testsrc(a.frame) FROM input('x.mp4') a",
+        "SELECT feedback(a.video[1], a.video[1]) FROM input('x.mp4') a",
+        "SELECT testsrc(a.video[1]) FROM input('x.mp4') a",
     ):
         assert _reject_dyn(sql, _registry).code is ErrorCode.UNKNOWN_FUNCTION
 
@@ -3206,9 +3186,9 @@ def test_there_is_no_name_collision_left_to_win(_registry: Registry) -> None:
     """`scale` and `crop` used to be curated functions shadowing real filters.
     They are the filters now -- ffmpeg's option NAMES and ffmpeg's option
     ORDER, with no remapping layer in between."""
-    g = _dyn("SELECT scale(a.frame, 'iw/2', -2) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT scale(a.video[1], 'iw/2', -2) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].args == {"width": "iw/2", "height": -2}
-    g = _dyn("SELECT crop(a.frame, 3, 4, 1, 2) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT crop(a.video[1], 3, 4, 1, 2) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].args == {"out_w": 3, "out_h": 4, "x": 1, "y": 2}
 
 
@@ -3219,20 +3199,20 @@ def test_a_builtin_that_is_also_a_filter_still_resolves_to_the_filter(
     argument under `this` rather than in the argument list -- so the call
     resolves to ffmpeg's trim filter but arrives with NO positional args. The
     rejection is typed (and names the pad signature), not a panic."""
-    err = _reject_dyn("SELECT trim(a.frame) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT trim(a.video[1]) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "trim() is an ffmpeg filter" in err.message
     assert "got (nothing)" in err.message
 
 
 def test_a_dynamic_call_nests_inside_a_stdlib_call(_registry: Registry) -> None:
-    g = _dyn("SELECT scale(gblur(a.frame, sigma => 2), 0.5) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT scale(gblur(a.video[1], sigma => 2), 0.5) FROM input('x.mp4') a", _registry)
     assert _filters(g) == ["gblur", "scale"]
     assert g.nodes["n2"].inputs == ["n1"]
 
 
 def test_a_stdlib_call_nests_inside_a_dynamic_call(_registry: Registry) -> None:
-    g = _dyn("SELECT gblur(scale(a.frame, 0.5), sigma => 2) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT gblur(scale(a.video[1], 0.5), sigma => 2) FROM input('x.mp4') a", _registry)
     assert _filters(g) == ["scale", "gblur"]
     assert g.nodes["n2"].inputs == ["n1"]
 
@@ -3241,14 +3221,14 @@ def test_a_stdlib_call_nests_inside_a_dynamic_call(_registry: Registry) -> None:
 
 
 def test_unknown_option_suggests_a_real_one(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT gblur(a.frame, sigmma => 5) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT gblur(a.video[1], sigmma => 5) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
     assert "filter 'gblur' has no option 'sigmma'" in err.message
     assert err.hint is not None and "sigma" in err.hint
 
 
 def test_unknown_option_without_a_match_lists_the_real_options(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT gblur(a.frame, zzzz => 5) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT gblur(a.video[1], zzzz => 5) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
     assert err.hint is not None
     assert "sigma" in err.hint and "planes" in err.hint
@@ -3257,20 +3237,20 @@ def test_unknown_option_without_a_match_lists_the_real_options(_registry: Regist
 def test_option_names_are_case_sensitive(_registry: Registry) -> None:
     """ffmpeg AVOption names are case-sensitive, so the name is NOT folded the
     Postgres way: sigmaV is a real option, SIGMA is not."""
-    g = _dyn("SELECT gblur(a.frame, sigmaV => 3) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT gblur(a.video[1], sigmaV => 3) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].args == {"sigmaV": 3}
-    err = _reject_dyn("SELECT gblur(a.frame, SIGMA => 5) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT gblur(a.video[1], SIGMA => 5) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
 
 
 def test_numeric_option_rejects_a_string(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT gblur(a.frame, sigma => '5') FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT gblur(a.video[1], sigma => '5') FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "expects a number" in err.message
 
 
 def test_numeric_option_enforces_the_introspected_range(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT gblur(a.frame, sigma => 5000) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT gblur(a.video[1], sigma => 5000) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "from 0 to 1024" in err.message
     assert "got 5000" in err.message
@@ -3278,37 +3258,37 @@ def test_numeric_option_enforces_the_introspected_range(_registry: Registry) -> 
 
 def test_numeric_option_range_check_is_two_sided(_registry: Registry) -> None:
     assert (
-        _reject_dyn("SELECT gblur(a.frame, steps => 0) FROM input('x.mp4') a", _registry).code
+        _reject_dyn("SELECT gblur(a.video[1], steps => 0) FROM input('x.mp4') a", _registry).code
         is ErrorCode.FILTER_OPTION_TYPE
     )
     assert _dyn(
-        "SELECT gblur(a.frame, steps => 6) FROM input('x.mp4') a", _registry
+        "SELECT gblur(a.video[1], steps => 6) FROM input('x.mp4') a", _registry
     ).nodes["n1"].args == {"steps": 6}
 
 
 def test_an_unbounded_numeric_option_takes_any_number(_registry: Registry) -> None:
     """deband's `range` is `(from INT_MIN to INT_MAX)`, which does not parse as
     a float -- the registry records no bounds and no range is enforced."""
-    g = _dyn("SELECT deband(a.frame, range => -4000) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT deband(a.video[1], range => -4000) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].args == {"range": -4000}
 
 
 def test_boolean_option_takes_bare_true_and_false(_registry: Registry) -> None:
-    g = _dyn("SELECT deband(a.frame, blur => false) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT deband(a.video[1], blur => false) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].args == {"blur": False}
     # emit renders an ffmpeg boolean as 1/0
     assert "deband=blur=0" in emit(insert_splits(g)).filter_complex
 
 
 def test_boolean_option_rejects_a_number(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT deband(a.frame, blur => 1) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT deband(a.video[1], blur => 1) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "expects true or false" in err.message
 
 
 def test_enum_option_accepts_one_of_its_constants(_registry: Registry) -> None:
     g = _dyn(
-        "SELECT xfade(a.frame, b.frame, transition => 'circlecrop') "
+        "SELECT xfade(a.video[1], b.video[1], transition => 'circlecrop') "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
@@ -3317,7 +3297,7 @@ def test_enum_option_accepts_one_of_its_constants(_registry: Registry) -> None:
 
 def test_enum_option_rejects_anything_else(_registry: Registry) -> None:
     err = _reject_dyn(
-        "SELECT xfade(a.frame, b.frame, transition => 'nope') "
+        "SELECT xfade(a.video[1], b.video[1], transition => 'nope') "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
@@ -3330,7 +3310,7 @@ def test_enum_option_message_stops_counting_at_a_dozen(_registry: Registry) -> N
     """xfade's transition has 15 constants in the fixture (59 in a real
     ffmpeg): the message lists the first dozen and counts the rest."""
     err = _reject_dyn(
-        "SELECT xfade(a.frame, b.frame, transition => 'nope') "
+        "SELECT xfade(a.video[1], b.video[1], transition => 'nope') "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
@@ -3339,7 +3319,7 @@ def test_enum_option_message_stops_counting_at_a_dozen(_registry: Registry) -> N
 
 def test_enum_option_suggests_a_near_miss_constant(_registry: Registry) -> None:
     err = _reject_dyn(
-        "SELECT xfade(a.frame, b.frame, transition => 'wipelft') "
+        "SELECT xfade(a.video[1], b.video[1], transition => 'wipelft') "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
@@ -3350,7 +3330,7 @@ def test_enum_option_rejects_the_constants_number(_registry: Registry) -> None:
     """The registry records constant NAMES, not their values, so a bare number
     is not something sqlmpeg can check -- it is rejected, with the names."""
     err = _reject_dyn(
-        "SELECT xfade(a.frame, b.frame, transition => 1) "
+        "SELECT xfade(a.video[1], b.video[1], transition => 1) "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
@@ -3363,7 +3343,7 @@ def test_a_string_option_also_takes_a_bare_number(_registry: Registry) -> None:
     but an option value is text on the command line either way, and writing
     `duration => '1'` for a number would be a papercut."""
     g = _dyn(
-        "SELECT xfade(a.frame, b.frame, duration => 1, offset => 2.5) "
+        "SELECT xfade(a.video[1], b.video[1], duration => 1, offset => 2.5) "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
@@ -3372,7 +3352,7 @@ def test_a_string_option_also_takes_a_bare_number(_registry: Registry) -> None:
 
 def test_a_string_option_rejects_a_boolean(_registry: Registry) -> None:
     err = _reject_dyn(
-        "SELECT xfade(a.frame, b.frame, expr => true) "
+        "SELECT xfade(a.video[1], b.video[1], expr => true) "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
@@ -3384,7 +3364,7 @@ def test_option_rejection_anchors_on_the_value(_registry: Registry) -> None:
     """A Kwarg's Var name carries no token position, so the anchor is the
     value literal -- here on line 2, where the option was written."""
     err = _reject_dyn(
-        "SELECT gblur(a.frame,\n       sigma => 5000)\nFROM input('x.mp4') a", _registry
+        "SELECT gblur(a.video[1],\n       sigma => 5000)\nFROM input('x.mp4') a", _registry
     )
     assert err.line == 2
 
@@ -3395,17 +3375,17 @@ def test_option_rejection_anchors_on_the_value(_registry: Registry) -> None:
 def test_a_dynamic_call_merges_named_args_after_positional(_registry: Registry) -> None:
     """`planes` is validated against gblur's options and merged AFTER the
     positionally-mapped sigma -- no stdlib/macro layer involved anymore."""
-    g = _dyn("SELECT gblur(a.frame, 5, planes => 1) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT gblur(a.video[1], 5, planes => 1) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].filter == "gblur"
     assert list(g.nodes["n1"].args.items()) == [("sigma", 5), ("planes", 1)]
 
 
 def test_a_named_extra_is_validated_like_a_dynamic_one(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT gblur(a.frame, 5, planes => 99) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT gblur(a.video[1], 5, planes => 99) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "from 0 to 15" in err.message
 
-    err = _reject_dyn("SELECT gblur(a.frame, 5, planez => 1) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT gblur(a.video[1], 5, planez => 1) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
     assert "filter 'gblur'" in err.message
 
@@ -3417,7 +3397,7 @@ def test_a_named_extra_cannot_override_the_positional_signature(
     this is a conflict, never a silent override. Message/code changed under
     the registry-driven option checker: FILTER_OPTION_TYPE, not UDF_ARG_TYPE."""
     err = _reject_dyn(
-        "SELECT crop(a.frame, 10, 10, 0, 0, out_w => 5) FROM input('x.mp4') a", _registry
+        "SELECT crop(a.video[1], 10, 10, 0, 0, out_w => 5) FROM input('x.mp4') a", _registry
     )
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "already set positionally by crop()" in err.message
@@ -3432,7 +3412,7 @@ def test_a_named_extra_merges_with_positional_xfade_args(
     order, after it."""
     both = "FROM input('x.mp4') a, input('y.mp4') b"
     g = _dyn(
-        f"SELECT xfade(a.frame, b.frame, 'wipeleft', duration => 1, offset => 8) {both}",
+        f"SELECT xfade(a.video[1], b.video[1], 'wipeleft', duration => 1, offset => 8) {both}",
         _registry,
     )
     assert g.nodes["n1"].args == {"transition": "wipeleft", "duration": 1, "offset": 8}
@@ -3444,7 +3424,7 @@ def test_a_named_extra_conflicts_with_a_positional_xfade_transition(
     """When the positional call already sets transition, a named one on top
     of it is a genuine conflict."""
     err = _reject_dyn(
-        "SELECT xfade(a.frame, b.frame, 'fade', transition => 'wipeleft') "
+        "SELECT xfade(a.video[1], b.video[1], 'fade', transition => 'wipeleft') "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
@@ -3456,7 +3436,7 @@ def test_a_named_extra_that_the_xfade_signature_leaves_free(_registry: Registry)
     """The 2-argument (transition-only) positional call sets no `expr`, so a
     named one merges in."""
     g = _dyn(
-        "SELECT xfade(a.frame, b.frame, 'wipeleft', expr => 'A') "
+        "SELECT xfade(a.video[1], b.video[1], 'wipeleft', expr => 'A') "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
@@ -3474,7 +3454,7 @@ def test_a_filter_this_ffmpeg_lacks_is_an_unknown_function(_registry: Registry) 
     """`subtitles` is not in this (fixture) ffmpeg's filter set, so the NAME is
     what fails -- there is no curated entry left to resolve it first."""
     err = _reject_dyn(
-        "SELECT subtitles(a.frame, 'subs.srt', force_style => 'x') FROM input('x.mp4') a",
+        "SELECT subtitles(a.video[1], 'subs.srt', force_style => 'x') FROM input('x.mp4') a",
         _registry,
     )
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
@@ -3530,7 +3510,7 @@ def test_a_dynamic_call_reports_a_zip_mismatch(_registry: Registry) -> None:
 
 def test_a_dynamic_join_drops_a_disagreeing_tag(_registry: Registry) -> None:
     g = _dyn(
-        "SELECT xfade(a.frame, b.frame) FROM input('x.mp4') a, input('y.mp4') b",
+        "SELECT xfade(a.video[1], b.video[1]) FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
         {
             "a": _probe_result(video_tags={"language": "eng"}),
@@ -3543,7 +3523,7 @@ def test_a_dynamic_join_drops_a_disagreeing_tag(_registry: Registry) -> None:
 def test_a_dynamic_node_is_split_like_any_other(_registry: Registry) -> None:
     g = insert_splits(
         _dyn(
-            "WITH c AS (SELECT gblur(a.frame, sigma => 2) AS f FROM input('x.mp4') a) "
+            "WITH c AS (SELECT gblur(a.video[1], sigma => 2) AS f FROM input('x.mp4') a) "
             "SELECT hstack(c.f, c.f) FROM c",
             _registry,
         )
@@ -3560,7 +3540,7 @@ def test_a_dynamic_node_is_split_like_any_other(_registry: Registry) -> None:
 
 
 def test_without_a_registry_a_filter_name_is_an_unknown_function() -> None:
-    err = _reject_dyn("SELECT deband(a.frame, range => 8) FROM input('x.mp4') a", None)
+    err = _reject_dyn("SELECT deband(a.video[1], range => 8) FROM input('x.mp4') a", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert err.hint is not None and "provisioner" in err.hint
 
@@ -3569,18 +3549,18 @@ def test_without_a_registry_every_name_is_unknown_including_common_ones() -> Non
     """No name is privileged any more -- there is no curated list to fall back
     on, so `scale` fails exactly the way `deband` does."""
     for name in ("scale", "crop", "gblur", "volume", "amix"):
-        err = _reject_dyn(f"SELECT {name}(a.frame) FROM input('x.mp4') a", None)
+        err = _reject_dyn(f"SELECT {name}(a.video[1]) FROM input('x.mp4') a", None)
         assert err.code is ErrorCode.UNKNOWN_FUNCTION, name
 
 
 def test_without_a_registry_the_namespace_is_unknown_too() -> None:
-    err = _reject_dyn("SELECT ffmpeg.gblur(a.frame) FROM input('x.mp4') a", None)
+    err = _reject_dyn("SELECT ffmpeg.gblur(a.video[1]) FROM input('x.mp4') a", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert err.hint is not None and "provisioner" in err.hint
 
 
 def test_did_you_mean_over_the_registry(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT gblu(a.frame) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT gblu(a.video[1]) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert err.hint is not None and "gblur()" in err.hint
 
@@ -3593,7 +3573,7 @@ def test_did_you_mean_can_suggest_an_n_input_filter(_registry: Registry) -> None
 
 
 def test_no_match_says_the_surface_is_the_filter_set(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT zzzz(a.frame) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT zzzz(a.video[1]) FROM input('x.mp4') a", _registry)
     assert err.hint is not None and "filter of your installed ffmpeg" in err.hint
 
 
@@ -3607,7 +3587,7 @@ def test_compile_sql_always_builds_a_registry(monkeypatch: pytest.MonkeyPatch) -
         return real()
 
     monkeypatch.setattr(compiler.registry_module, "load", counted)
-    compile_sql("SELECT gblur(a.frame, 5) FROM input('x.mp4') a")
+    compile_sql("SELECT gblur(a.video[1], 5) FROM input('x.mp4') a")
     assert calls, "compile_sql must consult the registry"
 
 
@@ -3742,8 +3722,8 @@ def test_union_splat_pairs_every_language_track(_av2_fixture: str, _av3_fixture:
     both branches, and the tracks pair up by position -- eng with eng, fra with
     fra -- into one concat with 1 video and 2 audio pads."""
     g = compile_sql(
-        f"SELECT a.frame, a.audio FROM input('{_av2_fixture}') a "
-        f"UNION ALL SELECT b.frame, b.audio FROM input('{_av3_fixture}') b"
+        f"SELECT a.video[1], a.audio FROM input('{_av2_fixture}') a "
+        f"UNION ALL SELECT b.video[1], b.audio FROM input('{_av3_fixture}') b"
     )
     assert _filters(g) == ["concat"]
     assert g.nodes["n1"].args == {"n": 2, "v": 1, "a": 2}
@@ -3787,7 +3767,7 @@ def test_crossfade_of_two_trimmed_segments_compiles(
     call against two independently seeked inputs. The windows are input options
     (one per -i), so xfade consumes the raw refs and the graph is one node."""
     g = compile_sql(
-        f"SELECT xfade(a.frame, b.frame, duration => 1, offset => 1) "
+        f"SELECT xfade(a.video[1], b.video[1], duration => 1, offset => 1) "
         f"FROM input('{_av2_fixture}') a, input('{_av3_fixture}') b "
         f"WHERE a.t BETWEEN 0 AND 2 AND b.t BETWEEN 0 AND 2"
     )
@@ -3840,7 +3820,7 @@ def test_the_ad_insert_composition_lowers_end_to_end() -> None:
 
 def test_video_delay_threads_provenance_like_any_1_to_1_chain() -> None:
     g = _lower(
-        "SELECT sqlmpeg.delay(a.frame, 1) FROM input('x.mp4') a",
+        "SELECT sqlmpeg.delay(a.video[1], 1) FROM input('x.mp4') a",
         {"a": _probe_result(video_tags={"language": "eng"})},
     )
     assert [o.metadata for o in g.outputs] == [{"language": "eng"}]
@@ -3858,12 +3838,12 @@ def test_delay_over_a_passthrough_stream_is_still_udf_arg_type() -> None:
 #
 # One spelling of a filter name that no SQL grammar has an opinion about, and
 # that resolves in the registry ALONE. The offline fixture registry above has
-# `trim` in it, which is exactly the interesting case: bare `trim(a.frame)` is
+# `trim` in it, which is exactly the interesting case: bare `trim(a.video[1])` is
 # Postgres's string TRIM and loses the argument.
 
 
 def test_a_namespaced_call_lowers_to_an_ordinary_node(_registry: Registry) -> None:
-    g = _dyn("SELECT ffmpeg.gblur(a.frame, sigma => 5) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT ffmpeg.gblur(a.video[1], sigma => 5) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].filter == "gblur"  # the NODE knows nothing of the namespace
     assert g.nodes["n1"].args == {"sigma": 5}
     assert g.nodes["n1"].inputs == ["src:a:v:0"]
@@ -3875,35 +3855,35 @@ def test_the_namespace_and_the_bare_name_are_the_same_call(_registry: Registry) 
     are one filter, one option set, one argument order -- the namespace only
     changes what Postgres's parser does with the NAME."""
     named = _dyn(
-        "SELECT ffmpeg.scale(a.frame, width => 640) FROM input('x.mp4') a", _registry
+        "SELECT ffmpeg.scale(a.video[1], width => 640) FROM input('x.mp4') a", _registry
     )
     assert named.nodes["n1"].filter == "scale"
     assert named.nodes["n1"].args == {"width": 640}
 
-    bare = _dyn("SELECT scale(a.frame, 640, 480) FROM input('x.mp4') a", _registry)
+    bare = _dyn("SELECT scale(a.video[1], 640, 480) FROM input('x.mp4') a", _registry)
     assert bare.nodes["n1"].filter == "scale"
     assert bare.nodes["n1"].args == {"width": 640, "height": 480}
 
     qualified = _dyn(
-        "SELECT ffmpeg.scale(a.frame, 640, 480) FROM input('x.mp4') a", _registry
+        "SELECT ffmpeg.scale(a.video[1], 640, 480) FROM input('x.mp4') a", _registry
     )
     assert qualified.nodes["n1"].args == bare.nodes["n1"].args
 
 
 def test_the_namespace_reaches_a_name_postgres_claimed(_registry: Registry) -> None:
-    """Bare `trim(a.frame)` parses as Postgres's TRIM and arrives with NO
+    """Bare `trim(a.video[1])` parses as Postgres's TRIM and arrives with NO
     positional arguments; the namespaced spelling keeps them."""
-    err = _reject_dyn("SELECT trim(a.frame) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT trim(a.video[1]) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "got (nothing)" in err.message
 
-    g = _dyn("SELECT ffmpeg.trim(a.frame) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT ffmpeg.trim(a.video[1]) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].filter == "trim"
     assert g.nodes["n1"].inputs == ["src:a:v:0"]
 
 
 def test_the_namespace_qualifier_folds_like_any_identifier(_registry: Registry) -> None:
-    g = _dyn("SELECT FFMPEG.GBlur(a.frame, sigma => 1) FROM input('x.mp4') a", _registry)
+    g = _dyn("SELECT FFMPEG.GBlur(a.video[1], sigma => 1) FROM input('x.mp4') a", _registry)
     assert g.nodes["n1"].filter == "gblur"
 
 
@@ -3915,7 +3895,7 @@ def test_a_namespaced_call_checks_its_pad_signature(_registry: Registry) -> None
 
 def test_a_namespaced_option_is_validated_the_ordinary_way(_registry: Registry) -> None:
     err = _reject_dyn(
-        "SELECT ffmpeg.gblur(a.frame, sigmma => 5) FROM input('x.mp4') a", _registry
+        "SELECT ffmpeg.gblur(a.video[1], sigmma => 5) FROM input('x.mp4') a", _registry
     )
     assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
     # The message names the FILTER, which is what has the options.
@@ -3926,7 +3906,7 @@ def test_a_namespaced_option_is_validated_the_ordinary_way(_registry: Registry) 
 def test_a_namespaced_unknown_name_suggests_the_namespaced_spelling(
     _registry: Registry,
 ) -> None:
-    err = _reject_dyn("SELECT ffmpeg.gblurr(a.frame) FROM input('x.mp4') a", _registry)
+    err = _reject_dyn("SELECT ffmpeg.gblurr(a.video[1]) FROM input('x.mp4') a", _registry)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert "unknown function ffmpeg.gblurr()" in err.message
     assert err.hint == "did you mean ffmpeg.gblur()?"
@@ -3960,21 +3940,21 @@ def test_the_scope_check_applies_to_the_namespace_too(_registry: Registry) -> No
     ...); multi-output, source and `split`-shaped (`N` on the OUTPUT side,
     admitted by neither table) names stay excluded."""
     for sql in (
-        "SELECT ffmpeg.feedback(a.frame, a.frame) FROM input('x.mp4') a",
-        "SELECT ffmpeg.testsrc(a.frame) FROM input('x.mp4') a",
-        "SELECT ffmpeg.split(a.frame) FROM input('x.mp4') a",
+        "SELECT ffmpeg.feedback(a.video[1], a.video[1]) FROM input('x.mp4') a",
+        "SELECT ffmpeg.testsrc(a.video[1]) FROM input('x.mp4') a",
+        "SELECT ffmpeg.split(a.video[1]) FROM input('x.mp4') a",
     ):
         assert _reject_dyn(sql, _registry).code is ErrorCode.UNKNOWN_FUNCTION
 
 
 def test_namespaced_calls_nest_in_both_directions(_registry: Registry) -> None:
     g = _dyn(
-        "SELECT scale(ffmpeg.gblur(a.frame, sigma => 2), 0.5) FROM input('x.mp4') a",
+        "SELECT scale(ffmpeg.gblur(a.video[1], sigma => 2), 0.5) FROM input('x.mp4') a",
         _registry,
     )
     assert _filters(g) == ["gblur", "scale"]
     g = _dyn(
-        "SELECT ffmpeg.gblur(scale(a.frame, 0.5), sigma => 2) FROM input('x.mp4') a",
+        "SELECT ffmpeg.gblur(scale(a.video[1], 0.5), sigma => 2) FROM input('x.mp4') a",
         _registry,
     )
     assert _filters(g) == ["scale", "gblur"]
@@ -3991,27 +3971,27 @@ def test_a_namespaced_call_broadcasts_like_any_other(_registry: Registry) -> Non
 
 
 def test_without_a_registry_the_namespace_is_an_unknown_function() -> None:
-    err = _reject_dyn("SELECT ffmpeg.gblur(a.frame) FROM input('x.mp4') a", None)
+    err = _reject_dyn("SELECT ffmpeg.gblur(a.video[1]) FROM input('x.mp4') a", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert err.hint is not None and "provisioner" in err.hint
 
 
 def test_no_ffmpeg_turns_the_namespace_off() -> None:
-    err = _reject_dyn("SELECT ffmpeg.gblur(a.frame) FROM input('x.mp4') a", None)
+    err = _reject_dyn("SELECT ffmpeg.gblur(a.video[1]) FROM input('x.mp4') a", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert err.hint is not None and "provisioner" in err.hint
 
 
 def test_ffmpeg_is_reserved_as_an_input_alias() -> None:
-    err = _reject_lower("SELECT ffmpeg.frame FROM input('x.mp4') ffmpeg", {})
+    err = _reject_lower("SELECT ffmpeg.video[1] FROM input('x.mp4') ffmpeg", {})
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "reserved for the filter namespace" in err.message
 
 
 def test_ffmpeg_is_reserved_as_a_cte_name() -> None:
     err = _reject_lower(
-        "WITH ffmpeg AS (SELECT a.frame FROM input('x.mp4') a) "
-        "SELECT ffmpeg.frame FROM ffmpeg",
+        "WITH ffmpeg AS (SELECT a.video[1] FROM input('x.mp4') a) "
+        "SELECT ffmpeg.video[1] FROM ffmpeg",
         {},
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -4029,7 +4009,7 @@ def test_a_bare_ffmpeg_column_points_at_the_call_form() -> None:
 def test_an_unrelated_qualified_call_is_still_rejected() -> None:
     """The namespace is exactly one name; `foo.gblur(...)` is not a call
     sqlmpeg knows how to read."""
-    err = _reject_lower("SELECT foo.gblur(a.frame) FROM input('x.mp4') a", {})
+    err = _reject_lower("SELECT foo.gblur(a.video[1]) FROM input('x.mp4') a", {})
     assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
@@ -4305,7 +4285,7 @@ def test_an_array_call_cannot_also_broadcast_over_an_array(_registry: Registry) 
 
 def test_an_array_call_checks_its_input_pad_type(_registry: Registry) -> None:
     err = _reject_dyn(
-        "SELECT ffmpeg.channelsplit(a.frame) FROM input('x.mp4') a", _registry
+        "SELECT ffmpeg.channelsplit(a.video[1]) FROM input('x.mp4') a", _registry
     )
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "it takes audio as its stream input, got (video)" in err.message
@@ -4424,7 +4404,7 @@ def _offline(monkeypatch: pytest.MonkeyPatch) -> Registry:
 
 def test_a_source_compiles_offline(_offline: Registry) -> None:
     g = lower(
-        resolve(parse("SELECT t.frame FROM ffmpeg.testsrc(duration => 2, size => '320x240') t")),
+        resolve(parse("SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2, size => '320x240') t")),
         {},
         registry=_offline,
     )
@@ -4436,7 +4416,7 @@ def test_a_source_compiles_offline(_offline: Registry) -> None:
 
 def test_enable_compiles_offline(_offline: Registry) -> None:
     g = lower(
-        resolve(parse("SELECT gblur(a.frame, 5, enable => 'between(t,2,5)') FROM input('x.mp4') a")),
+        resolve(parse("SELECT gblur(a.video[1], 5, enable => 'between(t,2,5)') FROM input('x.mp4') a")),
         {},
         registry=_offline,
     )
@@ -4447,7 +4427,7 @@ def test_enable_still_requires_the_timeline_flag_offline(_offline: Registry) -> 
     """scale is not T-flagged, and the snapshot carries that flag verbatim."""
     with pytest.raises(SqlmpegError) as excinfo:
         lower(
-            resolve(parse("SELECT scale(a.frame, 640, enable => 'gt(t,1)') FROM input('x.mp4') a")),
+            resolve(parse("SELECT scale(a.video[1], 640, enable => 'gt(t,1)') FROM input('x.mp4') a")),
             {},
             registry=_offline,
         )
@@ -4489,7 +4469,7 @@ def test_positional_options_bind_offline_exactly_as_they_do_live(
 ) -> None:
     """The snapshot preserves ffmpeg's option ORDER, not just its content."""
     g = lower(
-        resolve(parse("SELECT crop(a.frame, 100, 50, 10, 20) FROM input('x.mp4') a")),
+        resolve(parse("SELECT crop(a.video[1], 100, 50, 10, 20) FROM input('x.mp4') a")),
         {},
         registry=_offline,
     )
@@ -4520,7 +4500,7 @@ def test_amix_is_callable_bare_with_two_streams(_registry: Registry) -> None:
 def test_hstack_and_vstack_are_callable_bare(_registry: Registry) -> None:
     for name in ("hstack", "vstack"):
         g = _dyn(
-            f"SELECT {name}(a.frame, b.frame) FROM input('x.mp4') a, input('y.mp4') b",
+            f"SELECT {name}(a.video[1], b.video[1]) FROM input('x.mp4') a, input('y.mp4') b",
             _registry,
         )
         assert g.nodes["n1"].filter == name
@@ -4584,7 +4564,7 @@ def test_a_count_larger_than_the_streams_is_also_rejected(
 
 def test_an_n_input_filter_type_checks_every_stream(_registry: Registry) -> None:
     err = _reject_dyn(
-        "SELECT amix(a.audio[1], a.frame) FROM input('x.mp4') a", _registry
+        "SELECT amix(a.audio[1], a.video[1]) FROM input('x.mp4') a", _registry
     )
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "its stream inputs are all audio" in err.message
@@ -4659,7 +4639,7 @@ def test_an_n_input_filter_has_no_timeline_support(_registry: Registry) -> None:
 def test_an_n_input_node_is_split_like_any_other(_registry: Registry) -> None:
     g = insert_splits(
         _dyn(
-            "WITH c AS (SELECT gblur(a.frame, sigma => 2) AS f FROM input('x.mp4') a) "
+            "WITH c AS (SELECT gblur(a.video[1], sigma => 2) AS f FROM input('x.mp4') a) "
             "SELECT hstack(c.f, c.f) FROM c",
             _registry,
         )
@@ -4708,7 +4688,7 @@ def test_join_is_a_reserved_keyword_so_it_needs_the_namespace(
 
 def test_interleave_and_ainterleave_count_via_nb_inputs(_registry: Registry) -> None:
     g = _dyn(
-        "SELECT interleave(a.frame, b.frame) FROM input('x.mp4') a, input('y.mp4') b",
+        "SELECT interleave(a.video[1], b.video[1]) FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
     node = g.nodes["n1"]
@@ -4729,13 +4709,13 @@ def test_interleaves_count_option_agrees_with_the_streams_supplied(
     _registry: Registry,
 ) -> None:
     g = _dyn(
-        "SELECT interleave(a.frame, b.frame, c.frame, nb_inputs => 3) "
+        "SELECT interleave(a.video[1], b.video[1], c.video[1], nb_inputs => 3) "
         "FROM input('x.mp4') a, input('y.mp4') b, input('z.mp4') c",
         _registry,
     )
     assert g.nodes["n1"].args == {"nb_inputs": 3}
     err = _reject_dyn(
-        "SELECT interleave(a.frame, b.frame, c.frame) "
+        "SELECT interleave(a.video[1], b.video[1], c.video[1]) "
         "FROM input('x.mp4') a, input('y.mp4') b, input('z.mp4') c",
         _registry,
     )
@@ -4745,7 +4725,7 @@ def test_interleaves_count_option_agrees_with_the_streams_supplied(
 
 def test_amerge_rejects_a_video_stream(_registry: Registry) -> None:
     err = _reject_dyn(
-        "SELECT amerge(a.audio[1], a.frame) FROM input('x.mp4') a", _registry
+        "SELECT amerge(a.audio[1], a.video[1]) FROM input('x.mp4') a", _registry
     )
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "its stream inputs are all audio" in err.message
@@ -4753,7 +4733,7 @@ def test_amerge_rejects_a_video_stream(_registry: Registry) -> None:
 
 def test_interleave_rejects_an_audio_stream(_registry: Registry) -> None:
     err = _reject_dyn(
-        "SELECT interleave(a.frame, a.audio[1]) FROM input('x.mp4') a", _registry
+        "SELECT interleave(a.video[1], a.audio[1]) FROM input('x.mp4') a", _registry
     )
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "its stream inputs are all video" in err.message
@@ -4769,7 +4749,7 @@ def test_amerge_join_interleave_ainterleave_reachable_through_the_namespace(
         )
         assert g.nodes["n1"].filter == name
     g = _dyn(
-        "SELECT ffmpeg.interleave(a.frame, b.frame) "
+        "SELECT ffmpeg.interleave(a.video[1], b.video[1]) "
         "FROM input('x.mp4') a, input('y.mp4') b",
         _registry,
     )
@@ -4823,7 +4803,7 @@ def test_ladspa_rejects_an_unknown_option(_registry: Registry) -> None:
 
 def test_ladspa_rejects_a_video_stream(_registry: Registry) -> None:
     err = _reject_dyn(
-        "SELECT ladspa(a.frame, file => 'amp') FROM input('x.mp4') a", _registry
+        "SELECT ladspa(a.video[1], file => 'amp') FROM input('x.mp4') a", _registry
     )
     assert err.code is ErrorCode.UDF_ARG_TYPE
     assert "its stream inputs are all audio" in err.message
@@ -4875,10 +4855,9 @@ def test_a_source_with_no_options_sets_no_args(_registry: Registry) -> None:
     assert g.nodes["n1"].args == {}
 
 
-def test_a_video_source_answers_to_frame_and_video(_registry: Registry) -> None:
-    for column in ("t.frame", "t.video[1]"):
-        g = _dyn(f"SELECT {column} FROM ffmpeg.testsrc(duration => 2) t", _registry)
-        assert _outputs(g) == [("n1", "video", None)], column
+def test_a_video_source_answers_to_its_subscript(_registry: Registry) -> None:
+    g = _dyn("SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2) t", _registry)
+    assert _outputs(g) == [("n1", "video", None)]
 
 
 def test_a_source_bare_array_is_a_length_one_array(_registry: Registry) -> None:
@@ -4921,11 +4900,13 @@ def test_a_source_rejects_the_other_types_column(_registry: Registry) -> None:
     assert "ffmpeg.testsrc produces 1 video stream" in err.message
 
 
-def test_frame_sugar_is_video_only_on_a_source(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT s.frame FROM ffmpeg.anullsrc() s", _registry)
+def test_a_source_column_of_the_wrong_type_names_what_it_produces(
+    _registry: Registry,
+) -> None:
+    err = _reject_dyn("SELECT s.video[1] FROM ffmpeg.anullsrc() s", _registry)
     assert err.code is ErrorCode.STREAM_NOT_FOUND
     assert "ffmpeg.anullsrc produces 1 audio stream" in err.message
-    assert err.hint is not None and "s.audio[1]" in err.hint
+    assert err.hint is not None and "s.audio" in err.hint
 
 
 def test_a_source_subscript_is_bounded_statically(_registry: Registry) -> None:
@@ -4933,12 +4914,6 @@ def test_a_source_subscript_is_bounded_statically(_registry: Registry) -> None:
     assert err.code is ErrorCode.STREAM_NOT_FOUND
     assert "'t.video[2]' does not exist" in err.message
     assert "ffmpeg.testsrc produces 1 video stream" in err.message
-
-
-def test_a_source_frame_cannot_be_subscripted(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT t.frame[1] FROM ffmpeg.testsrc() t", _registry)
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "cannot be subscripted" in err.message
 
 
 def test_a_source_rejects_an_unknown_column(_registry: Registry) -> None:
@@ -4952,7 +4927,7 @@ def test_a_source_node_is_minted_once_per_alias(_registry: Registry) -> None:
     """Memoized on first column access, so fan-out is the split pass's
     ordinary business -- never a second generator."""
     g = _dyn(
-        "SELECT gblur(t.frame, sigma => 2), t.frame FROM ffmpeg.testsrc() t", _registry
+        "SELECT gblur(t.video[1], sigma => 2), t.video[1] FROM ffmpeg.testsrc() t", _registry
     )
     assert _filters(g) == ["testsrc", "gblur"]
     g = insert_splits(g)
@@ -4962,7 +4937,7 @@ def test_a_source_node_is_minted_once_per_alias(_registry: Registry) -> None:
 
 def test_an_unused_source_alias_mints_no_node(_registry: Registry) -> None:
     g = _dyn(
-        "SELECT a.frame FROM input('x.mp4') a, ffmpeg.testsrc(duration => 2) t",
+        "SELECT a.video[1] FROM input('x.mp4') a, ffmpeg.testsrc(duration => 2) t",
         _registry,
     )
     assert g.nodes == {}
@@ -4972,25 +4947,25 @@ def test_an_unused_source_alias_mints_no_node(_registry: Registry) -> None:
 def test_a_source_validates_its_options_against_the_registry(
     _registry: Registry,
 ) -> None:
-    err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrc(durationn => 2) t", _registry)
+    err = _reject_dyn("SELECT t.video[1] FROM ffmpeg.testsrc(durationn => 2) t", _registry)
     assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
     assert "filter 'testsrc' has no option 'durationn'" in err.message
     assert err.hint == "did you mean duration => ...?"
 
-    err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrc(decimals => 'x') t", _registry)
+    err = _reject_dyn("SELECT t.video[1] FROM ffmpeg.testsrc(decimals => 'x') t", _registry)
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "expects a number" in err.message
 
 
 def test_a_source_option_range_is_checked(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrc(decimals => 99) t", _registry)
+    err = _reject_dyn("SELECT t.video[1] FROM ffmpeg.testsrc(decimals => 99) t", _registry)
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "from 0 to 17" in err.message
 
 
 def test_source_options_keep_their_written_order(_registry: Registry) -> None:
     g = _dyn(
-        "SELECT t.frame FROM ffmpeg.testsrc(size => '320x240', rate => 15, "
+        "SELECT t.video[1] FROM ffmpeg.testsrc(size => '320x240', rate => 15, "
         "duration => 2) t",
         _registry,
     )
@@ -5006,7 +4981,7 @@ def test_source_options_keep_their_written_order(_registry: Registry) -> None:
 
 
 def test_an_unknown_source_suggests_a_real_one(_registry: Registry) -> None:
-    err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrcc() t", _registry)
+    err = _reject_dyn("SELECT t.video[1] FROM ffmpeg.testsrcc() t", _registry)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert "unknown generated source ffmpeg.testsrcc()" in err.message
     assert err.hint == "did you mean ffmpeg.testsrc()?"
@@ -5018,7 +4993,7 @@ def test_an_excluded_source_gets_the_exclusion_message(_registry: Registry) -> N
     them -- they are indistinguishable from a typo here and land on the same
     rejection, whose hint states the exclusion."""
     for name in ("avsynctest", "movie", "amovie"):
-        err = _reject_dyn(f"SELECT t.frame FROM ffmpeg.{name}() t", _registry)
+        err = _reject_dyn(f"SELECT t.video[1] FROM ffmpeg.{name}() t", _registry)
         assert err.code is ErrorCode.UNKNOWN_FUNCTION, name
         assert err.hint is not None
         assert "more than one output pad (avsynctest)" in err.hint
@@ -5033,27 +5008,27 @@ def test_a_sink_is_not_a_source_either(_registry: Registry) -> None:
 def test_a_regular_filter_in_from_says_it_takes_inputs(_registry: Registry) -> None:
     """The one excluded case that IS positively identifiable: the name is a
     real filter of this ffmpeg, it just has input pads."""
-    err = _reject_dyn("SELECT t.frame FROM ffmpeg.gblur(sigma => 2) t", _registry)
+    err = _reject_dyn("SELECT t.video[1] FROM ffmpeg.gblur(sigma => 2) t", _registry)
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "ffmpeg.gblur is an ffmpeg filter, not a source" in err.message
-    assert err.hint is not None and "SELECT ffmpeg.gblur(a.frame)" in err.hint
+    assert err.hint is not None and "SELECT ffmpeg.gblur(a.video[1])" in err.hint
 
 
 def test_a_source_needs_a_registry() -> None:
-    err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t", None)
+    err = _reject_dyn("SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2) t", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert err.hint is not None and "provisioner" in err.hint
 
 
 def test_no_ffmpeg_turns_the_source_namespace_off() -> None:
-    err = _reject_dyn("SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t", None)
+    err = _reject_dyn("SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2) t", None)
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert err.hint is not None and "provisioner" in err.hint
 
 
 def test_where_on_a_source_alias_points_at_duration(_registry: Registry) -> None:
     err = _reject_dyn(
-        "SELECT t.frame FROM ffmpeg.testsrc(duration => 2) t WHERE t.t <= 1", _registry
+        "SELECT t.video[1] FROM ffmpeg.testsrc(duration => 2) t WHERE t.t <= 1", _registry
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'t' is a generated source" in err.message
@@ -5068,13 +5043,13 @@ def test_a_source_time_column_is_not_a_stream(_registry: Registry) -> None:
 
 def test_a_source_carries_no_provenance(_registry: Registry) -> None:
     """Nothing was probed, because nothing was read."""
-    g = _dyn("SELECT t.frame FROM ffmpeg.testsrc() t", _registry)
+    g = _dyn("SELECT t.video[1] FROM ffmpeg.testsrc() t", _registry)
     assert g.outputs[0].metadata == {}
 
 
 def test_a_source_works_inside_a_cte(_registry: Registry) -> None:
     g = _dyn(
-        "WITH bg AS (SELECT t.frame AS v FROM ffmpeg.testsrc(duration => 2) t) "
+        "WITH bg AS (SELECT t.video[1] AS v FROM ffmpeg.testsrc(duration => 2) t) "
         "SELECT gblur(bg.v, sigma => 2) FROM bg",
         _registry,
     )
@@ -5131,7 +5106,7 @@ def test_a_source_in_select_position_points_at_from(_registry: Registry) -> None
 
 def test_an_unknown_alias_hint_lists_source_aliases(_registry: Registry) -> None:
     err = _reject_dyn(
-        "SELECT nope.frame FROM ffmpeg.testsrc(duration => 2) t", _registry
+        "SELECT nope.video[1] FROM ffmpeg.testsrc(duration => 2) t", _registry
     )
     assert err.code is ErrorCode.UNKNOWN_ALIAS
     assert err.hint == "known names: t"
@@ -5152,7 +5127,7 @@ def test_enable_is_accepted_on_a_timeline_capable_tier_two_filter(
     _registry: Registry,
 ) -> None:
     g = _dyn(
-        "SELECT gblur(a.frame, sigma => 5, enable => 'between(t,0.5,1.5)') "
+        "SELECT gblur(a.video[1], sigma => 5, enable => 'between(t,0.5,1.5)') "
         "FROM input('x.mp4') a",
         _registry,
     )
@@ -5163,7 +5138,7 @@ def test_enable_is_an_ordinary_node_arg_in_written_order(_registry: Registry) ->
     """It renders like any other option -- nothing downstream knows it is
     special (emit sees a plain `enable=...` in the node's args)."""
     g = _dyn(
-        "SELECT gblur(a.frame, enable => 'gt(t,1)', sigma => 2) FROM input('x.mp4') a",
+        "SELECT gblur(a.video[1], enable => 'gt(t,1)', sigma => 2) FROM input('x.mp4') a",
         _registry,
     )
     assert list(g.nodes["n1"].args.items()) == [("enable", "gt(t,1)"), ("sigma", 2)]
@@ -5171,7 +5146,7 @@ def test_enable_is_an_ordinary_node_arg_in_written_order(_registry: Registry) ->
 
 def test_enable_works_through_the_namespace_spelling(_registry: Registry) -> None:
     g = _dyn(
-        "SELECT ffmpeg.gblur(a.frame, enable => 'lt(t,1)') FROM input('x.mp4') a",
+        "SELECT ffmpeg.gblur(a.video[1], enable => 'lt(t,1)') FROM input('x.mp4') a",
         _registry,
     )
     assert g.nodes["n1"].args == {"enable": "lt(t,1)"}
@@ -5182,7 +5157,7 @@ def test_enable_is_rejected_on_a_filter_without_timeline_support(
 ) -> None:
     """`scale` is `..C` in the fixture AND in real ffmpeg 7.1: no T."""
     err = _reject_dyn(
-        "SELECT ffmpeg.scale(a.frame, enable => 'gt(t,1)') FROM input('x.mp4') a",
+        "SELECT ffmpeg.scale(a.video[1], enable => 'gt(t,1)') FROM input('x.mp4') a",
         _registry,
     )
     assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
@@ -5194,7 +5169,7 @@ def test_enable_is_rejected_on_a_filter_without_timeline_support(
 def test_enable_reaches_through_a_stdlib_call_to_its_filter(_registry: Registry) -> None:
     """Tier-1 named extra: `blur` expands to `gblur`, which has the T flag."""
     g = _dyn(
-        "SELECT gblur(a.frame, 5, enable => 'between(t,0.5,1.5)') FROM input('x.mp4') a",
+        "SELECT gblur(a.video[1], 5, enable => 'between(t,0.5,1.5)') FROM input('x.mp4') a",
         _registry,
     )
     node = g.nodes["n1"]
@@ -5208,8 +5183,8 @@ def test_enable_on_a_stdlib_call_follows_the_underlying_filters_flag(
     """The flag consulted is the TARGET filter's, not the function's name:
     `crop` and `scale` are both non-T, so neither stdlib call takes it."""
     for query, filter_name in (
-        ("SELECT crop(a.frame, 0, 0, 10, 10, enable => 'gt(t,1)')", "crop"),
-        ("SELECT scale(a.frame, 640, 360, enable => 'gt(t,1)')", "scale"),
+        ("SELECT crop(a.video[1], 0, 0, 10, 10, enable => 'gt(t,1)')", "crop"),
+        ("SELECT scale(a.video[1], 640, 360, enable => 'gt(t,1)')", "scale"),
     ):
         err = _reject_dyn(f"{query} FROM input('x.mp4') a", _registry)
         assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION, filter_name
@@ -5221,7 +5196,7 @@ def test_enable_on_a_macro_is_still_the_macro_rejection(_registry: Registry) -> 
     arguments are positional only -- `enable` is not a way around that,
     same as any other named extra."""
     err = _reject_dyn(
-        "SELECT sqlmpeg.blur_regions(a.frame, 0, 0, 10, 10, 5, enable => 'gt(t,1)') "
+        "SELECT sqlmpeg.blur_regions(a.video[1], 0, 0, 10, 10, 5, enable => 'gt(t,1)') "
         "FROM input('x.mp4') a",
         _registry,
     )
@@ -5243,7 +5218,7 @@ def test_enable_on_a_generated_source_is_rejected(_registry: Registry) -> None:
 def test_enable_needs_a_string_expression(_registry: Registry) -> None:
     for value, got in (("1", "1"), ("true", "true"), ("-2.5", "-2.5")):
         err = _reject_dyn(
-            f"SELECT gblur(a.frame, enable => {value}) FROM input('x.mp4') a",
+            f"SELECT gblur(a.video[1], enable => {value}) FROM input('x.mp4') a",
             _registry,
         )
         assert err.code is ErrorCode.FILTER_OPTION_TYPE, value
@@ -5257,7 +5232,7 @@ def test_enable_expression_content_is_not_validated(_registry: Registry) -> None
     per-filter and not introspectable, so nonsense compiles and it is ffmpeg
     that rejects it at run time."""
     g = _dyn(
-        "SELECT gblur(a.frame, enable => 'wat(zzz,1)') FROM input('x.mp4') a",
+        "SELECT gblur(a.video[1], enable => 'wat(zzz,1)') FROM input('x.mp4') a",
         _registry,
     )
     assert g.nodes["n1"].args == {"enable": "wat(zzz,1)"}
@@ -5267,7 +5242,7 @@ def test_enable_is_case_sensitive_like_every_option_name(_registry: Registry) ->
     """`ENABLE` is not `enable`; it falls through to the ordinary lookup and
     gblur has no such option."""
     err = _reject_dyn(
-        "SELECT gblur(a.frame, ENABLE => 'gt(t,1)') FROM input('x.mp4') a", _registry
+        "SELECT gblur(a.video[1], ENABLE => 'gt(t,1)') FROM input('x.mp4') a", _registry
     )
     assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
     assert "'ENABLE'" in err.message
@@ -5277,7 +5252,7 @@ def test_enable_without_a_registry_never_gets_that_far() -> None:
     """No ffmpeg means no filter named `gblur` at all, so the call is unknown
     before anything asks about timeline support."""
     err = _reject_dyn(
-        "SELECT gblur(a.frame, 5, enable => 'gt(t,1)') FROM input('x.mp4') a", None
+        "SELECT gblur(a.video[1], 5, enable => 'gt(t,1)') FROM input('x.mp4') a", None
     )
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
 
@@ -5334,7 +5309,7 @@ def test_a_pure_tier_two_filter_compiles_and_runs(
     """curves is in no stdlib table: name, pad signature, `preset` and its
     constants all come from the installed ffmpeg -- and the command runs."""
     query = (
-        f"SELECT curves(a.frame, preset => 'lighter'), a.audio[1] "
+        f"SELECT curves(a.video[1], preset => 'lighter'), a.audio[1] "
         f"FROM input('{_av_fixture}') a"
     )
     g = compile_sql(query)
@@ -5347,7 +5322,7 @@ def test_a_pure_tier_two_filter_compiles_and_runs(
 @pytest.mark.exec
 def test_two_named_options_on_a_real_filter_run(_av_fixture: str, tmp_path: Path) -> None:
     query = (
-        f"SELECT unsharp(a.frame, luma_msize_x => 7, luma_amount => 1.5) "
+        f"SELECT unsharp(a.video[1], luma_msize_x => 7, luma_amount => 1.5) "
         f"FROM input('{_av_fixture}') a"
     )
     assert compile_sql(query).nodes["n1"].args == {"luma_msize_x": 7, "luma_amount": 1.5}
@@ -5360,14 +5335,14 @@ def test_a_real_boolean_option_renders_as_ffmpeg_wants_it(
 ) -> None:
     """deband's `blur` is a real <boolean> AVOption; SQL writes true/false and
     emit renders 1/0, which is what ffmpeg parses."""
-    query = f"SELECT deband(a.frame, blur => false) FROM input('{_av_fixture}') a"
+    query = f"SELECT deband(a.video[1], blur => false) FROM input('{_av_fixture}') a"
     assert "deband=blur=0" in emit(compile_sql(query)).filter_complex
     _run_compiled(query, tmp_path / "deband.mp4")
 
 
 @pytest.mark.exec
 def test_the_real_gblur_range_comes_from_ffmpeg(_av_fixture: str) -> None:
-    err = _reject(f"SELECT gblur(a.frame, sigma => 5000) FROM input('{_av_fixture}') a")
+    err = _reject(f"SELECT gblur(a.video[1], sigma => 5000) FROM input('{_av_fixture}') a")
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "0 to 1024" in err.message
 
@@ -5379,12 +5354,12 @@ def test_the_real_xfade_transition_constants_are_enforced(
     """xfade as a DYNAMIC call (the stdlib name is crossfade): its transition
     is an ffmpeg enum, so a constant name is checked against the real list."""
     both = f"FROM input('{_av2_fixture}') a, input('{_av3_fixture}') b"
-    err = _reject(f"SELECT xfade(a.frame, b.frame, transition => 'sideways') {both}")
+    err = _reject(f"SELECT xfade(a.video[1], b.video[1], transition => 'sideways') {both}")
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "wipeleft" in err.message
 
     query = (
-        f"SELECT xfade(a.frame, b.frame, transition => 'wipeleft', "
+        f"SELECT xfade(a.video[1], b.video[1], transition => 'wipeleft', "
         f"duration => 1, offset => 1) {both}"
     )
     assert compile_sql(query).nodes["n1"].args == {
@@ -5397,7 +5372,7 @@ def test_the_real_xfade_transition_constants_are_enforced(
 
 @pytest.mark.exec
 def test_a_real_unknown_option_lists_the_real_ones(_av_fixture: str) -> None:
-    err = _reject(f"SELECT gblur(a.frame, sigmma => 5) FROM input('{_av_fixture}') a")
+    err = _reject(f"SELECT gblur(a.video[1], sigmma => 5) FROM input('{_av_fixture}') a")
     assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
     assert err.hint is not None and "sigma" in err.hint
 
@@ -5406,7 +5381,7 @@ def test_a_real_unknown_option_lists_the_real_ones(_av_fixture: str) -> None:
 def test_a_tier_one_named_extra_runs(_av_fixture: str, tmp_path: Path) -> None:
     """blur() reaches through to gblur's full option set: `planes` is not in any
     sqlmpeg table, it was read out of this ffmpeg."""
-    query = f"SELECT gblur(a.frame, 5, planes => 1) FROM input('{_av_fixture}') a"
+    query = f"SELECT gblur(a.video[1], 5, planes => 1) FROM input('{_av_fixture}') a"
     assert compile_sql(query).nodes["n1"].args == {"sigma": 5, "planes": 1}
     _run_compiled(query, tmp_path / "blur-planes.mp4")
 
@@ -5436,7 +5411,7 @@ def test_a_tier_two_audio_filter_broadcasts_over_real_tracks(
 
 @pytest.mark.exec
 def test_did_you_mean_reaches_into_the_real_filter_set(_av_fixture: str) -> None:
-    err = _reject(f"SELECT gblu(a.frame) FROM input('{_av_fixture}') a")
+    err = _reject(f"SELECT gblu(a.video[1]) FROM input('{_av_fixture}') a")
     assert err.code is ErrorCode.UNKNOWN_FUNCTION
     assert err.hint is not None and "gblur()" in err.hint
 
@@ -5465,12 +5440,12 @@ def test_did_you_mean_reaches_into_the_real_filter_set(_av_fixture: str) -> None
 
 _FIDELITY_CASES: list[tuple[str, str, str, list[str]]] = [
     # (filter, "v"|"a", pad spelling in SQL, positional values)
-    ("scale", "v", "a.frame", ["160", "120", "'lanczos'"]),
-    ("gblur", "v", "a.frame", ["5", "2", "1"]),
-    ("crop", "v", "a.frame", ["100", "50", "10", "20"]),
+    ("scale", "v", "a.video[1]", ["160", "120", "'lanczos'"]),
+    ("gblur", "v", "a.video[1]", ["5", "2", "1"]),
+    ("crop", "v", "a.video[1]", ["100", "50", "10", "20"]),
     ("volume", "a", "a.audio[1]", ["0.5"]),
-    ("eq", "v", "a.frame", ["1.2", "0.1", "1.5"]),
-    ("hqdn3d", "v", "a.frame", ["4", "3", "6"]),
+    ("eq", "v", "a.video[1]", ["1.2", "0.1", "1.5"]),
+    ("hqdn3d", "v", "a.video[1]", ["4", "3", "6"]),
 ]
 
 
@@ -5565,7 +5540,7 @@ def test_a_positionally_compiled_call_runs(_av_fixture: str, tmp_path: Path) -> 
     """The whole convention, end to end: streams, positionals, then a named."""
     out = tmp_path / "positional.mp4"
     query = (
-        f"SELECT gblur(crop(a.frame, 160, 120, 10, 20), 3, 2), "
+        f"SELECT gblur(crop(a.video[1], 160, 120, 10, 20), 3, 2), "
         f"volume(a.audio[1], 0.5) FROM input('{_av_fixture}') a"
     )
     _run_compiled(query, out)
@@ -5614,10 +5589,10 @@ def test_the_snapshot_agrees_with_the_installed_ffmpeg_on_option_order(
 # census compiles every collided name through the namespace.
 
 _CENSUS_ARG_FORMS = (
-    "a.frame",
-    "a.frame, b.frame",
-    "a.frame, b.frame, 1, 2",
-    "a.frame, x => 1",
+    "a.video[1]",
+    "a.video[1], b.video[1]",
+    "a.video[1], b.video[1], 1, 2",
+    "a.video[1], x => 1",
 )
 
 # Measured against ffmpeg 7.1 (464 in-scope filters) and sqlglot 30.17.
@@ -5729,7 +5704,7 @@ def test_the_real_overlay_options_are_reachable_through_the_namespace(
     OVERLAY..PLACING grammar makes `=>` a PARSE_ERROR); namespaced, the whole
     option set is there -- and the command runs."""
     query = (
-        "SELECT ffmpeg.overlay(a.frame, b.frame, x => 20, y => 20, "
+        "SELECT ffmpeg.overlay(a.video[1], b.video[1], x => 20, y => 20, "
         "eof_action => 'pass') "
         f"FROM input('{_av2_fixture}') a, input('{_av3_fixture}') b"
     )
@@ -5739,7 +5714,7 @@ def test_the_real_overlay_options_are_reachable_through_the_namespace(
     _run_compiled(query, tmp_path / "ns-overlay.mp4")
 
     assert _reject(
-        "SELECT overlay(a.frame, b.frame, x => 20, y => 20) "
+        "SELECT overlay(a.video[1], b.video[1], x => 20, y => 20) "
         f"FROM input('{_av2_fixture}') a, input('{_av3_fixture}') b"
     ).code is ErrorCode.PARSE_ERROR
 
@@ -5755,7 +5730,7 @@ def test_the_real_trim_filter_runs_through_the_namespace(
     binary, not from any table here.
     """
     query = (
-        f"SELECT ffmpeg.trim(a.frame, starti => 0.5, durationi => 1) "
+        f"SELECT ffmpeg.trim(a.video[1], starti => 0.5, durationi => 1) "
         f"FROM input('{_av_fixture}') a"
     )
     assert compile_sql(query).nodes["n1"].args == {"starti": 0.5, "durationi": 1}
@@ -5773,13 +5748,13 @@ def test_the_real_trim_filter_runs_through_the_namespace(
 
 _VIEW_SCRIPT = (
     "CREATE VIEW master AS\n"
-    "  SELECT scale(a.frame, 1280, -2) AS v FROM input('film.mkv') a;\n"
+    "  SELECT scale(a.video[1], 1280, -2) AS v FROM input('film.mkv') a;\n"
     "COPY (SELECT gblur(master.v, 2) FROM master) TO 'out.mp4' WITH (crf 20);"
 )
 
 _CTE_EQUIVALENT = (
     "COPY (WITH master AS (\n"
-    "  SELECT scale(a.frame, 1280, -2) AS v FROM input('film.mkv') a\n"
+    "  SELECT scale(a.video[1], 1280, -2) AS v FROM input('film.mkv') a\n"
     ") SELECT gblur(master.v, 2) FROM master) TO 'out.mp4' WITH (crf 20);"
 )
 
@@ -5806,7 +5781,7 @@ def test_a_view_script_compiles_to_one_ffmpeg_command() -> None:
 def test_a_view_is_split_across_its_consumers() -> None:
     """Two reads of one view pad go through a split, exactly like a CTE's."""
     g = compile_sql(
-        "CREATE VIEW m AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
+        "CREATE VIEW m AS SELECT a.video[1] AS v FROM input('x.mp4') a;\n"
         "COPY (SELECT gblur(m.v, 1), gblur(m.v, 2) FROM m) TO 'out.mp4';"
     )
     assert any(node.filter == "split" for node in g.nodes.values())
@@ -5814,7 +5789,7 @@ def test_a_view_is_split_across_its_consumers() -> None:
 
 def test_a_view_body_with_its_own_with_lowers() -> None:
     g = compile_sql(
-        "CREATE VIEW v AS WITH c AS (SELECT a.frame AS f FROM input('x.mp4') a) "
+        "CREATE VIEW v AS WITH c AS (SELECT a.video[1] AS f FROM input('x.mp4') a) "
         "SELECT scale(c.f, 0.5) AS v FROM c;\n"
         "COPY (SELECT v.v FROM v) TO 'out.mp4';"
     )
@@ -5823,7 +5798,7 @@ def test_a_view_body_with_its_own_with_lowers() -> None:
 
 def test_a_view_referencing_a_view_lowers() -> None:
     g = compile_sql(
-        "CREATE VIEW one AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
+        "CREATE VIEW one AS SELECT a.video[1] AS v FROM input('x.mp4') a;\n"
         "CREATE VIEW two AS SELECT scale(one.v, 0.5) AS v FROM one;\n"
         "COPY (SELECT gblur(two.v, 3) FROM two) TO 'out.mp4';"
     )
@@ -5832,7 +5807,7 @@ def test_a_view_referencing_a_view_lowers() -> None:
 
 def test_a_view_column_error_still_names_the_view() -> None:
     err = _reject(
-        "CREATE VIEW m AS SELECT a.frame AS v FROM input('x.mp4') a;\n"
+        "CREATE VIEW m AS SELECT a.video[1] AS v FROM input('x.mp4') a;\n"
         "COPY (SELECT m.nope FROM m) TO 'out.mp4';"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -5842,7 +5817,7 @@ def test_a_view_column_error_still_names_the_view() -> None:
 # --- multiple sinks ---
 
 _TWO_SINKS = (
-    "CREATE VIEW m AS SELECT a.frame AS v FROM input('film.mkv') a;\n"
+    "CREATE VIEW m AS SELECT a.video[1] AS v FROM input('film.mkv') a;\n"
     "COPY (SELECT scale(m.v, 1280, -2) FROM m) TO '720.mp4';\n"
     "COPY (SELECT scale(m.v, 640, -2) FROM m) TO '360.mp4';"
 )
@@ -5994,7 +5969,7 @@ def _row_query(where: str = "", order: str = "", column: str = "audio") -> str:
     their order, which is exactly what these tests are about.
     """
     return (
-        f"SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.{column}) t"
+        f"SELECT array_agg(t) FROM input('f.mkv') f, unnest(f.{column}) t"
         + (f" WHERE {where}" if where else "")
         + (f" ORDER BY {order}" if order else "")
     )
@@ -6038,7 +6013,7 @@ def test_a_codecless_row_is_still_inspectable_as_a_table() -> None:
     codec-less tracks (codec column NULL) -- that is how you find out."""
     probes = _row_probes(_track("data", 0, language="en", codec=None))
     sinks = lower_table(
-        resolve(parse("SELECT t.track, t.language, t.codec FROM input('f.mpd') f, unnest(f.data) t")),
+        resolve(parse("SELECT t, t.language, t.codec FROM input('f.mpd') f, unnest(f.data) t")),
         probes,
     )
     assert len(sinks) == 1
@@ -6188,7 +6163,7 @@ def test_subtitle_rows_work_the_same_and_stay_passthrough() -> None:
         _track("subtitle", 1, language="fra"),
     )
     g = _lower(
-        "SELECT s.track FROM input('f.mkv') f, unnest(f.subtitle) s "
+        "SELECT s FROM input('f.mkv') f, unnest(f.subtitle) s "
         "WHERE s.language = 'eng'",
         probes,
     )
@@ -6207,13 +6182,47 @@ def test_video_rows_carry_the_video_schema() -> None:
     assert _outputs(g) == [("src:f:v:0", "video", None)]
 
 
+def test_a_bare_row_alias_is_that_rows_stream() -> None:
+    """The row IS the stream, wherever a stream is expected."""
+    probes = _row_probes()
+    plain = _lower("SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE t.index = 1", probes)
+    assert _outputs(plain) == [("src:f:a:0", "audio", None)]
+    filtered = _lower(
+        "SELECT volume(t, 0.5) FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.index = 1",
+        probes,
+    )
+    assert _filters(filtered) == ["volume"]
+    gathered = _lower("SELECT array_agg(t) FROM input('f.mkv') f, unnest(f.audio) t", probes)
+    assert len(gathered.outputs) == 3
+
+
+def test_grouping_by_the_row_groups_by_the_stream_not_its_metadata() -> None:
+    """Identity is the stream itself: two tracks agreeing on every column are
+    still two groups, and two groups need a file each."""
+    probes = _row_probes(
+        _track("video", 0, width=640, height=360),
+        _track("video", 1, width=640, height=360),
+    )
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT v, array_agg(v) FROM input('f.mkv') f, unnest(f.video) v "
+                "GROUP BY v"
+            )
+        ),
+        probes,
+    )
+    assert len(sinks[0].result.rows) == 2
+
+
 def test_selecting_a_metadata_column_is_a_typed_rejection() -> None:
     err = _reject_lower(
         "SELECT t.language FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "is track metadata, not a stream" in err.message
-    assert err.hint is not None and "<alias>.track" in err.hint
+    assert err.hint is not None and "the row itself, <alias>" in err.hint
 
 
 def test_unnesting_an_unprobeable_input_is_a_typed_rejection() -> None:
@@ -6236,22 +6245,22 @@ def test_a_star_cannot_expand_a_row_table() -> None:
     assert "cannot expand the track-row table" in err.message
 
 
-def test_the_track_column_is_an_array_and_subscripts_like_one() -> None:
+def test_a_row_alias_is_an_array_and_subscripts_like_one() -> None:
     g = _lower(
-        "SELECT array_agg(t.track[2]) FROM input('f.mkv') f, unnest(f.audio) t",
+        "SELECT array_agg(t[2]) FROM input('f.mkv') f, unnest(f.audio) t",
         _row_probes(),
     )
     assert _outputs(g) == [("src:f:a:1", "audio", None)]
     err = _reject_lower(
-        "SELECT t.track[9] FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
+        "SELECT t[9] FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
     )
     assert err.code is ErrorCode.STREAM_NOT_FOUND
     assert "'t' has 3 rows" in err.message
 
 
-def test_the_track_array_broadcasts_a_call_like_any_other_array() -> None:
+def test_the_row_array_broadcasts_a_call_like_any_other_array() -> None:
     g = _lower(
-        "SELECT array_agg(volume(t.track, 0.5)) FROM input('f.mkv') f, "
+        "SELECT array_agg(volume(t, 0.5)) FROM input('f.mkv') f, "
         "unnest(f.audio) t WHERE t.channels = 2",
         _row_probes(),
     )
@@ -6262,7 +6271,7 @@ def test_the_track_array_broadcasts_a_call_like_any_other_array() -> None:
 def test_a_row_query_works_inside_a_cte_body() -> None:
     g = _lower(
         "WITH picked AS ("
-        "  SELECT t.track AS a FROM input('f.mkv') f, unnest(f.audio) t "
+        "  SELECT t AS a FROM input('f.mkv') f, unnest(f.audio) t "
         "  WHERE t.channel_layout = 'stereo'"
         ") SELECT picked.a FROM picked",
         _row_probes(),
@@ -6276,10 +6285,10 @@ def test_a_row_query_works_in_a_union_all_branch() -> None:
     probes = _row_probes()
     probes["g"] = probes["f"]
     g = _lower(
-        "SELECT f.video[1], t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "SELECT f.video[1], t FROM input('f.mkv') f, unnest(f.audio) t "
         "WHERE t.language = 'eng' "
         "UNION ALL "
-        "SELECT g.video[1], u.track FROM input('g.mkv') g, unnest(g.audio) u "
+        "SELECT g.video[1], u FROM input('g.mkv') g, unnest(g.audio) u "
         "WHERE u.language = 'fra'",
         probes,
     )
@@ -6297,7 +6306,7 @@ def test_a_seeked_caption_row_is_still_rejected() -> None:
     # streams belong to that input -- so the rejection survives the indirection.
     probes = _row_probes(_track("subtitle", 0, language="eng"))
     err = _reject_lower(
-        "SELECT s.track FROM input('f.mkv') f, unnest(f.subtitle) s "
+        "SELECT s FROM input('f.mkv') f, unnest(f.subtitle) s "
         "WHERE f.t >= 1 AND s.language = 'eng'",
         probes,
     )
@@ -6316,7 +6325,7 @@ def test_a_track_row_query_runs_end_to_end(tmp_path: Path) -> None:
     """
     out = tmp_path / "eng.m4a"
     query = (
-        f"SELECT t.track FROM input('{(FIXTURES_DIR / 'av2.mp4').as_posix()}') f, "
+        f"SELECT t FROM input('{(FIXTURES_DIR / 'av2.mp4').as_posix()}') f, "
         "unnest(f.audio) t WHERE t.language = 'eng'"
     )
     args = build_ffmpeg_args(emit(compile_sql(query)), str(out))
@@ -6703,25 +6712,6 @@ def test_a_time_window_and_an_assertion_coexist_as_separate_conjuncts() -> None:
     assert _outputs(g) == [("src:f:a:0", "audio", None)]
 
 
-def test_dot_track_sugar_lowers_identically_to_the_bare_bracket() -> None:
-    sugar = _lower(
-        "SELECT f.audio[1].track FROM input('f.mkv') f", _row_probes()
-    )
-    plain = _lower("SELECT f.audio[1] FROM input('f.mkv') f", _row_probes())
-    assert _outputs(sugar) == _outputs(plain) == [("src:f:a:0", "audio", None)]
-
-
-def test_dot_track_sugar_works_as_a_call_argument_too() -> None:
-    sugar = _lower(
-        "SELECT scale(f.video[1].track, 640, 480) FROM input('f.mkv') f",
-        _row_probes(),
-    )
-    plain = _lower(
-        "SELECT scale(f.video[1], 640, 480) FROM input('f.mkv') f", _row_probes()
-    )
-    assert _filters(sugar) == _filters(plain) == ["scale"]
-
-
 # ---------------------------------------------------------------------------
 # track-row JOINs and COALESCE fills
 # ---------------------------------------------------------------------------
@@ -6754,11 +6744,11 @@ def _pair_probes(
     }
 
 
-_GATHERED = "array_agg(a.track), array_agg(b.track)"
+_GATHERED = "array_agg(a), array_agg(b)"
 
 
 def _join_query(
-    projection: str = "a.track, b.track",
+    projection: str = "a, b",
     join: str = "JOIN",
     on: str = "ON a.language = b.language",
     where: str = "",
@@ -6792,7 +6782,7 @@ def test_result_row_order_is_the_left_sides_track_order() -> None:
     )
     g = _lower(_join_query(_GATHERED), probes)
     # `g` stores fra first, but the rows follow `f`: eng, then fra. (Outputs are
-    # column-major -- `a.track`'s gather, then `b.track`'s -- so the PAIRING is
+    # column-major -- `a`'s gather, then `b`'s -- so the PAIRING is
     # element k of one against element k of the other.)
     assert _refs(g) == ["src:f:a:0", "src:f:a:1", "src:g:a:1", "src:g:a:0"]
 
@@ -6824,20 +6814,20 @@ def test_a_null_key_matches_nothing() -> None:
         left=[_track("audio", 0, duration=2.0)],  # no language tag at all
         right=[_track("audio", 0, duration=2.0)],
     )
-    g = _lower(_join_query(projection="a.track", join="LEFT JOIN"), probes)
-    err = _reject_lower(_join_query(projection="b.track", join="LEFT JOIN"), probes)
+    g = _lower(_join_query(projection="a", join="LEFT JOIN"), probes)
+    err = _reject_lower(_join_query(projection="b", join="LEFT JOIN"), probes)
     assert _refs(g) == ["src:f:a:0"]  # the left row survives, unpaired
     assert err.code is ErrorCode.STREAM_NOT_FOUND
 
 
 def test_a_left_join_keeps_unmatched_left_rows() -> None:
     g = _lower(
-        _join_query(projection="array_agg(a.track)", join="LEFT JOIN"), _pair_probes()
+        _join_query(projection="array_agg(a)", join="LEFT JOIN"), _pair_probes()
     )
     assert _refs(g) == ["src:f:a:0", "src:f:a:1"]
 
 
-def test_a_data_rows_null_track_hint_names_the_join_not_a_fill() -> None:
+def test_a_data_rows_null_row_hint_names_the_join_not_a_fill() -> None:
     """`_FILL_SPELLINGS` has no 'data' entry: the NULL-track rejection must
     still be the typed one (a KeyError here would surface as INTERNAL,
     guardrail #7) and its hint must steer to a tighter join, since nothing
@@ -6850,7 +6840,7 @@ def test_a_data_rows_null_track_hint_names_the_join_not_a_fill() -> None:
         right=[_track("data", 0, language="eng")],
     )
     err = _reject_lower(
-        _join_query(projection="b.track", join="FULL OUTER JOIN", column="data"),
+        _join_query(projection="b", join="FULL OUTER JOIN", column="data"),
         probes,
     )
     assert err.code is ErrorCode.STREAM_NOT_FOUND
@@ -6866,19 +6856,19 @@ def test_a_full_join_appends_unmatched_right_rows_in_their_own_order() -> None:
         ]
     )
     # Rows are eng (matched), fra (unmatched left), then the unmatched RIGHT
-    # row -- whose `a.track` is NULL, which is what this rejection is about.
+    # row -- whose `a` is NULL, which is what this rejection is about.
     err = _reject_lower(
-        _join_query(projection="a.track", join="FULL OUTER JOIN"), probes
+        _join_query(projection="a", join="FULL OUTER JOIN"), probes
     )
     assert err.code is ErrorCode.STREAM_NOT_FOUND
     assert "is NULL in row 3" in err.message
     assert "b.language='deu'" in err.message
-    assert "COALESCE(a.track" in (err.hint or "")
+    assert "COALESCE(a" in (err.hint or "")
     # Filled, the whole row order shows: the matched pair, the unmatched LEFT
     # row (silence on the right), then the unmatched RIGHT row appended last.
     filled = _lower(
         _join_query(
-            projection="array_agg(COALESCE(b.track, ffmpeg.anullsrc(duration => 1)))",
+            projection="array_agg(COALESCE(b, ffmpeg.anullsrc(duration => 1)))",
             join="FULL OUTER JOIN",
         ),
         probes,
@@ -6890,17 +6880,17 @@ def test_a_full_join_appends_unmatched_right_rows_in_their_own_order() -> None:
 def test_full_join_with_and_without_the_outer_keyword_are_one_join() -> None:
     probes = _pair_probes()
     with_kind = _lower(
-        _join_query(projection="array_agg(a.track)", join="FULL OUTER JOIN"), probes
+        _join_query(projection="array_agg(a)", join="FULL OUTER JOIN"), probes
     )
     without = _lower(
-        _join_query(projection="array_agg(a.track)", join="FULL JOIN"), probes
+        _join_query(projection="array_agg(a)", join="FULL JOIN"), probes
     )
     assert _refs(with_kind) == _refs(without) == ["src:f:a:0", "src:f:a:1"]
 
 
 def test_a_comma_between_two_unnests_is_the_cross_join() -> None:
     g = _lower(
-        "SELECT array_agg(a.track), array_agg(b.track) FROM input('f.mkv') f, "
+        "SELECT array_agg(a), array_agg(b) FROM input('f.mkv') f, "
         "input('g.mkv') g, unnest(f.audio) a, unnest(g.audio) b",
         _pair_probes(
             right=[
@@ -6921,7 +6911,7 @@ def test_where_filters_the_joined_rows_not_the_tables() -> None:
     one and dropped exactly the rows it is about."""
     g = _lower(
         _join_query(
-            projection="a.track", join="FULL OUTER JOIN", where="b.language IS NULL"
+            projection="a", join="FULL OUTER JOIN", where="b.language IS NULL"
         ),
         _pair_probes(),
     )
@@ -6941,7 +6931,7 @@ def test_order_by_re_sorts_the_joined_rows_and_keeps_the_pairing() -> None:
 # -- COALESCE fills ---------------------------------------------------------
 
 
-def _fill_query(fill: str, projection: str = "COALESCE(b.track, {fill})") -> str:
+def _fill_query(fill: str, projection: str = "COALESCE(b, {fill})") -> str:
     return _join_query(
         projection=f"array_agg({projection.format(fill=fill)})", join="FULL OUTER JOIN"
     )
@@ -6979,7 +6969,7 @@ def test_a_fill_with_no_duration_to_inherit_is_a_typed_rejection() -> None:
 def test_a_fill_takes_the_paired_rows_tags_as_its_provenance() -> None:
     g = _lower(
         _join_query(
-            projection="array_agg(amix(a.track, COALESCE(b.track, ffmpeg.anullsrc())))",
+            projection="array_agg(amix(a, COALESCE(b, ffmpeg.anullsrc())))",
             join="FULL OUTER JOIN",
         ),
         _pair_probes(),
@@ -7021,7 +7011,7 @@ def test_a_video_fill_inherits_size_rate_and_duration() -> None:
     }
     g = _lower(
         _join_query(
-            projection="array_agg(COALESCE(b.track, ffmpeg.color()))",
+            projection="array_agg(COALESCE(b, ffmpeg.color()))",
             join="FULL OUTER JOIN",
             column="video",
         ),
@@ -7034,7 +7024,7 @@ def test_a_video_fill_inherits_size_rate_and_duration() -> None:
 def test_a_fill_of_the_wrong_type_for_the_column_is_udf_arg_type() -> None:
     err = _reject_lower(_fill_query("ffmpeg.color()"), _pair_probes())
     assert err.code is ErrorCode.UDF_ARG_TYPE
-    assert "generates a video stream, but 'b.track' is audio" in err.message
+    assert "generates a video stream, but 'b' is audio" in err.message
     assert "anullsrc" in (err.hint or "")
 
 
@@ -7050,7 +7040,7 @@ def test_a_caption_gap_fills_with_an_empty_captions_input() -> None:
     }
     g = _lower(
         _join_query(
-            projection="array_agg(COALESCE(b.track, sqlmpeg.empty_captions()))",
+            projection="array_agg(COALESCE(b, sqlmpeg.empty_captions()))",
             join="FULL OUTER JOIN",
             column="subtitle",
         ),
@@ -7082,7 +7072,7 @@ def test_the_empty_captions_input_renders_its_format_flag_before_the_i() -> None
     }
     g = _lower(
         _join_query(
-            projection="array_agg(COALESCE(b.track, sqlmpeg.empty_captions()))",
+            projection="array_agg(COALESCE(b, sqlmpeg.empty_captions()))",
             join="FULL OUTER JOIN",
             column="subtitle",
         ),
@@ -7100,7 +7090,7 @@ def test_a_coalesce_fill_must_be_a_generated_stand_in() -> None:
     assert "a COALESCE fill is a generated stand-in" in err.message
 
 
-def test_coalesces_first_argument_is_a_track_column() -> None:
+def test_coalesces_first_argument_is_a_row_stream() -> None:
     err = _reject_lower(
         _join_query(
             projection="COALESCE(f.audio[1], ffmpeg.anullsrc())",
@@ -7115,7 +7105,7 @@ def test_coalesces_first_argument_is_a_track_column() -> None:
 def test_coalesce_takes_exactly_two_arguments() -> None:
     err = _reject_lower(
         _join_query(
-            projection="COALESCE(b.track, ffmpeg.anullsrc(), ffmpeg.anullsrc())",
+            projection="COALESCE(b, ffmpeg.anullsrc(), ffmpeg.anullsrc())",
             join="FULL OUTER JOIN",
         ),
         _pair_probes(),
@@ -7134,7 +7124,7 @@ def test_a_joined_track_query_runs_end_to_end(tmp_path: Path) -> None:
     """
     out = tmp_path / "mixed.mka"
     query = (
-        "SELECT array_agg(amix(a.track, b.track)) FROM "
+        "SELECT array_agg(amix(a, b)) FROM "
         f"input('{(FIXTURES_DIR / 'av2.mp4').as_posix()}') f, "
         f"input('{(FIXTURES_DIR / 'av3.mp4').as_posix()}') g, "
         "unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language"
@@ -7152,7 +7142,7 @@ def test_an_empty_captions_fill_muxes_a_real_track(tmp_path: Path) -> None:
     mux a taggable, zero-cue subtitle stream (2026-08-17, ffmpeg 7.1)."""
     out = tmp_path / "subs.mkv"
     query = (
-        "SELECT s.track, sqlmpeg.empty_captions() FROM "
+        "SELECT s, sqlmpeg.empty_captions() FROM "
         f"input('{(FIXTURES_DIR / 'avs.mkv').as_posix()}') f, "
         "unnest(f.subtitle) s WHERE s.language = 'eng'"
     )
@@ -7172,7 +7162,7 @@ def test_an_empty_captions_fill_muxes_a_real_track(tmp_path: Path) -> None:
 # shapes are the cookbook's (recipes 37-38, exec tier).
 
 
-def _tag_query(tag: str, projection: str = "t.track", column: str = "audio") -> str:
+def _tag_query(tag: str, projection: str = "t", column: str = "audio") -> str:
     """Tag every row, then gather the rows into one file.
 
     Two scopes, and the tags need the inner one: rows are tracks inside the
@@ -7308,7 +7298,7 @@ def test_a_tag_is_row_scoped_across_every_track_the_row_carries() -> None:
     the row computes lands on both."""
     probes = _row_probes(_track("video", 0), _track("audio", 0, language="eng"))
     g = _lower(
-        "SELECT v.track, a.track, 'Feature' AS title FROM input('f.mkv') f, "
+        "SELECT v, a, 'Feature' AS title FROM input('f.mkv') f, "
         "unnest(f.video) v, unnest(f.audio) a",
         probes,
     )
@@ -7329,7 +7319,7 @@ def test_a_joined_row_tags_one_sides_track_from_the_others_column() -> None:
     )
     g = _lower(
         "WITH titled AS ("
-        "  SELECT a.track AS track, b.title AS title"
+        "  SELECT a AS track, b.title AS title"
         "  FROM input('f.mkv') f, input('g.mkv') g,"
         "       unnest(f.audio) a JOIN unnest(g.audio) b ON a.language = b.language"
         ") SELECT array_agg(titled.track) FROM titled",
@@ -7353,7 +7343,7 @@ def test_one_track_cannot_take_two_values_for_the_same_tag() -> None:
         ],
     )
     err = _reject_lower(
-        "SELECT a.track, b.language AS language FROM input('f.mkv') f, "
+        "SELECT a, b.language AS language FROM input('f.mkv') f, "
         "input('g.mkv') g, unnest(f.audio) a, unnest(g.audio) b",
         probes,
     )
@@ -7363,7 +7353,7 @@ def test_one_track_cannot_take_two_values_for_the_same_tag() -> None:
 
 def test_a_tag_survives_a_filter_that_threads_provenance() -> None:
     g = _lower(
-        _tag_query("'Loud' AS title", projection="volume(t.track, 2.0)"),
+        _tag_query("'Loud' AS title", projection="volume(t, 2.0)"),
         _row_probes(_track("audio", 0, language="eng")),
     )
     assert [o.metadata for o in g.outputs] == [{"language": "eng", "title": "Loud"}]
@@ -7473,7 +7463,7 @@ def test_an_unknown_input_column_still_names_the_structural_columns() -> None:
     err = _reject("SELECT f.bogus FROM input('f.mkv') f")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     hint = err.hint or ""
-    for column in ("frame", "video", "audio", "subtitle", "data", "t", "duration"):
+    for column in ("video", "audio", "subtitle", "data", "t", "duration"):
         assert column in hint
     assert "container tags" in hint
 
@@ -7556,7 +7546,7 @@ def test_container_tags_survive_the_ir_round_trip() -> None:
 
 def test_an_unaliased_row_metadata_column_is_still_not_a_stream() -> None:
     err = _reject_lower(
-        "SELECT t.track, t.language FROM input('f.mkv') f, unnest(f.audio) t",
+        "SELECT t, t.language FROM input('f.mkv') f, unnest(f.audio) t",
         _row_probes(),
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -7620,7 +7610,7 @@ def test_a_written_tag_reads_back_out_of_the_file(tmp_path: Path) -> None:
     and ffprobe reads it back off the muxed stream."""
     out = tmp_path / "tagged.mka"
     query = (
-        "SELECT t.track, 'Audio (' || t.language || ')' AS title "
+        "SELECT t, 'Audio (' || t.language || ')' AS title "
         f"FROM input('{(FIXTURES_DIR / 'av-eng.mp4').as_posix()}') f, "
         "unnest(f.audio) t"
     )
@@ -7824,7 +7814,7 @@ def test_a_subscripted_array_column_still_keeps_its_plain_cell() -> None:
 
 _TAGGED_CTE = (
     "WITH tagged AS ("
-    "  SELECT t.track AS track, 'Audio (' || t.language || ')' AS title"
+    "  SELECT t AS track, 'Audio (' || t.language || ')' AS title"
     "  FROM input('f.mkv') f, unnest(f.audio) t"
     ") "
 )
@@ -7871,7 +7861,7 @@ def test_a_cte_tag_survives_a_filter_in_the_outer_query() -> None:
 def test_a_null_cte_tag_clears_the_key_as_it_does_in_a_sink() -> None:
     g = _lower(
         "WITH tagged AS ("
-        "  SELECT t.track AS track, NULL AS language"
+        "  SELECT t AS track, NULL AS language"
         "  FROM input('f.mkv') f, unnest(f.audio) t"
         ") SELECT array_agg(tagged.track) FROM tagged",
         _row_probes(),
@@ -7888,7 +7878,7 @@ def test_the_sinks_own_tag_wins_over_the_ctes_on_the_same_key() -> None:
     """
     g = _lower(
         "WITH tagged AS ("
-        "  SELECT t.track AS track, 'Audio (' || t.language || ')' AS title"
+        "  SELECT t AS track, 'Audio (' || t.language || ')' AS title"
         "  FROM input('f.mkv') f, unnest(f.audio) t WHERE t.index = 1"
         ") SELECT tagged.track, 'Outer' AS title "
         "FROM tagged, input('f.mkv') g, unnest(g.audio) u WHERE u.index = 1",
@@ -7900,7 +7890,7 @@ def test_the_sinks_own_tag_wins_over_the_ctes_on_the_same_key() -> None:
 def test_two_sinks_over_one_tagged_view_each_carry_its_tags() -> None:
     g = _lower(
         "CREATE VIEW tagged AS"
-        "  SELECT t.track AS track, 'Inner' AS title"
+        "  SELECT t AS track, 'Inner' AS title"
         "  FROM input('f.mkv') f, unnest(f.audio) t;"
         "COPY (SELECT array_agg(tagged.track) FROM tagged) TO 'a.mka';"
         "COPY (SELECT array_agg(tagged.track) FROM tagged) TO 'b.mka';",
@@ -7918,10 +7908,10 @@ def test_two_cte_bodies_cannot_tag_one_track_two_ways() -> None:
     carry-over dict, so a disagreement between them has no representation."""
     err = _reject_lower(
         "WITH one AS ("
-        "  SELECT t.track AS track, 'One' AS title"
+        "  SELECT t AS track, 'One' AS title"
         "  FROM input('f.mkv') f, unnest(f.audio) t"
         "), two AS ("
-        "  SELECT u.track AS track, 'Two' AS title"
+        "  SELECT u AS track, 'Two' AS title"
         "  FROM input('g.mkv') g, unnest(g.audio) u"
         ") SELECT one.track FROM one",
         _shared_probes(),
@@ -7964,7 +7954,7 @@ def test_a_table_query_over_a_tagged_cte_prints_the_same_rows() -> None:
     column is accepted and changes nothing that gets printed."""
     plain = (
         "WITH tagged AS ("
-        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        "  SELECT t AS track FROM input('f.mkv') f, unnest(f.audio) t"
         ") SELECT tagged.track FROM tagged"
     )
     tagged = lower_table(
@@ -7997,7 +7987,7 @@ def _cte_report_query(where: str = "t.language = 'eng'", *, gather: bool = False
     column = "array_agg(aud.track)" if gather else "aud.track"
     return (
         "WITH aud AS ("
-        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        "  SELECT t AS track FROM input('f.mkv') f, unnest(f.audio) t"
         + (f" WHERE {where}" if where else "")
         + f") SELECT {column} FROM aud"
     )
@@ -8036,7 +8026,7 @@ def test_a_cte_column_broadcasts_an_input_scalar_beside_it() -> None:
     as they do beside an ordinary row relation."""
     query = (
         "WITH aud AS ("
-        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        "  SELECT t AS track FROM input('f.mkv') f, unnest(f.audio) t"
         ") SELECT aud.track, g.duration FROM aud, input('f.mkv') g"
     )
     sinks = lower_table(
@@ -8059,7 +8049,7 @@ def test_a_subscripted_cte_column_broadcasts_over_the_ctes_rows() -> None:
     produced, and each of them prints it."""
     query = (
         "WITH aud AS ("
-        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        "  SELECT t AS track FROM input('f.mkv') f, unnest(f.audio) t"
         ") SELECT aud.track[1] FROM aud"
     )
     sinks = lower_table(resolve(parse(query)), {"f": ProbeResult(streams=_LANG_TRACKS)})
@@ -8071,7 +8061,7 @@ def test_two_columns_from_the_same_cte_stay_aligned() -> None:
     for row without any extra bookkeeping."""
     query = (
         "WITH aud AS ("
-        "  SELECT t.track AS track, v.track AS frame FROM input('f.mkv') f, "
+        "  SELECT t AS track, v AS frame FROM input('f.mkv') f, "
         "  unnest(f.audio) t, unnest(f.video) v"
         ") SELECT aud.track, aud.frame FROM aud"
     )
@@ -8095,9 +8085,9 @@ def test_two_ctes_cross_join_with_real_multiplicity() -> None:
     video rows print six, each value repeated as often as it occurs."""
     query = (
         "WITH a1 AS ("
-        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        "  SELECT t AS track FROM input('f.mkv') f, unnest(f.audio) t"
         "), a2 AS ("
-        "  SELECT v.track AS track FROM input('g.mkv') g, unnest(g.video) v"
+        "  SELECT v AS track FROM input('g.mkv') g, unnest(g.video) v"
         ") SELECT a1.track, a2.track FROM a1, a2"
     )
     sinks = lower_table(
@@ -8119,9 +8109,9 @@ def test_one_cte_row_crossed_with_two_repeats_the_single_value() -> None:
     visible in both."""
     query = (
         "WITH vid AS ("
-        "  SELECT v.track AS track FROM input('f.mkv') f, unnest(f.video) v"
+        "  SELECT v AS track FROM input('f.mkv') f, unnest(f.video) v"
         "), aud AS ("
-        "  SELECT t.track AS track FROM input('f.mkv') f2, unnest(f2.audio) t"
+        "  SELECT t AS track FROM input('f.mkv') f2, unnest(f2.audio) t"
         ") SELECT vid.track, aud.track FROM vid, aud"
     )
     probes = ProbeResult(streams=[_track("video", 0), *_LANG_TRACKS[:2]])
@@ -8136,9 +8126,9 @@ def test_a_grouped_cross_join_prints_one_row_with_an_array_cell() -> None:
     """Recipe 57's table form: group by the video, gather the audio."""
     query = (
         "WITH vid AS ("
-        "  SELECT v.track AS track FROM input('f.mkv') f, unnest(f.video) v"
+        "  SELECT v AS track FROM input('f.mkv') f, unnest(f.video) v"
         "), aud AS ("
-        "  SELECT t.track AS track FROM input('f.mkv') f2, unnest(f2.audio) t"
+        "  SELECT t AS track FROM input('f.mkv') f2, unnest(f2.audio) t"
         ") SELECT vid.track, array_agg(aud.track) FROM vid, aud GROUP BY vid.track"
     )
     probes = ProbeResult(streams=[_track("video", 0), *_LANG_TRACKS[:2]])
@@ -8161,9 +8151,9 @@ def test_a_grouped_cross_join_prints_one_row_per_key() -> None:
     gathering the whole audio set."""
     query = (
         "WITH vid AS ("
-        "  SELECT v.track AS track FROM input('f.mkv') f, unnest(f.video) v"
+        "  SELECT v AS track FROM input('f.mkv') f, unnest(f.video) v"
         "), aud AS ("
-        "  SELECT t.track AS track FROM input('f.mkv') f2, unnest(f2.audio) t"
+        "  SELECT t AS track FROM input('f.mkv') f2, unnest(f2.audio) t"
         ") SELECT vid.track, array_agg(aud.track) FROM vid, aud GROUP BY vid.track"
     )
     probes = ProbeResult(
@@ -8187,8 +8177,8 @@ def test_a_cte_beside_an_unnest_relation_is_a_cross_join() -> None:
     between them is an ordinary cross join, so the table prints all six."""
     query = (
         "WITH aud AS ("
-        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
-        ") SELECT aud.track, v.track FROM aud, input('g.mkv') g, unnest(g.video) v"
+        "  SELECT t AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        ") SELECT aud.track, v FROM aud, input('g.mkv') g, unnest(g.video) v"
     )
     sinks = lower_table(
         resolve(parse(query)),
@@ -8209,8 +8199,8 @@ def test_a_cte_beside_an_unnest_relation_maps_the_cross_join() -> None:
     output, in relation order."""
     g = _lower(
         "WITH aud AS ("
-        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
-        ") SELECT array_agg(aud.track), array_agg(v.track) "
+        "  SELECT t AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        ") SELECT array_agg(aud.track), array_agg(v) "
         "FROM aud, input('g.mkv') g, unnest(g.video) v",
         {
             "f": ProbeResult(streams=_LANG_TRACKS),
@@ -8227,9 +8217,9 @@ def test_a_cte_beside_an_unnest_relation_maps_the_cross_join() -> None:
 
 _VID_AUD_CTES = (
     "WITH vid AS ("
-    "  SELECT v.track AS track FROM input('f.mkv') f, unnest(f.video) v"
+    "  SELECT v AS track FROM input('f.mkv') f, unnest(f.video) v"
     "), aud AS ("
-    "  SELECT t.track AS track FROM input('f.mkv') f2, unnest(f2.audio) t"
+    "  SELECT t AS track FROM input('f.mkv') f2, unnest(f2.audio) t"
     ") "
 )
 
@@ -8285,7 +8275,7 @@ def test_a_single_cte_source_still_gathers_its_rows_in_order() -> None:
     ungrouped COPY maps them in row order, as it always did."""
     g = _lower(
         "WITH aud AS ("
-        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        "  SELECT t AS track FROM input('f.mkv') f, unnest(f.audio) t"
         ") SELECT array_agg(aud.track) FROM aud",
         {"f": ProbeResult(streams=_LANG_TRACKS)},
     )
@@ -8297,7 +8287,7 @@ def test_order_by_a_cte_column_has_no_streaming_equivalent() -> None:
     ORDER BY over a CTE source is rejected rather than silently ignored."""
     err = _reject(
         "WITH aud AS ("
-        "  SELECT t.track AS track FROM input('f.mkv') f, unnest(f.audio) t"
+        "  SELECT t AS track FROM input('f.mkv') f, unnest(f.audio) t"
         ") SELECT aud.track FROM aud ORDER BY aud.track"
     )
     assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
@@ -8418,7 +8408,7 @@ def test_a_computed_filter_argument_is_evaluated_per_row() -> None:
         )
     }
     g = _lower(
-        "SELECT array_agg(scale(t.track, t.width / 2, -2)) "
+        "SELECT array_agg(scale(t, t.width / 2, -2)) "
         "FROM input('f.mkv') f, unnest(f.video) t",
         probes,
     )
@@ -8435,7 +8425,7 @@ def test_a_computed_named_argument_is_evaluated_per_row() -> None:
         )
     }
     g = _lower(
-        "SELECT array_agg(scale(t.track, width => t.width / 4, height => -2)) "
+        "SELECT array_agg(scale(t, width => t.width / 4, height => -2)) "
         "FROM input('f.mkv') f, unnest(f.video) t",
         probes,
     )
@@ -8444,7 +8434,7 @@ def test_a_computed_named_argument_is_evaluated_per_row() -> None:
 
 def test_a_computed_argument_still_meets_the_option_table() -> None:
     err = _reject_lower(
-        "SELECT gblur(t.track, t.language || 'x') "
+        "SELECT gblur(t, t.language || 'x') "
         "FROM input('f.mkv') f, unnest(f.video) t",
         {"f": ProbeResult(streams=[_track("video", 0, width=320)])},
     )
@@ -8474,16 +8464,16 @@ def _agg_copy(select: str) -> str:
 # WHERE narrows the relation to one row it is legal, and writes the same file.
 _AGG_SHAPES = [
     (
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t",
-        "SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t",
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t",
+        "SELECT array_agg(t) FROM input('f.mkv') f, unnest(f.audio) t",
         ["ffmpeg", "-i", "f.mkv",
          "-map", "0:a:0", "-c:0", "copy", "-metadata:s:0", "language=eng",
          "-map", "0:a:1", "-c:1", "copy", "-metadata:s:1", "language=fra",
          "-map", "0:a:2", "-c:2", "copy", "out.mkv"],
     ),
     (
-        "SELECT f.video, t.track FROM input('f.mkv') f, unnest(f.audio) t",
-        "SELECT f.video, array_agg(t.track) FROM input('f.mkv') f, "
+        "SELECT f.video, t FROM input('f.mkv') f, unnest(f.audio) t",
+        "SELECT f.video, array_agg(t) FROM input('f.mkv') f, "
         "unnest(f.audio) t GROUP BY f.video",
         ["ffmpeg", "-i", "f.mkv",
          "-map", "0:v:0", "-c:0", "copy",
@@ -8492,8 +8482,8 @@ _AGG_SHAPES = [
          "-map", "0:a:2", "-c:3", "copy", "out.mkv"],
     ),
     (
-        "SELECT volume(t.track, 0.5) FROM input('f.mkv') f, unnest(f.audio) t",
-        "SELECT array_agg(volume(t.track, 0.5)) FROM input('f.mkv') f, "
+        "SELECT volume(t, 0.5) FROM input('f.mkv') f, unnest(f.audio) t",
+        "SELECT array_agg(volume(t, 0.5)) FROM input('f.mkv') f, "
         "unnest(f.audio) t",
         ["ffmpeg", "-i", "f.mkv", "-filter_complex",
          "[0:a:0]volume=volume=0.5[out0];[0:a:1]volume=volume=0.5[out1];"
@@ -8503,9 +8493,9 @@ _AGG_SHAPES = [
          "-map", "[out2]", "out.mkv"],
     ),
     (
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
         "ORDER BY t.channels DESC",
-        "SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t "
+        "SELECT array_agg(t) FROM input('f.mkv') f, unnest(f.audio) t "
         "ORDER BY t.channels DESC",
         ["ffmpeg", "-i", "f.mkv",
          "-map", "0:a:1", "-c:0", "copy", "-metadata:s:0", "language=fra",
@@ -8515,11 +8505,11 @@ _AGG_SHAPES = [
 ]
 
 _NARROWED = (
-    "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t "
+    "SELECT t FROM input('f.mkv') f, unnest(f.audio) t "
     "WHERE t.language = 'fra'"
 )
 _NARROWED_AGGREGATE = (
-    "SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t "
+    "SELECT array_agg(t) FROM input('f.mkv') f, unnest(f.audio) t "
     "WHERE t.language = 'fra'"
 )
 _NARROWED_ARGV = [
@@ -8562,7 +8552,7 @@ def test_a_where_that_leaves_one_row_needs_no_aggregate() -> None:
 def test_an_aggregate_without_a_group_by_is_one_group() -> None:
     """Postgres's own rule: an aggregate and no GROUP BY is the whole set."""
     g = _lower(
-        _agg_copy("SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t"),
+        _agg_copy("SELECT array_agg(t) FROM input('f.mkv') f, unnest(f.audio) t"),
         _row_probes(),
     )
     assert len(g.outputs) == 3
@@ -8573,11 +8563,11 @@ def test_a_grouped_scalar_tags_the_container_not_the_tracks() -> None:
     file; ungrouped and single-row, the same column tags the track."""
     probes = _row_probes()
     grouped = _agg_copy(
-        "SELECT array_agg(t.track), 'Set' AS album FROM input('f.mkv') f, "
+        "SELECT array_agg(t), 'Set' AS album FROM input('f.mkv') f, "
         "unnest(f.audio) t GROUP BY f.video"
     )
     per_row = _agg_copy(
-        "SELECT t.track, 'Set' AS album FROM input('f.mkv') f, unnest(f.audio) t "
+        "SELECT t, 'Set' AS album FROM input('f.mkv') f, unnest(f.audio) t "
         "WHERE t.index = 1"
     )
     assert _lower(grouped, probes).sinks[0].tags == {"album": "Set"}
@@ -8590,7 +8580,7 @@ def test_the_group_key_itself_reads_as_a_container_tag() -> None:
         _track("audio", 1, language="eng", codec="aac"),
     )
     g = _lower(
-        "COPY (SELECT array_agg(t.track), t.language AS title "
+        "COPY (SELECT array_agg(t), t.language AS title "
         "FROM input('f.mkv') f, unnest(f.audio) t GROUP BY t.language) "
         "TO (t.language || '.mka')",
         probes,
@@ -8602,7 +8592,7 @@ def test_the_group_key_itself_reads_as_a_container_tag() -> None:
 def test_disposition_is_still_not_a_container_key_when_grouped() -> None:
     err = _reject_lower(
         _agg_copy(
-            "SELECT array_agg(t.track), 'default' AS disposition "
+            "SELECT array_agg(t), 'default' AS disposition "
             "FROM input('f.mkv') f, unnest(f.audio) t"
         ),
         _row_probes(),
@@ -8617,7 +8607,7 @@ def test_disposition_is_still_not_a_container_key_when_grouped() -> None:
 def test_an_ungrouped_row_scalar_is_rejected_beside_an_aggregate() -> None:
     err = _reject(
         _agg_copy(
-            "SELECT array_agg(t.track), t.language AS title "
+            "SELECT array_agg(t), t.language AS title "
             "FROM input('f.mkv') f, unnest(f.audio) t"
         )
     )
@@ -8630,18 +8620,18 @@ def test_an_ungrouped_row_scalar_is_rejected_beside_an_aggregate() -> None:
 def test_an_ungrouped_row_stream_is_rejected_beside_an_aggregate() -> None:
     err = _reject(
         _agg_copy(
-            "SELECT array_agg(t.track), u.track FROM input('f.mkv') f, "
+            "SELECT array_agg(t), u FROM input('f.mkv') f, "
             "unnest(f.audio) t, unnest(f.video) u"
         )
     )
-    assert "'u.track' is neither aggregated nor a GROUP BY key" in err.message
+    assert "'u' is neither aggregated nor a GROUP BY key" in err.message
     assert "array_agg" in (err.hint or "")
 
 
 def test_a_row_star_is_rejected_in_a_grouped_branch() -> None:
     err = _reject(
         _agg_copy(
-            "SELECT array_agg(t.track), u.* FROM input('f.mkv') f, "
+            "SELECT array_agg(t), u.* FROM input('f.mkv') f, "
             "unnest(f.audio) t, unnest(f.video) u"
         )
     )
@@ -8650,7 +8640,7 @@ def test_a_row_star_is_rejected_in_a_grouped_branch() -> None:
 
 def test_a_to_expression_may_only_read_the_group_keys() -> None:
     err = _reject(
-        "COPY (SELECT array_agg(t.track) FROM input('f.mkv') f, "
+        "COPY (SELECT array_agg(t) FROM input('f.mkv') f, "
         "unnest(f.audio) t GROUP BY t.language) TO (t.codec || '.mka')"
     )
     assert "'t.codec' is neither aggregated nor a GROUP BY key" in err.message
@@ -8658,7 +8648,7 @@ def test_a_to_expression_may_only_read_the_group_keys() -> None:
 
 def test_grouping_by_a_row_column_needs_a_fan_out_destination() -> None:
     err = _reject(
-        "COPY (SELECT array_agg(t.track) FROM input('f.mkv') f, "
+        "COPY (SELECT array_agg(t) FROM input('f.mkv') f, "
         "unnest(f.audio) t GROUP BY t.language) TO 'out.mka'"
     )
     assert "writes one file per group" in err.message
@@ -8669,7 +8659,7 @@ def test_a_subscript_works_as_a_group_key() -> None:
     """``GROUP BY f.video[1]``: an input-level key, so one group, and the
     keyed column is mapped once ahead of the gather."""
     g = _lower(
-        "COPY (SELECT f.video[1], array_agg(t.track) FROM input('f.mkv') f, "
+        "COPY (SELECT f.video[1], array_agg(t) FROM input('f.mkv') f, "
         "unnest(f.audio) t GROUP BY f.video[1]) TO 'out.mkv'",
         _row_probes(),
     )
@@ -8686,9 +8676,9 @@ def test_a_union_all_branch_may_aggregate_its_own_rows() -> None:
     probes = _row_probes()
     probes["g"] = ProbeResult(streams=list(_ROW_TRACKS))
     g = _lower(
-        "COPY (SELECT f.video[1], array_agg(t.track) FROM input('f.mkv') f, "
+        "COPY (SELECT f.video[1], array_agg(t) FROM input('f.mkv') f, "
         "unnest(f.audio) t GROUP BY f.video[1] UNION ALL "
-        "SELECT g.video[1], array_agg(u.track) FROM input('g.mkv') g, "
+        "SELECT g.video[1], array_agg(u) FROM input('g.mkv') g, "
         "unnest(g.audio) u GROUP BY g.video[1]) TO 'out.mkv'",
         probes,
     )
@@ -8706,7 +8696,7 @@ def test_a_tag_survives_the_gather_onto_the_output_it_rode_in_on() -> None:
     row's language tag: the gather moves streams, and a tag rides its own."""
     probes = _pair_probes()  # f: eng + fra, g: eng only
     g = _lower(
-        "COPY (SELECT array_agg(amix(a.track, COALESCE(b.track, "
+        "COPY (SELECT array_agg(amix(a, COALESCE(b, "
         "ffmpeg.anullsrc(duration => 1)))) "
         "FROM input('f.mkv') f, input('g.mkv') g, "
         "unnest(f.audio) a FULL OUTER JOIN unnest(g.audio) b "
@@ -8721,7 +8711,7 @@ def test_a_multi_row_view_read_in_from_is_a_row_source() -> None:
     """A view body follows the CTE rule: several rows in FROM, several rows in
     the query reading it, and one path cannot hold them."""
     err = _reject_lower(
-        "CREATE VIEW aud AS SELECT t.track AS track "
+        "CREATE VIEW aud AS SELECT t AS track "
         "FROM input('f.mkv') f, unnest(f.audio) t; "
         "COPY (SELECT aud.track FROM aud) TO 'out.mka'",
         _row_probes(),
@@ -8733,7 +8723,7 @@ def test_a_multi_row_view_read_in_from_is_a_row_source() -> None:
 
 def test_the_same_view_gathered_writes_the_file() -> None:
     g = _lower(
-        "CREATE VIEW aud AS SELECT t.track AS track "
+        "CREATE VIEW aud AS SELECT t AS track "
         "FROM input('f.mkv') f, unnest(f.audio) t; "
         "COPY (SELECT array_agg(aud.track) FROM aud) TO 'out.mka'",
         _row_probes(),
@@ -8746,7 +8736,7 @@ def test_a_bare_select_compiled_to_a_file_is_anchored_on_the_query() -> None:
     rejection anchors on the query and says what it says without naming a
     path."""
     err = _reject_lower(
-        "SELECT t.track FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
+        "SELECT t FROM input('f.mkv') f, unnest(f.audio) t", _row_probes()
     )
     assert err.code is ErrorCode.ROW_COUNT_MISMATCH
     assert err.message == "this query has 3 rows, and it writes one file"
@@ -8828,7 +8818,7 @@ def test_a_grouped_table_query_over_an_input_level_key_is_one_group() -> None:
     sinks = lower_table(
         resolve(
             parse(
-                "SELECT f.video, array_agg(t.track) FROM input('f.mkv') f, "
+                "SELECT f.video, array_agg(t) FROM input('f.mkv') f, "
                 "unnest(f.audio) t GROUP BY f.video"
             )
         ),
@@ -8862,7 +8852,7 @@ def test_a_grouped_table_query_over_a_row_key_is_one_row_per_group() -> None:
     sinks = lower_table(
         resolve(
             parse(
-                "SELECT t.language, array_agg(t.track) FROM input('f.mkv') f, "
+                "SELECT t.language, array_agg(t) FROM input('f.mkv') f, "
                 "unnest(f.audio) t GROUP BY t.language"
             )
         ),
@@ -8903,7 +8893,7 @@ def test_an_empty_row_set_still_stops_the_media_query_it_would_write() -> None:
     """The table query above prints nothing; the COPY that would WRITE those
     rows keeps its typed rejection."""
     err = _reject_lower(
-        "COPY (SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.data) t) "
+        "COPY (SELECT array_agg(t) FROM input('f.mkv') f, unnest(f.data) t) "
         "TO 'out.mka'",
         _row_probes(),
     )
@@ -8915,7 +8905,7 @@ def test_unaliased_array_agg_column_is_named_array_agg() -> None:
     sinks = lower_table(
         resolve(
             parse(
-                "SELECT f.video, array_agg(t.track) FROM input('f.mkv') f, "
+                "SELECT f.video, array_agg(t) FROM input('f.mkv') f, "
                 "unnest(f.audio) t GROUP BY f.video"
             )
         ),
@@ -8928,7 +8918,7 @@ def test_an_aliased_array_agg_column_keeps_its_alias() -> None:
     sinks = lower_table(
         resolve(
             parse(
-                "SELECT f.video, array_agg(t.track) AS tracks FROM input('f.mkv') f, "
+                "SELECT f.video, array_agg(t) AS tracks FROM input('f.mkv') f, "
                 "unnest(f.audio) t GROUP BY f.video"
             )
         ),
@@ -8941,14 +8931,14 @@ def test_table_query_grouping_still_enforces_the_grouping_rule() -> None:
     """No GROUP BY key at all makes the whole relation one group, so an
     ungrouped row scalar beside ``array_agg`` still has nothing to match."""
     err = _reject_table(
-        "SELECT t.language, array_agg(t.track) FROM input('f.mkv') f, unnest(f.audio) t"
+        "SELECT t.language, array_agg(t) FROM input('f.mkv') f, unnest(f.audio) t"
     )
     assert "'t.language' is neither aggregated nor a GROUP BY key" in err.message
 
 
 def test_table_query_still_rejects_order_by_inside_array_agg() -> None:
     err = _reject_table(
-        "SELECT array_agg(t.track ORDER BY t.index) FROM input('f.mkv') f, unnest(f.audio) t"
+        "SELECT array_agg(t ORDER BY t.index) FROM input('f.mkv') f, unnest(f.audio) t"
     )
     assert "ORDER BY inside array_agg() is not supported" in err.message
 
@@ -8956,7 +8946,7 @@ def test_table_query_still_rejects_order_by_inside_array_agg() -> None:
 def test_order_by_inside_array_agg_is_rejected() -> None:
     err = _reject(
         _agg_copy(
-            "SELECT array_agg(t.track ORDER BY t.index) FROM input('f.mkv') f, "
+            "SELECT array_agg(t ORDER BY t.index) FROM input('f.mkv') f, "
             "unnest(f.audio) t"
         )
     )
@@ -8972,7 +8962,7 @@ def test_array_agg_outside_a_row_branch_is_rejected() -> None:
 def test_array_agg_is_only_a_whole_select_column() -> None:
     err = _reject(
         _agg_copy(
-            "SELECT volume(array_agg(t.track), 0.5) FROM input('f.mkv') f, "
+            "SELECT volume(array_agg(t), 0.5) FROM input('f.mkv') f, "
             "unnest(f.audio) t"
         )
     )
@@ -8983,7 +8973,7 @@ def test_array_agg_is_only_a_whole_select_column() -> None:
 def test_the_other_aggregates_keep_their_typed_rejection(name: str) -> None:
     err = _reject(
         _agg_copy(
-            f"SELECT array_agg(t.track), {name}(t.index) AS n "
+            f"SELECT array_agg(t), {name}(t.index) AS n "
             "FROM input('f.mkv') f, unnest(f.audio) t"
         )
     )
@@ -8995,12 +8985,12 @@ def test_the_other_aggregates_keep_their_typed_rejection(name: str) -> None:
 _AGG_CONTEXTS = [
     (
         "a CTE body",
-        "COPY (WITH c AS (SELECT array_agg(t.track) AS track FROM input('f.mkv') f, "
+        "COPY (WITH c AS (SELECT array_agg(t) AS track FROM input('f.mkv') f, "
         "unnest(f.audio) t GROUP BY f.video) SELECT c.track FROM c) TO 'out.mka'",
     ),
     (
         "a view body",
-        "CREATE VIEW v AS SELECT array_agg(t.track) AS track FROM input('f.mkv') f, "
+        "CREATE VIEW v AS SELECT array_agg(t) AS track FROM input('f.mkv') f, "
         "unnest(f.audio) t GROUP BY f.video; COPY (SELECT v.track FROM v) TO 'out.mka'",
     ),
 ]

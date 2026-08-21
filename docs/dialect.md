@@ -53,9 +53,10 @@ source ([rows.md](rows.md#joins)).
 
 Each column is one of:
 
-- **A stream**: `f.video[1]`, `f.frame`, a bare array splat
-  (`f.audio` = every track), `a.track`, `*`, or a filter call over
-  any of these. In a media COPY, column order is `-map` order.
+- **A stream**: `f.video[1]`, a bare array splat (`f.audio` = every
+  track), a bare track-row alias (`a`, the row IS the stream), `*`, or
+  a filter call over any of these. In a media COPY, column order is
+  `-map` order.
 - **A filter call**: any filter of the installed ffmpeg, bare or
   `ffmpeg.<name>`, plus the `sqlmpeg.<name>` macros - streams first,
   then options positionally in the filter's own order, then
@@ -69,9 +70,9 @@ Each column is one of:
 - **A metadata column** (table queries): any row column prints as
   data.
 
-Subscripts are positive integer literals, 1-based. `alias.frame` is
-sugar for `alias.video[1]`. `(f.audio[1]).language`-style accessors
-reach row columns without unnest; in WHERE they are assertions.
+Subscripts are positive integer literals, 1-based.
+`(f.audio[1]).language`-style accessors reach row columns without
+unnest; in WHERE they are assertions.
 
 ## Values and predicates
 

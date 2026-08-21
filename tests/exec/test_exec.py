@@ -228,7 +228,7 @@ def test_scale_reports_expected_dimensions(tmp_path: Path) -> None:
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "scaled.mp4"
     query = (
-        f"SELECT scale(a.frame, 'iw/2', 'ih/2') FROM input('{_sql_path(_TESTSRC)}') a"
+        f"SELECT scale(a.video[1], 'iw/2', 'ih/2') FROM input('{_sql_path(_TESTSRC)}') a"
     )
 
     _compile_and_run(query, out_path)
@@ -242,7 +242,7 @@ def test_trim_reports_expected_duration(tmp_path: Path) -> None:
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "trimmed.mp4"
     query = (
-        f"SELECT a.frame FROM input('{_sql_path(_TESTSRC)}') a "
+        f"SELECT a.video[1] FROM input('{_sql_path(_TESTSRC)}') a "
         "WHERE a.t BETWEEN 0 AND 1"
     )
 
@@ -288,7 +288,7 @@ def test_input_seek_is_frame_accurate_when_the_stream_is_re_encoded(
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "reencoded.mp4"
     query = (
-        f"SELECT hflip(a.frame) FROM input('{_sql_path(_TESTSRC)}') a "
+        f"SELECT hflip(a.video[1]) FROM input('{_sql_path(_TESTSRC)}') a "
         f"WHERE a.t BETWEEN {_TRIM_START} AND {_TRIM_END}"
     )
 
@@ -346,7 +346,7 @@ def test_tail_only_input_seek_is_frame_accurate_when_the_stream_is_re_encoded(
     ffmpeg reads to EOF -- so the output is exactly the tail, 4.0 - 1.0 = 3.0s."""
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "tail-reencoded.mp4"
-    query = f"SELECT hflip(a.frame) FROM input('{_sql_path(_TESTSRC)}') a WHERE a.t >= 1"
+    query = f"SELECT hflip(a.video[1]) FROM input('{_sql_path(_TESTSRC)}') a WHERE a.t >= 1"
 
     emitted = emit(compile_sql(query))
     args = build_ffmpeg_args(emitted, str(out_path))
@@ -421,7 +421,7 @@ def test_a_trimmed_captioned_input_still_remuxes_video_and_audio(tmp_path: Path)
 def test_hflip_matches_pil_flipped_source_by_phash(tmp_path: Path) -> None:
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "hflipped.mp4"
-    query = f"SELECT hflip(a.frame) FROM input('{_sql_path(_TESTSRC)}') a"
+    query = f"SELECT hflip(a.video[1]) FROM input('{_sql_path(_TESTSRC)}') a"
 
     _compile_and_run(query, out_path)
 
@@ -506,9 +506,9 @@ def test_union_splat_concatenates_both_language_tracks(tmp_path: Path) -> None:
     _require_fixture(_AV3)
     out_path = tmp_path / "season.mp4"
     query = (
-        f"SELECT a.frame, a.audio FROM input('{_sql_path(_AV2)}') a "
+        f"SELECT a.video[1], a.audio FROM input('{_sql_path(_AV2)}') a "
         f"UNION ALL "
-        f"SELECT b.frame, b.audio FROM input('{_sql_path(_AV3)}') b"
+        f"SELECT b.video[1], b.audio FROM input('{_sql_path(_AV3)}') b"
     )
 
     _compile_and_run(query, out_path)
@@ -542,10 +542,10 @@ def test_pip_mix_flagship_composites_video_and_keeps_both_language_tags(
     out_path = tmp_path / "pip.mp4"
     query = (
         "WITH pip AS ("
-        f"  SELECT scale(c.frame, 'iw/4', 'ih/4') AS frame, c.audio AS sound "
+        f"  SELECT scale(c.video[1], 'iw/4', 'ih/4') AS frame, c.audio AS sound "
         f"  FROM input('{_sql_path(_AV3)}') c"
         ") "
-        "SELECT overlay(f.frame, pip.frame, 20, 20), "
+        "SELECT overlay(f.video[1], pip.frame, 20, 20), "
         "       amix(volume(f.audio, 0.65), volume(pip.sound, 0.35)) "
         f"FROM input('{_sql_path(_AV2)}') f, pip"
     )
@@ -580,9 +580,9 @@ def test_copy_sink_codec_options_land_in_the_real_encode(tmp_path: Path) -> None
     out_path = tmp_path / "sink.mkv"
     query = (
         "COPY (\n"
-        f"  SELECT a.frame, a.audio FROM input('{_sql_path(_AV2)}') a\n"
+        f"  SELECT a.video[1], a.audio FROM input('{_sql_path(_AV2)}') a\n"
         "  UNION ALL\n"
-        f"  SELECT b.frame, b.audio FROM input('{_sql_path(_AV3)}') b\n"
+        f"  SELECT b.video[1], b.audio FROM input('{_sql_path(_AV3)}') b\n"
         f") TO '{_sql_path(out_path)}' WITH (\n"
         "  video_codec 'libx264', crf 28, audio_codec 'aac', audio_bitrate '96k'\n"
         ")"
@@ -631,7 +631,7 @@ def test_profile_level_maxrate_land_in_a_real_encode(tmp_path: Path) -> None:
     out_path = tmp_path / "delivery.mp4"
     query = (
         "COPY (\n"
-        f"  SELECT a.frame FROM input('{_sql_path(_TESTSRC)}') a\n"
+        f"  SELECT a.video[1] FROM input('{_sql_path(_TESTSRC)}') a\n"
         f") TO '{_sql_path(out_path)}' WITH (\n"
         "  video_codec 'libx264', profile 'baseline', level '3.1', "
         "maxrate '500k', bufsize '1000k'\n"
@@ -650,7 +650,7 @@ def test_seek_end_produces_a_shorter_file_than_the_source(tmp_path: Path) -> Non
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "tail.mp4"
     query = (
-        f"SELECT a.frame FROM input('{_sql_path(_TESTSRC)}', seek_end => 1) a"
+        f"SELECT a.video[1] FROM input('{_sql_path(_TESTSRC)}', seek_end => 1) a"
     )
 
     _compile_and_run(query, out_path)
@@ -833,7 +833,8 @@ def test_ad_insert_composites_a_delayed_clip_over_the_film(tmp_path: Path) -> No
     _require_fixture(_AV3)
     out_path = tmp_path / "ad-insert.mp4"
     query = (
-        "SELECT overlay(f.frame, sqlmpeg.delay(scale(a.frame, 'iw*0.33', 'ih*0.33'), 1), 20, 20), "
+        "SELECT overlay(f.video[1], "
+        "sqlmpeg.delay(scale(a.video[1], 'iw*0.33', 'ih*0.33'), 1), 20, 20), "
         "       amix(f.audio[1], volume(adelay(a.audio[1], 1000), 0.5)) "
         f"FROM input('{_sql_path(_AV2)}') f, input('{_sql_path(_AV3)}') a"
     )
@@ -878,19 +879,19 @@ def test_a_delayed_video_is_transparent_before_and_after_its_clip(
     _require_fixture(_AV3)
     base_cte = (
         "WITH base AS ("
-        f"  SELECT f.frame FROM input('{_sql_path(_AV2)}') f "
+        f"  SELECT f.video[1] AS v FROM input('{_sql_path(_AV2)}') f "
         "  UNION ALL "
-        f"  SELECT g.frame FROM input('{_sql_path(_AV3)}') g"
+        f"  SELECT g.video[1] AS v FROM input('{_sql_path(_AV3)}') g"
         ") "
     )
     base_path = tmp_path / "base.mp4"
     composite_path = tmp_path / "composite.mp4"
 
-    _compile_and_run(base_cte + "SELECT base.frame FROM base", base_path)
+    _compile_and_run(base_cte + "SELECT base.v FROM base", base_path)
     _compile_and_run(
         base_cte
-        + "SELECT overlay(base.frame, "
-        "sqlmpeg.delay(scale(a.frame, 'iw*0.33', 'ih*0.33'), 1), 20, 20) "
+        + "SELECT overlay(base.v, "
+        "sqlmpeg.delay(scale(a.video[1], 'iw*0.33', 'ih*0.33'), 1), 20, 20) "
         f"FROM base, input('{_sql_path(_AV3)}') a",
         composite_path,
     )
@@ -955,11 +956,11 @@ def test_ad_splice_tail_trim_needs_no_between_placeholder(tmp_path: Path) -> Non
     av3_path = _sql_path(_AV3)
     out_path = tmp_path / "ad-splice.mp4"
     query = (
-        f"SELECT a.frame FROM input('{av2_path}') a WHERE a.t BETWEEN 0 AND 1 "
+        f"SELECT a.video[1] FROM input('{av2_path}') a WHERE a.t BETWEEN 0 AND 1 "
         "UNION ALL "
-        f"SELECT b.frame FROM input('{av3_path}') b "
+        f"SELECT b.video[1] FROM input('{av3_path}') b "
         "UNION ALL "
-        f"SELECT g.frame FROM input('{av2_path}') g WHERE g.t >= 1"
+        f"SELECT g.video[1] FROM input('{av2_path}') g WHERE g.t >= 1"
     )
 
     graph = compile_sql(query)
@@ -1013,7 +1014,7 @@ def test_looped_png_title_card_composites_onto_testsrc(tmp_path: Path) -> None:
     _require_fixture(_FRAME_PNG)
     out_path = tmp_path / "title-card.mp4"
     query = (
-        "SELECT overlay(v.frame, p.frame, 20, 20) "
+        "SELECT overlay(v.video[1], p.video[1], 20, 20) "
         f"FROM input('{_sql_path(_TESTSRC)}') v, "
         f"input('{_sql_path(_FRAME_PNG)}', loop => true, framerate => 15) p "
         "WHERE p.t <= 2"
@@ -1103,7 +1104,7 @@ def test_a_color_matte_composites_under_a_padded_clip(tmp_path: Path) -> None:
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "matte.mp4"
     query = (
-        "SELECT overlay(m.frame, v.frame, 160, 120) "
+        "SELECT overlay(m.video[1], v.video[1], 160, 120) "
         "FROM ffmpeg.color(color => 'navy', size => '640x480', rate => 15, "
         "duration => 2) m, "
         f"input('{_sql_path(_TESTSRC)}') v"
@@ -1209,7 +1210,7 @@ def test_enable_blurs_only_inside_its_timeline_window(tmp_path: Path) -> None:
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "enable-blur.mp4"
     query = (
-        "SELECT gblur(a.frame, 12, enable => 'between(t,0.5,1.5)') "
+        "SELECT gblur(a.video[1], 12, enable => 'between(t,0.5,1.5)') "
         f"FROM input('{_sql_path(_TESTSRC)}') a"
     )
 
@@ -1231,7 +1232,7 @@ def test_a_tier_two_filter_takes_enable_through_the_namespace(tmp_path: Path) ->
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "enable-box.mp4"
     query = (
-        "SELECT ffmpeg.drawbox(a.frame, x => 20, y => 20, width => 120, "
+        "SELECT ffmpeg.drawbox(a.video[1], x => 20, y => 20, width => 120, "
         "height => 90, color => 'red', thickness => 8, "
         "enable => 'between(t,0.5,1.5)') "
         f"FROM input('{_sql_path(_TESTSRC)}') a"
@@ -1250,7 +1251,7 @@ def test_enable_is_rejected_where_this_ffmpeg_reports_no_timeline_flag() -> None
     and a generated source has no timeline at all."""
     with pytest.raises(SqlmpegError) as excinfo:
         compile_sql(
-            "SELECT scale(a.frame, 640, 360, enable => 'gt(t,1)') "
+            "SELECT scale(a.video[1], 640, 360, enable => 'gt(t,1)') "
             f"FROM input('{_sql_path(_TESTSRC)}') a"
         )
     assert excinfo.value.code.value == "UNKNOWN_FILTER_OPTION"
@@ -1277,7 +1278,7 @@ def test_a_centered_overlay_runs_without_knowing_either_size(tmp_path: Path) -> 
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "centered.mp4"
     query = (
-        "SELECT overlay(m.frame, v.frame, '(W-w)/2', '(H-h)/2') "
+        "SELECT overlay(m.video[1], v.video[1], '(W-w)/2', '(H-h)/2') "
         "FROM ffmpeg.color(color => 'navy', size => '640x480', rate => 15, "
         "duration => 2) m, "
         f"input('{_sql_path(_TESTSRC)}') v"
@@ -1317,7 +1318,7 @@ def test_expression_crop_and_scale_run(tmp_path: Path) -> None:
     _require_fixture(_TESTSRC)
     out_path = tmp_path / "expr-crop.mp4"
     query = (
-        "SELECT scale(crop(a.frame, 'iw/2', 'ih', 0, 0), 'iw*2', 'ih') "
+        "SELECT scale(crop(a.video[1], 'iw/2', 'ih', 0, 0), 'iw*2', 'ih') "
         f"FROM input('{_sql_path(_TESTSRC)}') a"
     )
 
@@ -1653,7 +1654,7 @@ def test_disposition_tag_column_flags_the_default_track(tmp_path: Path) -> None:
     out_path = tmp_path / "flagged.mka"
     query = (
         "WITH flagged AS ("
-        "  SELECT t.track AS track, "
+        "  SELECT t AS track, "
         "  CASE WHEN t.language = 'eng' THEN 'default' ELSE '0' END AS disposition "
         f"  FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) t"
         ") SELECT array_agg(flagged.track) FROM flagged"
@@ -1834,7 +1835,7 @@ def test_a_cte_tags_the_streams_while_the_outer_select_tags_the_file(
     query = (
         "COPY ("
         "  WITH tagged AS ("
-        "    SELECT a.track AS track, 'Audio (' || a.language || ')' AS title"
+        "    SELECT a AS track, 'Audio (' || a.language || ')' AS title"
         f"    FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) a"
         "  )"
         "  SELECT g.video, array_agg(tagged.track), 'Director Cut' AS title"
@@ -1922,7 +1923,7 @@ def test_two_pass_keeps_a_filtered_audio_pad_connected_in_pass_one(
     out_path = tmp_path / "two-pass-filtered.mp4"
     query = (
         "COPY (\n"
-        f"  SELECT hflip(f.frame), volume(f.audio[1], 0.5)\n"
+        f"  SELECT hflip(f.video[1]), volume(f.audio[1], 0.5)\n"
         f"  FROM input('{_sql_path(_AV)}') f\n"
         f") TO '{_sql_path(out_path)}' WITH (\n"
         "  video_codec 'libx264', video_bitrate '500k', two_pass true, "
@@ -2139,7 +2140,7 @@ def test_a_per_row_scale_argument_runs_against_the_real_probe(tmp_path: Path) ->
     _require_fixture(_AV2)
     out_path = tmp_path / "half.mp4"
     query = (
-        "SELECT scale(t.track, t.width / 2, -2) "
+        "SELECT scale(t, t.width / 2, -2) "
         f"FROM input('{_sql_path(_AV2)}') f, unnest(f.video) t"
     )
 

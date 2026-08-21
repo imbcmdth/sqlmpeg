@@ -88,7 +88,7 @@ unchanged at rung 3.
 
 1. **`wasm0r` - a frei0r host plugin.** ffmpeg's stock `frei0r` filter
    loads plugins at runtime, common builds ship it enabled, and
-   `frei0r(f.frame, filter_name => '...')` already compiles through
+   `frei0r(f.video[1], filter_name => '...')` already compiles through
    sqlmpeg unmodified. One native library (wasmtime behind the frei0r
    ABI) whose parameters name a `.wasm` module makes pluggable WASM
    video filters work on stock ffmpeg, no fork. The ABI's limits

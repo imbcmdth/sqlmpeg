@@ -9,21 +9,21 @@ One calling convention:
 ```
 
 - **Stream inputs first.** Count and types come from the pad signature (`unsharp` is `V->V`: one video in; `xfade` is `VV->V`: two). Mismatch: `UDF_ARG_TYPE`.
-- **Positional options bind in declared order** - the order `ffmpeg -help filter=<name>` prints, identical to how `gblur=5:1` binds in a filtergraph. `gblur(a.frame, 5, 1)` is `sigma=5:steps=1`; `crop(a.frame, 640, 360, 0, 0)` is `out_w=640:out_h=360:x=0:y=0`.
-- **Named options follow**, Postgres `name => value`: `unsharp(a.frame, luma_amount => 1.5)`, or mixed after positionals. A positional after a named argument is rejected; a named argument naming an option already bound positionally is `FILTER_OPTION_TYPE` ("already set"), never a silent override.
+- **Positional options bind in declared order** - the order `ffmpeg -help filter=<name>` prints, identical to how `gblur=5:1` binds in a filtergraph. `gblur(a.video[1], 5, 1)` is `sigma=5:steps=1`; `crop(a.video[1], 640, 360, 0, 0)` is `out_w=640:out_h=360:x=0:y=0`.
+- **Named options follow**, Postgres `name => value`: `unsharp(a.video[1], luma_amount => 1.5)`, or mixed after positionals. A positional after a named argument is rejected; a named argument naming an option already bound positionally is `FILTER_OPTION_TYPE` ("already set"), never a silent override.
 
 A positional validates as the option it lands on. Option errors are `UNKNOWN_FILTER_OPTION` (with did-you-mean) and `FILTER_OPTION_TYPE` (with type, range, or constants) - captured examples in [errors.md](errors.md).
 
 ## Values
 
-Bare numbers, `true`/`false`, single-quoted strings. Enum options take the quoted constant name (`transition => 'wipeleft'`), not the integer. String-typed options accept ffmpeg expressions (`scale(a.frame, 'iw/2', -2)`, `overlay(a.frame, b.frame, '(W-w)/2', '(H-h)/2')`), evaluated per frame by ffmpeg. Expression content is not validated at compile time; a typo inside the quotes surfaces at run time.
+Bare numbers, `true`/`false`, single-quoted strings. Enum options take the quoted constant name (`transition => 'wipeleft'`), not the integer. String-typed options accept ffmpeg expressions (`scale(a.video[1], 'iw/2', -2)`, `overlay(a.video[1], b.video[1], '(W-w)/2', '(H-h)/2')`), evaluated per frame by ffmpeg. Expression content is not validated at compile time; a typo inside the quotes surfaces at run time.
 
 ## `enable`
 
 `enable` is ffmpeg's timeline switch, a framework option rather than a filter option: an expression evaluated per frame; while false, frames pass through untouched.
 
 ```sql
-SELECT gblur(a.frame, 12, enable => 'between(t,0.5,1.5)')
+SELECT gblur(a.video[1], 12, enable => 'between(t,0.5,1.5)')
 FROM input('clip.mp4') a
 ```
 
@@ -34,8 +34,8 @@ Accepted only on filters whose `ffmpeg -filters` line carries the `T` flag; else
 Some filter names are Postgres grammar (`overlay`, `trim`, `format`, ...) and parse as builtins before sqlmpeg sees them. `ffmpeg.<name>(...)` always means the raw filter and never collides:
 
 ```sql
-SELECT ffmpeg.trim(a.frame, start => 1, end => 4),
-       ffmpeg.overlay(a.frame, b.frame, x => 20, y => 20, eof_action => 'pass')
+SELECT ffmpeg.trim(a.video[1], start => 1, end => 4),
+       ffmpeg.overlay(a.video[1], b.video[1], x => 20, y => 20, eof_action => 'pass')
 FROM input('a.mp4') a, input('b.mp4') b
 ```
 
@@ -50,7 +50,7 @@ Four macros that do what no single filter does. `sqlmpeg` is reserved like `ffmp
 - **`sqlmpeg.delay(f, seconds)`** - delay a video stream on a transparent canvas (`format=pix_fmts=yuva420p` + `tpad=start_duration=<s>:stop=1:color=black@0`). Use for timed overlays: the delayed stream is invisible until its start time.
 
   ```sql
-  SELECT overlay(f.frame, sqlmpeg.delay(p.frame, 120), 20, 20)
+  SELECT overlay(f.video[1], sqlmpeg.delay(p.video[1], 120), 20, 20)
   FROM input('film.mkv') f, input('ad.mp4') p
   ```
 
@@ -90,7 +90,7 @@ FROM ffmpeg.testsrc2(duration => 1, size => '320x240', rate => 15) t,
      ffmpeg.anullsrc(duration => 1) s
 ```
 
-Sources take options by name only (no input pads means no positional slots). A source alias exposes exactly one stream of one known type (`t.frame`/`t.video[1]` or `s.audio[1]`), carries no provenance, cannot be `WHERE`-trimmed (length comes from its own `duration =>`), and adds no `-i` to the command.
+Sources take options by name only (no input pads means no positional slots). A source alias exposes exactly one stream of one known type (`t.video[1]` or `s.audio[1]`), carries no provenance, cannot be `WHERE`-trimmed (length comes from its own `duration =>`), and adds no `-i` to the command.
 
 ## Array-returning and N-input filters
 

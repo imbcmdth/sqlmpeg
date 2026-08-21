@@ -131,7 +131,7 @@ def test_single_node_graph() -> None:
 
 
 def test_readme_example_shape() -> None:
-    """WITH pip AS (scale(crop(b.frame,...), 0.5)) SELECT overlay(a.frame, pip.frame, 20, 20).
+    """WITH pip AS (scale(crop(b.video[1],...), 0.5)) SELECT overlay(a.video[1], pip.frame, 20, 20).
 
     `a` and `b` are both untrimmed, option-free aliases of the SAME path, so
     input dedup folds them onto one `-i`: both source refs render

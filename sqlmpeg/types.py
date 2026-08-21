@@ -15,7 +15,9 @@ Kinds:
     scalar     ``text``, ``number``, ``boolean`` — Postgres typing; boolean
                is predicates only, never a column.
     handle     internal, with no name in the language: ``stream`` is the
-               graph node behind a stream record, ``seek`` is ``<alias>.t``.
+               graph node behind a stream record — no field carries it,
+               since the record IS the stream — and ``seek`` is
+               ``<alias>.t``.
     stream     a record ABOUT a stream: ``video_stream``, ``audio_stream``,
                ``subtitle_stream``, ``data_stream``. The record IS the
                stream; identity is nominal, never field-by-field.
@@ -47,13 +49,11 @@ from typing import Literal
 __all__ = [
     "CHAPTERS_COLUMN",
     "COLUMN_TYPES",
-    "FRAME_COLUMN",
     "INPUT_COLUMNS",
     "INPUT_DURATION_COLUMN",
     "INPUT_TAG_COLUMNS",
     "ROW_COMMON",
     "ROW_SCHEMAS",
-    "ROW_STREAM_COLUMN",
     "STREAM_ARRAY_COLUMNS",
     "STREAM_TAG_COLUMNS",
     "TIME_COLUMN",
@@ -70,10 +70,11 @@ __all__ = [
 
 TypeKind = Literal["scalar", "handle", "stream", "record", "container"]
 
-# The compile-time type of a row column. `stream` is the row's own stream (the
-# only column that can BE an output); `text` and `number` are probed metadata,
-# comparable against literals of the matching kind and nothing else. The three
-# names are type names, so a field whose type is one of them is a column.
+# The compile-time type of a row column. `text` and `number` are probed
+# metadata, comparable against literals of the matching kind and nothing else;
+# `stream` is what a bare row alias types as — the row itself, the only thing
+# that can BE an output. The three names are type names, so a field whose type
+# is one of them is a column.
 RowColumnType = str  # "stream" | "text" | "number"
 
 COLUMN_TYPES = frozenset({"stream", "text", "number"})
@@ -157,8 +158,6 @@ def _stream_type(name: str, *probed: Field) -> Type:
         name,
         "stream",
         (
-            # The row's own stream, as a column of the row.
-            _ro("track", "stream"),
             _ro("index", "number"),
             _w("language", "text", tag_entry=True),
             _w("title", "text", tag_entry=True),
@@ -270,8 +269,6 @@ _DECLARED: tuple[Type, ...] = (
             _w("data", "data_stream[]"),
             _w("chapters", "chapter[]"),
             _w("attachments", "attachment[]", exposed=False),
-            # The first video stream, as a column of its own.
-            _ro("frame", "video_stream"),
             # The seek handle: legal only in a WHERE trim window, never a
             # value and never part of SELECT *.
             _ro("t", "seek"),
@@ -337,31 +334,6 @@ TIME_COLUMN = _sole(
     "the container's seek column",
 )
 
-# The container's single-stream column: `<alias>.frame`, the first video
-# stream under another name.
-FRAME_COLUMN = _sole(
-    tuple(
-        f.name
-        for f in _container_fields()
-        if not is_array(f.type) and resolve(f.type).kind == "stream"
-    ),
-    "the container's single-stream column",
-)
-
-# The column a row's own stream is read as.
-ROW_STREAM_COLUMN = _sole(
-    tuple(
-        dict.fromkeys(
-            f.name
-            for t in TYPES.values()
-            if t.kind == "stream"
-            for f in t.fields
-            if f.type == "stream"
-        )
-    ),
-    "the row's stream column",
-)
-
 # The structural column names an INPUT alias exposes. A CTE alias exposes
 # whatever its body named with AS, so the whitelist does not apply there (lower
 # checks those).
@@ -377,12 +349,11 @@ _STREAM_ARRAYS = _array_columns("stream")
 STREAM_ARRAY_COLUMNS = frozenset(_STREAM_ARRAYS)
 
 # The array columns `unnest(<alias>.<name>)` accepts: every array of records.
-# `frame` is one stream, `t` is a timeline and `duration` is a scalar, and
-# none of them is a set of rows.
+# `t` is a timeline and `duration` is a scalar, and neither is a set of rows.
 UNNEST_COLUMNS = frozenset(_array_columns("stream", "record"))
 
-# The columns each unnest row table exposes, per container array column. A
-# chapter row has no `track` column at all, and so no schema entry for one.
+# The columns each unnest row table exposes, per container array column. The
+# row's own stream is not among them: the row IS the stream.
 ROW_SCHEMAS: dict[str, dict[str, RowColumnType]] = {
     f.name: resolve(f.type).columns() for f in _container_fields() if f.name in UNNEST_COLUMNS
 }

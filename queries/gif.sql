@@ -3,7 +3,7 @@
 -- example: sqlmpeg compile -f queries/gif.sql -v source=clip.mp4 -v dest=clip.gif
 COPY (
   WITH small AS (
-    SELECT fps(scale(v.frame, 480, -2), 12) AS frame
+    SELECT fps(scale(v.video[1], 480, -2), 12) AS frame
     FROM input(:'source') v
   )
   SELECT paletteuse(small.frame, palettegen(small.frame))

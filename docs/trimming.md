@@ -56,8 +56,8 @@ Measured against `tests/fixtures/testsrc.mp4` (30 frames, 15 fps, 2.000s, one ke
 
 | path | `ffmpeg` | measured output duration |
 |---|---|---|
-| stream-copied (`SELECT a.frame`, nothing filters it) | `-ss 0.5 -to 1.5 -i ... -c copy` | **1.367s** - snapped to the file's only keyframe at t=0 |
-| decoded (wrapped in any filter, e.g. `hflip(a.frame)`) | `-ss 0.5 -to 1.5 -i ... -c:v libx264 ...` | **1.000s** exactly |
+| stream-copied (`SELECT a.video[1]`, nothing filters it) | `-ss 0.5 -to 1.5 -i ... -c copy` | **1.367s** - snapped to the file's only keyframe at t=0 |
+| decoded (wrapped in any filter, e.g. `hflip(a.video[1])`) | `-ss 0.5 -to 1.5 -i ... -c:v libx264 ...` | **1.000s** exactly |
 
 If the exact cut point matters, wrap the column in a filter and accept the re-encode. Fast, frame-accurate copy-trims do not exist in any tool without a re-encode somewhere.
 

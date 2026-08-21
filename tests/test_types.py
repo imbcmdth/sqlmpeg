@@ -33,7 +33,6 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
     "tag": {"key": ("text", "W"), "value": ("text", "W")},
     "flag": {"key": ("text", "W"), "set": ("boolean", "W")},
     "video_stream": {
-        "track": ("stream", "RO"),
         "index": ("number", "RO"),
         "language": ("text", "W"),
         "title": ("text", "W"),
@@ -48,7 +47,6 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
         "disposition": ("flag[]", "W"),
     },
     "audio_stream": {
-        "track": ("stream", "RO"),
         "index": ("number", "RO"),
         "language": ("text", "W"),
         "title": ("text", "W"),
@@ -62,7 +60,6 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
         "disposition": ("flag[]", "W"),
     },
     "subtitle_stream": {
-        "track": ("stream", "RO"),
         "index": ("number", "RO"),
         "language": ("text", "W"),
         "title": ("text", "W"),
@@ -71,7 +68,6 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
         "disposition": ("flag[]", "W"),
     },
     "data_stream": {
-        "track": ("stream", "RO"),
         "index": ("number", "RO"),
         "language": ("text", "W"),
         "title": ("text", "W"),
@@ -103,7 +99,6 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
         "data": ("data_stream[]", "W"),
         "chapters": ("chapter[]", "W"),
         "attachments": ("attachment[]", "W"),
-        "frame": ("video_stream", "RO"),
         "t": ("seek", "RO"),
         "duration": ("number", "RO"),
         "tags": ("tag[]", "W"),
@@ -185,7 +180,6 @@ EXPECTED_KINDS = {
 # --- The views, as parser.py spelled them out before they were derived. ---
 
 EXPECTED_ROW_COMMON = {
-    "track": "stream",
     "index": "number",
     "language": "text",
     "title": "text",
@@ -221,7 +215,7 @@ EXPECTED_ROW_SCHEMAS = {
 }
 
 EXPECTED_INPUT_COLUMNS = frozenset(
-    {"frame", "video", "audio", "subtitle", "data", "t", "duration", "chapters"}
+    {"video", "audio", "subtitle", "data", "t", "duration", "chapters"}
 )
 
 EXPECTED_INPUT_TAG_COLUMNS = (
@@ -355,10 +349,8 @@ def test_column_set_views() -> None:
 def test_named_column_views() -> None:
     assert types.INPUT_TAG_COLUMNS == EXPECTED_INPUT_TAG_COLUMNS
     assert types.STREAM_TAG_COLUMNS == ("language", "title")
-    assert types.ROW_STREAM_COLUMN == "track"
     assert types.CHAPTERS_COLUMN == "chapters"
     assert types.INPUT_DURATION_COLUMN == "duration"
-    assert types.FRAME_COLUMN == "frame"
     assert types.TIME_COLUMN == "t"
 
 
@@ -368,7 +360,6 @@ def test_parser_reexports_are_the_view_objects() -> None:
     assert parser.INPUT_COLUMNS is types.INPUT_COLUMNS
     assert parser.UNNEST_COLUMNS is types.UNNEST_COLUMNS
     assert parser.STREAM_ARRAY_COLUMNS is types.STREAM_ARRAY_COLUMNS
-    assert parser.ROW_STREAM_COLUMN == types.ROW_STREAM_COLUMN
     assert parser.CHAPTERS_COLUMN == types.CHAPTERS_COLUMN
     assert parser.INPUT_DURATION_COLUMN == types.INPUT_DURATION_COLUMN
 

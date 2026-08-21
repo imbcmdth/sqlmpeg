@@ -2,7 +2,7 @@
 -- variables: source (input media path), high (1080p output path), mid (720p output path), low (480p output path)
 -- example: sqlmpeg compile -f queries/abr-ladder.sql -v source=in.mp4 -v high=1080p.mp4 -v mid=720p.mp4 -v low=480p.mp4
 CREATE VIEW decoded AS
-  SELECT f.frame AS v, f.audio[1] AS a
+  SELECT f.video[1] AS v, f.audio[1] AS a
   FROM input(:'source') f;
 
 COPY (SELECT scale(d.v, 1920, -2) AS v, d.a FROM decoded d)

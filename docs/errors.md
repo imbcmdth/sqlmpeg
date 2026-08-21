@@ -47,7 +47,7 @@ The hint is a did-you-mean match against every filter name the installed ffmpeg 
 
 ## UNKNOWN_ALIAS
 
-**Meaning:** A `<alias>.video`/`<alias>.audio`/`<alias>.frame` reference (or a bare table reference in `FROM`) names an alias or CTE this query never introduced.
+**Meaning:** A `<alias>.video`/`<alias>.audio` reference (or a bare table reference in `FROM`) names an alias or CTE this query never introduced.
 
 **Fires when:** you reference `b.video[1]` but only declared `FROM input('x.mp4') a`, or reference a CTE that hasn't been defined or isn't visible yet (CTEs see only earlier CTEs in the same `WITH`; no forward references).
 
@@ -153,7 +153,7 @@ One CLI-layer rejection lands here: a query referencing a `:'variable'` (psql-st
 One probed-reality rejection lands here: a stream ffprobe reports NO codec for (some DASH manifests' WebVTT tracks arrive this way - ffmpeg's demuxer sees them but cannot name them, an open ffmpeg limitation measured through 9.0) selected into a media sink. Such a stream can be neither copied (no tag to write) nor transcoded (no decoder to invoke), so the run is guaranteed to die at header-write; sqlmpeg knows at compile time and says so at compile time. Table queries are exempt on purpose - a codec-less track shows up as a row with a NULL codec column, which is how you discover it:
 
 ```json
-{"line": 1, "col": 26, "code": "UNSUPPORTED_SQL", "message": "'s.track' (row 1) has no identifiable codec: ffmpeg's demuxer reports none, so the stream can be neither copied nor transcoded and no container can carry it", "hint": "drop it from the SELECT (a query with no COPY can still inspect it as a table row, codec column NULL); if it is a subtitle track, extract it with a tool that can read it and mux the resulting file as its own input() instead"}
+{"line": 1, "col": 26, "code": "UNSUPPORTED_SQL", "message": "'s' (row 1) has no identifiable codec: ffmpeg's demuxer reports none, so the stream can be neither copied nor transcoded and no container can carry it", "hint": "drop it from the SELECT (a query with no COPY can still inspect it as a table row, codec column NULL); if it is a subtitle track, extract it with a tool that can read it and mux the resulting file as its own input() instead"}
 ```
 
 Two argument-shape rejections land here: a named argument written out of place (a positional after a named one, or the same name twice - standard Postgres rules), and a named argument on a `sqlmpeg.<name>` macro, whose signature is positional only:
@@ -202,8 +202,8 @@ WHERE a.t BETWEEN 1 AND 2
 **Example query** (a script: the view is defined but nothing reads it):
 
 ```sql
-CREATE VIEW unused AS SELECT a.frame AS v FROM input('x.mp4') a;
-COPY (SELECT b.frame FROM input('x.mp4') b) TO 'out.mp4';
+CREATE VIEW unused AS SELECT a.video[1] AS v FROM input('x.mp4') a;
+COPY (SELECT b.video[1] FROM input('x.mp4') b) TO 'out.mp4';
 ```
 
 **Error JSON:**
@@ -282,7 +282,7 @@ FROM input('tests/fixtures/av2.mp4') a, input('tests/fixtures/av.mp4') b
 
 ```sql
 COPY (
-  SELECT t.track
+  SELECT t
   FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
 ) TO 'out.mka'
 ```
@@ -293,7 +293,7 @@ COPY (
 {"line": 4, "col": 6, "code": "ROW_COUNT_MISMATCH", "message": "this query has 2 rows, and 'out.mka' is one file", "hint": "gather the rows into that one file with array_agg(...), adding GROUP BY the column they share when they share one; or give each row a file of its own with a TO expression, e.g. TO (t.language || '.mka')"}
 ```
 
-Both exits compile: `SELECT array_agg(t.track)` writes both tracks into `out.mka`, and `TO (t.language || '.mka')` writes one file per track instead.
+Both exits compile: `SELECT array_agg(t)` writes both tracks into `out.mka`, and `TO (t.language || '.mka')` writes one file per track instead.
 
 ## UNKNOWN_SINK_OPTION
 
@@ -347,12 +347,12 @@ COPY (
 
 **Meaning:** A named argument (`<name> => <value>`) names an option the targeted ffmpeg filter doesn't have. The option set is read out of the installed ffmpeg (`ffmpeg -help filter=<name>`, see `sqlmpeg/registry.py`), so it is exactly what that binary supports, not a table somebody in this repo has to keep current.
 
-**Fires when:** the option name is misspelled or belongs to a different filter: `gblur(a.frame, sigmma => 5)`. A *positional* option can't reach this code (it binds by position, so there is no name to get wrong); its failure modes are `FILTER_OPTION_TYPE` for a bad value and `UDF_ARG_TYPE` for one option too many.
+**Fires when:** the option name is misspelled or belongs to a different filter: `gblur(a.video[1], sigmma => 5)`. A *positional* option can't reach this code (it binds by position, so there is no name to get wrong); its failure modes are `FILTER_OPTION_TYPE` for a bad value and `UDF_ARG_TYPE` for one option too many.
 
 **Example query:**
 
 ```sql
-SELECT gblur(a.frame, sigmma => 5)
+SELECT gblur(a.video[1], sigmma => 5)
 FROM input('x.mp4') a
 ```
 
@@ -369,7 +369,7 @@ A query using this code compiles only where that ffmpeg does. With no working ff
 **Also fires for `enable`:** `enable` is never a real option of any filter (it is framework-level, see [docs/filters.md](filters.md)), so the validator special-cases the name instead of looking it up — but it names this same code, worded to say so, when the target filter isn't one your ffmpeg flags as timeline-capable (the `T` column of `ffmpeg -filters`):
 
 ```sql
-SELECT scale(a.frame, 640, 360, enable => 'gt(t,1)')
+SELECT scale(a.video[1], 640, 360, enable => 'gt(t,1)')
 FROM input('x.mp4') a
 ```
 
@@ -379,14 +379,14 @@ FROM input('x.mp4') a
 
 ## FILTER_OPTION_TYPE
 
-**Meaning:** An option's value doesn't match its introspected type, declared range, or set of named constants. Positional or named makes no difference: a positional binds to the option its slot lands on and validates as that option, so `gblur(a.frame, 5000)` and `gblur(a.frame, sigma => 5000)` fail identically.
+**Meaning:** An option's value doesn't match its introspected type, declared range, or set of named constants. Positional or named makes no difference: a positional binds to the option its slot lands on and validates as that option, so `gblur(a.video[1], 5000)` and `gblur(a.video[1], sigma => 5000)` fail identically.
 
 **Fires when:** a numeric option gets a string or a value outside its `(from A to B)` range, a boolean option gets anything but `true`/`false`, an enum option gets something that isn't one of its constants (or a bare number instead of a quoted constant name), or the option's ffmpeg type is one sqlmpeg cannot set at all (`binary`, `dictionary`).
 
 **Example query:**
 
 ```sql
-SELECT gblur(a.frame, sigma => 5000)
+SELECT gblur(a.video[1], sigma => 5000)
 FROM input('x.mp4') a
 ```
 
@@ -407,7 +407,7 @@ Enum options quote their constant name (`transition => 'wipeleft'`), and the mes
 **Also fires for `enable`:** on a filter that does accept it, `enable`'s value must still be a single-quoted string (an ffmpeg timeline expression) — anything else is this code, not `UNKNOWN_FILTER_OPTION`, since the name itself was fine:
 
 ```sql
-SELECT gblur(a.frame, 5, enable => 5)
+SELECT gblur(a.video[1], 5, enable => 5)
 FROM input('x.mp4') a
 ```
 
@@ -415,7 +415,7 @@ FROM input('x.mp4') a
 {"line": 1, "col": 35, "code": "FILTER_OPTION_TYPE", "message": "option 'enable' of filter 'gblur' expects an ffmpeg timeline expression, got 5", "hint": "enable takes a single-quoted ffmpeg timeline expression over t (seconds), n (frame number) or pos, e.g. enable => 'between(t,2,5)'"}
 ```
 
-The expression's own *content* is never checked here (or anywhere at compile time) — see [docs/filters.md](filters.md). The same goes for expressions in ordinary string-typed options (`scale(a.frame, 'iw/2', -2)`, `overlay(a.frame, b.frame, '(W-w)/2', '(H-h)/2')`): the string is accepted as the option's value, and a typo inside the quotes surfaces when the command runs.
+The expression's own *content* is never checked here (or anywhere at compile time) — see [docs/filters.md](filters.md). The same goes for expressions in ordinary string-typed options (`scale(a.video[1], 'iw/2', -2)`, `overlay(a.video[1], b.video[1], '(W-w)/2', '(H-h)/2')`): the string is accepted as the option's value, and a typo inside the quotes surfaces when the command runs.
 
 ## UNKNOWN_INPUT_OPTION
 
@@ -426,7 +426,7 @@ The expression's own *content* is never checked here (or anywhere at compile tim
 **Example query:**
 
 ```sql
-SELECT p.frame FROM input('logo.png', loob => true) p
+SELECT p.video[1] FROM input('logo.png', loob => true) p
 ```
 
 **Error JSON:**
@@ -446,7 +446,7 @@ Anchoring: like a named argument's `exp.Var` name (`UNKNOWN_FILTER_OPTION`) and 
 **Example query:**
 
 ```sql
-SELECT p.frame FROM input('logo.png', framerate => 'fast') p
+SELECT p.video[1] FROM input('logo.png', framerate => 'fast') p
 ```
 
 **Error JSON:**

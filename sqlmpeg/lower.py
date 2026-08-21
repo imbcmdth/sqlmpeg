@@ -60,8 +60,6 @@ What lowering does, in order:
   recorded columns (under its own name, or under a branch-local alias:
   ``FROM master m``), and a ``ffmpeg.<source>(...)`` alias exposes exactly one
   statically-typed stream (see below).
-* ``<alias>.frame`` is sugar for ``<alias>.video[1]``. A single unnamed video
-  column of a CTE is likewise reachable as ``<cte>.frame``.
 * ``WHERE <alias>.t BETWEEN x AND y`` records a per-alias time range; where
   that window lands depends on what the alias is:
 
@@ -111,7 +109,7 @@ What makes it different from an ``input()`` alias is that there is no FILE:
   memoized on the binding, so fan-out is the split pass's ordinary business
   and never a second generator;
 * one output pad means one stream of one statically-known type, so every
-  column rule is answered without a probe: ``a.frame``/``a.video[1]`` on a
+  column rule is answered without a probe: ``a.video[1]`` on a
   video source, ``a.audio[1]`` on an audio one, a bare ``a.video``/``a.audio``
   that is an array of LENGTH 1, ``a.*`` = that one column, and
   ``STREAM_NOT_FOUND`` (naming the source and what it produces) for the other
@@ -301,8 +299,10 @@ from sqlmpeg.macros import INPUT_MACROS, MACROS, InputMacro, Macro, macro_names
 from sqlmpeg.parser import (
     _ARITHMETIC,
     _ARITHMETIC_NAMES,
+    _REMOVED_FRAME,
     FILTER_NAMESPACE,
     MACRO_NAMESPACE,
+    ROW_STREAM,
     RawRowJoin,
     RawSink,
     RawSinkOption,
@@ -345,11 +345,9 @@ from sqlmpeg.table import (
 )
 from sqlmpeg.types import (
     CHAPTERS_COLUMN,
-    FRAME_COLUMN,
     INPUT_DURATION_COLUMN,
     INPUT_TAG_COLUMNS,
     ROW_SCHEMAS,
-    ROW_STREAM_COLUMN,
     STREAM_TAG_COLUMNS,
     TIME_COLUMN,
 )
@@ -395,7 +393,9 @@ _TIME_HINT = (
     "<alias>.t is only usable as WHERE <alias>.t BETWEEN <start> AND <end>, "
     "<alias>.t >= <start>, or <alias>.t <= <end>"
 )
-_STREAM_HINT = "a SELECT column must be a stream, e.g. a.video[1] or scale(a.frame, 640, -2)"
+_STREAM_HINT = (
+    "a SELECT column must be a stream, e.g. a.video[1] or scale(a.video[1], 640, -2)"
+)
 _SUBSCRIPT_HINT = "stream subscripts are 1-based: a.video[1] is the first video stream"
 _ZIP_HINT = (
     "broadcast arrays zip elementwise, one output per element; "
@@ -415,11 +415,11 @@ _SOURCE_DURATION_HINT = (
 _ROW_METADATA_HINT = (
     "a track row's metadata columns are what you FILTER, JOIN and SORT rows by; "
     "the only column that is a stream — and therefore the only one that can be "
-    "an output — is <alias>.track. Give the column an alias to write it back as "
-    "a TAG instead, e.g. SELECT t.track, t.language AS language"
+    "an output — is the row itself, <alias>. Give the column an alias to write "
+    "it back as a TAG instead, e.g. SELECT t, t.language AS language"
 )
 _ARRAY_AGG_HINT = (
-    "array_agg takes one track-row stream expression, e.g. array_agg(t.track) "
+    "array_agg takes one track-row stream expression, e.g. array_agg(t) "
     "over FROM input('f.mkv') f, unnest(f.audio) t"
 )
 _ONE_FILE_PER_ROW_HINT = (
@@ -831,19 +831,6 @@ def _unwrap(node: exp.Expr) -> exp.Expr:
         return node
 
 
-def _strip_track_sugar(node: exp.Expr) -> exp.Expr:
-    """``<alias>.<type>[k].track`` is sugar for ``<alias>.<type>[k]``:
-    the SAME stream, spelled with the accessor that names it explicitly.
-    Every other accessor a subscript metadata shape could name is metadata,
-    not a stream, and resolve already confines those to WHERE, so this is the
-    only substitution a stream-expression position ever needs.
-    """
-    shape = subscript_metadata_shape(node)
-    if shape is not None and shape[1] == ROW_STREAM_COLUMN:
-        return shape[0]
-    return node
-
-
 def _projection_name(node: exp.Expr) -> str | None:
     """The ``AS`` name of a projection, folded Postgres-style, else None."""
     if not isinstance(node, exp.Alias):
@@ -859,8 +846,9 @@ def _table_column_name(node: exp.Expr) -> str:
     """A table/csv column's header: the ``AS`` alias, else its natural name.
 
     The SELECT alias when given, else the column expression's natural name
-    (``language``, ``track``, ...). A bare row/input column
-    names itself; a subscript metadata accessor names the metadata field it
+    (``language``, ``codec``, ...). A bare row/input column names itself, and
+    a bare row alias names the alias, as Postgres does for a whole-row
+    reference; a subscript metadata accessor names the metadata field it
     reads (``f.audio[1].language`` -> ``language``, matching a row table's
     own column of the same name); anything else (a filter call, COALESCE,
     ...) has no single name to fall back to.
@@ -870,7 +858,8 @@ def _table_column_name(node: exp.Expr) -> str:
         return alias
     inner = _unwrap(node)
     if isinstance(inner, exp.Column):
-        return _fold(inner.this)
+        name = _fold(inner.this)
+        return _fold(inner.args.get("table")) if name == ROW_STREAM else name
     if isinstance(inner, exp.ArrayAgg):
         return "array_agg"  # Postgres's own convention for the unaliased column
     shape = subscript_metadata_shape(inner)
@@ -1463,8 +1452,8 @@ class _SourceBinding:
 
     Everything about the stream is known before any projection lowers: the
     registry's :class:`~sqlmpeg.registry.SourceFilter` says which
-    type the source's single output pad carries, so ``a.video[1]`` /
-    ``a.frame`` (video sources), ``a.audio[1]`` (audio ones), the bare array
+    type the source's single output pad carries, so ``a.video[1]``
+    (video sources), ``a.audio[1]`` (audio ones), the bare array
     ``a.video`` (length 1, statically), and ``a.*`` are all answered without
     a probe — there is no file to probe, and no ``-i``: the source is a
     ZERO-INPUT filter node.
@@ -1477,7 +1466,7 @@ class _SourceBinding:
     Mutable on purpose: `ref` memoizes the node, which is minted lazily on
     the FIRST column access and shared by every later one. Fan-out beyond
     that is the split pass's job, exactly as for any other node, so
-    ``SELECT a.frame, hflip(a.frame) FROM ffmpeg.testsrc(...) a`` is one
+    ``SELECT a.video[1], hflip(a.video[1]) FROM ffmpeg.testsrc(...) a`` is one
     ``testsrc`` plus a ``split``, never two generators.
     """
 
@@ -1510,7 +1499,7 @@ _NO_CHAPTER_STREAM = _Stream(ref="chapters:no-stream", type="data", source=None)
 class _TrackRow:
     """One row of an ``unnest`` table: the track, plus its metadata columns.
 
-    `stream` IS the ``track`` column, and its ``_Stream.source`` is the very
+    `stream` IS the row's stream, and its ``_Stream.source`` is the very
     ``StreamMeta`` `columns` was read from — a row's provenance and its columns
     are the same probed fact, seen twice.
     """
@@ -1544,7 +1533,7 @@ class _RowRelation:
     alias to that row's track, or to ``None`` where an outer join left a gap,
     and each CTE alias to the body row it took. All of a branch's row sources
     share this one object, which is what keeps
-    ``a.track`` and ``b.track`` aligned: element `i` of each is the pair the
+    ``a`` and ``b`` aligned: element `i` of each is the pair the
     join made, so the existing zip/broadcast machinery wires the right streams
     together without learning that joins exist.
 
@@ -1568,7 +1557,7 @@ class _RowBinding:
     outer join found no counterpart. It is what the WHERE predicate and the
     ORDER BY rewrite (both act on the shared :class:`_RowRelation`, so every
     alias stays aligned), and both happen once per branch before any projection
-    lowers. Selecting ``t.track`` over N surviving rows is an N-element array in
+    lowers. Selecting ``t`` over N surviving rows is an N-element array in
     that order, which is the same array value a bare ``f.audio`` produces — the
     row model and the array model are one mechanism.
 
@@ -1657,7 +1646,7 @@ def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
                  "color_transfer"):
         probed = getattr(meta, name, None)
         values[name] = probed if isinstance(probed, str | int | float) else None
-    return {name: values.get(name) for name in schema if name != ROW_STREAM_COLUMN}
+    return {name: values.get(name) for name in schema}
 
 
 def _join_keys(on: exp.Expr) -> dict[str, list[str]]:
@@ -1692,7 +1681,7 @@ _FILL_SPELLINGS: dict[StreamType, str] = {
 }
 
 _COALESCE_HINT = (
-    "COALESCE fills an outer join's gaps: COALESCE(b.track, "
+    "COALESCE fills an outer join's gaps: COALESCE(b, "
     f"{FILTER_NAMESPACE}.anullsrc(duration => 2)) for audio, "
     f"{FILTER_NAMESPACE}.color() for video, "
     f"{MACRO_NAMESPACE}.empty_captions() for captions"
@@ -2519,7 +2508,7 @@ class _Lowerer:
                 "stream",
                 fallback=select,
                 hint="a tag rides on the file the query writes; select its "
-                "tracks too, e.g. SELECT t.track, ... AS title",
+                "tracks too, e.g. SELECT t, ... AS title",
             )
         if tags == "sink":
             self._check_one_row_per_file(select, env)
@@ -2625,8 +2614,8 @@ class _Lowerer:
 
         A grouped branch gathers each group in turn: an aggregate sees its
         whole group, every other column the group's first tuple -- which is
-        what makes ``SELECT vid.track, array_agg(aud.track) ... GROUP BY
-        vid.track`` map the video once and every audio of its group after it.
+        what makes ``SELECT vid, array_agg(aud) ... GROUP BY vid`` map the
+        video once and every audio of its group after it.
         With no partitioning key there is a single group, and the same split
         holds inside it: a group-constant column is mapped ONCE however many
         tuples the relation carries (:meth:`_lower_grouped_table_branch` reads
@@ -2763,7 +2752,7 @@ class _Lowerer:
                 f"'{_DISPOSITION_TAG}' is a per-stream key, not a container tag",
                 projection,
                 fallback=select,
-                hint="a disposition rides on a track row, e.g. SELECT t.track, "
+                hint="a disposition rides on a track row, e.g. SELECT t, "
                 "'default' AS disposition FROM input('f.mkv') f, unnest(f.audio) t",
             )
         value = self._eval_value(_unwrap(projection), env, _group_row(env), select)
@@ -2870,17 +2859,16 @@ class _Lowerer:
         columns: list[_Column] = []
         for binding in bindings:
             if isinstance(binding, _RowBinding):
-                # A row table's columns are mostly metadata, and a star over
-                # them would have to mean "the track column" -- which is what
-                # `<alias>.track` already says, unambiguously.
+                # A row table's columns are metadata, and a star over them
+                # would have to mean the row's stream -- which the bare alias
+                # already says, unambiguously.
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"'*' cannot expand the track-row table '{binding.alias}': "
-                    "most of its columns are metadata, not streams",
+                    "its columns are metadata, not streams",
                     anchor,
                     fallback=select,
-                    hint=f"select the stream column: {binding.alias}."
-                    f"{ROW_STREAM_COLUMN}",
+                    hint=f"the row is the stream: select {binding.alias}",
                 )
             if isinstance(binding, _InputBinding):
                 columns += self._star_input(binding.alias, anchor, env, select)
@@ -3004,7 +2992,7 @@ class _Lowerer:
 
         No node is minted and no ``-i`` is taken: the rows' streams are the
         INPUT alias's streams, already probed and already mapped, so a row
-        table is pure bookkeeping until ``t.track`` is actually selected. That
+        table is pure bookkeeping until ``t`` is actually selected. That
         is what makes the consume-once rule fall out of ordinary column
         selection -- an unmatched row's stream is simply never read.
         """
@@ -3349,7 +3337,7 @@ class _Lowerer:
                 raw.call_node,
                 fallback=select,
                 hint=f"call it over a stream instead, e.g. SELECT "
-                f"{FILTER_NAMESPACE}.{raw.name}(a.frame) FROM input('clip.mp4') a",
+                f"{FILTER_NAMESPACE}.{raw.name}(a.video[1]) FROM input('clip.mp4') a",
             )
         raise _error(
             ErrorCode.UNKNOWN_FUNCTION,
@@ -3489,7 +3477,7 @@ class _Lowerer:
         Standard SQL: WHERE admits TRUE only, so a row whose metadata field was
         never probed simply does not match — no new rule, and no silent guess.
         The surviving set is written back onto the branch's relation, so every
-        later ``t.track`` sees it and an unselected row's stream is never
+        later ``t`` sees it and an unselected row's stream is never
         touched. Filtering happens AFTER the joins, which is where
         SQL puts it: dropping a row of an outer join's nullable side before the
         join would silently turn it into an inner one.
@@ -3508,7 +3496,7 @@ class _Lowerer:
         Ungrouped, a group is a single row and this is the per-row pin it has
         always been. Under a GROUP BY over row columns the relation partitions
         into one group per distinct key, and the pinned group keeps ALL its
-        tuples: everything downstream then works unchanged, since ``t.track``
+        tuples: everything downstream then works unchanged, since ``t``
         over the surviving tuples is exactly the array ``array_agg`` asked for,
         and the trim bounds and the path expression read `fanout_row` -- the
         group's first tuple, which stands for the whole group because the key
@@ -3590,7 +3578,7 @@ class _Lowerer:
         binding = env.bindings.get(_fold(table_node))
         name = _fold(column_node.this)
         if isinstance(binding, _RowBinding):
-            if name != ROW_STREAM_COLUMN:
+            if name != ROW_STREAM:
                 return None
             track = _track_of(row, binding.alias)
             return track.stream if track is not None else None
@@ -3735,7 +3723,7 @@ class _Lowerer:
                 hint=self._known_hint(),
             )
         name = _fold(column.this)
-        if name not in ROW_SCHEMAS[binding.column] or name == ROW_STREAM_COLUMN:
+        if name not in ROW_SCHEMAS[binding.column]:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"unknown column '{binding.alias}.{column.name}'",
@@ -4103,14 +4091,6 @@ class _Lowerer:
                 fallback=select,
                 hint=_SUBSCRIPT_HINT,
             )
-        if name == ROW_STREAM_COLUMN:  # defensive: resolve rejects `.track` here
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"'{alias}.{array_column}[{index}].{ROW_STREAM_COLUMN}' is a "
-                "stream, not a value to compare",
-                bracket,
-                fallback=select,
-            )
         result = self.probes.get(alias)
         if result is None:
             path = self._path_of(alias)
@@ -4447,7 +4427,7 @@ class _Lowerer:
     # -- expressions ------------------------------------------------------
 
     def _lower_expr(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Value:
-        node = _strip_track_sugar(_unwrap(node))
+        node = _unwrap(node)
         if isinstance(node, exp.Bracket | exp.Column):
             alias, value = self._base_stream(node, env, select)
             return self._access(env, alias, value, node, select)
@@ -4495,7 +4475,7 @@ class _Lowerer:
         """``array_agg(<stream expression>)``: the explicit splat.
 
         The argument lowers over the branch's surviving tuples exactly as it
-        would on its own -- ``t.track`` is already the N-element array of the
+        would on its own -- ``t`` is already the N-element array of the
         rows in row order (:meth:`_row_value`), and a filter call over it
         already broadcasts elementwise -- so the aggregate is the identity on
         the value, and the sugar and the spelled-out form emit the same bytes
@@ -4611,10 +4591,10 @@ class _Lowerer:
         anchor: exp.Expr,
         select: exp.Select,
     ) -> _Value:
-        """One column of a track-row table — and only ``track`` is a stream.
+        """One column of a track-row table — and only the row itself is a stream.
 
-        ``t.track`` over N surviving rows is an N-element ARRAY in row order,
-        exactly what a bare ``f.audio`` is, so
+        ``t`` over N surviving rows is an N-element ARRAY in row order, exactly
+        what a bare ``f.audio`` is, so
         every existing array rule (splat, broadcast, subscript, zip) applies to
         it unchanged and the downstream passes learn nothing new.
 
@@ -4624,16 +4604,16 @@ class _Lowerer:
         metadata columns ARE for.
         """
         schema = ROW_SCHEMAS[binding.column]
-        if name not in schema:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"unknown column '{binding.alias}.{name}'",
-                anchor,
-                fallback=select,
-                hint=f"{binding.column} track rows expose "
-                f"{', '.join(sorted(schema))}",
-            )
-        if name != ROW_STREAM_COLUMN:
+        if name != ROW_STREAM:
+            if name not in schema:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"unknown column '{binding.alias}.{name}'",
+                    anchor,
+                    fallback=select,
+                    hint=f"{binding.column} track rows expose "
+                    f"{', '.join(sorted(schema))}",
+                )
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"'{binding.alias}.{name}' is track metadata, not a stream, and "
@@ -4644,10 +4624,18 @@ class _Lowerer:
                 if binding.column == CHAPTERS_COLUMN
                 else _ROW_METADATA_HINT,
             )
+        if binding.column == CHAPTERS_COLUMN:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{binding.alias}' is a chapter row, not a stream",
+                anchor,
+                fallback=select,
+                hint=_CHAPTER_ROW_HINT,
+            )
         if not binding.rows:
             raise _error(
                 ErrorCode.STREAM_NOT_FOUND,
-                f"'{binding.alias}.{ROW_STREAM_COLUMN}' selects nothing: no "
+                f"'{binding.alias}' selects nothing: no "
                 f"{binding.column} track of '{self._path_of(binding.source)}' "
                 "survived",
                 anchor,
@@ -4665,7 +4653,7 @@ class _Lowerer:
             have = f"{len(streams)} row" + ("" if len(streams) == 1 else "s")
             raise _error(
                 ErrorCode.STREAM_NOT_FOUND,
-                f"'{binding.alias}.{ROW_STREAM_COLUMN}[{index}]' does not exist: "
+                f"'{binding.alias}[{index}]' does not exist: "
                 f"'{binding.alias}' has {have}",
                 anchor,
                 fallback=select,
@@ -4700,7 +4688,7 @@ class _Lowerer:
         if row is not None:
             self._reject_codecless(
                 row.stream.source,
-                f"'{binding.alias}.{ROW_STREAM_COLUMN}' (row {position + 1})",
+                f"'{binding.alias}' (row {position + 1})",
                 anchor,
                 select,
             )
@@ -4710,7 +4698,7 @@ class _Lowerer:
         fill = _FILL_SPELLINGS.get(binding.type)
         hint = (
             f"an outer join leaves gaps; fill them with "
-            f"COALESCE({binding.alias}.{ROW_STREAM_COLUMN}, {fill})"
+            f"COALESCE({binding.alias}, {fill})"
             if fill is not None
             # data rows have no fill spelling at all: nothing can stand in
             # for a missing data track, so the join itself must not leave
@@ -4720,7 +4708,7 @@ class _Lowerer:
         )
         raise _error(
             ErrorCode.STREAM_NOT_FOUND,
-            f"'{binding.alias}.{ROW_STREAM_COLUMN}' is NULL in row {position + 1}: "
+            f"'{binding.alias}' is NULL in row {position + 1}: "
             f"{self._unmatched_text(binding, position)}",
             anchor,
             fallback=select,
@@ -4761,12 +4749,12 @@ class _Lowerer:
                 return other, track
         return None, None
 
-    # -- COALESCE(<row>.track, <fill>) -----------------
+    # -- COALESCE(<row>, <fill>) -----------------
 
     def _lower_coalesce(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Value:
         """The accepted spelling for a nullable track column: fill its gaps.
 
-        The result is the same N-element array ``<alias>.track`` is, in the
+        The result is the same N-element array ``<alias>`` is, in the
         same row order — every gap replaced by a generated stand-in. Only the
         gaps mint anything: a join with no unmatched rows compiles to exactly
         the command the bare column would -- consume-once here means "generate
@@ -4777,7 +4765,7 @@ class _Lowerer:
         if not relation.tuples:
             raise _error(
                 ErrorCode.STREAM_NOT_FOUND,
-                f"'{binding.alias}.{ROW_STREAM_COLUMN}' selects nothing: no "
+                f"'{binding.alias}' selects nothing: no "
                 f"{binding.column} track of '{self._path_of(binding.source)}' "
                 "survived",
                 node,
@@ -4790,7 +4778,7 @@ class _Lowerer:
             track = _track_of(row, binding.alias)
             if track is not None:
                 # The real track goes through `_access` exactly as a bare
-                # `<alias>.track` would, so the input's WHERE window (and the
+                # a bare `<alias>` would, so the input's WHERE window (and the
                 # caption-seek rejection) still applies to it.
                 streams.append(
                     self._access(
@@ -4833,7 +4821,7 @@ class _Lowerer:
             table_node = column.args.get("table")
             if table_node is not None:
                 binding = env.bindings.get(_fold(table_node))
-        if not isinstance(binding, _RowBinding) or _fold(column.this) != ROW_STREAM_COLUMN:
+        if not isinstance(binding, _RowBinding) or _fold(column.this) != ROW_STREAM:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 "COALESCE's first argument is a track-row stream column, got "
@@ -4963,7 +4951,7 @@ class _Lowerer:
         raise _error(
             ErrorCode.UDF_ARG_TYPE,
             f"{display}() generates a {output} stream, but "
-            f"'{binding.alias}.{ROW_STREAM_COLUMN}' is {binding.type}",
+            f"'{binding.alias}' is {binding.type}",
             node,
             fallback=select,
             hint=self._fill_hint(binding),
@@ -4974,7 +4962,7 @@ class _Lowerer:
         if spelling is None:
             return (
                 f"nothing generates a {binding.type} track, so there is no fill "
-                f"for '{binding.alias}.{ROW_STREAM_COLUMN}'; select it from a "
+                f"for '{binding.alias}'; select it from a "
                 "join that always matches"
             )
         return (
@@ -5046,8 +5034,6 @@ class _Lowerer:
         column surface is decided by ``binding.output`` with no probe
         anywhere:
 
-        * ``a.frame`` — sugar for ``a.video[1]``, and therefore VIDEO sources
-          only; on an audio source it is a wrong-type column like any other.
         * ``a.video[1]`` / ``a.audio[1]`` — the stream, when the type matches.
         * bare ``a.video`` / ``a.audio`` — an ARRAY of length 1, so it splats
           into one Output and broadcasts a call exactly once. (Not a scalar:
@@ -5067,28 +5053,15 @@ class _Lowerer:
                 fallback=select,
                 hint=_SOURCE_DURATION_HINT,
             )
-        if name == FRAME_COLUMN:
-            if binding.output != "video":
-                raise _error(
-                    ErrorCode.STREAM_NOT_FOUND,
-                    f"'{binding.alias}.frame' does not exist: {produces}",
-                    anchor,
-                    fallback=select,
-                    hint=f"'{binding.alias}.frame' is sugar for "
-                    f"'{binding.alias}.video[1]'; write "
-                    f"'{binding.alias}.{binding.output}[1]'",
-                )
-            if index is not None:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"'{binding.alias}.frame' is a single stream and cannot be "
-                    "subscripted",
-                    anchor,
-                    fallback=select,
-                    hint=f"'{binding.alias}.frame' is sugar for "
-                    f"'{binding.alias}.video[1]'",
-                )
-            return _scalar(self._source_stream_of(binding))
+        if name == _REMOVED_FRAME:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{binding.alias}.{_REMOVED_FRAME}' is not a column",
+                anchor,
+                fallback=select,
+                hint=f"'{binding.display}' produces one {binding.output} "
+                f"stream: use '{binding.alias}.{binding.output}[1]'",
+            )
         array_type = _ARRAY_COLUMNS.get(name)
         if array_type is None:
             raise _error(
@@ -5119,10 +5092,7 @@ class _Lowerer:
         return _scalar(self._source_stream_of(binding))
 
     def _source_columns_hint(self, binding: _SourceBinding) -> str:
-        columns = [f"{binding.alias}.{binding.output}"]
-        if binding.output == "video":
-            columns.append(f"{binding.alias}.frame")
-        return f"'{binding.display}' exposes {' and '.join(columns)}"
+        return f"'{binding.display}' exposes {binding.alias}.{binding.output}"
 
     def _input_value(
         self,
@@ -5179,34 +5149,22 @@ class _Lowerer:
                 fallback=select,
                 hint=chapters_unnest_hint(alias),
             )
-        if name == FRAME_COLUMN:
-            if index is not None:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"'{alias}.frame' is a single stream and cannot be subscripted",
-                    anchor,
-                    fallback=select,
-                    hint=f"'{alias}.frame' is sugar for '{alias}.video[1]'",
-                )
-            stream_type: StreamType = "video"
-            zero_based = 0
-        else:
-            array_type = _ARRAY_COLUMNS.get(name)
-            if array_type is None:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"unknown column '{alias}.{name}'",
-                    anchor,
-                    fallback=select,
-                    hint=f"an input exposes the streams {alias}.frame, "
-                    f"{alias}.video, {alias}.audio, {alias}.subtitle and "
-                    f"{alias}.data, plus the values {alias}.t, "
-                    f"{alias}.{INPUT_DURATION_COLUMN} and its container tags",
-                )
-            if index is None:
-                return self._enumerate(alias, array_type, anchor, select)
-            stream_type = array_type
-            zero_based = index - 1
+        array_type = _ARRAY_COLUMNS.get(name)
+        if array_type is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"unknown column '{alias}.{name}'",
+                anchor,
+                fallback=select,
+                hint=f"an input exposes the streams {alias}.video, "
+                f"{alias}.audio, {alias}.subtitle and {alias}.data, plus the "
+                f"values {alias}.t, {alias}.{INPUT_DURATION_COLUMN} and its "
+                "container tags",
+            )
+        if index is None:
+            return self._enumerate(alias, array_type, anchor, select)
+        stream_type: StreamType = array_type
+        zero_based = index - 1
 
         self._check_bounds(alias, stream_type, zero_based, anchor, select)
         stream = self._source_stream(alias, stream_type, zero_based)
@@ -5395,17 +5353,10 @@ class _Lowerer:
         for column in binding.columns:
             if column.name == name:
                 return column
-        # v0 compat: a CTE that selects exactly one video column is reachable
-        # as `<cte>.frame` whatever (if anything) its AS named it. `frame` is
-        # singular sugar, so an array column does not answer to it.
-        if name == FRAME_COLUMN and _is_single_video_column(binding):
-            return binding.columns[0]
         return None
 
     def _cte_columns_hint(self, binding: _CteBinding) -> str:
         names = {column.name for column in binding.columns if column.name is not None}
-        if _is_single_video_column(binding):
-            names.add(FRAME_COLUMN)
         if not names:
             return (
                 f"'{binding.name}' has no named columns; name them with AS "
@@ -6058,7 +6009,7 @@ class _Lowerer:
         """The filter's option table, fetched only when the call actually needs it.
 
         ``-help filter=X`` is a subprocess, and a call that passes no options
-        at all (``hflip(a.frame)``) has nothing to validate — so the table stays
+        at all (``hflip(a.video[1])``) has nothing to validate — so the table stays
         unfetched, exactly as it did before positional options existed.
         """
         if len(call.args) <= stream_arity and not call.named:
@@ -6077,7 +6028,7 @@ class _Lowerer:
         """A stream where an option value belongs, said plainly.
 
         Classifying first is also what keeps a TYPO in a nested call readable:
-        `gblur(a.frame, nope(a.frame))` is UNKNOWN_FUNCTION for `nope`, raised
+        `gblur(a.video[1], nope(a.video[1]))` is UNKNOWN_FUNCTION for `nope`, raised
         by the classifier, rather than a puzzled complaint about `sigma`'s type.
         Only stream-SHAPED arguments are classified -- a literal is the option
         validator's business and is left to it.
@@ -6113,7 +6064,7 @@ class _Lowerer:
         """This call's option dict, as a function of the broadcast element.
 
         An option written as a compile-time expression
-        (``scale(t.track, t.width / 2, -2)``) is evaluated against the row that
+        (``scale(t, t.width / 2, -2)``) is evaluated against the row that
         element came from and REPLACED BY THE LITERAL it computes to, so a
         per-row option and a written one bind through the same
         :meth:`_bind_options` and are validated by the same option table.
@@ -6474,10 +6425,10 @@ class _Lowerer:
         to unknown functions are reported here rather than being labelled a
         stream and swallowed by an outer arity error, and a nested call
         resolves exactly the way a top-level one does, so
-        ``scale(gblur(a.frame, 2), 640, 480)`` sees the inner call's output
+        ``scale(gblur(a.video[1], 2), 640, 480)`` sees the inner call's output
         pad type.
         """
-        node = _strip_track_sugar(_unwrap(node))
+        node = _unwrap(node)
         if isinstance(node, exp.Literal):
             return "str" if node.is_string else "num"
         if (
@@ -6536,7 +6487,7 @@ class _Lowerer:
     # A table query never reaches ffmpeg -- the row model holds every cell at
     # compile time -- so this is a second top-level entry point (`run_table`,
     # parallel to `run`), not a mode bolted onto the streaming one. It reuses
-    # the streaming machinery for anything STREAM-shaped (`.track`, a filtered
+    # the streaming machinery for anything STREAM-shaped (a row alias, a filtered
     # stream, COALESCE's fill) by calling into `_lower_expr` with
     # `self.table_mode` set; the one behavior that changes under it is
     # `_row_stream`'s NULL-row rejection, which becomes an empty cell. Metadata
@@ -6713,7 +6664,7 @@ class _Lowerer:
                 binding = env.bindings.get(_fold(table_node))
                 if isinstance(binding, _RowBinding):
                     name = _fold(expr.this)
-                    if name != ROW_STREAM_COLUMN:
+                    if name != ROW_STREAM:
                         return self._row_metadata_cells(binding, name, expr, select)
                 elif (
                     isinstance(binding, _InputBinding)
@@ -6736,7 +6687,7 @@ class _Lowerer:
         if is_value_expr(expr) or _is_input_value_column(expr, env):
             return self._value_cells(expr, env, select, cardinality)
         shape = subscript_metadata_shape(expr)
-        if shape is not None and shape[1] != ROW_STREAM_COLUMN:
+        if shape is not None:
             metadata_value = self._accessor_value(expr, select)
             return [metadata_value] * cardinality
         stream_value = self._lower_expr(projection, env, select)
@@ -6819,7 +6770,7 @@ class _Lowerer:
         self, value: _Value, cardinality: int, splat: bool = True
     ) -> list[CellValue]:
         """A lowered stream `_Value` as one cell per row: a scalar broadcasts,
-        and a row column's array (``t.track`` over N surviving rows) splats
+        and a row column's array (``t`` over N surviving rows) splats
         one stream cell per row -- the array IS the row set, not one cell.
 
         `splat` False marks an array that is NOT a row set -- a call broadcast
@@ -7057,7 +7008,7 @@ def _row_metadata_column(node: exp.Expr, env: _Env) -> str | None:
     if not isinstance(binding, _RowBinding) or binding.column == CHAPTERS_COLUMN:
         return None
     name = _fold(node.this)
-    return None if name == ROW_STREAM_COLUMN else name
+    return None if name == ROW_STREAM else name
 
 
 def _flatten(columns: list[_Column]) -> list[_Column]:
@@ -7082,14 +7033,6 @@ def _signature(columns: list[_Column]) -> str:
         for column in columns
     ]
     return ", ".join(parts) or "nothing"
-
-
-def _is_single_video_column(binding: _CteBinding) -> bool:
-    """True if `binding` exposes exactly one column and it is a single video stream."""
-    if len(binding.columns) != 1:
-        return False
-    value = binding.columns[0].value
-    return value.type == "video" and not value.is_array
 
 
 def _as_ref(value: object) -> FrameRef:
