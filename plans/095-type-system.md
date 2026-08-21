@@ -136,10 +136,32 @@ arrays empty.
 
 R1. `unnest(f.<array>) a` turns `T[]` into rows of `T`. Works for the
     four stream arrays, `chapters`, `attachments`.
-R2. ONE implicit coercion: a stream RECORD in stream position means
-    its `.track`. This is what makes `SELECT f.audio` splat and
-    `SELECT a.track` and `SELECT f.audio[1]` equivalent to their
-    handles. No other implicit conversion exists.
+R2. Stream records are ACCEPTED wherever a stream is expected
+    (subsumption, one direction). Why the rule exists: `f.audio` must
+    be `audio_stream[]` or `unnest(f.audio)` has no metadata, so by
+    SQL's array rule `f.audio[1]` is a record - yet `SELECT
+    f.audio[1]`, `scale(f.audio[1], ...)` and the splat `SELECT
+    f.audio` all need a stream, and SQL has no way to map `.track`
+    over an array. The alternatives are worse: two parallel arrays
+    per kind, or `.track` everywhere with no splat.
+    The rule, exactly:
+    - Where the checker expects a stream (a media COPY's SELECT
+      columns, filter arguments, array_agg's argument, COALESCE
+      branches, UNION ALL branch columns, CTE columns consumed as
+      streams), a stream record or an array of them is accepted; its
+      handle is used, elementwise for arrays.
+    - Nothing is invented: the handle is a field of the record.
+    - Nothing is lost: the record's non-NULL W fields stay attached
+      to the handle as riding tags, which is how tags already survive
+      filters. `SELECT a` and `SELECT a.track` produce identical
+      output, tags included.
+    - RO facts are not consulted; they describe the source, and a
+      consumer of streams has no use for them.
+    - It NEVER applies in value positions: WHERE, CASE, `||`, tag
+      expressions, fan-out TO, GROUP BY keys. A record where a value
+      is expected is a typed rejection, never a silent `.track`.
+    - The converse is false: a handle is not a record. A filter
+      output or `f.frame` has no fields (R3).
 R3. Field access: `f.audio[1].language`, `a.language`,
     `(f.audio[1]).language` all read the record field. On a handle
     (filter output, `f.frame`) there are no fields - typed rejection.
