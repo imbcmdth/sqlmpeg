@@ -6682,9 +6682,15 @@ class _Lowerer:
         relation is ONE group -- Postgres's own rule for an aggregate with
         nothing to partition by (unlike a media fan-out's ungrouped case,
         where every row writes its own file).
+
+        An EMPTY relation partitions into NO groups either way: a table query
+        prints the same zero rows an ungrouped branch does, and a media query
+        falls through to the empty-row-set rejection.
         """
         relation = env.relation
         tuples = relation.tuples if relation is not None else []
+        if not tuples:
+            return []
         if not env.group_keys:
             return [list(tuples)]
         groups: dict[tuple[RowValue, ...], list[_RowTuple]] = {}
@@ -6733,7 +6739,8 @@ class _Lowerer:
             metadata_value = self._accessor_value(expr, select)
             return [metadata_value] * cardinality
         stream_value = self._lower_expr(projection, env, select)
-        return self._value_to_cells(stream_value, cardinality)
+        splat = self._is_splat_projection(projection, env)
+        return self._value_to_cells(stream_value, cardinality, splat=splat)
 
     def _value_cells(
         self, node: exp.Expr, env: _Env, select: exp.Select, cardinality: int
@@ -6807,12 +6814,25 @@ class _Lowerer:
         )
         return [cell] * cardinality
 
-    def _value_to_cells(self, value: _Value, cardinality: int) -> list[CellValue]:
+    def _value_to_cells(
+        self, value: _Value, cardinality: int, splat: bool = True
+    ) -> list[CellValue]:
         """A lowered stream `_Value` as one cell per row: a scalar broadcasts,
         and a row column's array (``t.track`` over N surviving rows) splats
-        one stream cell per row -- the array IS the row set, not one cell."""
-        if value.is_array:
+        one stream cell per row -- the array IS the row set, not one cell.
+
+        `splat` False marks an array that is NOT a row set -- a call broadcast
+        over a bare input array, whose length is the file's track count and
+        has nothing to do with the row count. That one prints as a single
+        array cell per row, exactly as the bare array column does.
+        """
+        if value.is_array and splat:
             return [self._stream_to_cell(stream) for stream in value.streams]
+        if value.is_array:
+            array_cell = ArrayCell(
+                elements=tuple(self._stream_to_cell(stream) for stream in value.streams)
+            )
+            return [array_cell] * cardinality
         cell = self._stream_to_cell(value.streams[0])
         return [cell] * cardinality
 

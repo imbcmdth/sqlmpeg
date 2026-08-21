@@ -7760,6 +7760,49 @@ def test_csv_bare_array_column_broadcasts_beside_a_row_relation() -> None:
     )
 
 
+def test_a_filtered_bare_array_broadcasts_beside_a_row_relation() -> None:
+    """Fuzz find: the bare array through a FILTER took the row-set path, so
+    its one filtered stream was indexed once per chapter row and panicked.
+    A call over a bare array is not a row set -- it broadcasts, cell for cell
+    with the bare column above."""
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT hflip(f.video), t.language "
+                "FROM input('f.mkv') f, unnest(f.audio) t"
+            )
+        ),
+        _row_probes(),
+        registry=_snapshot_registry(),
+    )
+    video_cell = ArrayCell(elements=(StreamCell(type="video", spec="n1"),))
+    assert sinks[0].result.rows == [
+        [video_cell, "eng"],
+        [video_cell, "fra"],
+        [video_cell, None],
+    ]
+
+
+def test_a_filtered_bare_array_keeps_every_element_in_its_one_cell() -> None:
+    """The rowless case of the same column: both filtered tracks land in the
+    one array cell instead of the second being dropped."""
+    sinks = lower_table(
+        resolve(parse("SELECT hflip(f.video) FROM input('f.mkv') f")),
+        _row_probes(_track("video", 0), _track("video", 1)),
+        registry=_snapshot_registry(),
+    )
+    assert sinks[0].result.rows == [
+        [
+            ArrayCell(
+                elements=(
+                    StreamCell(type="video", spec="n1"),
+                    StreamCell(type="video", spec="n2"),
+                )
+            )
+        ]
+    ]
+
+
 def test_a_subscripted_array_column_still_keeps_its_plain_cell() -> None:
     """The one array-typed shape that stays a plain stream cell: a subscript
     already picks ONE element, so there is nothing to brace."""
@@ -8837,6 +8880,35 @@ def test_a_grouped_table_query_over_a_row_key_is_one_row_per_group() -> None:
         ],
         ["fra", ArrayCell(elements=(StreamCell(type="audio", spec="0:a:2"),))],
     ]
+
+
+def test_a_grouped_table_query_over_an_empty_relation_prints_no_rows() -> None:
+    """Fuzz find: no key and no surviving row used to make ONE empty group,
+    and printing it panicked. An empty relation has no groups -- the same
+    zero rows the ungrouped branch prints."""
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT f.duration AS d, array_agg(f.video[1]) "
+                "FROM input('f.mkv') f, unnest(f.data) t"
+            )
+        ),
+        _row_probes(),
+    )
+    assert sinks[0].result.columns == ["d", "array_agg"]
+    assert sinks[0].result.rows == []
+
+
+def test_an_empty_row_set_still_stops_the_media_query_it_would_write() -> None:
+    """The table query above prints nothing; the COPY that would WRITE those
+    rows keeps its typed rejection."""
+    err = _reject_lower(
+        "COPY (SELECT array_agg(t.track) FROM input('f.mkv') f, unnest(f.data) t) "
+        "TO 'out.mka'",
+        _row_probes(),
+    )
+    assert err.code is ErrorCode.STREAM_NOT_FOUND
+    assert "no data track of 'f.mkv' survived" in err.message
 
 
 def test_unaliased_array_agg_column_is_named_array_agg() -> None:
