@@ -218,4 +218,4 @@ The prompt's filter reference is rendered from the same registry the compiler re
 
 ---
 
-More docs: [cookbook](docs/examples.md) · [filters](docs/filters.md) · [row shapes](docs/rows.md) · [trimming](docs/trimming.md) · [error contract](docs/errors.md) · [known gaps](docs/known_gaps.md)
+More docs: [cookbook](docs/examples.md) · [filters](docs/filters.md) · [row shapes](docs/rows.md) · [trimming](docs/trimming.md) · [error contract](docs/errors.md) · [known gaps](docs/known_gaps.md) · [roadmap](ROADMAP.md)
