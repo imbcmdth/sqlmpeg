@@ -38,7 +38,7 @@ data streams are passthrough-only (no filter accepts them).
     CREATE TYPE video_stream AS (
         index          number,     -- RO  1-based, agrees with f.video[k]
         tags           tag[],      -- W   language, title, any key
-        disposition    text,       -- W   ffmpeg disposition spec
+        disposition    flag[],     -- W   default, forced, ... (closed set)
         codec          text,       -- RO
         width          number,     -- RO
         height         number,     -- RO
@@ -50,7 +50,7 @@ data streams are passthrough-only (no filter accepts them).
     CREATE TYPE audio_stream AS (
         index          number,     -- RO
         tags           tag[],      -- W   language, title, any key
-        disposition    text,       -- W
+        disposition    flag[],     -- W
         codec          text,       -- RO
         channels       number,     -- RO
         sample_rate    number,     -- RO
@@ -59,10 +59,21 @@ data streams are passthrough-only (no filter accepts them).
         duration       number);    -- RO
 
     CREATE TYPE subtitle_stream AS (
-        index number, tags tag[], disposition text, codec text);
-    CREATE TYPE data_stream AS (
-        index number, tags tag[], disposition text, codec text);
+        index number, tags tag[], disposition flag[], codec text);
+    CREATE TYPE data_stream AS (     -- the landmine bucket: anything
+        index number, tags tag[],    -- ffprobe cannot classify; never
+        disposition flag[], codec text); -- attachments, never cues
     -- index/codec RO; tags/disposition W
+
+    CREATE TYPE tag  AS (key text, value text);   -- free-form keys
+    CREATE TYPE flag AS (key text, set boolean);  -- disposition: the
+        -- closed set ffmpeg knows (default, forced, dub, original,
+        -- comment, lyrics, karaoke, hearing_impaired, visual_impaired,
+        -- clean_effects, attached_pic, captions, descriptions,
+        -- metadata, dependent, still_image, ...); an unknown key is a
+        -- typed rejection. Read: `a.disposition.forced` (boolean).
+        -- Write: emitted as `-disposition:N default+forced` from the
+        -- set flags.
 
 W = writable: an assertion the query may make; emitted as that
 stream's tag (`-metadata:s:N`, `-disposition:N`). RO = read-only: a
@@ -73,11 +84,6 @@ The fields are ABOUT the stream; the stream itself is the record's
 identity, not a field. Two records are the same stream or they are
 not - identity is nominal, never field-by-field (two filter outputs
 with all-NULL facts are two different streams).
-
-DECISION (maintainer): `disposition` joins the record as a W field
-(today it is a reserved tag key with no read side). Reading it back
-from ffprobe's disposition flags is cheap and makes the record
-symmetric.
 
 ## 4. Non-stream records
 
@@ -120,18 +126,17 @@ start_t < end_t, ascending, non-overlapping.
         duration    number,            -- RO
         tags        tag[]);            -- W   container tags
 
-    CREATE TYPE tag AS (key text, value text);
-
 Tags are an array, not a set of named columns: no collision between a
 tag key and a column name (`audio`, `track`, `duration` are plausible
 keys), and free-form keys are the only kind - reading and writing
 share one shape. Stream records carry `tags tag[]` the same way
-(`language`, `title` live there, not as fields). DECISION O6: the
-well-known keys stay readable as ACCESSOR SUGAR - `f.title`,
-`a.language` - meaning "the tag named so", resolved only when no real
-field has that name, and never part of `SELECT *`. This keeps `CASE
-WHEN f.title IS NULL ...` readable; the alternative is
-`unnest(f.tags) t WHERE t.key = 'title'` everywhere.
+(`language`, `title` live there, not as fields). Access is by path,
+`f.tags.title` / `a.tags.language` (parses today as a dotted column):
+the key after `tags.` names the entry, NULL when absent. No bare
+`f.title` sugar (DECIDED: O6). Writing: `'eng' AS tags.language`? No -
+a tag is written as a tag-column the way it is today, `'eng' AS
+language`, which is construction of the `tags` entry by key (R4);
+`NULL AS language` clears it.
 
 `input('path') f` is a table of ONE `container` row. `f.t` is not a
 field: it is the seek handle, legal only in `WHERE` trim windows, and
@@ -151,7 +156,7 @@ R2. `SELECT *`: over a container, its array columns (stream arrays
     shape, never the scalars. Over unnest rows, the record's fields -
     the metadata table. `SELECT a` over unnest rows is the stream.
 R3. Field access: `f.audio[1].codec`, `a.index`, `(f.audio[1]).index`
-    read a field; `a.language` / `f.title` read a tag (O6 sugar).
+    read a field; `a.tags.language` / `f.tags.title` read a tag.
     Field access on a FILTER OUTPUT is a typed rejection: the output
     pin is connected to nothing, so the node never exists, and a
     stream nobody mapped has nothing to report - `scale(v, 640,
@@ -205,17 +210,18 @@ R9. Homonyms: type names and column/alias names are separate
   construction rejected (new), `SELECT *` defined per R2, cues
   writable, field access on a filter output rejected.
 
-## 8. Open for the maintainer
+## 8. Decisions (maintainer, 2026-08-21)
 
-O1. `disposition` as a readable W field (section 3) - yes/no.
-O2. Constructed chapters must set start_t and end_t; title may be
-    NULL. Agree?
-O3. (resolved by `tags tag[]`: free-form everywhere.)
-O6. Accessor sugar for well-known tag keys (`f.title`, `a.language`)
-    on top of `tags` - keep, or require the unnest form?
-O4. Attachment read side: ffprobe reports attachments as streams
-    (codec_type attachment, filename/mimetype tags). Proposed: they
-    populate `f.attachments`, never `f.data`.
+- O1 `disposition`: a closed-key boolean map (`flag[]`), read by path,
+  written from set flags. No longer a reserved tag key.
+- O2 constructed chapters must set `start_t` and `end_t`; `title` may
+  be NULL.
+- O3 resolved by `tags tag[]`: free-form everywhere.
+- O4 attachments populate `f.attachments` only. `f.data` is reserved
+  for what ffprobe cannot classify - the landmine area - and nothing
+  well-typed is ever routed there.
+- O6 no accessor sugar: `f.tags.title`, `a.tags.language`, required.
+- R3 field access on a filter output is a typed rejection.
 
 ## After this lands
 094 (literals, output columns, cues), then 096 (functions: scalar and
