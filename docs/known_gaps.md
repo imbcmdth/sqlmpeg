@@ -47,6 +47,14 @@ output is plain ffmpeg, so the two mix freely in a script.
   are streams - so a `GROUP BY` over a CTE column with more than one
   group has no way to name its files yet. Group inside the CTE's body
   (where metadata columns exist) instead.
+- **Filter outputs carry no facts.** Metadata columns describe probed
+  input streams only; a filter's output is a stream with no readable
+  `channel_layout`, `width`, `codec` and so on, even where ffmpeg
+  itself derives them (`channelsplit` emits one-channel `FL`/`FR`
+  layouts, which the AAC encoder then rejects as non-`mono` - add
+  `aformat(..., channel_layouts => 'mono')` per leg). Reading a field
+  off a filter output is a typed rejection. Deriving facts through
+  filters that change them is future work.
 - **Streams ffmpeg cannot identify are rejected at compile time.**
   Some sources carry streams with no detectable codec (certain DASH
   text tracks, for example). Selecting one is a compile error; table
