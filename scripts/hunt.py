@@ -844,7 +844,8 @@ def main() -> None:
                 assert isinstance(result, Graph)
             compiled += 1
     print(
-        f"examples={count} seed={seed} p_bad={p_bad} compiled={compiled} rejected={rejected} parse_errors={parse_err}"
+        f"examples={count} seed={seed} p_bad={p_bad} "
+        f"compiled={compiled} rejected={rejected} parse_errors={parse_err}"
     )
     print(f"distinct findings: {len(findings)}")
     dump = sorted(findings.values(), key=lambda d: -d["hits"])
