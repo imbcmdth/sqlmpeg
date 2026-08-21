@@ -20,21 +20,21 @@ sqlglot parses these declarations and `::audio_stream[]` casts today.)
               -- any float operand gives float)
     boolean   -- predicates only; not a column type
 
-## 2. Handles - a reference to a stream in the graph
+## 2. Streams ARE the records
 
-    video, audio, subtitle, data
-
-A handle is what filters consume and produce, and what a `-map` maps.
-It carries its riding tags (provenance: language/title that survive
-through filters) but no probed facts. A filter call's type is the
-handle type of its output pad: `volume(x) : audio`, `overlay(v, w) :
-video`. Subtitle and data handles are passthrough-only (no filter
-accepts them).
+There is no separate handle type at the surface. A stream value is a
+`video_stream` / `audio_stream` / `subtitle_stream` / `data_stream`
+record: filters take them and return them, `-map` maps them,
+`SELECT a` selects one, `array_agg(a)` gathers them. The graph node
+behind a record (what the emitter turns into a `-map` or a pad label)
+is internal and has no name in the language. A filter output is a
+record whose RO facts are NULL (nothing probed them) and whose W
+fields ride through (how tags already survive filters). Subtitle and
+data streams are passthrough-only (no filter accepts them).
 
 ## 3. Stream records - what a row about a stream carries
 
     CREATE TYPE video_stream AS (
-        track          video,      -- the handle
         index          number,     -- RO  1-based, agrees with f.video[k]
         language       text,       -- W   tag
         title          text,       -- W   tag
@@ -48,7 +48,6 @@ accepts them).
         duration       number);    -- RO
 
     CREATE TYPE audio_stream AS (
-        track          audio,
         index          number,     -- RO
         language       text,       -- W
         title          text,       -- W
@@ -61,17 +60,22 @@ accepts them).
         duration       number);    -- RO
 
     CREATE TYPE subtitle_stream AS (
-        track subtitle, index number, language text, title text,
+        index number, language text, title text,
         disposition text, codec text);   -- index/codec RO
 
     CREATE TYPE data_stream AS (
-        track data, index number, language text, title text,
+        index number, language text, title text,
         disposition text, codec text);   -- index/codec RO
 
 W = writable: an assertion the query may make; emitted as that
 stream's tag (`-metadata:s:N`, `-disposition:N`). RO = read-only: a
 probed fact; a constructed record that sets one is a typed rejection.
 Every W field is nullable; NULL clears.
+
+The fields are ABOUT the stream; the stream itself is the record's
+identity, not a field. Two records are the same stream or they are
+not - identity is nominal, never field-by-field (two filter outputs
+with all-NULL facts are two different streams).
 
 DECISION (maintainer): `disposition` joins the record as a W field
 (today it is a reserved tag key with no read side). Reading it back
@@ -110,7 +114,6 @@ start_t < end_t, ascending, non-overlapping.
         data        data_stream[],
         chapters    chapter[],
         attachments attachment[],      -- 094
-        frame       video,             -- sugar: video[1].track
         duration    number,            -- RO
         title       text,              -- W   container tags:
         artist      text,              -- W
@@ -125,55 +128,34 @@ start_t < end_t, ascending, non-overlapping.
         encoder     text,              -- W
         description text);             -- W
 
-`input('path') f` is a table of ONE `container` row. `t` is not a
-field: it is the seek handle, legal only in `WHERE` trim windows.
+`input('path') f` is a table of ONE `container` row. Two names on
+the alias are not fields: `f.frame` is parser sugar for `f.video[1]`,
+and `f.t` is the seek handle, legal only in `WHERE` trim windows.
+Neither takes part in `SELECT *`.
 
 A generated source (`ffmpeg.sine(...) s`) is a `container` whose one
-array holds one record: the handle set, every fact NULL, the other
-arrays empty.
+array holds one record with every fact NULL; the other arrays are
+empty.
 
 ## 6. Rules
 
 R1. `unnest(f.<array>) a` turns `T[]` into rows of `T`. Works for the
     four stream arrays, `chapters`, `attachments`.
-R2. Stream records are ACCEPTED wherever a stream is expected
-    (subsumption, one direction). Why the rule exists: `f.audio` must
-    be `audio_stream[]` or `unnest(f.audio)` has no metadata, so by
-    SQL's array rule `f.audio[1]` is a record - yet `SELECT
-    f.audio[1]`, `scale(f.audio[1], ...)` and the splat `SELECT
-    f.audio` all need a stream, and SQL has no way to map `.track`
-    over an array. The alternatives are worse: two parallel arrays
-    per kind, or `.track` everywhere with no splat.
-    The rule, exactly:
-    - Where the checker expects a stream (a media COPY's SELECT
-      columns, filter arguments, array_agg's argument, COALESCE
-      branches, UNION ALL branch columns, CTE columns consumed as
-      streams), a stream record or an array of them is accepted; its
-      handle is used, elementwise for arrays.
-    - Nothing is invented: the handle is a field of the record.
-    - Nothing is lost: the record's non-NULL W fields stay attached
-      to the handle as riding tags, which is how tags already survive
-      filters. `SELECT a` and `SELECT a.track` produce identical
-      output, tags included.
-    - RO facts are not consulted; they describe the source, and a
-      consumer of streams has no use for them.
-    - It NEVER applies in value positions: WHERE, CASE, `||`, tag
-      expressions, fan-out TO, GROUP BY keys. A record where a value
-      is expected is a typed rejection, never a silent `.track`.
-    - The converse is false: a handle is not a record. A filter
-      output or `f.frame` has no fields (R3).
+R2. `SELECT *`: over a container, its array columns (stream arrays
+    in v/a/s/d order, then `chapters`, `attachments`) - the remux
+    shape, never the scalars. Over unnest rows, the record's fields -
+    the metadata table. `SELECT a` over unnest rows is the stream.
 R3. Field access: `f.audio[1].language`, `a.language`,
-    `(f.audio[1]).language` all read the record field. On a handle
-    (filter output, `f.frame`) there are no fields - typed rejection.
-R4. Construction:
-    - narrow records (chapter, attachment): positional
-      `ROW(...)::chapter`, or `ARRAY[ROW(...)::chapter, ...]`.
-    - stream records: by SELECT aliases in a function body or CTE -
-      `SELECT a.audio[1] AS track, 'eng' AS language` builds an
-      `audio_stream` with `track` and `language` set and every other
-      field NULL. Positional ROW() for stream records is a typed
-      rejection (too wide to be safe).
-    - Setting an RO field in any construction is a typed rejection.
+    `(f.audio[1]).language` read a field. On a filter output the RO
+    facts are NULL (DECISION O5: NULL, or a typed rejection?); W
+    fields read the riding tag.
+R4. Construction is "a stream plus W-field columns": in a function
+    body, CTE, or SELECT list, `SELECT a.audio[1], 'eng' AS language`
+    yields that stream with `language` overridden - the existing tag-
+    column shape, now the only constructor for stream records.
+    Narrow non-stream records (chapter, attachment) construct
+    positionally: `ROW(...)::chapter`, `ARRAY[ROW(...)::chapter, ...]`.
+    Setting an RO field anywhere is a typed rejection.
 R5. Tags ARE writable fields. Today's "tag column" is exactly R4's
     alias construction applied to a row - the two stories merge. A
     record reaching an output emits its non-NULL W fields.
@@ -182,13 +164,13 @@ R6. The OUTPUT row is positional streams + container scalars +
     named stream arrays (`... AS audio`) are rejected on output -
     streams are positional, one way to say it.
 R7. Nullability is SQL's: an outer join's gap side is a NULL record;
-    `COALESCE(b.track, ffmpeg.anullsrc(...))` produces a handle.
+    `COALESCE(b, ffmpeg.anullsrc(...))` produces a stream.
 R8. CTE/view rows have the body's column types (an anonymous row
     type), as in SQL. A function's `RETURNS` names one of the types
     above, an array of one, or `TABLE(...)` of them.
 R9. Homonyms: type names and column/alias names are separate
-    namespaces (SQL's rule). `f.audio` is an `audio_stream[]`, not an
-    `audio`. Type names are legal as aliases but discouraged in docs.
+    namespaces (SQL's rule); `audio_stream` the type and `f.audio` the
+    column never collide.
 
 ## 7. What the implementation derives from this
 
@@ -200,20 +182,25 @@ R9. Homonyms: type names and column/alias names are separate
   "expected audio, got video".
 - Error hints, docs/rows.md tables, and the LLM prompt's column
   sections render from the same data.
-- No behavior change intended beyond: `disposition` readable (new),
-  RO-field construction rejected (new), positional ROW for stream
-  records rejected (new). Every pinned recipe byte-identical.
+- BREAKING: `.track` disappears. `SELECT a` / `array_agg(a)` /
+  `GROUP BY a` / `scale(a, ...)` replace `a.track` everywhere
+  (~20 recipes, the queries, tests); `a.track` becomes a typed
+  rejection with the hint "the row is the stream: use a". Every
+  pinned ffmpeg command stays byte-identical.
+- Other behavior changes: `disposition` readable (new), RO-field
+  construction rejected (new), `SELECT *` defined per R2.
 
 ## 8. Open for the maintainer
 
 O1. `disposition` as a readable W field (section 3) - yes/no.
-O2. Record-by-alias construction requiring `track` to be set, or may
-    a record be all-NULL (a "placeholder")? Proposed: `track` required
-    for stream records; chapters need start_t/end_t.
+O2. Constructed chapters must set start_t and end_t; title may be
+    NULL. Agree?
 O3. Container W fields: the twelve tags listed, or any free-form key?
     Today tag columns accept free-form keys on output. Proposed:
     free-form stays for OUTPUT (ffmpeg accepts any key), the twelve
     are the READABLE ones.
+O5. Reading an RO fact off a filter output (`scale(f.frame).width`):
+    NULL (SQL's "unknown"; proposed) or a typed rejection?
 O4. Attachment read side: ffprobe reports attachments as streams
     (codec_type attachment, filename/mimetype tags). Proposed: they
     populate `f.attachments`, never `f.data`.
