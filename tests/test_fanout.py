@@ -96,7 +96,7 @@ def _paths(sql: str) -> list[str | None]:
 
 
 _CHAPTER_SPLIT = (
-    f"COPY (SELECT f.video[1], f.audio[1] FROM input('{SRC}') f, chapters(f) c "
+    f"COPY (SELECT f.video[1], f.audio[1] FROM input('{SRC}') f, unnest(f.chapters) c "
     "WHERE f.t BETWEEN c.start_t AND c.end_t) TO ('ch' || c.index::text || '.mkv')"
 )
 _PER_LANGUAGE = (
@@ -221,7 +221,7 @@ def test_a_filtered_stream_is_enough_to_seek_the_outputs() -> None:
     """No codec named at all: one filtered column re-encodes the file anyway."""
     sql = (
         f"COPY (SELECT hflip(f.video[1]), f.audio[1] FROM input('{SRC}') f, "
-        "chapters(f) c WHERE f.t BETWEEN c.start_t AND c.end_t) "
+        "unnest(f.chapters) c WHERE f.t BETWEEN c.start_t AND c.end_t) "
         "TO ('ch' || c.index::text || '.mkv')"
     )
     graphs = compile_commands(sql)
@@ -243,7 +243,7 @@ def test_two_windows_in_one_file_send_the_fan_out_back_to_the_chain() -> None:
     only be said on the inputs."""
     sql = (
         "COPY (SELECT f.video[1], g.audio[1] FROM input('a.mkv') f, "
-        "input('b.mkv') g, chapters(f) c "
+        "input('b.mkv') g, unnest(f.chapters) c "
         "WHERE f.t BETWEEN c.start_t AND c.end_t AND g.t BETWEEN 0 AND 2) "
         "TO ('ch' || c.index::text || '.mkv') WITH (video_codec 'libx264')"
     )
@@ -482,7 +482,7 @@ def test_a_numeric_to_expression_is_rejected() -> None:
 
 def test_a_row_bounded_window_needs_a_fan_out_to() -> None:
     sql = (
-        f"COPY (SELECT f.video[1] FROM input('{SRC}') f, chapters(f) c "
+        f"COPY (SELECT f.video[1] FROM input('{SRC}') f, unnest(f.chapters) c "
         "WHERE f.t BETWEEN c.start_t AND c.end_t) TO ('one.mkv')"
     )
     err = _rejects(sql)
@@ -491,7 +491,7 @@ def test_a_row_bounded_window_needs_a_fan_out_to() -> None:
 
 def test_a_row_bounded_window_under_a_quoted_to_keeps_the_old_rejection() -> None:
     sql = (
-        f"COPY (SELECT f.video[1] FROM input('{SRC}') f, chapters(f) c "
+        f"COPY (SELECT f.video[1] FROM input('{SRC}') f, unnest(f.chapters) c "
         "WHERE f.t BETWEEN c.start_t AND c.end_t) TO 'one.mkv'"
     )
     assert "cannot mix track-row columns" in _rejects(sql).message
@@ -621,7 +621,7 @@ def _duration(path: Path) -> float:
 def _chapter_split_sql(options: str = "") -> str:
     source = (FIXTURES_DIR / "av-chapters.mkv").as_posix()
     return (
-        f"COPY (SELECT f.video[1], f.audio[1] FROM input('{source}') f, chapters(f) c "
+        f"COPY (SELECT f.video[1], f.audio[1] FROM input('{source}') f, unnest(f.chapters) c "
         "WHERE f.t BETWEEN c.start_t AND c.end_t) TO ('ch' || c.index::text || '.mkv')"
         + options
     )

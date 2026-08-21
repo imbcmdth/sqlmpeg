@@ -53,7 +53,7 @@ from sqlmpeg.parser import parse, resolve
 from sqlmpeg.probe import ChapterMeta, ProbeResult, StreamMeta
 from sqlmpeg.registry import Registry, load_reference
 from sqlmpeg.split import insert_splits
-from sqlmpeg.table import ArrayCell, StreamCell, render_csv
+from sqlmpeg.table import ArrayCell, RecordCell, StreamCell, render_csv, render_table
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
@@ -6328,7 +6328,7 @@ def test_a_track_row_query_runs_end_to_end(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# chapters(f) read, and the `chapters`/`chapters_from` sink options
+# unnest(f.chapters) read, and the `chapters`/`chapters_from` sink options
 # ---------------------------------------------------------------------------
 
 
@@ -6346,7 +6346,7 @@ def test_chapters_table_output_reads_the_fixed_schema() -> None:
     sinks = lower_table(
         resolve(parse(
             "SELECT c.index, c.title, c.start_t, c.end_t "
-            "FROM input('f.mkv') f, chapters(f) c"
+            "FROM input('f.mkv') f, unnest(f.chapters) c"
         )),
         _chapter_probes(*_TWO_CHAPTERS),
     )
@@ -6358,7 +6358,7 @@ def test_chapters_table_output_reads_the_fixed_schema() -> None:
 def test_chapters_where_and_order_by_use_the_same_row_machinery_unnest_does() -> None:
     sinks = lower_table(
         resolve(parse(
-            "SELECT c.title FROM input('f.mkv') f, chapters(f) c "
+            "SELECT c.title FROM input('f.mkv') f, unnest(f.chapters) c "
             "WHERE c.start_t >= 1 ORDER BY c.title DESC"
         )),
         _chapter_probes(*_TWO_CHAPTERS),
@@ -6368,22 +6368,94 @@ def test_chapters_where_and_order_by_use_the_same_row_machinery_unnest_does() ->
 
 def test_an_unreadable_input_rejects_chapters_like_unnest() -> None:
     err = _reject_lower(
-        "SELECT c.title FROM input('f.mkv') f, chapters(f) c", {"f": None}
+        "SELECT c.title FROM input('f.mkv') f, unnest(f.chapters) c", {"f": None}
     )
     assert err.code is ErrorCode.INPUT_NOT_FOUND
 
 
 def test_a_chapters_column_in_a_media_copy_is_a_typed_rejection_not_a_tag() -> None:
-    """A row column with no alias would otherwise be checked as a tag
-    (plan 076); a chapters row has no stream to tag at all, so it must fall
-    through to the ordinary "not an output" rejection instead."""
+    """A row column with no alias would otherwise be checked as a tag; a
+    chapters row has no stream to tag at all, so it must fall through to the
+    ordinary "not an output" rejection instead."""
     err = _reject_lower(
-        "COPY (SELECT c.title FROM input('f.mkv') f, chapters(f) c) TO 'out.mkv'",
+        "COPY (SELECT c.title FROM input('f.mkv') f, unnest(f.chapters) c) TO 'out.mkv'",
         _chapter_probes(*_TWO_CHAPTERS),
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'c.title' is track metadata, not a stream" in err.message
-    assert "chapters(f) has no stream column" in (err.hint or "")
+    assert "a chapter row has no stream column" in (err.hint or "")
+
+
+def test_a_bare_chapters_column_prints_as_one_array_cell() -> None:
+    """The array VALUE, not a row source: records in schema order, Postgres
+    array-literal braces around them."""
+    sinks = lower_table(
+        resolve(parse("SELECT f.title, f.chapters FROM input('f.mkv') f")),
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    assert sinks[0].result.columns == ["title", "chapters"]
+    assert sinks[0].result.rows == [
+        [
+            None,
+            ArrayCell(
+                elements=(
+                    RecordCell(fields=(1, "Intro", 0.0, 1.0)),
+                    RecordCell(fields=(2, "Credits", 1.0, 2.0)),
+                )
+            ),
+        ]
+    ]
+    assert "{(1,Intro,0.0,1.0),(2,Credits,1.0,2.0)}" in render_table(sinks[0].result)
+
+
+def test_a_bare_chapters_column_broadcasts_over_track_rows() -> None:
+    """One cell per printed row, the same broadcast a bare stream array does."""
+    sinks = lower_table(
+        resolve(parse(
+            "SELECT t.index, f.chapters FROM input('f.mkv') f, unnest(f.audio) t"
+        )),
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    assert len(sinks[0].result.rows) == 1
+    assert isinstance(sinks[0].result.rows[0][1], ArrayCell)
+
+
+def test_a_bare_chapters_column_needs_a_readable_input() -> None:
+    err = _reject_lower_table("SELECT f.chapters FROM input('f.mkv') f", {"f": None})
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+    assert "cannot read chapters" in err.message
+
+
+def test_a_bare_chapters_column_in_a_media_copy_is_a_typed_rejection() -> None:
+    """Chapters are records, not streams: nothing to map into a container."""
+    err = _reject_lower(
+        "COPY (SELECT f.chapters FROM input('f.mkv') f) TO 'out.mkv'",
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.chapters' carries no streams" in err.message
+    assert "unnest(f.chapters) c" in (err.hint or "")
+
+
+def test_a_chapters_subscript_is_rejected_in_a_table_query_too() -> None:
+    err = _reject_lower_table(
+        "SELECT f.chapters[1] FROM input('f.mkv') f", _chapter_probes(*_TWO_CHAPTERS)
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.chapters' cannot be subscripted" in err.message
+    assert "unnest(f.chapters) c" in (err.hint or "")
+
+
+def test_chapter_rows_cross_join_track_rows() -> None:
+    """No mixing carve-out left: one row per (track, chapter) pair."""
+    sinks = lower_table(
+        resolve(parse(
+            "SELECT t.index, c.title "
+            "FROM input('f.mkv') f, unnest(f.audio) t, unnest(f.chapters) c"
+        )),
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    assert sinks[0].result.rows == [[1, "Intro"], [1, "Credits"]]
 
 
 def test_chapters_write_mints_an_ffmetadata_input_and_sets_map_chapters() -> None:
@@ -8649,7 +8721,7 @@ def test_a_chapters_table_over_one_path_is_rejected_too() -> None:
         )
     }
     err = _reject_lower(
-        "COPY (SELECT f.video[1] FROM input('f.mkv') f, chapters(f) c) TO 'out.mkv'",
+        "COPY (SELECT f.video[1] FROM input('f.mkv') f, unnest(f.chapters) c) TO 'out.mkv'",
         probes,
     )
     assert err.code is ErrorCode.ROW_COUNT_MISMATCH

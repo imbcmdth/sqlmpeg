@@ -890,11 +890,11 @@ ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng
 
 ## 39. List a file's chapters
 
-`chapters(f)` is a table: one row per chapter, straight from the container. Like every metadata query, no COPY means it prints and nothing runs:
+`chapters` is an array column of the input, like the stream arrays: unnest it and each chapter is a row, straight from the container. Like every metadata query, no COPY means it prints and nothing runs:
 
 ```pgsql
 SELECT c.index, c.title, c.start_t, c.end_t
-FROM input('tests/fixtures/av-chapters.mkv') f, chapters(f) c
+FROM input('tests/fixtures/av-chapters.mkv') f, unnest(f.chapters) c
 ```
 
 ```
@@ -1046,7 +1046,7 @@ A `TO` expression over a row table's columns means one output file per row - the
 ```pgsql
 COPY (
   SELECT f.video, f.audio
-  FROM input('tests/fixtures/av-chapters.mkv') f, chapters(f) c
+  FROM input('tests/fixtures/av-chapters.mkv') f, unnest(f.chapters) c
   WHERE f.t BETWEEN c.start_t AND c.end_t
 ) TO ('ch-' || c.title || '.mkv')
 ```
@@ -1070,7 +1070,7 @@ ffmpeg -ss 0.0 -to 1.0 -i tests/fixtures/av-chapters.mkv -map 0:v:0 -c:0 copy -m
 ```pgsql
 COPY (
   SELECT f.video, f.audio
-  FROM input('tests/fixtures/av-chapters.mkv') f, chapters(f) c
+  FROM input('tests/fixtures/av-chapters.mkv') f, unnest(f.chapters) c
   WHERE f.t BETWEEN c.start_t AND c.end_t
 ) TO ('ch-' || c.title || '.mkv') WITH (video_codec 'libx264', crf 18, audio_codec 'aac')
 ```

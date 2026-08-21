@@ -1753,7 +1753,7 @@ def test_unnest_rejects_more_than_one_argument() -> None:
         "SELECT t.track FROM input('f.mkv') f, unnest(f.audio, f.video) t"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "exactly one stream array" in err.message
+    assert "exactly one array column" in err.message
 
 
 def test_unnest_only_sees_comma_sources_written_before_it() -> None:
@@ -1770,12 +1770,12 @@ def test_unnest_needs_an_input_not_a_cte_or_a_generated_source() -> None:
         "SELECT t.track FROM c, unnest(c.tracks) t"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "only an input's stream array can be unnested" in err.message
+    assert "only an input's array column can be unnested" in err.message
     err = _reject(
         "SELECT t.track FROM ffmpeg.anullsrc(duration => 2) s, unnest(s.audio) t"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "only an input's stream array can be unnested" in err.message
+    assert "only an input's array column can be unnested" in err.message
 
 
 # -- JOIN between track-row tables ----------------------
@@ -2296,14 +2296,14 @@ def test_never_raises_anything_but_sqlmpeg_error(sql: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# chapters(f) in FROM, and VALUES CTEs
+# unnest(f.chapters) in FROM, and VALUES CTEs
 # ---------------------------------------------------------------------------
 
 
 def test_chapters_binds_a_row_table_shaped_like_a_track_row() -> None:
     res = _resolve(
         "SELECT c.index, c.title, c.start_t, c.end_t "
-        "FROM input('f.mkv') f, chapters(f) c"
+        "FROM input('f.mkv') f, unnest(f.chapters) c"
     )
     assert list(res.track_rows) == ["c"]
     rows = res.track_rows["c"]
@@ -2311,70 +2311,85 @@ def test_chapters_binds_a_row_table_shaped_like_a_track_row() -> None:
 
 
 def test_chapters_accepts_the_as_spelling_and_folds_the_alias() -> None:
-    res = _resolve("SELECT C.title FROM input('f.mkv') f, chapters(f) AS C")
+    res = _resolve("SELECT C.title FROM input('f.mkv') f, unnest(f.chapters) AS C")
     assert list(res.track_rows) == ["c"]
 
 
 def test_chapters_requires_an_alias() -> None:
-    err = _reject("SELECT 1 FROM input('f.mkv') f, chapters(f)")
+    err = _reject("SELECT 1 FROM input('f.mkv') f, unnest(f.chapters)")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "requires an alias" in err.message
 
 
-def test_chapters_takes_exactly_one_bare_input_alias() -> None:
-    err = _reject("SELECT 1 FROM input('f.mkv') f, input('g.mkv') g, chapters(f, g) c")
+def test_the_chapters_table_function_is_gone() -> None:
+    """`chapters(f)` was removed: it hits the unknown-table-function path,
+    with a hint naming the array column that replaced it."""
+    err = _reject("SELECT 1 FROM input('f.mkv') f, chapters(f) c")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "exactly one input alias" in err.message
+    assert "unsupported table function chapters()" in err.message
+    assert "unnest(f.chapters) c" in (err.hint or "")
 
-    err = _reject("SELECT 1 FROM input('f.mkv') f, chapters(f.audio) c")
+
+def test_chapters_unnests_only_an_input_alias() -> None:
+    err = _reject(f"WITH x AS ({SINK_QUERY}) SELECT 1 FROM x, unnest(x.chapters) c")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "only an input's array column can be unnested" in err.message
+
+    err = _reject(
+        "SELECT 1 FROM input('f.mkv') f, unnest(f.audio) t, unnest(t.chapters) c"
+    )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
 
-    err = _reject("SELECT 1 FROM input('f.mkv') f, chapters(nope) c")
+    err = _reject("SELECT 1 FROM input('f.mkv') f, unnest(nope.chapters) c")
     assert err.code is ErrorCode.UNKNOWN_ALIAS
 
 
-def test_chapters_needs_an_input_not_a_cte_or_row() -> None:
-    err = _reject(f"WITH x AS ({SINK_QUERY}) SELECT 1 FROM x, chapters(x) c")
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "chapters() only reads an input's own chapters" in err.message
-
-    err = _reject(
-        "SELECT 1 FROM input('f.mkv') f, unnest(f.audio) t, chapters(t) c"
+def test_chapters_rows_combine_with_track_rows_like_any_other_array() -> None:
+    """No carve-out left: two unnest tables of one input cross join."""
+    res = _resolve(
+        "SELECT t.language, c.title "
+        "FROM input('f.mkv') f, unnest(f.audio) t, unnest(f.chapters) c"
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert [rows.column for rows in res.track_rows.values()] == ["audio", "chapters"]
 
 
-def test_chapters_cannot_combine_with_unnest_either_direction() -> None:
-    err = _reject(
-        "SELECT 1 FROM input('f.mkv') f, chapters(f) c, unnest(f.audio) t"
+def test_two_inputs_chapters_are_two_row_tables() -> None:
+    res = _resolve(
+        "SELECT c.title, d.title FROM input('f.mkv') f, input('g.mkv') g, "
+        "unnest(f.chapters) c, unnest(g.chapters) d"
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "cannot combine" in err.message
-
-    err = _reject(
-        "SELECT 1 FROM input('f.mkv') f, unnest(f.audio) t, chapters(f) c"
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "cannot combine" in err.message
+    assert [rows.source for rows in res.track_rows.values()] == ["f", "g"]
 
 
-def test_only_one_chapters_table_per_query() -> None:
-    err = _reject(
-        "SELECT 1 FROM input('f.mkv') f, input('g.mkv') g, "
-        "chapters(f) c, chapters(g) d"
-    )
+def test_a_chapters_subscript_is_rejected_with_an_unnest_hint() -> None:
+    err = _reject("SELECT f.chapters[1].title FROM input('f.mkv') f")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "cannot combine" in err.message
+    assert "'f.chapters' cannot be subscripted" in err.message
+    assert "unnest(f.chapters) c" in (err.hint or "")
+
+
+def test_a_bare_chapters_accessor_names_the_unnest() -> None:
+    err = _reject("SELECT f.chapters.title FROM input('f.mkv') f")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.chapters.title' needs a row" in err.message
+    assert "unnest(f.chapters) c" in (err.hint or "")
+
+
+def test_a_chapters_column_in_a_value_expression_is_rejected() -> None:
+    err = _reject("SELECT f.chapters::text FROM input('f.mkv') f")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.chapters' is an array of chapter records" in err.message
+    assert "unnest(f.chapters) c" in (err.hint or "")
 
 
 def test_chapters_column_list_is_rejected() -> None:
-    err = _reject("SELECT 1 FROM input('f.mkv') f, chapters(f) c(x)")
+    err = _reject("SELECT 1 FROM input('f.mkv') f, unnest(f.chapters) c(x)")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "table column aliases are not supported" in err.message
 
 
 def test_chapters_row_columns_are_the_fixed_schema() -> None:
-    err = _reject("SELECT c.track FROM input('f.mkv') f, chapters(f) c")
+    err = _reject("SELECT c.track FROM input('f.mkv') f, unnest(f.chapters) c")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unknown column 'c.track'" in err.message
 

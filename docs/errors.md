@@ -274,7 +274,7 @@ FROM input('tests/fixtures/av2.mp4') a, input('tests/fixtures/av.mp4') b
 
 **Meaning:** One row is one file. A query whose relation resolves to more than one row (or, once it aggregates, more than one group) names a single destination, and rows are never combined behind your back. The two ways to combine them are both in the SQL: `array_agg(...)` gathers a branch's rows into the one file it writes (with `GROUP BY` when another column has to stay unaggregated), and `TO (<expression>)` gives every row a destination of its own.
 
-**Fires when:** an `unnest(...)` table, a join, a `chapters(...)` table or a multi-row CTE reference leaves several rows in a media `COPY` (or a bare `SELECT` with no destination) that writes one path. The count is the RESOLVED one, after the `WHERE` and the joins: a predicate that narrows the rows to one on the actual file compiles as it always did.
+**Fires when:** an `unnest(...)` table, a join or a multi-row CTE reference leaves several rows in a media `COPY` (or a bare `SELECT` with no destination) that writes one path. The count is the RESOLVED one, after the `WHERE` and the joins: a predicate that narrows the rows to one on the actual file compiles as it always did.
 
 **Anchor:** the `TO` the file is named at, or the query itself for a bare `SELECT`.
 

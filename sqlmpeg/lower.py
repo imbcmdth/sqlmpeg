@@ -301,6 +301,7 @@ from sqlmpeg.macros import INPUT_MACROS, MACROS, InputMacro, Macro, macro_names
 from sqlmpeg.parser import (
     _ARITHMETIC,
     _ARITHMETIC_NAMES,
+    CHAPTERS_COLUMN,
     FILTER_NAMESPACE,
     INPUT_DURATION_COLUMN,
     INPUT_TAG_COLUMNS,
@@ -311,11 +312,13 @@ from sqlmpeg.parser import (
     RawSink,
     RawSinkOption,
     RawSource,
+    RawTrackRows,
     RawValuesTable,
     Resolved,
     _pos,
     _projection_expr,
     _time_bounds,
+    chapters_unnest_hint,
     from_entries,
     group_keys,
     is_grouped,
@@ -337,7 +340,14 @@ from sqlmpeg.sink import (
     validate_csv_option,
 )
 from sqlmpeg.sink import validate_option as validate_sink_option
-from sqlmpeg.table import ArrayCell, CellValue, StreamCell, TableResult, TableSink
+from sqlmpeg.table import (
+    ArrayCell,
+    CellValue,
+    RecordCell,
+    StreamCell,
+    TableResult,
+    TableSink,
+)
 
 __all__ = ["lower", "lower_table"]
 
@@ -426,7 +436,7 @@ _GROUPED_CTE_HINT = (
     "array_agg(...), or add it to the GROUP BY to make it the group's key"
 )
 _CHAPTER_ROW_HINT = (
-    "chapters(f) has no stream column at all — a chapter is not a track — "
+    "a chapter row has no stream column at all — a chapter is not a track — "
     "so it can only be read as a metadata query, e.g. no COPY, or COPY ... "
     "WITH (FORMAT csv)"
 )
@@ -1486,7 +1496,7 @@ class _SourceBinding:
 # not carry) or the probed scalar. Never a stream — `track` is not in here.
 RowValue = str | int | float | None
 
-# `_TrackRow.stream` for a `chapters(f)` row: never a real stream (chapters
+# `_TrackRow.stream` for a chapter row: never a real stream (chapter
 # rows have no `track` column at all, so `ROW_SCHEMAS["chapters"]` never
 # resolves this), only a dataclass filler. Its ref deliberately fails
 # `is_src()` (no "src:" prefix) and is not a node id either, so anything that
@@ -3012,26 +3022,30 @@ class _Lowerer:
                 fallback=select,
                 hint="unnest one input's stream array, e.g. unnest(f.audio) t",
             )
-        stream_type = _ARRAY_COLUMNS[raw.column]
-        result = self.probes.get(raw.source)
-        if result is None:
-            raise _error(
-                ErrorCode.INPUT_NOT_FOUND,
-                f"cannot unnest '{raw.source}.{raw.column}' of "
-                f"'{self._path_of(raw.source)}': file not found or unreadable",
-                unnest,
-                fallback=select,
-                hint=f"unnest lists the tracks of a file and reads their "
-                f"metadata, and only a readable input has either; subscript "
-                f"one stream instead, e.g. {raw.source}.{raw.column}[1]",
-            )
-        rows = [
-            _TrackRow(
-                stream=self._source_stream(raw.source, stream_type, position),
-                columns=_row_columns(meta, raw.column),
-            )
-            for position, meta in enumerate(result.by_type(stream_type))
-        ]
+        if raw.column == CHAPTERS_COLUMN:
+            stream_type: StreamType = "data"  # filler: a chapter row has no track
+            rows = self._chapter_rows(raw, unnest, select)
+        else:
+            stream_type = _ARRAY_COLUMNS[raw.column]
+            result = self.probes.get(raw.source)
+            if result is None:
+                raise _error(
+                    ErrorCode.INPUT_NOT_FOUND,
+                    f"cannot unnest '{raw.source}.{raw.column}' of "
+                    f"'{self._path_of(raw.source)}': file not found or unreadable",
+                    unnest,
+                    fallback=select,
+                    hint=f"unnest lists the tracks of a file and reads their "
+                    f"metadata, and only a readable input has either; subscript "
+                    f"one stream instead, e.g. {raw.source}.{raw.column}[1]",
+                )
+            rows = [
+                _TrackRow(
+                    stream=self._source_stream(raw.source, stream_type, position),
+                    columns=_row_columns(meta, raw.column),
+                )
+                for position, meta in enumerate(result.by_type(stream_type))
+            ]
         if env.relation is None:
             env.relation = _RowRelation()
         env.bindings[alias] = _RowBinding(
@@ -3116,44 +3130,27 @@ class _Lowerer:
             return alias
         return self.res.input_paths[index]
 
-    def _add_chapter_rows(
-        self, table: exp.Expr, alias_node: exp.Expr | None, env: _Env, select: exp.Select
-    ) -> None:
-        """Bind one ``chapters(<input>) alias`` table: one row per chapter.
+    def _chapter_rows(
+        self, raw: RawTrackRows, unnest: exp.Expr, select: exp.Select
+    ) -> list[_TrackRow]:
+        """The rows of ``unnest(<input>.chapters)``: one per probed chapter.
 
-        A sibling of :meth:`_add_track_rows`, not a call to it: a chapter row
-        has no ``track`` column (`ROW_SCHEMAS["chapters"]` carries none), so
-        it always takes the "first row table" branch of :meth:`_join_rows` --
-        resolve's mixing guard (``_add_chapters_table`` /
-        ``_add_track_rows``) already refused any query that would need a
-        second one to join against.
+        The one array column whose elements are not streams, so every row
+        carries `_NO_CHAPTER_STREAM` in place of a track and only the
+        `ROW_SCHEMAS["chapters"]` metadata columns are ever read.
         """
-        alias = (
-            _fold(alias_node.this)
-            if isinstance(alias_node, exp.TableAlias) and alias_node.this is not None
-            else ""
-        )
-        raw = self.res.track_rows.get(alias)
-        if raw is None:  # defensive: resolve records every chapters() alias
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                "malformed chapters() in FROM",
-                table,
-                fallback=select,
-                hint="chapters(f) reads one input's chapters, e.g. chapters(f) c",
-            )
         result = self.probes.get(raw.source)
         if result is None:
             raise _error(
                 ErrorCode.INPUT_NOT_FOUND,
                 f"cannot read chapters of '{self._path_of(raw.source)}': file "
                 "not found or unreadable",
-                table,
+                unnest,
                 fallback=select,
-                hint="chapters(f) lists a file's chapters, and only a readable "
-                "input has any",
+                hint=f"unnest({raw.source}.{CHAPTERS_COLUMN}) lists a file's "
+                "chapters, and only a readable input has any",
             )
-        rows = [
+        return [
             _TrackRow(
                 stream=_NO_CHAPTER_STREAM,
                 columns={
@@ -3165,16 +3162,6 @@ class _Lowerer:
             )
             for chapter in result.chapters
         ]
-        if env.relation is None:
-            env.relation = _RowRelation()
-        env.bindings[alias] = _RowBinding(
-            alias=alias,
-            source=raw.source,
-            column="chapters",
-            type="data",  # never read: a chapters row has no `track` column
-            relation=env.relation,
-        )
-        self._join_rows(env.relation, alias, rows, None, env, select)
 
     def _add_table(self, table: exp.Expr | None, env: _Env, select: exp.Select) -> None:
         if not isinstance(table, exp.Table):
@@ -3191,9 +3178,6 @@ class _Lowerer:
             # `FROM ffmpeg.<source>(...) alias`: resolve already
             # shape-checked it and parked the record in `res.source_filters`.
             self._add_source(table, alias_node, env, select)
-            return
-        if isinstance(inner, exp.Anonymous) and str(inner.this).lower() == "chapters":
-            self._add_chapter_rows(table, alias_node, env, select)
             return
         if isinstance(inner, exp.Anonymous):
             if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
@@ -4655,7 +4639,9 @@ class _Lowerer:
                 "a SELECT column is an output stream",
                 anchor,
                 fallback=select,
-                hint=_CHAPTER_ROW_HINT if binding.column == "chapters" else _ROW_METADATA_HINT,
+                hint=_CHAPTER_ROW_HINT
+                if binding.column == CHAPTERS_COLUMN
+                else _ROW_METADATA_HINT,
             )
         if not binding.rows:
             raise _error(
@@ -5172,6 +5158,25 @@ class _Lowerer:
                 fallback=select,
                 hint=f"give it an alias to write it back, e.g. SELECT "
                 f"{alias}.video[1], {alias}.{name} AS {name}",
+            )
+        if name == CHAPTERS_COLUMN:
+            if index is not None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{alias}.{CHAPTERS_COLUMN}' cannot be subscripted: a "
+                    "chapter is not a stream",
+                    anchor,
+                    fallback=select,
+                    hint=chapters_unnest_hint(alias),
+                )
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{CHAPTERS_COLUMN}' carries no streams: it is an "
+                "array of chapter records, and a SELECT column of a media "
+                "query is an output stream",
+                anchor,
+                fallback=select,
+                hint=chapters_unnest_hint(alias),
             )
         if name == _FRAME_COLUMN:
             if index is not None:
@@ -6704,6 +6709,11 @@ class _Lowerer:
                     if name != ROW_STREAM_COLUMN:
                         return self._row_metadata_cells(binding, name, expr, select)
                 elif (
+                    isinstance(binding, _InputBinding)
+                    and _fold(expr.this) == CHAPTERS_COLUMN
+                ):
+                    return self._chapters_cells(binding.alias, expr, select, cardinality)
+                elif (
                     isinstance(binding, _InputBinding | _SourceBinding)
                     and _fold(expr.this) in _ARRAY_COLUMNS
                 ):
@@ -6753,6 +6763,36 @@ class _Lowerer:
                 hint=f"{binding.column} track rows expose {', '.join(sorted(schema))}",
             )
         return [None if row is None else row.columns.get(name) for row in binding.rows]
+
+    def _chapters_cells(
+        self, alias: str, anchor: exp.Expr, select: exp.Select, cardinality: int
+    ) -> list[CellValue]:
+        """A bare ``<input>.chapters`` as ONE array cell, broadcast to every row.
+
+        The array's records print in schema order (index, title, start_t,
+        end_t): ``{(1,Intro,0.0,1.0),(2,Chapter 1,1.0,2.0)}``. Unnest it to
+        read the fields as columns.
+        """
+        result = self.probes.get(alias)
+        if result is None:
+            raise _error(
+                ErrorCode.INPUT_NOT_FOUND,
+                f"cannot read chapters of '{self._path_of(alias)}': file not "
+                "found or unreadable",
+                anchor,
+                fallback=select,
+                hint=f"'{alias}.{CHAPTERS_COLUMN}' is the container's own "
+                "chapter list, and only a readable input has one",
+            )
+        cell = ArrayCell(
+            elements=tuple(
+                RecordCell(
+                    fields=(chapter.index, chapter.title, chapter.start_t, chapter.end_t)
+                )
+                for chapter in result.chapters
+            )
+        )
+        return [cell] * cardinality
 
     def _array_cell_broadcast(
         self, node: exp.Expr, env: _Env, select: exp.Select, cardinality: int
@@ -6993,7 +7033,7 @@ def _row_metadata_column(node: exp.Expr, env: _Env) -> str | None:
     if table_node is None:
         return None
     binding = env.bindings.get(_fold(table_node))
-    if not isinstance(binding, _RowBinding) or binding.column == "chapters":
+    if not isinstance(binding, _RowBinding) or binding.column == CHAPTERS_COLUMN:
         return None
     name = _fold(node.this)
     return None if name == ROW_STREAM_COLUMN else name

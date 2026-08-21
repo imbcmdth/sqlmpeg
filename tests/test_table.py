@@ -9,7 +9,14 @@ singular, and the stream-placeholder forms -- built directly against
 
 from __future__ import annotations
 
-from sqlmpeg.table import ArrayCell, StreamCell, TableResult, render_csv, render_table
+from sqlmpeg.table import (
+    ArrayCell,
+    RecordCell,
+    StreamCell,
+    TableResult,
+    render_csv,
+    render_table,
+)
 
 
 def test_widths_are_max_of_header_and_values() -> None:
@@ -172,3 +179,34 @@ def test_csv_array_cell_placeholder() -> None:
     # The comma inside the braces is a real field separator to `csv`, which
     # quotes the whole field -- stock `QUOTE_MINIMAL`, same as any other value.
     assert render_csv(result, header=False) == '"{<audio 0:a:0>,<audio 0:a:1>}"\n'
+
+
+# ---------------------------------------------------------------------------
+# RecordCell
+# ---------------------------------------------------------------------------
+
+
+_CHAPTER_ARRAY = ArrayCell(
+    elements=(
+        RecordCell(fields=(1, "Intro", 0.0, 1.0)),
+        RecordCell(fields=(2, "Chapter 1", 1.0, 2.0)),
+    )
+)
+
+
+def test_record_cell_parenthesizes_the_comma_joined_fields() -> None:
+    result = TableResult(columns=["chapters"], rows=[[_CHAPTER_ARRAY]])
+    text = render_table(result)
+    assert text.split("\n")[2].strip() == "{(1,Intro,0.0,1.0),(2,Chapter 1,1.0,2.0)}"
+
+
+def test_record_cell_null_field_is_empty() -> None:
+    result = TableResult(columns=["c"], rows=[[RecordCell(fields=(1, None, 0.0, 1.0))]])
+    assert render_table(result).split("\n")[2].strip() == "(1,,0.0,1.0)"
+
+
+def test_csv_record_array_is_one_quoted_field() -> None:
+    result = TableResult(columns=["chapters"], rows=[[_CHAPTER_ARRAY]])
+    assert render_csv(result, header=False) == (
+        '"{(1,Intro,0.0,1.0),(2,Chapter 1,1.0,2.0)}"\n'
+    )

@@ -255,12 +255,26 @@ _COPY_ALLOWED = frozenset({"this", "kind", "credentials", "files", "params"})
 # compile-time expression; lower reads it off the probe.
 INPUT_DURATION_COLUMN = "duration"
 
+# The record-array pseudo-column every INPUT alias carries: the container's
+# chapter list. An array VALUE like the stream arrays, unnested the same way,
+# but its records are not streams -- no subscript, nothing to select as output.
+CHAPTERS_COLUMN = "chapters"
+
 # The structural column names an INPUT alias exposes. A CTE alias exposes
 # whatever its body named with AS, so the whitelist does not apply there (lower
 # checks those). `subtitle`/`data` have the same array/subscript/splat surface
 # as video/audio but are passthrough-only downstream (lower enforces that half).
 _INPUT_COLUMNS = frozenset(
-    {"frame", "video", "audio", "subtitle", "data", "t", INPUT_DURATION_COLUMN}
+    {
+        "frame",
+        "video",
+        "audio",
+        "subtitle",
+        "data",
+        "t",
+        INPUT_DURATION_COLUMN,
+        CHAPTERS_COLUMN,
+    }
 )
 
 # The container tags an INPUT alias also exposes, as text pseudo-columns read
@@ -285,10 +299,14 @@ _INPUT_TAG_COLUMNS = frozenset(INPUT_TAG_COLUMNS)
 # What a hint says about them: three keys standing for the twelve.
 _INPUT_TAGS_HINT = f"container tags ({', '.join(INPUT_TAG_COLUMNS[:3])}, ...)"
 
+# The array columns whose elements are STREAMS: the only ones a subscript or
+# a `[k].<column>` metadata accessor reaches.
+_STREAM_ARRAY_COLUMNS = frozenset({"video", "audio", "subtitle", "data"})
+
 # The array columns `unnest(<alias>.<name>)` accepts. Exactly the
 # array-typed half of `_INPUT_COLUMNS`: `frame` is one stream, `t` is a
-# timeline and `duration` is a scalar, and none of them is a set of tracks.
-_UNNEST_COLUMNS = frozenset({"video", "audio", "subtitle", "data"})
+# timeline and `duration` is a scalar, and none of them is a set of rows.
+_UNNEST_COLUMNS = _STREAM_ARRAY_COLUMNS | {CHAPTERS_COLUMN}
 
 # The compile-time type of a track-row column. `stream` is the track itself
 # (the only column that can BE an output); `text` and `number` are probed
@@ -332,10 +350,10 @@ ROW_SCHEMAS: dict[str, dict[str, RowColumnType]] = {
     },
     "subtitle": dict(_ROW_COMMON),
     "data": dict(_ROW_COMMON),
-    # `chapters(f)` rows: no `track` column at all -- a chapter is not a
-    # stream, so there is nothing to select as output, only metadata to read
+    # `unnest(f.chapters)` rows: no `track` column at all -- a chapter is not
+    # a stream, so there is nothing to select as output, only metadata to read
     # or filter on. `index` is ffprobe's own chapter order, 1-based.
-    "chapters": {
+    CHAPTERS_COLUMN: {
         "index": "number",
         "title": "text",
         "start_t": "number",
@@ -385,7 +403,7 @@ _KWARG_HINT = (
     "e.g. gblur(a.frame, sigma => 5)"
 )
 _UNNEST_HINT = (
-    "unnest takes one bare stream array of an input alias and needs a name for "
+    "unnest takes one bare array column of an input alias and needs a name for "
     "its rows, e.g. FROM input('film.mkv') f, unnest(f.audio) t"
 )
 _ROW_WHERE_HINT = (
@@ -1032,14 +1050,12 @@ class RawTrackRows:
 
     `source` is the INPUT alias whose array was unnested, already known to be
     comma-visible at this point in the FROM clause; `column` is one of
-    ``video``/``audio``/``subtitle``/``data`` and decides the row schema.
-    `node` is the ``exp.Unnest`` itself, the anchor for anything lower rejects
-    about the table rather than about a column of it.
+    ``video``/``audio``/``subtitle``/``data``/``chapters`` and decides the row
+    schema. `node` is the ``exp.Unnest`` itself, the anchor for anything lower
+    rejects about the table rather than about a column of it.
 
-    ``chapters(<alias>) c`` in FROM binds one of these too -- a sibling shape,
-    not a variant of unnest: `column` is the literal string ``"chapters"``
-    (its own ``ROW_SCHEMAS`` entry, no ``track`` column) and `node` is the
-    ``exp.Table`` the call itself parsed as.
+    ``chapters`` is the one non-stream array: its rows carry no ``track``
+    column (its own ``ROW_SCHEMAS`` entry), only chapter metadata.
     """
 
     alias: str
@@ -1125,8 +1141,7 @@ class Resolved:
     order across the whole script. Disjoint from every other name
     table: a row alias takes no ``-i`` of its own — its streams belong to the
     input alias named in ``RawTrackRows.source`` — and shares the one flat
-    namespace views, CTEs and aliases live in. ``chapters(<input>) c`` also
-    lands here, `column` set to ``"chapters"``."""
+    namespace views, CTEs and aliases live in."""
 
     values_ctes: dict[str, RawValuesTable] = field(default_factory=dict)
     """``WITH <alias>(<cols>) AS (VALUES ...)`` records, keyed by alias.
@@ -1136,6 +1151,14 @@ class Resolved:
 
 def _listed_columns(names: Iterable[str]) -> str:
     return ", ".join(sorted(names))
+
+
+def chapters_unnest_hint(alias: str) -> str:
+    """What to write instead of reaching into ``<alias>.chapters`` directly."""
+    return (
+        f"unnest it into rows: unnest({alias}.{CHAPTERS_COLUMN}) c, then read "
+        "c.index, c.title, c.start_t and c.end_t"
+    )
 
 
 def _unwrap_paren(node: exp.Expr) -> exp.Expr:
@@ -1164,14 +1187,26 @@ def _bare_array_error(sub: exp.Column, fallback: exp.Expr) -> SqlmpegError | Non
     ):
         alias = _ident_name(db_node)
         array_column = _ident_name(table_node)
+        if array_column == CHAPTERS_COLUMN:
+            message = (
+                f"'{alias}.{CHAPTERS_COLUMN}.{sub.name}' needs a row: an array "
+                "has no metadata of its own"
+            )
+            hint = (
+                f"unnest the array (unnest({alias}.{CHAPTERS_COLUMN}) c) and read "
+                f"c.{sub.name}"
+            )
+        else:
+            message = (
+                f"'{alias}.{array_column}.{sub.name}' needs a subscript: an "
+                "array has no metadata of its own"
+            )
+            hint = (
+                f"subscript one track ({alias}.{array_column}[1].{sub.name}) or "
+                f"unnest the whole array (unnest({alias}.{array_column}) t)"
+            )
         return _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            f"'{alias}.{array_column}.{sub.name}' needs a subscript: an array "
-            "has no metadata of its own",
-            sub,
-            fallback=fallback,
-            hint=f"subscript one track ({alias}.{array_column}[1].{sub.name}) or "
-            f"unnest the whole array (unnest({alias}.{array_column}) t)",
+            ErrorCode.UNSUPPORTED_SQL, message, sub, fallback=fallback, hint=hint
         )
     return None
 
@@ -1254,11 +1289,11 @@ def from_items(select: exp.Select) -> list[exp.Expr]:
 
 
 def _has_row_source(select: exp.Select, visible: set[str]) -> bool:
-    """True if this branch's FROM clause holds rows: ``unnest(...)``, its
-    sibling ``chapters(...)``, or a reference to a CTE or view -- each of
-    which contributes rows to group over, and admits the ORDER BY carve-out."""
+    """True if this branch's FROM clause holds rows: ``unnest(...)`` or a
+    reference to a CTE or view -- each of which contributes rows to group
+    over, and admits the ORDER BY carve-out."""
     for item in from_items(select):
-        if isinstance(item, exp.Unnest) or _is_chapters_call(item):
+        if isinstance(item, exp.Unnest):
             return True
         if (
             isinstance(item, exp.Table)
@@ -1307,15 +1342,6 @@ def _references_row(node: exp.Expr, scope: dict[str, str]) -> bool:
         if table_node is not None and scope.get(_ident_name(table_node)) == "row":
             return True
     return False
-
-
-def _is_chapters_call(item: exp.Expr) -> bool:
-    """True for a bare ``chapters(...)`` FROM item, shape only (unvalidated)."""
-    return (
-        isinstance(item, exp.Table)
-        and isinstance(item.this, exp.Anonymous)
-        and str(item.this.this).lower() == "chapters"
-    )
 
 
 def _unwrap(node: exp.Expr) -> exp.Expr:
@@ -2891,9 +2917,6 @@ class _Resolver:
         if namespaced:
             self._add_source(table, inner, alias_node, scope)
             return
-        if isinstance(inner, exp.Anonymous) and str(inner.this).lower() == "chapters":
-            self._add_chapters_table(table, inner, alias_node, scope)
-            return
         if isinstance(inner, exp.Anonymous):
             self._add_input(table, inner, alias_node, scope)
             return
@@ -2976,7 +2999,7 @@ class _Resolver:
         if len(arguments) != 1:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                "unnest takes exactly one stream array",
+                "unnest takes exactly one array column",
                 _first_expression(arguments[1:]) or unnest,
                 fallback=unnest,
                 hint=_UNNEST_HINT,
@@ -2985,7 +3008,7 @@ class _Resolver:
         if not isinstance(argument, exp.Column) or isinstance(argument.this, exp.Star):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                "unnest takes a bare stream array, not "
+                "unnest takes a bare array column, not "
                 f"{_describe_unnest_arg(argument)}",
                 argument if isinstance(argument, exp.Expr) else unnest,
                 fallback=unnest,
@@ -3022,7 +3045,7 @@ class _Resolver:
             what = "a track-row table" if kind == "row" else f"a {kind}"
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{source}' is {what}, and only an input's stream array can "
+                f"'{source}' is {what}, and only an input's array column can "
                 "be unnested",
                 table_node,
                 fallback=unnest,
@@ -3032,7 +3055,7 @@ class _Resolver:
         if column not in _UNNEST_COLUMNS:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{source}.{column}' is not a stream array",
+                f"'{source}.{column}' is not an array column",
                 argument,
                 fallback=unnest,
                 hint=f"unnest one of {_listed_columns(_UNNEST_COLUMNS)}, "
@@ -3062,107 +3085,8 @@ class _Resolver:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
             )
-        if any(self.track_rows[a].column == "chapters" for a in scope if scope[a] == "row"):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                "unnest(...) cannot combine with chapters(...) in the same query",
-                unnest,
-                hint="chapters(f) is its own row table; read it in a separate query",
-            )
         self.track_rows[alias] = RawTrackRows(
             alias=alias, source=source, column=column, node=unnest
-        )
-        scope[alias] = "row"
-
-    def _add_chapters_table(
-        self,
-        table: exp.Table,
-        func: exp.Anonymous,
-        alias_node: exp.Expr | None,
-        scope: dict[str, str],
-    ) -> None:
-        """``chapters(<input alias>) <alias>`` in FROM -- a sibling of unnest.
-
-        One argument: a bare, comma-visible INPUT alias (not a stream array,
-        not a subscript -- chapters belong to the whole file). At most one
-        chapters(f) row table per query, and it may not combine with an
-        unnest(...) track-row table: neither has anything to align against
-        the other, so there is no join to make of them.
-        """
-        args = func.expressions
-        if len(args) != 1:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                "chapters() takes exactly one input alias",
-                _first_expression(args[1:]) or table,
-                fallback=table,
-                hint="e.g. FROM input('film.mkv') f, chapters(f) c",
-            )
-        argument = args[0]
-        if (
-            not isinstance(argument, exp.Column)
-            or isinstance(argument.this, exp.Star)
-            or argument.args.get("table") is not None
-        ):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                "chapters() takes a bare input alias, not "
-                f"{_describe_unnest_arg(argument)}",
-                argument if isinstance(argument, exp.Expr) else table,
-                fallback=table,
-                hint="e.g. FROM input('film.mkv') f, chapters(f) c",
-            )
-        source = _ident_name(argument.this)
-        kind = scope.get(source)
-        if kind is None:
-            raise _error(
-                ErrorCode.UNKNOWN_ALIAS,
-                f"unknown alias '{source}'",
-                argument,
-                fallback=table,
-                hint=self._known_hint(scope),
-            )
-        if kind != "input":
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"'{source}' is a {kind}, and chapters() only reads an input's "
-                "own chapters",
-                argument,
-                fallback=table,
-                hint="chapters(f) takes an input('path') alias",
-            )
-        if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"chapters({source}) requires an alias",
-                table,
-                hint=f"name the rows, e.g. chapters({source}) c",
-            )
-        if alias_node.args.get("columns"):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                "table column aliases are not supported",
-                alias_node,
-                fallback=table,
-                hint="a chapter row's columns are fixed: "
-                f"{_listed_columns(ROW_SCHEMAS['chapters'])}",
-            )
-        alias = _ident_name(alias_node.this)
-        self._reserve(alias, alias_node.this)
-        if alias in scope:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
-            )
-        if "row" in scope.values():
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                "chapters(...) cannot combine with another row table in the "
-                "same query",
-                table,
-                hint="chapters(f) is its own row table; read it in a separate query",
-            )
-        self.track_rows[alias] = RawTrackRows(
-            alias=alias, source=source, column="chapters", node=table
         )
         scope[alias] = "row"
 
@@ -3203,12 +3127,25 @@ class _Resolver:
     ) -> None:
         func_name = str(func.this).lower()
         if func_name != "input":
+            hint = "the only table function is input('path')"
+            if func_name == CHAPTERS_COLUMN:
+                argument = func.expressions[0] if func.expressions else None
+                source = (
+                    _ident_name(argument.this)
+                    if isinstance(argument, exp.Column)
+                    and isinstance(argument.this, exp.Identifier)
+                    else "f"
+                )
+                hint = (
+                    f"chapters is an array column of the input: write "
+                    f"unnest({source}.{CHAPTERS_COLUMN}) c"
+                )
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"unsupported table function {func_name}()",
                 func,
                 fallback=table,
-                hint="the only table function is input('path')",
+                hint=hint,
             )
         args = func.expressions
         if not args or not (isinstance(args[0], exp.Literal) and args[0].is_string):
@@ -3479,14 +3416,23 @@ class _Resolver:
             raise self._accessor_alias_error(
                 alias, kind, array_column, name, table_node, scope, fallback
             )
-        if array_column not in _UNNEST_COLUMNS:
+        if array_column == CHAPTERS_COLUMN:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{CHAPTERS_COLUMN}' cannot be subscripted: a chapter "
+                "is not a stream",
+                inner,
+                fallback=fallback,
+                hint=chapters_unnest_hint(alias),
+            )
+        if array_column not in _STREAM_ARRAY_COLUMNS:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"'{alias}.{array_column}' has no per-track metadata",
                 inner,
                 fallback=fallback,
                 hint=f"metadata accessors need an array column: "
-                f"{_listed_columns(_UNNEST_COLUMNS)}",
+                f"{_listed_columns(_STREAM_ARRAY_COLUMNS)}",
             )
         if subscript_index(bracket) is None:  # defensive: _check_subscript checked it
             raise _error(
@@ -4129,6 +4075,15 @@ class _Resolver:
                     table_node,
                     fallback=where,
                     hint=self._known_hint(scope),
+                )
+            if scope[alias] == "input" and _ident_name(column.this) == CHAPTERS_COLUMN:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{alias}.{CHAPTERS_COLUMN}' is an array of chapter "
+                    "records, not a single value",
+                    column,
+                    fallback=where,
+                    hint=chapters_unnest_hint(alias),
                 )
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,

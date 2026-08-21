@@ -244,9 +244,9 @@ def _generate_avs(subs_path: Path) -> None:
 def _generate_av_chapters() -> None:
     """av2.mp4 remuxed with two chapters, via ffmpeg's own ffmetadata `data:` URI.
 
-    The chapters(f) read fixture (plan 077): same mechanism the compiler
-    itself uses to WRITE chapters, run once by hand to build a file to READ
-    them back from. Must run after av.mp4 exists.
+    The chapter-reading fixture: same mechanism the compiler itself uses to
+    WRITE chapters, run once by hand to build a file to READ them back from.
+    Must run after av.mp4 exists.
     """
     uri = "data:text/plain;base64," + base64.b64encode(
         _CHAPTERS_FFMETADATA.encode()

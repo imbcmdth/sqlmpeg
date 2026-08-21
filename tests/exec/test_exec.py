@@ -1543,8 +1543,53 @@ def test_extractplanes_extracts_the_luma_plane_as_grey(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# chapters: write from a VALUES CTE, read back with ffprobe
+# chapters: read the array column off a real file; write from a VALUES CTE
+# and read that back with ffprobe
 # ---------------------------------------------------------------------------
+
+
+def test_unnest_chapters_prints_the_files_own_chapter_list(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recipe 39 against the real fixture: the printed rows are exactly what
+    ffprobe reports for the same file, read through the array column."""
+    source = _FIXTURES_DIR / "av-chapters.mkv"
+    _require_fixture(source)
+    query = (
+        "SELECT c.index, c.title, c.start_t, c.end_t "
+        f"FROM input('{_sql_path(source)}') f, unnest(f.chapters) c"
+    )
+
+    assert cli.main([query]) == 0
+
+    printed = capsys.readouterr().out
+    expected = _ffprobe_chapters(source)
+    assert f"({len(expected)} rows)" in printed
+    for position, chapter in enumerate(expected, start=1):
+        tags = chapter["tags"]
+        assert isinstance(tags, dict)
+        title = tags["title"]
+        assert isinstance(title, str)
+        row = [line for line in printed.splitlines() if line.startswith(f" {position} ")]
+        assert len(row) == 1, printed
+        assert title in row[0]
+        assert f"{float(str(chapter['start_time'])):g}" in row[0]
+
+
+def test_a_bare_chapters_column_prints_the_whole_list_as_one_cell(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The array VALUE over a real file: one cell, one record per chapter."""
+    source = _FIXTURES_DIR / "av-chapters.mkv"
+    _require_fixture(source)
+    query = f"SELECT f.chapters FROM input('{_sql_path(source)}') f"
+
+    assert cli.main([query]) == 0
+
+    printed = capsys.readouterr().out
+    assert "{(1,Intro,0.0,1.0),(2,Chapter 1,1.0,2.0)," in printed
+    assert "(3,Chapter 2,2.0,3.0),(4,Credits,3.0,4.0)}" in printed
+    assert "(1 row)" in printed
 
 
 def test_values_cte_chapters_are_written_and_read_back(tmp_path: Path) -> None:

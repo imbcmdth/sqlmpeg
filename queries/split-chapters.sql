@@ -5,6 +5,6 @@
 -- example: sqlmpeg compile -f queries/split-chapters.sql -v source=in.mkv -v prefix=ch
 COPY (
   SELECT f.video[1], f.audio[1]
-  FROM input(:'source') f, chapters(f) c
+  FROM input(:'source') f, unnest(f.chapters) c
   WHERE f.t BETWEEN c.start_t AND c.end_t
 ) TO (:'prefix' || c.index::text || '.mkv')

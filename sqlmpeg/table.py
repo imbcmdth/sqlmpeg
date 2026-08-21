@@ -25,6 +25,7 @@ from .ir import StreamType
 __all__ = [
     "StreamCell",
     "ArrayCell",
+    "RecordCell",
     "CellValue",
     "TableResult",
     "TableSink",
@@ -48,8 +49,20 @@ class StreamCell:
 
 
 @dataclass(frozen=True)
+class RecordCell:
+    """One record of a record array (a chapter), one nested cell.
+
+    Postgres record-literal style over the fields' own cell text, in schema
+    order -- ``(1,Intro,0.0,1.0)``. Nothing is quoted or escaped: these are
+    printable data, not a re-parseable literal.
+    """
+
+    fields: tuple[CellValue, ...]
+
+
+@dataclass(frozen=True)
 class ArrayCell:
-    """A bare input array column's full stream list, one table cell.
+    """A bare input array column's full element list, one table cell.
 
     Postgres array-literal style over the elements' own cell text --
     ``{<audio 0:a:0>,<audio 0:a:1>}`` -- braces even for one element.
@@ -59,9 +72,9 @@ class ArrayCell:
 
 
 # One table cell: NULL (empty, psql-style), a probed scalar, a stream
-# placeholder, or an array of cells. Never a raw FrameRef -- that would leak
-# IR shape into printable data.
-CellValue = str | int | float | bool | None | StreamCell | ArrayCell
+# placeholder, a record, or an array of cells. Never a raw FrameRef -- that
+# would leak IR shape into printable data.
+CellValue = str | int | float | bool | None | StreamCell | RecordCell | ArrayCell
 
 
 @dataclass(frozen=True)
@@ -97,6 +110,8 @@ def _cell_text(cell: CellValue) -> str:
         return f"<{cell.type} {cell.spec}>"
     if isinstance(cell, ArrayCell):
         return "{" + ",".join(_cell_text(element) for element in cell.elements) + "}"
+    if isinstance(cell, RecordCell):
+        return "(" + ",".join(_cell_text(field) for field in cell.fields) + ")"
     return str(cell)
 
 
