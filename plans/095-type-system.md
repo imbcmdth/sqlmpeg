@@ -223,6 +223,41 @@ R9. Homonyms: type names and column/alias names are separate
 - O6 no accessor sugar: `f.tags.title`, `a.tags.language`, required.
 - R3 field access on a filter output is a typed rejection.
 
+
+## 9. Waves (dependency-ordered; each is its own agent + review)
+
+A. FOUNDATION - `sqlmpeg/types.py` holds the declarations as data
+   (types, fields, field kind stream/text/number/array, W vs RO,
+   which array unnests to which record). `ROW_SCHEMAS`, `_ROW_COMMON`,
+   `_INPUT_COLUMNS`, `_UNNEST_COLUMNS`, `_STREAM_ARRAY_COLUMNS`,
+   `INPUT_TAG_COLUMNS`, `ROW_STREAM_COLUMN`, `CHAPTERS_COLUMN`,
+   `INPUT_DURATION_COLUMN` become views over it and stop being
+   independent sources of truth. ZERO behavior change: every existing
+   test passes untouched. Acceptance: 2256 default + 213 exec green
+   with no test file edited.
+
+B. RENAMES - `.track` and `f.frame` leave the language. `a.track` ->
+   `a` (the row IS the stream), `f.frame` -> `f.video[1]`. Both become
+   typed rejections with hints naming the replacement. Sweep: ~38 + 30
+   cookbook references, 18 query files, ~850 test references. Every
+   pinned ffmpeg command byte-identical.
+
+C. MAPS - `tags tag[]` replaces the twelve container tag columns and
+   the per-stream `language`/`title` fields; read by path
+   (`f.tags.title`, `a.tags.language`), written as today's tag columns
+   (`'eng' AS language` constructs the entry, `NULL` clears).
+   `disposition flag[]` with the closed ffmpeg key set, read
+   `a.disposition.forced`, written from set flags; the reserved
+   tag-key special case disappears.
+
+D. RULES - `SELECT *` per R2 (container: array columns; row: fields),
+   field access on a filter output rejected (R3), RO-field
+   construction rejected (R4), constructed-chapter constraints (O2),
+   attachments never routed to `f.data` (O4).
+
+Then: orchestrator docs - this file becomes docs/types.md, rows.md
+shrinks to point at it, dialect.md and the prompt follow, release.
+
 ## After this lands
 094 (literals, output columns, cues), then 096 (functions: scalar and
 table-returning, with RETURNS over these types).
