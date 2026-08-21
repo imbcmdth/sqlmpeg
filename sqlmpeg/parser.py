@@ -859,7 +859,15 @@ def parse(text: str) -> exp.Expression:
         raise SqlmpegError(
             ErrorCode.PARSE_ERROR, _parse_error_message(err), line=1, col=1
         ) from err
-    except Exception as err:  # sqlglot bug / recursion / anything at all
+    except RecursionError as err:
+        raise SqlmpegError(
+            ErrorCode.PARSE_ERROR,
+            "query nests too deeply to parse",
+            line=1,
+            col=1,
+            hint="flatten the expression: fewer nested parentheses or calls",
+        ) from err
+    except Exception as err:  # sqlglot bug / anything at all
         raise SqlmpegError(
             ErrorCode.PARSE_ERROR,
             f"could not parse SQL ({err.__class__.__name__})",

@@ -2560,3 +2560,20 @@ def test_an_input_column_outside_the_tag_list_is_still_unknown() -> None:
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "unknown column 'f.mood'" in err.message
     assert "container tags" in (err.hint or "")
+
+
+def test_a_query_nested_too_deeply_is_a_plain_rejection() -> None:
+    """Deep nesting is user input, not a bug: a typed, non-internal error
+    with a plain message, at whichever layer the recursion limit bites."""
+    import pytest
+
+    from sqlmpeg.compiler import compile_sql
+    from sqlmpeg.errors import ErrorCode, SqlmpegError
+
+    depth = 3000
+    query = "SELECT " + "(" * depth + "a.video[1]" + ")" * depth + " FROM input('x.mp4') a"
+    with pytest.raises(SqlmpegError) as excinfo:
+        compile_sql(query)
+    assert excinfo.value.code is not ErrorCode.INTERNAL
+    assert "nests too deeply" in excinfo.value.message
+    assert "RecursionError" not in excinfo.value.message

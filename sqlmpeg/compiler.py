@@ -91,11 +91,11 @@ def compile_commands(text: str) -> list[Graph]:
         raise
     except RecursionError as err:
         raise SqlmpegError(
-            ErrorCode.INTERNAL,
-            "internal error while compiling (query nests too deeply)",
+            ErrorCode.UNSUPPORTED_SQL,
+            "query nests too deeply to compile",
             line=1,
             col=1,
-            hint="please report this query as a bug",
+            hint="flatten the expression: fewer nested parentheses or calls",
         ) from err
     except Exception as err:  # guardrail #7: no panics on user input
         raise SqlmpegError(
@@ -141,11 +141,11 @@ def compile_table_sql(text: str) -> list[TableSink]:
         raise
     except RecursionError as err:
         raise SqlmpegError(
-            ErrorCode.INTERNAL,
-            "internal error while compiling (query nests too deeply)",
+            ErrorCode.UNSUPPORTED_SQL,
+            "query nests too deeply to compile",
             line=1,
             col=1,
-            hint="please report this query as a bug",
+            hint="flatten the expression: fewer nested parentheses or calls",
         ) from err
     except Exception as err:  # guardrail #7: no panics on user input
         raise SqlmpegError(
