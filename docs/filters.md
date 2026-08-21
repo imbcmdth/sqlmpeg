@@ -109,9 +109,18 @@ $ sqlmpeg compile -f query.sql
 ffmpeg -i stereo.mp4 -filter_complex '[0:a:0]channelsplit[n10][n11];[n10]volume=volume=0.5[n2];[n11]volume=volume=2.0[n3];[n2][n3]amix=inputs=2[out0]' -map '[out0]' out.mp4
 ```
 
-Three N-input filters take however many streams you pass: `amix`, `hstack`, `vstack`. Their `inputs` option is set from the stream count; a written `inputs` that disagrees with the count is a typed error.
+The N-input filters take however many streams you pass: `amix`, `hstack`, `vstack`, `amerge`, `ffmpeg.join` (bare `join` is the SQL keyword), `interleave`, `ainterleave`, `ladspa`. Where the filter has an `inputs`/`nb_inputs` option it is set from the stream count, and a written value that disagrees is a typed error; `ladspa` has none - its pad count comes from the loaded plugin.
 
 To choose which tracks to pass in the first place (by language, codec, resolution), use track rows: [rows.md](rows.md).
+
+## Plugins
+
+Two filters load code at runtime, and both compile like any other call:
+
+- `frei0r(video, filter_name => '<plugin>', filter_params => 'a|b|c')` and the source `ffmpeg.frei0r_src(...)`: video effect plugins found through the `FREI0R_PATH` environment variable. [Recipe 62](examples.md#62-use-a-plugin-filter).
+- `ladspa(audio, ..., file => '<library>', plugin => '<label>', controls => 'c0|c1')`: audio plugins found through `LADSPA_PATH`; pass as many streams as the plugin has input ports.
+
+Whether either exists is a property of the installed ffmpeg build, exactly like every other filter - `frei0r` and `ladspa` both appear in common full builds. Plugin parameters are opaque strings to the compiler; their meaning belongs to the plugin.
 
 ## Not supported
 
