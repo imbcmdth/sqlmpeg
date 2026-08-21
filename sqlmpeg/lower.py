@@ -1149,6 +1149,9 @@ def _bare_name(node: exp.Expr) -> str | None:
     return None
 
 
+# A chapter needs a span; `title` is nullable and defaults to NULL, so a
+# VALUES CTE may leave the column out entirely.
+_CHAPTER_REQUIRED_COLUMNS = frozenset({"start_t", "end_t"})
 _CHAPTER_COLUMNS = frozenset({"start_t", "end_t", "title"})
 # Characters ffmetadata's own escaping would need (`\`, `=`, `;`, `#`, a
 # newline) -- rejected outright rather than silently writing a file ffmpeg
@@ -1163,15 +1166,18 @@ def _chapters_ffmetadata(raw: RawValuesTable) -> str:
     ``TIMEBASE=1/1`` so ``START``/``END`` are plain seconds -- exactly what
     the cookbook's pinned recipe expects, byte for byte. `raw.columns` are
     matched by NAME, not position: ``marks(title, start_t, end_t)`` works the
-    same as ``marks(start_t, end_t, title)``.
+    same as ``marks(start_t, end_t, title)``. `title` may be omitted; it
+    defaults to NULL like any nullable field.
     """
-    if frozenset(raw.columns) != _CHAPTER_COLUMNS:
+    written = frozenset(raw.columns)
+    if not _CHAPTER_REQUIRED_COLUMNS <= written or not written <= _CHAPTER_COLUMNS:
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            f"'{raw.alias}' must define exactly start_t, end_t, title, got "
-            f"{', '.join(raw.columns)}",
+            f"'{raw.alias}' must define start_t and end_t, and nothing but "
+            f"title besides, got {', '.join(raw.columns)}",
             raw.node,
-            hint=f"WITH {raw.alias}(start_t, end_t, title) AS (VALUES ...)",
+            hint=f"WITH {raw.alias}(start_t, end_t, title) AS (VALUES ...), "
+            "or leave title out",
         )
     index = {name: position for position, name in enumerate(raw.columns)}
     lines = [";FFMETADATA1"]
@@ -1181,7 +1187,8 @@ def _chapters_ffmetadata(raw: RawValuesTable) -> str:
         end_cell = row[index["end_t"]]
         start = _chapter_number(start_cell, raw.alias, "start_t")
         end = _chapter_number(end_cell, raw.alias, "end_t")
-        title = _chapter_title(row[index["title"]], raw.alias)
+        title_cell = row[index["title"]] if "title" in index else None
+        title = _chapter_title(title_cell, raw.alias) if title_cell is not None else None
         _check_chapter_span(
             raw.alias, position, start, end, previous, start_cell, end_cell
         )

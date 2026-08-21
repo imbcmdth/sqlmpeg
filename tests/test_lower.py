@@ -6622,14 +6622,14 @@ def test_chapters_option_must_name_a_real_values_cte() -> None:
     assert "names a VALUES CTE" in err.message
 
 
-def test_chapters_values_cte_needs_start_t_end_t_title_by_name() -> None:
+def test_chapters_values_cte_names_its_columns_start_t_end_t_title() -> None:
     err = _reject(
         "COPY (WITH marks(a, b, c) AS (VALUES (0, 60, 'Intro')) "
         "SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
         "TO 'out.mkv' WITH (chapters marks)"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "must define exactly start_t, end_t, title" in err.message
+    assert "must define start_t and end_t" in err.message
 
 
 def test_chapters_values_cte_rejects_a_non_numeric_start_t() -> None:
@@ -9520,3 +9520,28 @@ def test_a_disposition_survives_a_filter_the_way_a_tag_does() -> None:
         _flag_probes(),
     )
     assert g.sinks[0].outputs[0].disposition == ("forced",)
+
+
+def test_a_chapter_list_may_leave_title_out() -> None:
+    """title is nullable, so the VALUES CTE need not carry the column -
+    the same rule any nullable field follows at construction."""
+    query = (
+        "COPY (WITH marks(start_t, end_t) AS (VALUES (0, 30), (30, 90)) "
+        "SELECT f.video[1] FROM input('x.mp4') f) "
+        "TO 'o.mkv' WITH (chapters marks)"
+    )
+    graph = compile_sql(query)
+    document = base64.b64decode(graph.input_paths[1].split(",", 1)[1]).decode()
+    assert "title=" not in document
+    assert document.count("[CHAPTER]") == 2
+
+
+def test_a_chapter_list_still_needs_its_span() -> None:
+    query = (
+        "COPY (WITH marks(start_t, title) AS (VALUES (0, 'Intro')) "
+        "SELECT f.video[1] FROM input('x.mp4') f) "
+        "TO 'o.mkv' WITH (chapters marks)"
+    )
+    with pytest.raises(SqlmpegError) as excinfo:
+        compile_sql(query)
+    assert "must define start_t and end_t" in excinfo.value.message
