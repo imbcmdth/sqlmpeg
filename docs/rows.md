@@ -2,7 +2,7 @@
 
 Every FROM item is a compile-time table with a fixed shape. This page lists each shape, its columns, and what each column is for. Column values are ffprobe results, so inputs must be probeable wherever a metadata column is read (typed rejection otherwise); everything here evaluates at compile time - no filter, join, or sort reaches the ffmpeg command, only the wiring they decided.
 
-Column types: **stream** is selectable as output; **text**, **number** and **boolean** are values - usable in `WHERE`/`ON`, compile-time expressions (`CASE`, `||`, `::text`, `+ - * /`), tag columns, and table/CSV output, never as streams. A boolean stands alone as a condition (`WHERE t.disposition.default`) or compares against `true`/`false`. Unreported values are NULL with SQL semantics: `=` and `!=` both fail against NULL; use `IS [NOT] NULL`.
+The type vocabulary - what a stream record is, which fields a query may set, how the tag and disposition maps work - is [types.md](types.md). Here: the shapes and what you do with them. Unreported values are NULL with SQL semantics: `=` and `!=` both fail against NULL; use `IS [NOT] NULL`.
 
 ## Input rows - `input('film.mkv') f`
 

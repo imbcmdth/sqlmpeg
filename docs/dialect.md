@@ -34,7 +34,7 @@ dest    := 'path' | STDOUT | ( value-expression )
 ## FROM items
 
 Every FROM item is a compile-time table; the column model per shape is
-[rows.md](rows.md).
+[rows.md](rows.md), the type vocabulary [types.md](types.md).
 
 | form | rows | notes |
 | --- | --- | --- |
