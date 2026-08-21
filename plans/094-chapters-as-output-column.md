@@ -66,7 +66,34 @@ rewrite.
   subtitle track); rows.md gains the `chapter`/`cue` types and cue
   rows; dialect.md gains `ARRAY[ROW(...)::type]` in the value grammar.
 
-## Waves
+
+## Waves (dependency-ordered; the 095 lesson - split by machinery, not topic)
+
+A. CHAPTERS OUT. The `chapter` literal (`ARRAY[ROW(...)::chapter]`),
+   `chapters` as an output column with its three sources (literal,
+   copy-through, `array_agg` over rows), and the removal of the
+   `chapters`/`chapters_from` sink options. Emission is unchanged - the
+   same ffmetadata `data:` input - so recipe 40's pinned bytes must
+   come out byte-identical after its rewrite. The span checks already
+   exist as `_check_chapter_span` in lower.py; reuse, do not rewrite.
+   `title` stays optional (nullable fields need not be named).
+
+B. CUES. `unnest(v.cues) c` reading a WebVTT track (sqlmpeg parses the
+   VTT itself; ffprobe does not enumerate cues), and `cue[]` in a
+   subtitle position writing one - emission reuses the `data:` WebVTT
+   input `sqlmpeg.empty_captions()` builds. Chapters <-> cues both
+   ways. `cue` is already declared in types.py with `exposed=False`.
+
+C. ATTACHMENTS. `f.attachments` readable (ffprobe reports them as
+   streams with `codec_type=attachment`; the probe currently drops
+   them - see the O4 note in 095 wave D) and `attachment[]` writable,
+   emitting `-attach` with `-metadata:s:N mimetype=/filename=`. This
+   closes the last "not expressible" row in known_gaps.md. `attachment`
+   is declared with `exposed=False`; wave D's note says exposing the
+   container field wires it into STAR_COLUMNS, UNNEST_COLUMNS,
+   ROW_SCHEMAS and ROW_READONLY_FIELDS with no other edit.
+
+## Original wave sketch
 1. Recipes red first (40 rewritten, new VTT-import recipe, a literal
    recipe), plan committed.
 2. Implementation (opus): type + literal parsing/validation, the
