@@ -35,10 +35,6 @@ used in anger for a while.
 
 ### Robustness
 
-- The fuzz property (tests/test_fuzz.py, hypothesis over mutated
-  queries) currently allows `INTERNAL` as an outcome. Tighten it:
-  arbitrary input produces a compile or a *typed, non-internal* error -
-  guardrail #7 as an executable promise.
 - A cross-version ffmpeg matrix in CI: the registry snapshot mechanism
   already isolates version differences; run the default tier against
   captured 6.x/7.x/9.x registries.
@@ -59,6 +55,18 @@ In rough order of expected first-user pain:
 - Attachments and cover art.
 - HLS/DASH packaging - as array columns on a single row, the shape the
   one-row rule already reserves for manifests.
+- **Facts through filters.** A filter output carries no readable
+  facts today (known_gaps.md), though ffmpeg derives many. The lever
+  is the registry: an option typed `channel_layout` that names the
+  OUTPUT layout (`surround`'s `chl_out`, `channelmap`/`join`'s
+  `channel_layout`, `aformat`'s `channel_layouts`) propagates it when
+  given as a literal; likewise `w`/`h` for `scale`/`crop`/`pad`,
+  `fps` for `fps`, `pix_fmts` for `format`. Two audio exceptions need
+  their own rule: `pan` (layout is the first token of `args`) and
+  `channelsplit` (its option is the INPUT layout; each output pin is
+  one channel, `FL`/`FR`). An expression argument (`iw/2`) stays
+  unknown. Reads off a filter output then work where the fact is
+  derivable and reject where it is not.
 
 ### Documentation debt (the cheapest wins)
 
