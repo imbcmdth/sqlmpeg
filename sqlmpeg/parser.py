@@ -168,6 +168,7 @@ Notes for downstream passes (lower):
 
 from __future__ import annotations
 
+import difflib
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -179,19 +180,26 @@ from sqlglot.errors import ParseError, SqlglotError
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.types import (
     CHAPTERS_COLUMN,
+    DISPOSITION_COLUMN,
+    DISPOSITION_KEYS,
     INPUT_COLUMNS,
     INPUT_DURATION_COLUMN,
+    MAP_ELEMENTS,
     ROW_SCHEMAS,
     STREAM_ARRAY_COLUMNS,
+    STREAM_TAG_COLUMNS,
     TAGS_COLUMN,
     UNNEST_COLUMNS,
     is_array,
 )
 
 __all__ = [
+    "DISPOSITION_COLUMN",
+    "DISPOSITION_KEYS",
     "FILTER_NAMESPACE",
     "INPUT_DURATION_COLUMN",
     "MACRO_NAMESPACE",
+    "MAP_COLUMNS",
     "ROW_SCHEMAS",
     "ROW_STREAM",
     "TAGS_COLUMN",
@@ -205,12 +213,19 @@ __all__ = [
     "RawValuesTable",
     "Resolved",
     "column_label",
+    "disposition_key",
+    "flag_error",
+    "flag_hint",
     "from_entries",
     "from_items",
     "group_keys",
     "is_grouped",
     "is_value_expr",
     "kwarg_name",
+    "map_example",
+    "map_noun",
+    "map_path",
+    "map_ref",
     "parse",
     "resolve",
     "star_qualifier",
@@ -239,13 +254,19 @@ MACRO_NAMESPACE = "sqlmpeg"
 # row columns are checked.
 ROW_STREAM = "<stream>"
 
-# A tag is read by PATH -- `f.tags.title`, `a.tags.language` -- which parses as
-# a dotted column, one written part more than any other read. The two parts are
-# folded into one internal column name here (`_normalize_tag_paths`) so every
-# later pass looks up an ordinary column; the angle brackets keep it off the
-# surface, exactly as ROW_STREAM's do. `column_label` writes it back the way it
-# was typed wherever a rejection names it.
-_TAG_PATH_PREFIX = f"<{TAGS_COLUMN}>"
+# A map is read by PATH -- `f.tags.title`, `a.disposition.forced` -- which
+# parses as a dotted column, one written part more than any other read. The two
+# parts are folded into one internal column name here (`_normalize_map_paths`)
+# so every later pass looks up an ordinary column; the angle brackets keep it
+# off the surface, exactly as ROW_STREAM's do. `column_label` writes it back the
+# way it was typed wherever a rejection names it.
+MAP_COLUMNS = (TAGS_COLUMN, DISPOSITION_COLUMN)
+
+# The key each map's hints quote, so an example is never invented here.
+_MAP_EXAMPLES = {
+    TAGS_COLUMN: STREAM_TAG_COLUMNS[0],
+    DISPOSITION_COLUMN: DISPOSITION_KEYS[0],
+}
 
 # The spellings that left the language. Each keeps a rejection of its own
 # naming its replacement, so an old query says what to write instead.
@@ -493,28 +514,112 @@ def _ident_name(node: exp.Expr | None) -> str:
     return str(node.name).lower()
 
 
-# tag paths
+# map paths
+
+
+def map_path(column: str, key: str) -> str:
+    """The internal column name ``<alias>.<column>.<key>`` folds into."""
+    return f"<{column}>{key}"
+
+
+def map_ref(name: str) -> tuple[str, str] | None:
+    """The ``(map column, key)`` a folded column name carries, else None."""
+    for column in MAP_COLUMNS:
+        prefix = f"<{column}>"
+        if name.startswith(prefix):
+            return column, name[len(prefix) :]
+    return None
 
 
 def tag_path(key: str) -> str:
     """The internal column name ``<alias>.tags.<key>`` folds into."""
-    return f"{_TAG_PATH_PREFIX}{key}"
+    return map_path(TAGS_COLUMN, key)
 
 
 def tag_key(name: str) -> str | None:
     """The tag key a folded column name carries, or None for any other name."""
-    if not name.startswith(_TAG_PATH_PREFIX):
-        return None
-    return name[len(_TAG_PATH_PREFIX) :]
+    ref = map_ref(name)
+    return ref[1] if ref is not None and ref[0] == TAGS_COLUMN else None
+
+
+def disposition_key(name: str) -> str | None:
+    """The disposition key a folded column name carries, else None."""
+    ref = map_ref(name)
+    return ref[1] if ref is not None and ref[0] == DISPOSITION_COLUMN else None
 
 
 def column_label(name: str) -> str:
-    """A column name as it was TYPED: a folded tag path spelled back out."""
-    key = tag_key(name)
-    return name if key is None else f"{TAGS_COLUMN}.{key}"
+    """A column name as it was TYPED: a folded map path spelled back out."""
+    ref = map_ref(name)
+    return name if ref is None else f"{ref[0]}.{ref[1]}"
+
+
+def map_noun(column: str) -> str:
+    """The record a map column holds: `tags` holds tags, `disposition` flags."""
+    return MAP_ELEMENTS[column]
+
+
+def map_example(column: str) -> str:
+    """The key a hint quotes for one map column."""
+    return _MAP_EXAMPLES[column]
+
+
+def flag_hint(key: str) -> str:
+    """What to write instead of a key outside the closed disposition set."""
+    matches = difflib.get_close_matches(key, list(DISPOSITION_KEYS), n=1, cutoff=0.6)
+    if matches:
+        return f"did you mean '{matches[0]}'?"
+    return f"the disposition flags are {', '.join(DISPOSITION_KEYS)}"
+
+
+def flag_error(
+    label: str, key: str, node: exp.Expr | None, fallback: exp.Expr | None
+) -> SqlmpegError:
+    """A disposition key outside the closed set: the flag set is ffmpeg's own."""
+    return _error(
+        ErrorCode.UNSUPPORTED_SQL,
+        f"'{label}' is not a disposition flag",
+        node,
+        fallback=fallback,
+        hint=flag_hint(key),
+    )
+
+
+def _map_column_type(
+    ref: tuple[str, str], label: str, node: exp.Expr | None, fallback: exp.Expr | None
+) -> str:
+    """The type one folded map path reads: a tag is text, a flag is boolean."""
+    column, key = ref
+    if column == TAGS_COLUMN:
+        return "text"
+    if key not in DISPOSITION_KEYS:
+        raise flag_error(f"{label}.{column}.{key}", key, node, fallback)
+    return "boolean"
 
 
 # compile-time value shapes
+
+# How a literal and the type a comparison wanted are named back to the writer.
+_LITERAL_NAMES = {
+    "text": "a string",
+    "number": "a number",
+    "boolean": "true or false",
+}
+_WANTED_LITERALS = {
+    "text": "a quoted string",
+    "number": "a number",
+    "boolean": "the bare word true or false",
+}
+
+
+def _literal_type(node: exp.Expr | None) -> str | None:
+    """The type a written literal has, or None if `node` is not one."""
+    if isinstance(node, exp.Boolean):
+        return "boolean"
+    if isinstance(node, exp.Literal):
+        return "text" if node.is_string else "number"
+    return None
+
 
 # The operator nodes sqlglot builds for `+ - * /`, already nested in written
 # precedence (`a + b * c` puts the Mul under the Add). Unary `-x` is exp.Neg,
@@ -545,6 +650,25 @@ def is_value_expr(node: exp.Expr | None) -> bool:
 def _is_input_column(name: str) -> bool:
     """True for a column name an INPUT alias exposes, structural or tag path."""
     return name in INPUT_COLUMNS or tag_key(name) is not None
+
+
+def _input_disposition_error(
+    alias: str, node: exp.Expr | None, fallback: exp.Expr | None
+) -> SqlmpegError:
+    """``<input>.disposition``: a container has none, only its streams do."""
+    return _error(
+        ErrorCode.UNSUPPORTED_SQL,
+        f"'{alias}.{DISPOSITION_COLUMN}' is a stream field, not a container one",
+        node,
+        fallback=fallback,
+        hint=f"read it off a track row, e.g. unnest({alias}.audio) t ... "
+        f"t.{DISPOSITION_COLUMN}.{DISPOSITION_KEYS[0]}",
+    )
+
+
+def _is_input_disposition(name: str) -> bool:
+    """True for a folded ``<input>.disposition.<key>`` or the bare column."""
+    return name == DISPOSITION_COLUMN or disposition_key(name) is not None
 
 
 def _is_input_duration(node: exp.Expr | None, scope: dict[str, str]) -> bool:
@@ -643,7 +767,7 @@ def subscript_metadata_shape(node: exp.Expr) -> tuple[exp.Bracket, str] | None:
     semantics, told apart only by an extra ``Paren`` this unwraps. Returns
     ``None`` for anything else, ``f.audio.codec`` (no subscript, a plain
     3-part ``exp.Column``) included — that shape never reaches here at all.
-    A tag path is one Dot deeper, and `_normalize_tag_paths` folds it into
+    A map path is one Dot deeper, and `_normalize_map_paths` folds it into
     this same shape before any of this runs.
     """
     if not isinstance(node, exp.Dot):
@@ -1366,45 +1490,51 @@ def _value_parts(select: exp.Select, path_expr: exp.Expr | None) -> list[exp.Exp
     return parts
 
 
-def _fold_tag_path(sub: exp.Expr) -> None:
-    """Fold one written ``... .tags.<key>`` into a single column name, in place."""
+def _fold_map_path(sub: exp.Expr) -> None:
+    """Fold one written ``... .<map>.<key>`` into a single column name, in place."""
     if isinstance(sub, exp.Column):
-        # `<alias>.tags.<key>` -- a 3-part column, qualifier and all.
+        # `<alias>.<map>.<key>` -- a 3-part column, qualifier and all.
         db_node = sub.args.get("db")
         table_node = sub.args.get("table")
+        map_column = _ident_name(table_node)
         if (
             not sub.args.get("catalog")
             and isinstance(db_node, exp.Expr)
-            and _ident_name(table_node) == TAGS_COLUMN
+            and map_column in MAP_COLUMNS
         ):
             key = _ident_name(sub.this)
-            sub.set("this", exp.to_identifier(tag_path(key), quoted=False))
+            sub.set("this", exp.to_identifier(map_path(map_column, key), quoted=False))
             sub.set("table", db_node)
             sub.set("db", None)
         return
-    # `<alias>.<array>[k].tags.<key>` -- a Dot over the subscript's own Dot.
+    # `<alias>.<array>[k].<map>.<key>` -- a Dot over the subscript's own Dot.
     if not isinstance(sub, exp.Dot) or not isinstance(sub.this, exp.Dot):
         return
     inner = sub.this
     ident = sub.args.get("expression")
-    if _ident_name(inner.args.get("expression")) != TAGS_COLUMN:
+    map_column = _ident_name(inner.args.get("expression"))
+    if map_column not in MAP_COLUMNS:
         return
     if not isinstance(ident, exp.Identifier) or subscript_metadata_shape(inner) is None:
         return
     sub.set("this", inner.this)
-    sub.set("expression", exp.to_identifier(tag_path(_ident_name(ident)), quoted=False))
+    sub.set(
+        "expression",
+        exp.to_identifier(map_path(map_column, _ident_name(ident)), quoted=False),
+    )
 
 
-def _normalize_tag_paths(select: exp.Select, path_expr: exp.Expr | None = None) -> None:
-    """Fold every ``.tags.<key>`` path into one internal column name, in place.
+def _normalize_map_paths(select: exp.Select, path_expr: exp.Expr | None = None) -> None:
+    """Fold every ``.tags.<key>`` and ``.disposition.<key>`` path into one
+    internal column name, in place.
 
-    Reading a tag is the one read with two written parts after the qualifier.
-    Folding them here means no later pass has to know the shape: a tag is a
+    Reading a map is the one read with two written parts after the qualifier.
+    Folding them here means no later pass has to know the shape: an entry is a
     column with an unspellable name, looked up like any other.
     """
     for part in _value_parts(select, path_expr):
         for sub in list(part.walk()):
-            _fold_tag_path(sub)
+            _fold_map_path(sub)
 
 
 def _has_row_source(select: exp.Select, visible: set[str]) -> bool:
@@ -2397,7 +2527,7 @@ class _Resolver:
         # nowhere else. The carve-out is decided from the FROM clause alone,
         # before any of it is validated, so a branch with no rows keeps the
         # NO_STREAMING_EQUIVALENT rejection byte for byte.
-        _normalize_tag_paths(select, path_expr)
+        _normalize_map_paths(select, path_expr)
         _normalize_row_aliases(select, path_expr)
         rows = _has_row_source(select, visible)
         if rows:
@@ -3466,6 +3596,8 @@ class _Resolver:
                 raise _frame_error(sub, name, select)
             if kind == "input" and _ident_name(sub.this) in _REMOVED_INPUT_TAGS:
                 raise _removed_tag_error(name, _ident_name(sub.this), sub, select)
+            if kind == "input" and _is_input_disposition(_ident_name(sub.this)):
+                raise _input_disposition_error(name, sub, select)
             if kind == "input" and not _is_input_column(_ident_name(sub.this)):
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -3504,16 +3636,18 @@ class _Resolver:
                 fallback=select,
                 hint=f"the row is the stream: use '{alias}'",
             )
-        if tag_key(name) is not None:
+        ref = map_ref(name)
+        if ref is not None:
             if array_column == CHAPTERS_COLUMN:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"'{alias}' is a chapter row, and a chapter carries no tags",
+                    f"'{alias}' is a chapter row, and a chapter carries no "
+                    f"{ref[0]}",
                     column,
                     fallback=select,
                     hint=f"a chapter row exposes {_listed_columns(schema)}",
                 )
-            return "text"
+            return _map_column_type(ref, alias, column, select)
         if name in _REMOVED_STREAM_TAGS and name not in schema:
             raise _removed_tag_error(alias, name, column, select)
         column_type = schema.get(name)
@@ -3608,20 +3742,21 @@ class _Resolver:
                 hint=f"the subscript is already the stream: use '{label}'",
             )
         schema = ROW_SCHEMAS[array_column]
-        if tag_key(name) is not None:
-            return "text"
+        ref = map_ref(name)
+        if ref is not None:
+            return _map_column_type(ref, _subscript_label(bracket), anchor, fallback)
         if name in _REMOVED_STREAM_TAGS and name not in schema:
             raise _removed_tag_error(_subscript_label(bracket), name, anchor, fallback)
-        if name == TAGS_COLUMN:
+        if name in MAP_COLUMNS:
             label = _subscript_label(bracket)
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{label}.{TAGS_COLUMN}' is the whole tag map, not a value",
+                f"'{label}.{name}' is the whole {map_noun(name)} map, not a value",
                 anchor,
                 fallback=fallback,
-                hint=f"name the key: '{label}.{TAGS_COLUMN}.language', or "
+                hint=f"name the key: '{label}.{name}.{map_example(name)}', or "
                 f"unnest the array (unnest({alias}.{array_column}) t) and read "
-                f"t.{TAGS_COLUMN}",
+                f"t.{name}",
             )
         column_type = schema.get(name)
         if column_type is None:
@@ -3872,6 +4007,20 @@ class _Resolver:
                 literal, column_type, label, where, hint=_SUBSCRIPT_WHERE_HINT
             )
             return
+        shape = subscript_metadata_shape(node)
+        if shape is not None:
+            # A boolean accessor stands alone, as a boolean row column does.
+            column_type = self._subscript_operand(shape[0], shape[1], node, scope, where)
+            if column_type == "boolean":
+                return
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{_accessor_label(shape[0], shape[1])}' is {column_type}, "
+                "not a condition",
+                node,
+                fallback=where,
+                hint=_SUBSCRIPT_WHERE_HINT,
+            )
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             "unsupported WHERE predicate",
@@ -3896,6 +4045,11 @@ class _Resolver:
                     bare_array = _bare_array_error(sub, where)
                     if bare_array is not None:
                         raise bare_array
+                    alias = _ident_name(sub.args.get("table"))
+                    if scope.get(alias) == "input" and _is_input_disposition(
+                        _ident_name(sub.this)
+                    ):
+                        raise _input_disposition_error(alias, sub, where)
         conjuncts = [
             conjunct
             for conjunct in conjuncts
@@ -4199,6 +4353,23 @@ class _Resolver:
             column_type = self._row_operand(column, scope, where)
             self._check_row_literal(literal, column, column_type, where)
             return
+        if isinstance(node, exp.Boolean):
+            return
+        if isinstance(node, exp.Column):
+            # A boolean column stands alone, as it does in Postgres; anything
+            # else needs an operator to become a condition.
+            column_type = self._row_operand(node, scope, where)
+            if column_type == "boolean":
+                return
+            alias = _ident_name(node.args.get("table"))
+            label = f"{alias}.{column_label(_ident_name(node.this))}"
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{label}' is {column_type}, not a condition",
+                node,
+                fallback=where,
+                hint=_ROW_WHERE_HINT,
+            )
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             "unsupported WHERE predicate",
@@ -4247,6 +4418,8 @@ class _Resolver:
                 raise _frame_error(column, alias, where)
             if scope[alias] == "input" and _ident_name(column.this) in _REMOVED_INPUT_TAGS:
                 raise _removed_tag_error(alias, _ident_name(column.this), column, where)
+            if scope[alias] == "input" and _is_input_disposition(_ident_name(column.this)):
+                raise _input_disposition_error(alias, column, where)
             if scope[alias] == "input" and _ident_name(column.this) == TAGS_COLUMN:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
@@ -4285,13 +4458,14 @@ class _Resolver:
                 f"WHERE {alias}.{TAGS_COLUMN}.language = 'eng'",
             )
         if is_array(column_type):
+            name = _ident_name(column.this)
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{alias}.{_ident_name(column.this)}' is the whole tag map, "
+                f"'{alias}.{name}' is the whole {map_noun(name)} map, "
                 "not a single value",
                 column,
                 fallback=where,
-                hint=f"name the key: '{alias}.{TAGS_COLUMN}.language'",
+                hint=f"name the key: '{alias}.{name}.{map_example(name)}'",
             )
         return column_type
 
@@ -4303,7 +4477,8 @@ class _Resolver:
     ) -> str | None:
         """Static type of one compile-time value expression.
 
-        ``"text"``, ``"number"``, or None where the type is open — a bare NULL,
+        ``"text"``, ``"number"``, ``"boolean"``, or None where the type is
+        open — a bare NULL,
         or a CASE whose every result is NULL. Static because both sources are:
         a row column's type comes from :data:`ROW_SCHEMAS` and a literal's from
         how it was written, so nothing here depends on what a file contained.
@@ -4322,8 +4497,9 @@ class _Resolver:
             return self._row_operand(value, scope, fallback)
         if isinstance(value, exp.Neg):
             return self._check_numeric(value.this, "negation", value, scope, fallback)
-        if isinstance(value, exp.Literal):
-            return "text" if value.is_string else "number"
+        literal_type = _literal_type(value)
+        if literal_type is not None:
+            return literal_type
         if isinstance(value, exp.Case):
             return self._check_case(value, scope, fallback)
         if isinstance(value, exp.DPipe):
@@ -4395,16 +4571,26 @@ class _Resolver:
         to spell a number nobody asked it to format.
         """
         for side in (node.this, node.args.get("expression")):
-            if self._check_value_expr(side, scope, fallback) != "number":
-                continue
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                "'||' joins text, but one side is a number",
-                side if isinstance(side, exp.Expr) else None,
-                fallback=fallback,
-                hint="cast the number with ::text, quote it, or join text "
-                "columns: 'Audio (' || t.tags.language || ')'",
-            )
+            side_type = self._check_value_expr(side, scope, fallback)
+            if side_type == "number":
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "'||' joins text, but one side is a number",
+                    side if isinstance(side, exp.Expr) else None,
+                    fallback=fallback,
+                    hint="cast the number with ::text, quote it, or join text "
+                    "columns: 'Audio (' || t.tags.language || ')'",
+                )
+            if side_type == "boolean":
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "'||' joins text, but one side is a boolean",
+                    side if isinstance(side, exp.Expr) else None,
+                    fallback=fallback,
+                    hint="cast it with ::text, or fold it into a CASE: "
+                    f"CASE WHEN t.{DISPOSITION_COLUMN}.{DISPOSITION_KEYS[0]} "
+                    "THEN 'main' ELSE 'alt' END",
+                )
         return "text"
 
     def _check_arithmetic(
@@ -4524,25 +4710,24 @@ class _Resolver:
         node = _unwrap_paren(node) if isinstance(node, exp.Expr) else None
         if isinstance(node, exp.Neg) and isinstance(node.this, exp.Expr):
             node = _unwrap_paren(node.this)
-        if isinstance(node, exp.Literal):
-            wanted_string = column_type == "text"
-            if bool(node.is_string) == wanted_string:
-                return
-            got = "a string" if node.is_string else "a number"
+        got = _literal_type(node)
+        if got is None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{label}' is {column_type}, but the comparison value is {got}",
+                f"'{label}' can only be compared against a literal",
                 node,
                 fallback=where,
-                hint=f"compare '{label}' against "
-                + ("a quoted string" if wanted_string else "a number"),
+                hint=hint,
             )
+        if got == column_type:
+            return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            f"'{label}' can only be compared against a literal",
+            f"'{label}' is {column_type}, but the comparison value is "
+            f"{_LITERAL_NAMES[got]}",
             node,
             fallback=where,
-            hint=hint,
+            hint=f"compare '{label}' against {_WANTED_LITERALS[column_type]}",
         )
 
     # -- ORDER BY over track-row columns -------------------------

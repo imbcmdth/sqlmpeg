@@ -64,7 +64,8 @@ Each column is one of:
   two arrays in one call zip elementwise.
 - **A tag column**: an ALIASED non-stream expression. Over track rows
   it tags the row's streams; over input rows only, the container;
-  `NULL` clears ([rows.md](rows.md#tags)).
+  `NULL` clears ([rows.md](rows.md#tags)). Aliased `disposition`, it
+  sets the row's flags instead of a tag.
 - **`array_agg(<per-row stream expression>)`**: gathers rows in row
   order; must be a whole column ([rows.md](rows.md#combining-rows)).
 - **A metadata column** (table queries): any row column prints as
@@ -73,7 +74,8 @@ Each column is one of:
 Subscripts are positive integer literals, 1-based.
 `(f.audio[1]).codec`-style accessors reach row columns without
 unnest; in WHERE they are assertions. A tag is read by path,
-`f.tags.title` / `t.tags.language`, one key at a time.
+`f.tags.title` / `t.tags.language`, one key at a time, and so is a
+disposition flag, `t.disposition.forced`, over a closed key set.
 
 ## Values and predicates
 
@@ -90,7 +92,8 @@ value := literal | NULL | row-column | input-scalar
 ```
 
 Predicates: `= != < <= > >= BETWEEN IS [NOT] NULL IN (literals)`,
-combined with `AND OR NOT`. All decided at compile time against probed
+combined with `AND OR NOT`. A boolean value is a predicate on its own
+(`WHERE t.disposition.default`). All decided at compile time against probed
 metadata - never a runtime ffmpeg predicate. NULL follows SQL:
 `=`/`!=` both fail against it.
 

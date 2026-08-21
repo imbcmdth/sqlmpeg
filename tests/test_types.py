@@ -35,6 +35,7 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
     "video_stream": {
         "index": ("number", "RO"),
         "tags": ("tag[]", "W"),
+        "disposition": ("flag[]", "W"),
         "codec": ("text", "RO"),
         "width": ("number", "RO"),
         "height": ("number", "RO"),
@@ -42,30 +43,29 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
         "bitrate": ("number", "RO"),
         "duration": ("number", "RO"),
         "color_transfer": ("text", "RO"),
-        "disposition": ("flag[]", "W"),
     },
     "audio_stream": {
         "index": ("number", "RO"),
         "tags": ("tag[]", "W"),
+        "disposition": ("flag[]", "W"),
         "codec": ("text", "RO"),
         "channels": ("number", "RO"),
         "channel_layout": ("text", "RO"),
         "sample_rate": ("number", "RO"),
         "bitrate": ("number", "RO"),
         "duration": ("number", "RO"),
-        "disposition": ("flag[]", "W"),
     },
     "subtitle_stream": {
         "index": ("number", "RO"),
         "tags": ("tag[]", "W"),
-        "codec": ("text", "RO"),
         "disposition": ("flag[]", "W"),
+        "codec": ("text", "RO"),
     },
     "data_stream": {
         "index": ("number", "RO"),
         "tags": ("tag[]", "W"),
-        "codec": ("text", "RO"),
         "disposition": ("flag[]", "W"),
+        "codec": ("text", "RO"),
     },
     "chapter": {
         "index": ("number", "RO"),
@@ -100,10 +100,6 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
 # The fields declared but not surfaced by the compiler today, as
 # "<type>.<field>". Nothing else may carry `exposed=False`.
 EXPECTED_UNEXPOSED = {
-    "video_stream.disposition",
-    "audio_stream.disposition",
-    "subtitle_stream.disposition",
-    "data_stream.disposition",
     "attachment.filename",
     "attachment.mimetype",
     "attachment.path",
@@ -137,6 +133,7 @@ EXPECTED_KINDS = {
 EXPECTED_ROW_COMMON = {
     "index": "number",
     "tags": "tag[]",
+    "disposition": "flag[]",
     "codec": "text",
 }
 
@@ -175,6 +172,32 @@ EXPECTED_INPUT_COLUMNS = frozenset(
 EXPECTED_STREAM_ARRAY_COLUMNS = frozenset({"video", "audio", "subtitle", "data"})
 
 EXPECTED_UNNEST_COLUMNS = EXPECTED_STREAM_ARRAY_COLUMNS | {"chapters"}
+
+# The map columns and the record each holds.
+EXPECTED_MAP_ELEMENTS = {"tags": "tag", "disposition": "flag"}
+
+# Every key `ffprobe -show_entries stream_disposition` prints, in its order.
+EXPECTED_DISPOSITION_KEYS = (
+    "default",
+    "dub",
+    "original",
+    "comment",
+    "lyrics",
+    "karaoke",
+    "forced",
+    "hearing_impaired",
+    "visual_impaired",
+    "clean_effects",
+    "attached_pic",
+    "timed_thumbnails",
+    "non_diegetic",
+    "captions",
+    "descriptions",
+    "metadata",
+    "dependent",
+    "still_image",
+    "multilayer",
+)
 
 
 def _all_fields() -> list[tuple[str, Field]]:
@@ -276,6 +299,17 @@ def test_row_schemas_view() -> None:
 
 def test_row_common_view() -> None:
     assert types.ROW_COMMON == EXPECTED_ROW_COMMON
+
+
+def test_map_element_view() -> None:
+    assert types.MAP_ELEMENTS == EXPECTED_MAP_ELEMENTS
+    assert types.TAGS_COLUMN in types.MAP_ELEMENTS
+    assert types.DISPOSITION_COLUMN in types.MAP_ELEMENTS
+
+
+def test_disposition_keys_are_the_closed_set() -> None:
+    """The key set ffmpeg itself reports, in ffprobe's own order."""
+    assert types.DISPOSITION_KEYS == EXPECTED_DISPOSITION_KEYS
     assert list(types.ROW_COMMON) == list(EXPECTED_ROW_COMMON)
 
 

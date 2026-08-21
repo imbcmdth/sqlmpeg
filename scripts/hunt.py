@@ -43,6 +43,7 @@ from sqlmpeg.ir import Graph  # noqa: E402
 from sqlmpeg.probe import ChapterMeta, ProbeResult, StreamMeta  # noqa: E402
 from sqlmpeg.registry import load_reference  # noqa: E402
 from sqlmpeg.sink import SINK_OPTIONS  # noqa: E402
+from sqlmpeg.types import DISPOSITION_KEYS  # noqa: E402
 
 _VIDEO = StreamMeta(
     type="video",
@@ -256,8 +257,16 @@ SOURCES = REG.source_names()
 SINK_NAMES = sorted(SINK_OPTIONS)
 INPUT_NAMES = sorted(INPUT_OPTIONS)
 
-# Tags are read by path, so a row's tag column is two written parts.
-TRACK_COLS = ["tags.language", "tags.title", "codec", "index"]
+# Tags and disposition flags are read by path, so those row columns are two
+# written parts.
+TRACK_COLS = [
+    "tags.language",
+    "tags.title",
+    "disposition.default",
+    "disposition.forced",
+    "codec",
+    "index",
+]
 VIDEO_ROW_COLS = TRACK_COLS + ["width", "height", "fps"]
 AUDIO_ROW_COLS = TRACK_COLS + ["channels", "channel_layout", "sample_rate"]
 CHAPTER_COLS = ["index", "title", "start_t", "end_t"]
@@ -529,9 +538,12 @@ def gen_pred(ctx: Ctx, depth: int = 0) -> str:
         return f"{alias}.{col} BETWEEN {gen_value(ctx, depth + 1)} AND {gen_value(ctx, depth + 1)}"
     if r < 0.75:
         return f"{gen_value(ctx, depth + 1)} IS {'NOT ' if rng.random() < 0.5 else ''}NULL"
-    if r < 0.85:
+    if r < 0.8:
         vals = ", ".join(gen_value(ctx, depth + 1) for _ in range(rng.randint(1, 3)))
         return f"{gen_value(ctx, depth + 1)} IN ({vals})"
+    if r < 0.85 and ctx.items:
+        # A boolean stands alone as a condition.
+        return gen_row_col(ctx)
     if r < 0.95:
         return f"({gen_pred(ctx, depth + 1)} {ctx.pick(['AND', 'OR'])} {gen_pred(ctx, depth + 1)})"
     return f"NOT ({gen_pred(ctx, depth + 1)})"
@@ -736,6 +748,9 @@ def rand_stream(rng, kind, index):
         meta["language"] = rng.choice(["eng", "fra", "und", "", "zxx"])
     if rng.random() < 0.3:
         meta["title"] = rng.choice(["Track", "", "x" * 200])
+    flags = {}
+    if rng.random() < 0.7:
+        flags = {key: rng.random() < 0.2 for key in DISPOSITION_KEYS}
     codec = rng.choice(
         {
             "video": ["h264", "hevc", "png", None, "vp9"],
@@ -758,6 +773,7 @@ def rand_stream(rng, kind, index):
         bitrate=rng.choice([None, 128000, 0]),
         duration=rng.choice([None, 0.0, 4.0, 1e9]),
         color_transfer=rng.choice([None, "bt709", "smpte2084"]) if kind == "video" else None,
+        disposition=flags,
     )
 
 

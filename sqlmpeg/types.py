@@ -13,7 +13,8 @@ field's ``type`` is another type's name, ``[]``-suffixed for an array.
 Kinds:
 
     scalar     ``text``, ``number``, ``boolean`` — Postgres typing; boolean
-               is predicates only, never a column.
+               is what a `flag` entry holds and what a predicate answers,
+               never a column of its own.
     handle     internal, with no name in the language: ``stream`` is the
                graph node behind a stream record — no field carries it,
                since the record IS the stream — and ``seek`` is
@@ -50,8 +51,11 @@ from typing import Literal
 __all__ = [
     "CHAPTERS_COLUMN",
     "COLUMN_TYPES",
+    "DISPOSITION_COLUMN",
+    "DISPOSITION_KEYS",
     "INPUT_COLUMNS",
     "INPUT_DURATION_COLUMN",
+    "MAP_ELEMENTS",
     "ROW_COMMON",
     "ROW_SCHEMAS",
     "STREAM_ARRAY_COLUMNS",
@@ -74,9 +78,9 @@ TypeKind = Literal["scalar", "handle", "stream", "record", "map", "container"]
 # The compile-time type of a row column. `text` and `number` are probed
 # metadata, comparable against literals of the matching kind and nothing else;
 # `stream` is what a bare row alias types as — the row itself, the only thing
-# that can BE an output; `tag[]` is a map column, read one key at a time by
-# path and never comparable whole.
-RowColumnType = str  # "stream" | "text" | "number" | "tag[]"
+# that can BE an output; `tag[]` and `flag[]` are map columns, read one key at
+# a time by path and never comparable whole.
+RowColumnType = str  # "stream" | "text" | "number" | "tag[]" | "flag[]"
 
 COLUMN_TYPES = frozenset({"stream", "text", "number"})
 
@@ -165,10 +169,9 @@ def _stream_type(name: str, *probed: Field) -> Type:
         (
             _ro("index", "number"),
             _w("tags", "tag[]"),
+            _w("disposition", "flag[]"),
             _ro("codec", "text"),
             *probed,
-            # Declared, not wired up: the closed disposition key set.
-            _w("disposition", "flag[]", exposed=False),
         ),
     )
 
@@ -178,6 +181,31 @@ def _stream_type(name: str, *probed: Field) -> Type:
 # source carries: an `encoder` or `handler_name` tag riding through would emit
 # `-metadata` ffmpeg does not emit today and move bytes nobody asked to move.
 STREAM_TAG_COLUMNS = ("language", "title")
+
+# Every disposition key ffmpeg knows, in the order ffprobe prints them. The set
+# is CLOSED: `a.disposition.<key>` reads one of these and nothing else, and a
+# written spec names them. Taken from `ffprobe -show_entries stream_disposition`.
+DISPOSITION_KEYS = (
+    "default",
+    "dub",
+    "original",
+    "comment",
+    "lyrics",
+    "karaoke",
+    "forced",
+    "hearing_impaired",
+    "visual_impaired",
+    "clean_effects",
+    "attached_pic",
+    "timed_thumbnails",
+    "non_diegetic",
+    "captions",
+    "descriptions",
+    "metadata",
+    "dependent",
+    "still_image",
+    "multilayer",
+)
 
 _DECLARED: tuple[Type, ...] = (
     Type("text", "scalar"),
@@ -190,7 +218,7 @@ _DECLARED: tuple[Type, ...] = (
     # Free-form keys: `f.tags.title` reads one entry, `'eng' AS language`
     # writes one, and a key the file does not carry reads NULL.
     Type("tag", "map", (_w("key", "text"), _w("value", "text"))),
-    # The closed set of disposition keys ffmpeg knows; an unknown key is a
+    # The closed key set is :data:`DISPOSITION_KEYS`; a key outside it is a
     # typed rejection.
     Type("flag", "map", (_w("key", "text"), _w("set", "boolean"))),
     _stream_type(
@@ -337,6 +365,32 @@ TAGS_COLUMN = _sole(
     tuple(f.name for f in _CONTAINER.fields if element_type(f.type) == "tag"),
     "the container's tag map column",
 )
+
+# The map column every stream record carries its disposition flags in. Read by
+# path (`a.disposition.forced`), written as a flag column
+# (`'default+forced' AS disposition`).
+DISPOSITION_COLUMN = _sole(
+    tuple(
+        dict.fromkeys(
+            f.name
+            for declared in _DECLARED
+            if declared.kind == "stream"
+            for f in declared.fields
+            if element_type(f.type) == "flag"
+        )
+    ),
+    "the stream record's flag map column",
+)
+
+# Each map column and the record it holds: `tags` holds tags, `disposition`
+# holds flags. A rejection names the record, not the column.
+MAP_ELEMENTS: dict[str, str] = {
+    f.name: element_type(f.type)
+    for declared in _DECLARED
+    if declared.kind in {"stream", "container"}
+    for f in declared.fields
+    if f.exposed and is_array(f.type) and resolve(f.type).kind == "map"
+}
 
 # The array columns whose elements are STREAMS: the only ones a subscript or
 # a `[k].<column>` metadata accessor reaches.

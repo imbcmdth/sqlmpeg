@@ -175,6 +175,7 @@ def insert_splits(g: Graph) -> Graph:
                     type=output.type,
                     name=output.name,
                     metadata=dict(output.metadata),
+                    disposition=output.disposition,
                 )
                 for output in unit.outputs
             ],

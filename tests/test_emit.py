@@ -971,10 +971,9 @@ def test_build_ffmpeg_args_metadata_values_are_passed_raw() -> None:
     assert "title=12:30, take 'one'" in build_ffmpeg_args(e, "out.mp4")
 
 
-def test_disposition_renders_as_its_own_flag_not_metadata_s() -> None:
-    """`disposition` is a reserved tag key: it never joins the ordinary
-    `-metadata:s:<i> k=v` block, and its value is passed through verbatim
-    (ffmpeg's own disposition spec string), not a `key=value` pair."""
+def test_disposition_renders_as_its_own_flag_after_the_metadata() -> None:
+    """The disposition is a FIELD of its own, not a metadata key: it renders as
+    ffmpeg's own `+`-joined spec, after the `-metadata:s:<i> k=v` block."""
     e = Emitted(
         inputs=["a.mp4"],
         filter_complex="",
@@ -985,7 +984,8 @@ def test_disposition_renders_as_its_own_flag_not_metadata_s() -> None:
                         target="0:a:0",
                         type="audio",
                         copy=True,
-                        metadata={"language": "eng", "disposition": "default"},
+                        metadata={"language": "eng"},
+                        disposition=("default", "forced"),
                     )
                 ]
             )
@@ -1000,13 +1000,13 @@ def test_disposition_renders_as_its_own_flag_not_metadata_s() -> None:
         "-metadata:s:0",
         "language=eng",
         "-disposition:0",
-        "default",
+        "default+forced",
         "out.mp4",
     ]
     assert "-metadata:s:0" not in args[args.index("-disposition:0") :]
 
 
-def test_disposition_alone_omits_metadata_s_entirely() -> None:
+def test_no_flags_renders_the_clearing_spec() -> None:
     e = Emitted(
         inputs=["a.mp4"],
         filter_complex="",
@@ -1014,7 +1014,7 @@ def test_disposition_alone_omits_metadata_s_entirely() -> None:
             OutputGroup(
                 maps=[
                     OutputMap(
-                        target="0:a:0", type="audio", copy=True, metadata={"disposition": "0"}
+                        target="0:a:0", type="audio", copy=True, metadata={}, disposition=()
                     )
                 ]
             )
@@ -1023,6 +1023,19 @@ def test_disposition_alone_omits_metadata_s_entirely() -> None:
     args = build_ffmpeg_args(e, "out.mp4")
     assert "-metadata:s:0" not in args
     assert args[args.index("-disposition:0") + 1] == "0"
+
+
+def test_an_unflagged_output_renders_no_disposition_at_all() -> None:
+    e = Emitted(
+        inputs=["a.mp4"],
+        filter_complex="",
+        groups=[
+            OutputGroup(
+                maps=[OutputMap(target="0:a:0", type="audio", copy=True, metadata={})]
+            )
+        ],
+    )
+    assert "-disposition:0" not in build_ffmpeg_args(e, "out.mp4")
 
 
 # ---------------------------------------------------------------------------

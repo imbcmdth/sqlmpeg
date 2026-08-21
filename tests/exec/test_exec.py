@@ -28,6 +28,10 @@ from sqlmpeg import cli, loudnorm
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.emit import build_ffmpeg_args, build_ffmpeg_commands, emit
 from sqlmpeg.errors import SqlmpegError
+from sqlmpeg.lower import lower_table
+from sqlmpeg.parser import parse, resolve
+from sqlmpeg.probe import probe
+from sqlmpeg.types import DISPOSITION_KEYS
 
 pytestmark = pytest.mark.exec
 
@@ -1646,7 +1650,7 @@ def test_chapters_from_copies_an_inputs_own_chapters_through(tmp_path: Path) -> 
 # ---------------------------------------------------------------------------
 
 
-def test_disposition_tag_column_flags_the_default_track(tmp_path: Path) -> None:
+def test_disposition_column_flags_the_default_track(tmp_path: Path) -> None:
     """Cookbook recipe 41's query, run for real: ffprobe's own disposition
     block on the output proves `-disposition:<i>` actually reached the
     muxer, not just that the printed command has the right shape."""
@@ -1665,6 +1669,56 @@ def test_disposition_tag_column_flags_the_default_track(tmp_path: Path) -> None:
     dispositions = _ffprobe_audio_dispositions(out_path)
     assert dispositions[0]["disposition"]["default"] == 1
     assert dispositions[1]["disposition"]["default"] == 0
+
+
+def test_the_flag_set_is_the_one_this_ffmpeg_reports(tmp_path: Path) -> None:
+    """The closed key set in types.py comes from ffprobe itself, so the local
+    ffmpeg must still report exactly those keys and no others."""
+    _require_fixture(_AV2)
+    reported = _ffprobe_audio_dispositions(_AV2)[0]["disposition"]
+    assert isinstance(reported, dict)
+    assert tuple(reported) == DISPOSITION_KEYS
+
+
+def test_a_written_multi_flag_spec_reaches_the_muxer(tmp_path: Path) -> None:
+    """`'default+forced'` is ffmpeg's own spelling, and both flags land."""
+    _require_fixture(_AV2)
+    out_path = tmp_path / "both.mka"
+    query = (
+        "SELECT t, 'default+forced' AS disposition "
+        f"FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) t WHERE t.index = 2"
+    )
+
+    _compile_and_run(query, out_path)
+
+    flags = _ffprobe_audio_dispositions(out_path)[0]["disposition"]
+    assert isinstance(flags, dict)
+    assert flags["default"] == 1
+    assert flags["forced"] == 1
+
+
+def test_a_flag_read_back_off_the_output_finds_the_track(tmp_path: Path) -> None:
+    """The write and the read are the same map: flag a track, then pick it out
+    of the written file by that flag."""
+    _require_fixture(_AV2)
+    out_path = tmp_path / "flagged.mka"
+    query = (
+        "WITH flagged AS ("
+        "  SELECT t AS track, "
+        "  CASE WHEN t.index = 2 THEN 'forced' ELSE '0' END AS disposition "
+        f"  FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) t"
+        ") SELECT array_agg(flagged.track) FROM flagged"
+    )
+    _compile_and_run(query, out_path)
+
+    sinks = lower_table(
+        resolve(parse(
+            f"SELECT t.index FROM input('{_sql_path(out_path)}') g, unnest(g.audio) t "
+            "WHERE t.disposition.forced"
+        )),
+        {"g": probe(str(out_path))},
+    )
+    assert sinks[0].result.rows == [[2]]
 
 
 def test_amerge_runs_and_produces_one_multichannel_stream(tmp_path: Path) -> None:

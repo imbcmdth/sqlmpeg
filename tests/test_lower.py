@@ -54,6 +54,7 @@ from sqlmpeg.probe import ChapterMeta, ProbeResult, StreamMeta
 from sqlmpeg.registry import Registry, load_reference
 from sqlmpeg.split import insert_splits
 from sqlmpeg.table import ArrayCell, RecordCell, StreamCell, render_csv, render_table
+from sqlmpeg.types import DISPOSITION_KEYS
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
@@ -7488,10 +7489,10 @@ def test_a_number_container_tag_is_spelled_out() -> None:
     assert g.sinks[0].tags == {"date": "2026"}
 
 
-def test_disposition_is_not_a_container_tag_key() -> None:
+def test_a_container_has_no_disposition() -> None:
     err = _reject(_container_query("'default' AS disposition"))
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "per-stream key" in err.message
+    assert "'disposition' is a stream field, not a container one" in err.message
 
 
 def test_one_container_tag_key_cannot_take_two_values() -> None:
@@ -8589,7 +8590,7 @@ def test_the_group_key_itself_reads_as_a_container_tag() -> None:
     assert g.sinks[0].path == "eng.mka"
 
 
-def test_disposition_is_still_not_a_container_key_when_grouped() -> None:
+def test_a_grouped_branch_still_has_no_container_disposition() -> None:
     err = _reject_lower(
         _agg_copy(
             "SELECT array_agg(t), 'default' AS disposition "
@@ -8598,7 +8599,7 @@ def test_disposition_is_still_not_a_container_key_when_grouped() -> None:
         _row_probes(),
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "'disposition' is a per-stream key" in err.message
+    assert "'disposition' is a stream field, not a container one" in err.message
 
 
 # -- grouping validity ------------------------------------------------------
@@ -9122,3 +9123,170 @@ def test_only_language_and_title_ride_a_filter_through() -> None:
         },
     )
     assert g.outputs[0].metadata == {"language": "fra", "title": "VF"}
+
+# -- disposition flags ------------------------------------------------------
+
+
+def _flag_probes() -> dict[str, ProbeResult | None]:
+    return _row_probes(
+        _track("audio", 0, language="eng", codec="aac", disposition={"default": True}),
+        _track(
+            "audio",
+            1,
+            language="fra",
+            codec="ac3",
+            disposition={"default": False, "forced": True},
+        ),
+    )
+
+
+def _flag_copy(projection: str, where: str = "") -> str:
+    return (
+        f"COPY (SELECT {projection} FROM input('f.mkv') f, unnest(f.audio) t"
+        + (f" WHERE {where}" if where else "")
+        + ") TO 'out.mka'"
+    )
+
+
+def test_a_flag_reads_as_a_boolean_row_value() -> None:
+    sinks = lower_table(
+        resolve(parse(
+            "SELECT t.index, t.disposition.default, t.disposition.karaoke "
+            "FROM input('f.mkv') f, unnest(f.audio) t"
+        )),
+        _flag_probes(),
+    )
+    assert sinks[0].result.columns == ["index", "default", "karaoke"]
+    # The second track reported `default` false; neither reported `karaoke`.
+    assert sinks[0].result.rows == [[1, True, None], [2, False, None]]
+    assert " true " in render_table(sinks[0].result)
+
+
+def test_a_flag_filters_rows_at_compile_time() -> None:
+    g = _lower(_flag_copy("t", where="t.disposition.default"), _flag_probes())
+    assert _refs(g) == ["src:f:a:0"]
+    g = _lower(_flag_copy("t", where="NOT t.disposition.default"), _flag_probes())
+    assert _refs(g) == ["src:f:a:1"]
+    g = _lower(_flag_copy("t", where="t.disposition.forced = true"), _flag_probes())
+    assert _refs(g) == ["src:f:a:1"]
+
+
+def test_a_bare_disposition_column_prints_as_one_array_cell() -> None:
+    """The closed key set, in the type's order; a flag this file never reported
+    reads NULL, exactly as an absent tag does."""
+    sinks = lower_table(
+        resolve(parse(
+            "SELECT t.disposition FROM input('f.mkv') f, unnest(f.audio) t "
+            "WHERE t.index = 1"
+        )),
+        _flag_probes(),
+    )
+    cell = sinks[0].result.rows[0][0]
+    assert isinstance(cell, ArrayCell)
+    assert [record.fields[0] for record in cell.elements] == list(DISPOSITION_KEYS)
+    assert cell.elements[0] == RecordCell(fields=("default", True))
+    assert cell.elements[1] == RecordCell(fields=("dub", None))
+    assert "{(default,true),(dub,)" in render_table(sinks[0].result)
+
+
+def test_a_written_spec_becomes_the_flags_it_names() -> None:
+    g = _lower(_flag_copy("t, 'default+forced' AS disposition", "t.index = 1"),
+               _flag_probes())
+    assert g.sinks[0].outputs[0].disposition == ("default", "forced")
+    assert build_ffmpeg_args(emit(g))[-3:-1] == ["-disposition:0", "default+forced"]
+
+
+def test_the_flag_order_is_the_types_own_not_the_writers() -> None:
+    g = _lower(_flag_copy("t, 'forced+default' AS disposition", "t.index = 1"),
+               _flag_probes())
+    assert g.sinks[0].outputs[0].disposition == ("default", "forced")
+
+
+def test_a_cleared_disposition_writes_the_clearing_spec() -> None:
+    for value in ("'0'", "NULL"):
+        g = _lower(_flag_copy(f"t, {value} AS disposition", "t.index = 1"),
+                   _flag_probes())
+        assert g.sinks[0].outputs[0].disposition == ()
+        assert build_ffmpeg_args(emit(g))[-3:-1] == ["-disposition:0", "0"]
+
+
+def test_an_unwritten_disposition_reaches_no_argument() -> None:
+    """ffmpeg copies a stream's own flags; only a written column says otherwise."""
+    g = _lower(_flag_copy("t", "t.index = 1"), _flag_probes())
+    assert g.sinks[0].outputs[0].disposition is None
+    assert "-disposition:0" not in build_ffmpeg_args(emit(g))
+
+
+def test_a_written_flag_outside_the_closed_set_is_rejected() -> None:
+    err = _reject_lower(
+        _flag_copy("t, 'default+forcd' AS disposition", "t.index = 1"), _flag_probes()
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'forcd' is not a disposition flag" in err.message
+    assert err.hint == "did you mean 'forced'?"
+
+
+def test_a_relative_flag_spec_is_rejected() -> None:
+    """ffmpeg's own `+flag`/`-flag` adjusts what the source carries; this column
+    says what the whole map is, so there is nothing to adjust."""
+    for value in ("'+forced'", "'-forced'", "'default+'", "''"):
+        err = _reject_lower(
+            _flag_copy(f"t, {value} AS disposition", "t.index = 1"), _flag_probes()
+        )
+        assert err.code is ErrorCode.UNSUPPORTED_SQL
+        assert "is not a flag list" in err.message
+
+
+def test_a_numeric_disposition_value_is_rejected() -> None:
+    err = _reject_lower(_flag_copy("t, 0 AS disposition", "t.index = 1"), _flag_probes())
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "takes ffmpeg's flag spec, not a number" in err.message
+
+
+def test_one_track_cannot_take_two_dispositions() -> None:
+    """Row-scoped, like a tag: a track two result rows disagree about has no
+    single flag map to write."""
+    err = _reject_lower(
+        "COPY (SELECT t, CASE WHEN u.index = 1 THEN 'default' ELSE '0' END "
+        "AS disposition FROM input('f.mkv') f, unnest(f.audio) t, "
+        "unnest(f.audio) u) TO 'out.mka'",
+        _flag_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "the disposition takes two different values on the same track" in err.message
+
+
+def test_two_cte_bodies_cannot_flag_one_track_two_ways() -> None:
+    err = _reject_lower(
+        "WITH one AS ("
+        "  SELECT t AS track, 'default' AS disposition"
+        "  FROM input('f.mkv') f, unnest(f.audio) t"
+        "), two AS ("
+        "  SELECT u AS track, 'forced' AS disposition"
+        "  FROM input('g.mkv') g, unnest(g.audio) u"
+        ") SELECT one.track FROM one",
+        _shared_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "the disposition takes two different values on the same track" in err.message
+
+
+def test_a_cte_bodys_disposition_rides_into_the_sink() -> None:
+    """Recipe 41's shape: flag the rows inside the WITH, gather them outside."""
+    g = _lower(
+        "COPY (WITH flagged AS ("
+        "SELECT t AS track, "
+        "CASE WHEN t.tags.language = 'eng' THEN 'default' ELSE '0' END AS disposition "
+        "FROM input('f.mkv') f, unnest(f.audio) t) "
+        "SELECT array_agg(flagged.track) FROM flagged) TO 'out.mka'",
+        _flag_probes(),
+    )
+    assert [o.disposition for o in g.sinks[0].outputs] == [("default",), ()]
+
+
+def test_a_disposition_survives_a_filter_the_way_a_tag_does() -> None:
+    g = _lower(
+        _flag_copy("volume(t, 0.5), 'forced' AS disposition", "t.index = 2"),
+        _flag_probes(),
+    )
+    assert g.sinks[0].outputs[0].disposition == ("forced",)

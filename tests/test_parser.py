@@ -16,6 +16,7 @@ from sqlmpeg.parser import (
     subscript_index,
     union_branches,
 )
+from sqlmpeg.types import DISPOSITION_KEYS
 
 README_SQL = """WITH pip AS (
   SELECT scale(crop(b.video[1], 1200, 50, 600, 200), 0.5) AS frame
@@ -1900,7 +1901,8 @@ def test_join_is_rejected_when_its_left_side_is_not_a_row_table() -> None:
 @pytest.mark.parametrize(
     "column",
     [
-        "index", "tags.language", "tags.title", "codec", "channels",
+        "index", "tags.language", "tags.title", "disposition.default",
+        "disposition.forced", "codec", "channels",
         "channel_layout", "sample_rate", "bitrate", "duration",
     ],
 )
@@ -2677,3 +2679,87 @@ def test_a_tag_path_types_as_text() -> None:
         "SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE t.tags.whatever = 5"
     )
     assert "'t.tags.whatever' is text" in err.message
+
+
+# -- disposition flags ------------------------------------------------------
+
+
+def _rows(where: str) -> str:
+    return f"SELECT t FROM input('f.mkv') f, unnest(f.audio) t WHERE {where}"
+
+
+def test_a_disposition_path_types_as_boolean() -> None:
+    _resolve(_rows("t.disposition.forced"))
+    _resolve(_rows("t.disposition.forced = true"))
+    err = _reject(_rows("t.disposition.forced = 'yes'"))
+    assert "'t.disposition.forced' is boolean" in err.message
+    assert err.hint == (
+        "compare 't.disposition.forced' against the bare word true or false"
+    )
+
+
+def test_an_unknown_flag_names_the_closest_one() -> None:
+    err = _reject(_rows("t.disposition.forcd"))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t.disposition.forcd' is not a disposition flag" in err.message
+    assert err.hint == "did you mean 'forced'?"
+
+
+def test_an_unrecognizable_flag_lists_the_whole_set() -> None:
+    err = _reject(_rows("t.disposition.nonsense"))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    for key in DISPOSITION_KEYS:
+        assert key in (err.hint or "")
+
+
+def test_a_flag_reads_off_a_subscript_too() -> None:
+    _resolve("SELECT f.audio[1] FROM input('f.mkv') f WHERE f.audio[1].disposition.default")
+    err = _reject(
+        "SELECT f.audio[1] FROM input('f.mkv') f WHERE f.audio[1].disposition.nope"
+    )
+    assert "'f.audio[1].disposition.nope' is not a disposition flag" in err.message
+
+
+def test_a_bare_row_disposition_column_wants_a_flag() -> None:
+    err = _reject(_rows("t.disposition = 'x'"))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t.disposition' is the whole flag map, not a single value" in err.message
+    assert err.hint == "name the key: 't.disposition.default'"
+
+
+def test_a_subscripted_flag_map_wants_a_key() -> None:
+    err = _reject(
+        "SELECT f.audio[1] FROM input('f.mkv') f WHERE f.audio[1].disposition IS NULL"
+    )
+    assert "'f.audio[1].disposition' is the whole flag map, not a value" in err.message
+
+
+def test_a_container_has_no_disposition() -> None:
+    for query in (
+        "SELECT f.video[1] FROM input('f.mkv') f WHERE f.disposition.default",
+        "SELECT f.disposition FROM input('f.mkv') f",
+    ):
+        err = _reject(query)
+        assert err.code is ErrorCode.UNSUPPORTED_SQL
+        assert "'f.disposition' is a stream field, not a container one" in err.message
+
+
+def test_a_chapter_row_carries_no_disposition() -> None:
+    err = _reject(
+        "SELECT c.disposition.default FROM input('f.mkv') f, unnest(f.chapters) c"
+    )
+    assert "'c' is a chapter row, and a chapter carries no disposition" in err.message
+
+
+def test_a_non_boolean_column_is_not_a_condition_on_its_own() -> None:
+    err = _reject(_rows("t.tags.language"))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'t.tags.language' is text, not a condition" in err.message
+
+
+def test_a_boolean_does_not_join_text() -> None:
+    err = _reject(
+        "SELECT t, 'x' || t.disposition.default AS title "
+        "FROM input('f.mkv') f, unnest(f.audio) t"
+    )
+    assert "'||' joins text, but one side is a boolean" in err.message

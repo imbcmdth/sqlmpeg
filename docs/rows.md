@@ -2,7 +2,7 @@
 
 Every FROM item is a compile-time table with a fixed shape. This page lists each shape, its columns, and what each column is for. Column values are ffprobe results, so inputs must be probeable wherever a metadata column is read (typed rejection otherwise); everything here evaluates at compile time - no filter, join, or sort reaches the ffmpeg command, only the wiring they decided.
 
-Column types: **stream** is selectable as output; **text** and **number** are values - usable in `WHERE`/`ON`, compile-time expressions (`CASE`, `||`, `::text`, `+ - * /`), tag columns, and table/CSV output, never as streams. Unreported values are NULL with SQL semantics: `=` and `!=` both fail against NULL; use `IS [NOT] NULL`.
+Column types: **stream** is selectable as output; **text**, **number** and **boolean** are values - usable in `WHERE`/`ON`, compile-time expressions (`CASE`, `||`, `::text`, `+ - * /`), tag columns, and table/CSV output, never as streams. A boolean stands alone as a condition (`WHERE t.disposition.default`) or compares against `true`/`false`. Unreported values are NULL with SQL semantics: `=` and `!=` both fail against NULL; use `IS [NOT] NULL`.
 
 ## Input rows - `input('film.mkv') f`
 
@@ -28,6 +28,7 @@ The row IS the stream: a bare `t` where a stream is expected selects it, filters
 | --- | --- | --- | --- | --- | --- |
 | `index` | number | yes | yes | yes | yes |
 | `tags` | tag map | yes | yes | yes | yes |
+| `disposition` | flag map | yes | yes | yes | yes |
 | `codec` | text | yes | yes | yes | yes |
 | `channels`, `sample_rate` | number | yes | - | - | - |
 | `channel_layout` | text | yes | - | - | - |
@@ -39,6 +40,8 @@ The row IS the stream: a bare `t` where a stream is expected selects it, filters
 `index` is 1-based and agrees with the subscript: `WHERE t.index = 1` and `f.audio[1]` name the same track.
 
 `tags` is a map read by path - `t.tags.language`, `t.tags.title`, any key the file carries; absent reads NULL. There is no bare `t.language` spelling. Bare, `t.tags` prints the whole map as one array cell of `(key,value)` records.
+
+`disposition` is the same shape over a CLOSED key set - the flags ffmpeg itself reports: `default`, `dub`, `original`, `comment`, `lyrics`, `karaoke`, `forced`, `hearing_impaired`, `visual_impaired`, `clean_effects`, `attached_pic`, `timed_thumbnails`, `non_diegetic`, `captions`, `descriptions`, `metadata`, `dependent`, `still_image`, `multilayer`. `t.disposition.forced` is a boolean; a key outside the set is a typed rejection. Bare, `t.disposition` prints as one array cell of `(key,set)` records. Writing it is under Tags below.
 
 `WHERE` over row columns filters tracks; `ORDER BY` re-sorts them (multi-key, Postgres NULL placement) - without it, rows keep file order, which is player-visible and never changed implicitly. Both take the compile-time predicate grammar: `=`, `!=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, statically type-checked.
 
@@ -81,7 +84,7 @@ An aliased non-stream SELECT column is a metadata tag; the alias is the key (fre
 - **Over input rows only** (no track rows in the branch): tags the container - `-metadata`. The input's own tags feed the expressions, so `CASE WHEN f.tags.title IS NULL THEN 'Untitled' ELSE f.tags.title END AS title` fills a missing title. [Recipe 52](examples.md#52-read-the-containers-tags-rewrite-them-with-case).
 - **Both in one query**: layer with a CTE - tag columns in the body are per-stream, in the outer SELECT container-level, and the outer SELECT gathers the CTE's rows (`array_agg` + `GROUP BY`, see Combining rows); the outer value wins on a shared key. [Recipe 53](examples.md#53-tag-the-tracks-and-the-container-in-one-query).
 
-`disposition` is a reserved key: its value is ffmpeg's disposition spec (`'default'`, `'forced'`, `'default+forced'`, `'0'` clears) and it emits `-disposition:N` instead - [recipe 41](examples.md#41-flag-the-default-track). `metadata_from <alias>` copies an input's global tags, `strip_metadata true` drops them; a tag column overrides either for its key. The same columns in a table/CSV query print as plain data, which previews what a retag will write.
+`disposition` is not a tag but the row's own field: its value is ffmpeg's disposition spec (`'default'`, `'forced'`, `'default+forced'`, `'0'` clears), it says what the whole flag map is, and it emits `-disposition:N` - [recipe 41](examples.md#41-flag-the-default-track). A container has no disposition, so it needs a track row. `metadata_from <alias>` copies an input's global tags, `strip_metadata true` drops them; a tag column overrides either for its key. The same columns in a table/CSV query print as plain data, which previews what a retag will write.
 
 ## Combining rows
 

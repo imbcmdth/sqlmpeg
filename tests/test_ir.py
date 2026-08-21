@@ -244,6 +244,25 @@ def test_sink_unit_round_trip() -> None:
     }
 
 
+def test_output_disposition_round_trips() -> None:
+    """The flags are their own field, so they stay out of the metadata dict --
+    and out of the serialized shape entirely when the query asserted none."""
+    flagged = Output(
+        ref="0:a:0", type="audio", name=None, metadata={}, disposition=("default",)
+    )
+    d = flagged.to_dict()
+    assert d["disposition"] == ["default"]
+    assert Output.from_dict(d) == flagged
+
+    cleared = Output(ref="0:a:0", type="audio", name=None, metadata={}, disposition=())
+    assert cleared.to_dict()["disposition"] == []
+    assert Output.from_dict(cleared.to_dict()) == cleared
+
+    plain = Output(ref="0:a:0", type="audio", name=None, metadata={})
+    assert "disposition" not in plain.to_dict()
+    assert Output.from_dict(plain.to_dict()) == plain
+
+
 def test_sink_unit_container_tags_round_trip() -> None:
     unit = SinkUnit(
         outputs=[Output(ref="n2", type="video", name=None, metadata={})],

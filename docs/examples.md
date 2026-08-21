@@ -932,7 +932,7 @@ ffmpeg -i film.mkv -f ffmetadata -i \
 
 ## 41. Flag the default track
 
-`disposition` is a reserved tag key: its value is ffmpeg's disposition spec ('default', 'forced', 'default+forced'; '0' clears). Players open the default track first, so this decides what people hear. Same two levels as recipe 38: flag the rows in the `WITH`, gather them outside it:
+`disposition` is a field of the row, not a tag: its value is ffmpeg's disposition spec ('default', 'forced', 'default+forced'; '0' clears), and it says what the track's whole flag map is. Read it back by path, `t.disposition.default`. Players open the default track first, so this decides what people hear. Same two levels as recipe 38: flag the rows in the `WITH`, gather them outside it:
 
 ```pgsql
 COPY (
@@ -950,6 +950,22 @@ $ sqlmpeg compile -f query.sql
 ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng \
   -disposition:0 default -map 0:a:1 -c:1 copy -metadata:s:1 language=fra -disposition:1 \
   0 flagged.mka
+```
+
+Reading the flags back is the same path form the tags take, one key at a time, and each one is a boolean:
+
+```pgsql
+SELECT t.index, t.tags.language, t.disposition.default, t.disposition.forced
+FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+```
+
+```
+$ sqlmpeg -f query.sql
+ index | language | default | forced
+-------+----------+---------+--------
+ 1     | eng      | true    | false
+ 2     | fra      | false   | false
+(2 rows)
 ```
 
 ## 42. Title the file and keep its global tags

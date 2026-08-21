@@ -207,7 +207,10 @@ _DIALECT_TAIL = """\
   stream, and it is the only thing on a row that can appear in the SELECT
   list of a media query. Every row also carries `index` (1-based, the same
   numbering as `<alias>.audio[k]`), `tags` (the track's own tag map, read by
-  path: `t.tags.language`, `t.tags.title`, any key), `codec`. Audio rows add
+  path: `t.tags.language`, `t.tags.title`, any key), `disposition` (the
+  track's flag map, read by path: `t.disposition.default`,
+  `t.disposition.forced` -- a BOOLEAN, and the key set is closed), `codec`.
+  Audio rows add
   `channels`, `channel_layout`, `sample_rate`, `bitrate`, `duration`. Video
   rows add `width`, `height`, `fps` (verbatim, e.g. `'30000/1001'`),
   `bitrate`, `duration`, `color_transfer`. Subtitle and data rows carry only
@@ -230,9 +233,13 @@ _DIALECT_TAIL = """\
   `::text` / `CAST(x AS text)` to spell a number for `||`. NULL propagates.
   An aliased expression column is a metadata TAG on that row's tracks, the
   alias being the key: `SELECT t, 'Audio (' || t.tags.language || ')' AS
-  title`. In a query with NO track rows the same aliased column tags the
-  CONTAINER instead (`SELECT f.video[1], 'Remastered' AS title`), and `NULL
-  AS artist` clears that key in the output. To set both scopes in one query,
+  title`. `... AS disposition` is not a tag but the row's disposition FIELD:
+  its value is ffmpeg's own flag spec (`'default'`, `'default+forced'`,
+  `'0'` to clear), it says what the whole flag map is, and it needs a track
+  row -- a container has no disposition. In a query with NO track rows the
+  same aliased column tags the CONTAINER instead (`SELECT f.video[1],
+  'Remastered' AS title`), and `NULL AS artist` clears that key in the
+  output. To set both scopes in one query,
   tag the tracks inside a CTE and the container in the outer SELECT (the
   outer value wins on a shared key). Same grammar in a filter option
   over a row table, evaluated per row: `SELECT scale(t, t.width / 2,

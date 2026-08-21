@@ -57,6 +57,9 @@ class StreamMeta:
     bitrate: int | None = None  # ffprobe bit_rate, as int
     duration: float | None = None  # per-stream duration in seconds
     color_transfer: str | None = None  # video only; the HDR discriminator
+    # ffprobe's `disposition` object as booleans, keys lowercased. The
+    # flag map `<row>.disposition.<key>` reads.
+    disposition: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -199,6 +202,7 @@ def _parse_streams(data: object) -> ProbeResult | None:
             codec = _str_opt(raw, "codec_name")
             bitrate = _int_opt(raw, "bit_rate")
             duration = _float_opt(raw, "duration")
+            flags = _dispositions(raw)
 
             if codec_type == "video":
                 metadata = _tags(raw)
@@ -217,6 +221,7 @@ def _parse_streams(data: object) -> ProbeResult | None:
                         bitrate=bitrate,
                         duration=duration,
                         color_transfer=_str_opt(raw, "color_transfer"),
+                        disposition=flags,
                     )
                 )
                 video_idx += 1
@@ -237,6 +242,7 @@ def _parse_streams(data: object) -> ProbeResult | None:
                         bitrate=bitrate,
                         duration=duration,
                         color_transfer=None,
+                        disposition=flags,
                     )
                 )
                 audio_idx += 1
@@ -257,6 +263,7 @@ def _parse_streams(data: object) -> ProbeResult | None:
                         bitrate=bitrate,
                         duration=duration,
                         color_transfer=None,
+                        disposition=flags,
                     )
                 )
                 subtitle_idx += 1
@@ -277,6 +284,7 @@ def _parse_streams(data: object) -> ProbeResult | None:
                         bitrate=bitrate,
                         duration=duration,
                         color_transfer=None,
+                        disposition=flags,
                     )
                 )
                 data_idx += 1
@@ -359,6 +367,23 @@ def _str_opt(raw: dict[str, object], key: str) -> str | None:
     if key not in raw or raw[key] is None:
         return None
     return str(raw[key])
+
+
+def _dispositions(raw: dict[str, object]) -> dict[str, bool]:
+    """A ``disposition`` object as booleans, keys lowercased.
+
+    ffprobe prints 1/0 per flag; a value that is neither is dropped rather
+    than guessed, the same way every other field here nulls itself instead of
+    failing the whole probe.
+    """
+    flags = raw.get("disposition")
+    if not isinstance(flags, dict):
+        return {}
+    return {
+        str(key).lower(): bool(value)
+        for key, value in flags.items()
+        if isinstance(value, (bool, int))
+    }
 
 
 def _tags(raw: dict[str, object]) -> dict[str, str]:

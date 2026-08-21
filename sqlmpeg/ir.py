@@ -148,17 +148,24 @@ class Output:
     ref: FrameRef
     type: StreamType
     name: str | None  # SELECT ... AS name, else None
-    # provenance/tags (e.g. {"language": "fra"}) -> -metadata:s:; the reserved
-    # "disposition" key renders as -disposition: instead (see emit.py).
+    # provenance/tags (e.g. {"language": "fra"}) -> -metadata:s:
     metadata: dict[str, str]
+    # The disposition flags this stream asserts, in the type's own order, or
+    # None where the query asserted none. An empty tuple is `-disposition:<i> 0`.
+    disposition: tuple[str, ...] | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        d: dict[str, object] = {
             "ref": self.ref,
             "type": self.type,
             "name": self.name,
             "metadata": dict(self.metadata),
         }
+        # Emitted only when the query asserted one, like SinkUnit's optional
+        # fields: an output that flags nothing keeps the smaller shape.
+        if self.disposition is not None:
+            d["disposition"] = list(self.disposition)
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, object]) -> Output:
@@ -166,14 +173,19 @@ class Output:
         raw_type = d["type"]
         raw_name = d["name"]
         raw_metadata = d["metadata"]
+        raw_disposition = d.get("disposition")
         assert isinstance(raw_ref, str)
         assert raw_name is None or isinstance(raw_name, str)
         assert isinstance(raw_metadata, dict)
+        assert raw_disposition is None or isinstance(raw_disposition, list)
         return cls(
             ref=raw_ref,
             type=_parse_stream_type(raw_type),
             name=raw_name,
             metadata={str(k): str(v) for k, v in raw_metadata.items()},
+            disposition=(
+                None if raw_disposition is None else tuple(str(f) for f in raw_disposition)
+            ),
         )
 
 

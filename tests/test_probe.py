@@ -590,6 +590,50 @@ def test_container_tags_are_captured_whole(
     }
 
 
+def test_stream_disposition_is_captured_as_booleans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ffprobe prints 1/0 per flag; the probe keeps them as booleans."""
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps(
+            {
+                "streams": [
+                    {
+                        "codec_type": "audio",
+                        "disposition": {"default": 1, "forced": 0, "COMMENT": 1},
+                    }
+                ]
+            }
+        ),
+    )
+    result = probe(str(f))
+    assert result is not None
+    assert result.streams[0].disposition == {
+        "default": True,
+        "forced": False,
+        "comment": True,
+    }
+
+
+def test_a_stream_with_no_disposition_object_reports_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(
+        monkeypatch,
+        stdout=json.dumps({"streams": [{"codec_type": "audio", "disposition": "no"}]}),
+    )
+    result = probe(str(f))
+    assert result is not None
+    assert result.streams[0].disposition == {}
+
+
 def test_stream_tags_are_captured_whole(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

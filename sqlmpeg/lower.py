@@ -302,6 +302,7 @@ from sqlmpeg.parser import (
     _REMOVED_FRAME,
     FILTER_NAMESPACE,
     MACRO_NAMESPACE,
+    MAP_COLUMNS,
     ROW_STREAM,
     RawRowJoin,
     RawSink,
@@ -315,11 +316,16 @@ from sqlmpeg.parser import (
     _time_bounds,
     chapters_unnest_hint,
     column_label,
+    flag_error,
     from_entries,
     group_keys,
     is_grouped,
     is_value_expr,
     kwarg_name,
+    map_example,
+    map_noun,
+    map_path,
+    map_ref,
     references_row_alias,
     star_qualifier,
     subscript_index,
@@ -348,6 +354,8 @@ from sqlmpeg.table import (
 )
 from sqlmpeg.types import (
     CHAPTERS_COLUMN,
+    DISPOSITION_COLUMN,
+    DISPOSITION_KEYS,
     INPUT_DURATION_COLUMN,
     ROW_SCHEMAS,
     STREAM_TAG_COLUMNS,
@@ -866,12 +874,12 @@ def _table_column_name(node: exp.Expr) -> str:
         name = _fold(inner.this)
         if name == ROW_STREAM:
             return _fold(inner.args.get("table"))
-        return tag_key(name) or name
+        return _map_key(name)
     if isinstance(inner, exp.ArrayAgg):
         return "array_agg"  # Postgres's own convention for the unaliased column
     shape = subscript_metadata_shape(inner)
     if shape is not None:
-        return tag_key(shape[1]) or shape[1]
+        return _map_key(shape[1])
     return "column"
 
 
@@ -1490,8 +1498,9 @@ class _SourceBinding:
 
 
 # A track-row metadata value: NULL (unprobed input, or a field this file does
-# not carry) or the probed scalar. Never a stream — `track` is not in here.
-RowValue = str | int | float | None
+# not carry) or the probed scalar. A disposition flag is the boolean case.
+# Never a stream — the row IS that.
+RowValue = str | int | float | bool | None
 
 # `_TrackRow.stream` for a chapter row: never a real stream (chapter
 # rows have no `track` column at all, so `ROW_SCHEMAS["chapters"]` never
@@ -1595,9 +1604,10 @@ _TagOverrides = dict[int, dict[str, str | None]]
 # "rows" is a CTE body -- per-stream tags only, since a CTE has no container.
 _TagScope = Literal["sink", "rows"]
 
-# The reserved per-stream key emit renders as `-disposition:<i>`. A container
-# has no disposition, so it is not a container tag key.
-_DISPOSITION_TAG = "disposition"
+# One query's per-track disposition writes: probed StreamMeta identity -> the
+# flags that stream's output sets, in declared order. An empty tuple is the
+# written `'0'`: every flag off.
+_DispositionOverrides = dict[int, tuple[str, ...]]
 
 
 def _track_of(row: _RowTuple, alias: str) -> _TrackRow | None:
@@ -1621,6 +1631,12 @@ def _cte_row_count(columns: Iterable[_Column]) -> int:
     return max(widths) if widths else 1
 
 
+def _map_key(name: str) -> str:
+    """The key a folded map path names, else the column name itself."""
+    ref = map_ref(name)
+    return ref[1] if ref is not None else name
+
+
 def _tags_to_cell(tags: dict[str, str]) -> ArrayCell:
     """One tag map as an array cell of ``(key,value)`` records, in key order."""
     return ArrayCell(
@@ -1636,14 +1652,34 @@ def _tag_cell(row: _TrackRow | None) -> CellValue:
     return _tags_to_cell({} if source is None else source.metadata)
 
 
+def _flags_to_cell(flags: dict[str, bool]) -> ArrayCell:
+    """One disposition as an array cell of ``(key,set)`` records, in flag order.
+
+    The key set is CLOSED, so every declared flag is an entry; one this ffmpeg
+    did not report reads NULL, the way an absent tag does.
+    """
+    return ArrayCell(
+        elements=tuple(
+            RecordCell(fields=(key, flags.get(key))) for key in DISPOSITION_KEYS
+        )
+    )
+
+
+def _disposition_cell(row: _TrackRow | None) -> CellValue:
+    """One row's whole flag map as a cell; NULL where nothing was probed."""
+    if row is None or row.stream.source is None:
+        return None
+    return _flags_to_cell(row.stream.source.disposition)
+
+
 def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
     """One probed stream's row columns.
 
-    Two sources, one table: the stream's own tags (``StreamMeta.metadata``)
-    become one column per key under its folded path name, everything else comes
-    from a field of the StreamMeta itself. An absent field is NULL, and so is a
-    key the file does not carry — which is the whole NULL story, there is no
-    other way for a row column to be null.
+    Three sources, one table: the stream's own tags (``StreamMeta.metadata``)
+    and its disposition flags each become one column per key under a folded
+    path name, everything else comes from a field of the StreamMeta itself. An
+    absent field is NULL, and so is a key the file does not carry — which is
+    the whole NULL story, there is no other way for a row column to be null.
 
     ``index`` is +1'd: ``StreamMeta.index`` is the 0-based per-type index the
     IR ref uses, and the SQL surface is 1-based everywhere (``f.audio[1]``), so
@@ -1667,8 +1703,15 @@ def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
                  "color_transfer"):
         probed = getattr(meta, name, None)
         values[name] = probed if isinstance(probed, str | int | float) else None
-    columns = {name: values.get(name) for name in schema if name != TAGS_COLUMN}
+    columns = {name: values.get(name) for name in schema if name not in MAP_COLUMNS}
     columns.update({tag_path(key): value for key, value in meta.metadata.items()})
+    columns.update(
+        {
+            map_path(DISPOSITION_COLUMN, key): meta.disposition[key]
+            for key in DISPOSITION_KEYS
+            if key in meta.disposition
+        }
+    )
     return columns
 
 
@@ -1878,6 +1921,10 @@ class _Lowerer:
         # kept for the whole pass: a CTE's streams carry their tags into
         # whichever sink maps them, under that sink's own tags.
         self.cte_tags: _TagOverrides = {}
+        # The disposition columns of the query being lowered, and of every CTE
+        # body, on the same two-scope plan the tags follow.
+        self.dispositions: _DispositionOverrides = {}
+        self.cte_dispositions: _DispositionOverrides = {}
         # The same for the CONTAINER tags of the file being written, key ->
         # value, None meaning "clear this key".
         self.container_tags: dict[str, str | None] = {}
@@ -1942,6 +1989,7 @@ class _Lowerer:
                 self._lower_query(union_branches(body), body, tags="rows")
             )
             self._harvest_cte_tags(body)
+            self._harvest_cte_dispositions(body)
         if self.res.sinks:
             self.graph.sinks = self._lower_sinks()
             if self.fanout_count is None:
@@ -1950,7 +1998,9 @@ class _Lowerer:
             columns = self._lower_query(self.res.branches, self.res.select, tags="sink")
             self.graph.sinks = [
                 SinkUnit(
-                    outputs=_outputs(columns, self._layered_tags()),
+                    outputs=_outputs(
+                        columns, self._layered_tags(), self._layered_dispositions()
+                    ),
                     tags=dict(self.container_tags),
                 )
             ]
@@ -2107,7 +2157,7 @@ class _Lowerer:
             )
             option_nodes["metadata_from"] = metadata_from_opt.value
         _check_sink_option_conflicts(options, option_nodes, raw.path_node)
-        outputs = _outputs(columns, self._layered_tags())
+        outputs = _outputs(columns, self._layered_tags(), self._layered_dispositions())
         _check_two_pass_outputs(options, outputs, raw.path_node)
         path = raw.path
         if raw.path_expr is not None:
@@ -2338,6 +2388,7 @@ class _Lowerer:
         if not branches:
             raise _error(ErrorCode.UNSUPPORTED_SQL, "query has no SELECT", anchor)
         self.tags = {}
+        self.dispositions = {}
         self.container_tags = {}
         lowered = [self._lower_branch(branch, tags=tags) for branch in branches]
         if len(lowered) == 1:
@@ -2501,7 +2552,9 @@ class _Lowerer:
             # no per-row scope: its scalars are group-constants, so they tag
             # the group's container.
             if _is_tag_column(projection, env):
-                if _has_track_rows(env) and not env.grouped:
+                if _projection_name(projection) == DISPOSITION_COLUMN:
+                    self._collect_disposition(projection, env, select, scope=tags)
+                elif _has_track_rows(env) and not env.grouped:
                     self._collect_tag(projection, env, select)
                 elif tags == "sink":
                     self._collect_container_tag(projection, env, select)
@@ -2736,6 +2789,26 @@ class _Lowerer:
                     )
                 carried[key] = value
 
+    def _harvest_cte_dispositions(self, body: exp.Expr) -> None:
+        """Move the dispositions one CTE body just recorded into the carry-over
+        dict, exactly as `_harvest_cte_tags` does for its tags."""
+        for source_id, flags in self.dispositions.items():
+            carried = self.cte_dispositions.get(source_id)
+            if carried is not None and carried != flags:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "the disposition takes two different values on the same track",
+                    body,
+                    hint="two CTE bodies flag one track differently; give it a "
+                    "single value, or set it in the outer SELECT, which "
+                    "overrides them both",
+                )
+            self.cte_dispositions[source_id] = flags
+
+    def _layered_dispositions(self) -> _DispositionOverrides:
+        """The CTE bodies' dispositions with this sink's laid over them."""
+        return {**self.cte_dispositions, **self.dispositions}
+
     def _layered_tags(self) -> _TagOverrides:
         """The CTE bodies' tags with this sink's laid over them, per track.
 
@@ -2768,15 +2841,6 @@ class _Lowerer:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL, "malformed tag column", projection,
                 fallback=select,
-            )
-        if key == _DISPOSITION_TAG:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"'{_DISPOSITION_TAG}' is a per-stream key, not a container tag",
-                projection,
-                fallback=select,
-                hint="a disposition rides on a track row, e.g. SELECT t, "
-                "'default' AS disposition FROM input('f.mkv') f, unnest(f.audio) t",
             )
         value = self._eval_value(_unwrap(projection), env, _group_row(env), select)
         text = None if value is None else _tag_text(value)
@@ -2815,6 +2879,110 @@ class _Lowerer:
                 # tagged by the body that named them.
                 if isinstance(track, _TrackRow):
                     self._record_tag(track.stream.source, key, text, projection, select)
+
+    def _collect_disposition(
+        self, projection: exp.Expr, env: _Env, select: exp.Select, *, scope: _TagScope
+    ) -> None:
+        """``... AS disposition``: ffmpeg's own flag spec, per result row.
+
+        The value is the spec ffmpeg takes on the command line -- flag names
+        joined by ``+``, or ``'0'`` for none -- and it is ABSOLUTE: it says what
+        the output stream's whole flag map is, so every flag it does not name
+        is off. NULL says the same as ``'0'``, the way a NULL tag clears its
+        key. A container has no disposition, so a branch with no track row to
+        flag is a rejection rather than a container write.
+        """
+        relation = env.relation
+        if not _has_track_rows(env) or env.grouped or relation is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{DISPOSITION_COLUMN}' is a stream field, not a container one",
+                projection,
+                fallback=select,
+                hint="a disposition rides on a track row, e.g. SELECT t, "
+                f"'{DISPOSITION_KEYS[0]}' AS {DISPOSITION_COLUMN} FROM "
+                "input('f.mkv') f, unnest(f.audio) t"
+                if scope == "sink"
+                else "flag the rows a CTE body selects, then gather them outside it",
+            )
+        value_node = _unwrap(projection)
+        for row in relation.tuples:
+            flags = self._flag_spec(
+                self._eval_value(value_node, env, row, select), projection, select
+            )
+            for track in row.values():
+                if isinstance(track, _TrackRow):
+                    self._record_disposition(track.stream.source, flags, projection, select)
+
+    def _flag_spec(
+        self, value: RowValue, anchor: exp.Expr, select: exp.Select
+    ) -> tuple[str, ...]:
+        """One written disposition value as the flags it sets, in declared order.
+
+        ``'default+forced'`` sets those two, ``'0'`` and NULL set none, and a
+        name outside the closed set is a rejection naming the ones that are in
+        it. Order is the type's, not the writer's, so one flag map has one
+        spelling however it was typed.
+        """
+        if value is None:
+            return ()
+        if not isinstance(value, str):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{DISPOSITION_COLUMN}' takes ffmpeg's flag spec, not a number",
+                anchor,
+                fallback=select,
+                hint=f"quote the flags, e.g. '{DISPOSITION_KEYS[0]}' or '0' to "
+                "clear them",
+            )
+        if value == "0":
+            return ()
+        named = set()
+        for part in value.split("+"):
+            key = part.strip().lower()
+            if not key or key.startswith(("+", "-")):
+                # ffmpeg's own `+flag`/`-flag` adjusts what the source carries;
+                # this column says what the whole map is, so there is nothing
+                # for a relative spec to adjust.
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{value}' is not a flag list",
+                    anchor,
+                    fallback=select,
+                    hint="name every flag the track should have, joined with "
+                    f"'+', e.g. '{DISPOSITION_KEYS[0]}+{DISPOSITION_KEYS[6]}'; "
+                    "'0' clears them all",
+                )
+            if key not in DISPOSITION_KEYS:
+                raise flag_error(part.strip(), key, anchor, select)
+            named.add(key)
+        return tuple(key for key in DISPOSITION_KEYS if key in named)
+
+    def _record_disposition(
+        self,
+        source: StreamMeta | None,
+        flags: tuple[str, ...],
+        anchor: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """Note one track's disposition; disagreement is a rejection.
+
+        Keyed like `_record_tag`, by the identity of the probed StreamMeta, so
+        the flags find their track through any chain of filters.
+        """
+        if source is None:
+            return
+        recorded = self.dispositions.get(id(source))
+        if recorded is not None and recorded != flags:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "the disposition takes two different values on the same track",
+                anchor,
+                fallback=select,
+                hint="a disposition is row-scoped, so a track selected by "
+                "several result rows must get the same flags in each",
+            )
+        self.dispositions[id(source)] = flags
 
     def _record_tag(
         self,
@@ -3697,6 +3865,11 @@ class _Lowerer:
                 self._eval_value(node.this, env, rows, select),
                 self._eval_value(node.args.get("expression"), env, rows, select),
             )
+        if isinstance(node, exp.Boolean | exp.Column):
+            # A boolean value IS the condition, as it is in Postgres; resolve
+            # already turned away a column of any other type.
+            value = self._eval_value(node, env, rows, select)
+            return None if value is None else bool(value)
         raise _error(  # defensive: resolve accepted only the shapes above
             ErrorCode.UNSUPPORTED_SQL,
             "unsupported row predicate",
@@ -3747,16 +3920,16 @@ class _Lowerer:
                 hint=self._known_hint(),
             )
         name = _fold(column.this)
-        if name == TAGS_COLUMN:
+        if name in MAP_COLUMNS:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{binding.alias}.{TAGS_COLUMN}' is the whole tag map, not a "
-                "single value",
+                f"'{binding.alias}.{name}' is the whole {map_noun(name)} map, "
+                "not a single value",
                 column,
                 fallback=select,
-                hint=f"name the key: '{binding.alias}.{TAGS_COLUMN}.language'",
+                hint=f"name the key: '{binding.alias}.{name}.{map_example(name)}'",
             )
-        if name not in ROW_SCHEMAS[binding.column] and tag_key(name) is None:
+        if name not in ROW_SCHEMAS[binding.column] and map_ref(name) is None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"unknown column '{binding.alias}.{column.name}'",
@@ -3786,6 +3959,8 @@ class _Lowerer:
         value = _unwrap(node) if isinstance(node, exp.Expr) else None
         if isinstance(value, exp.Null):
             return None
+        if isinstance(value, exp.Boolean):
+            return bool(value.this)
         if isinstance(value, exp.Column):
             return self._row_value_of(value, env, rows, select)
         if isinstance(value, exp.Case):
@@ -4638,7 +4813,7 @@ class _Lowerer:
         """
         schema = ROW_SCHEMAS[binding.column]
         if name != ROW_STREAM:
-            if name not in schema and tag_key(name) is None:
+            if name not in schema and map_ref(name) is None:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"unknown column '{binding.alias}.{column_label(name)}'",
@@ -6546,6 +6721,7 @@ class _Lowerer:
                 self._lower_query(union_branches(body), body, tags="rows")
             )
             self._harvest_cte_tags(body)
+            self._harvest_cte_dispositions(body)
         self.table_mode = True
         sinks: list[TableSink] = []
         if self.res.sinks:
@@ -6767,7 +6943,9 @@ class _Lowerer:
         schema = ROW_SCHEMAS[binding.column]
         if name == TAGS_COLUMN:
             return [_tag_cell(row) for row in binding.rows]
-        if name not in schema and tag_key(name) is None:
+        if name == DISPOSITION_COLUMN and name in schema:
+            return [_disposition_cell(row) for row in binding.rows]
+        if name not in schema and map_ref(name) is None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"unknown column '{binding.alias}.{column_label(name)}'",
@@ -6962,7 +7140,11 @@ def _agreed_source(segments: list[_Stream]) -> StreamMeta | None:
     return segments[0].source
 
 
-def _outputs(columns: list[_Column], tags: _TagOverrides) -> list[Output]:
+def _outputs(
+    columns: list[_Column],
+    tags: _TagOverrides,
+    dispositions: _DispositionOverrides,
+) -> list[Output]:
     """One :class:`~sqlmpeg.ir.Output` per stream a SELECT list carries.
 
     The SELECT list IS the output stream list, and an array column is several
@@ -6976,6 +7158,7 @@ def _outputs(columns: list[_Column], tags: _TagOverrides) -> list[Output]:
             type=stream.type,
             name=column.name,
             metadata=_metadata(stream, tags),
+            disposition=_disposition(stream, dispositions),
         )
         for column in columns
         for stream in column.value.streams
@@ -6999,8 +7182,24 @@ def _metadata(stream: _Stream, tags: _TagOverrides) -> dict[str, str]:
     return metadata
 
 
-def _tag_text(value: str | int | float) -> str:
-    """A tag value as the text ffmpeg receives."""
+def _disposition(
+    stream: _Stream, dispositions: _DispositionOverrides
+) -> tuple[str, ...] | None:
+    """The flags one output asserts, or None where the query asserted none.
+
+    Nothing rides through from the source: ffmpeg copies a stream's own
+    disposition already, so only a written column puts `-disposition:<i>` on
+    the command line.
+    """
+    if stream.source is None:
+        return None
+    return dispositions.get(id(stream.source))
+
+
+def _tag_text(value: str | int | float | bool) -> str:
+    """A tag value as the text ffmpeg receives; a boolean spells itself out."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
     return value if isinstance(value, str) else str(value)
 
 

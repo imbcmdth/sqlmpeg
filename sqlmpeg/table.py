@@ -106,6 +106,8 @@ class TableSink:
 def _cell_text(cell: CellValue) -> str:
     if cell is None:
         return ""
+    if isinstance(cell, bool):
+        return "true" if cell else "false"
     if isinstance(cell, StreamCell):
         return f"<{cell.type} {cell.spec}>"
     if isinstance(cell, ArrayCell):

@@ -236,10 +236,6 @@ OUTPUT_LABEL_PREFIX = "out"
 _SPLIT_FILTERS = frozenset({"split", "asplit"})
 _VALUE_ONLY_KEYS = frozenset({"expr"})
 
-# A tag column aliased `disposition` is reserved: it renders as
-# `-disposition:<i> <value>` instead of `-metadata:s:<i> disposition=<value>`.
-_DISPOSITION_KEY = "disposition"
-
 _TYPE_MARKERS: dict[StreamType, str] = {
     "video": "v",
     "audio": "a",
@@ -282,6 +278,8 @@ class OutputMap:
     type: StreamType
     copy: bool  # passthrough -> True -> -c:<i> copy
     metadata: dict[str, str]
+    # The flags the query asserted, or None where it asserted none.
+    disposition: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -542,10 +540,9 @@ def build_ffmpeg_args(e: Emitted, out_path: str | None = None) -> list[str]:
 
     The SELECT list is authoritative: exactly one ``-map`` per
     :class:`OutputMap`, in order, with ``-c:<i> copy`` for passthrough streams
-    and ``-metadata:s:<i> k=v`` (keys sorted) for provenance metadata, except
-    the reserved ``disposition`` key, which renders ``-disposition:<i> <v>``
-    instead (ffmpeg's own spec string, not a ``k=v`` pair) and always after
-    the other metadata. Those ``<i>`` are PER GROUP — ffmpeg restarts output
+    and ``-metadata:s:<i> k=v`` (keys sorted) for provenance metadata, then
+    ``-disposition:<i> <flags>`` for a stream the query flagged (ffmpeg's own
+    ``+``-joined spec, ``0`` for none). Those ``<i>`` are PER GROUP — ffmpeg restarts output
     stream numbering at each file — so group 2's first map is ``-c:0``, not
     ``-c:<n>``.
     ``-filter_complex`` is rendered once for the command, omitted when the
@@ -638,11 +635,12 @@ def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> li
             if mapping.copy and mapping.type not in suppressed and group.window is None:
                 args += [f"-c:{index}", "copy"]
             for key in sorted(mapping.metadata):
-                if key == _DISPOSITION_KEY:
-                    continue
                 args += [f"-metadata:s:{index}", f"{key}={mapping.metadata[key]}"]
-            if _DISPOSITION_KEY in mapping.metadata:
-                args += [f"-disposition:{index}", mapping.metadata[_DISPOSITION_KEY]]
+            if mapping.disposition is not None:
+                args += [
+                    f"-disposition:{index}",
+                    "+".join(mapping.disposition) or "0",
+                ]
         # Ahead of the sink options. ffmpeg applies `-metadata` after
         # `-map_metadata` whatever the argv order, so a tag column wins over
         # `metadata_from`/`strip_metadata` either way.
@@ -1043,6 +1041,7 @@ def _output_map(g: Graph, output: Output, labels: dict[str, str]) -> OutputMap:
             type=output.type,
             copy=True,
             metadata=dict(output.metadata),
+            disposition=output.disposition,
         )
     slot = _slot(output.ref)
     label = labels.get(slot)
@@ -1053,6 +1052,7 @@ def _output_map(g: Graph, output: Output, labels: dict[str, str]) -> OutputMap:
         type=output.type,
         copy=False,
         metadata=dict(output.metadata),
+        disposition=output.disposition,
     )
 
 
