@@ -1516,3 +1516,36 @@ ffmpeg -i tests/fixtures/av-chapters.mkv -f webvtt -i \
 
 The reverse - a `.vtt` file's cues becoming a chapter list - is the same expression with the types swapped: `array_agg(ROW(c.text, c.start_t, c.end_t)::chapter) AS chapters` over `unnest(v.cues) c`.
 
+## 66. Attach a font, and list what a file carries
+
+An attachment is a file riding inside the container - a subtitle font, cover art, a script. Build the list from `attachment` records: filename, MIME type, and the file to read:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1],
+         ARRAY[ROW('font.ttf', 'application/x-truetype-font',
+                   'tests/fixtures/font.ttf')::attachment] AS attachments
+  FROM input('tests/fixtures/av2.mp4') f
+) TO 'fonted.mkv'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av2.mp4 -attach tests/fixtures/font.ttf -map 0:v:0 -c:0 copy   -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -metadata:s:2   mimetype=application/x-truetype-font -metadata:s:2 filename=font.ttf fonted.mkv
+```
+
+Reading is the mirror - attachments are rows like chapters and cues, so a table query lists what a file carries:
+
+```pgsql
+SELECT a.index, a.filename, a.mimetype
+FROM input('tests/fixtures/attached.mkv') f, unnest(f.attachments) a
+```
+
+```
+$ sqlmpeg -f query.sql
+ index | filename | mimetype
+-------+----------+---------------------------------
+ 1     | font.ttf | application/x-truetype-font
+(1 row)
+```
+
