@@ -81,6 +81,15 @@ devices - with a member count and an uncompressed size cap. Python's
 produces the same bytes and so the same digest, and a published version
 never changes underneath a pin.
 
+**The client already pins the shape.** Both `index.json` and the detail
+files must carry `"format_version": 1`; the client refuses another
+rather than guessing what its keys mean. The detail file is what decides
+which version is highest - the catalogue's `version` field is a search
+convenience, so a stale cached catalogue can never pin an older release
+than the one published. Package names are `<owner>/<name>`, lowercase,
+each half starting with a letter or digit, checked before a name is ever
+part of a URL or a path.
+
 ## The site
 
 Built from the same JSON by the same CI run: a search page reading
