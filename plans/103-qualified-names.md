@@ -1,5 +1,9 @@
 # 103 — namespace/package, and what a call writes
 
+**Superseded by plan 104**, which folds this in with the absence rule,
+signature defaults, the Cargo-style alias, and the demo sweep. Kept for
+the record; do not implement from here.
+
 Supersedes the manifest surface of plans 100 and 101. Maintainer,
 2026-08-22. The resolution machinery underneath is unchanged; what
 changes is what a package is called and how a call reaches into one.
