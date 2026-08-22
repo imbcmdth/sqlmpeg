@@ -267,49 +267,90 @@ nothing. Functions are for packages whose point is to be called from
 other queries; none of the demos is that. (This also means the CTE
 fan-out gap in `docs/known_gaps.md` is not on this path.)
 
-The sweep: every program gains the optional variables Part 1 makes
-free, and anything that is another program with different knobs
-exposed is culled into it.
+The sweep has two halves: every program gains the optional variables
+Part 1 makes free, and anything that is another program with different
+knobs exposed is culled into it.
 
-| program | change |
+### 4.1 The culls
+
+Four, and one rename.
+
+| change | why |
 | --- | --- |
-| `encode` ← `transcode`, `compress` | one program. All tracks by default (`f.video`, `f.audio`, subtitles carried). `vcodec`, `acodec`, `crf`, `video_bitrate`, `audio_bitrate`, `preset` all optional — unset drops the COPY option, ffmpeg decides. |
-| `abr-ladder` | keep; a different shape (one decode, several outputs), not a knob set. Rung sizes optional. |
-| `clip` | `start` and `end` each optional — open-ended trims already exist. |
-| `resize` | `height` optional, defaults to `-2`. |
-| `rotate` | `dir` optional. |
-| `watermark` | `x`, `y`, `scale` optional. |
-| `loudnorm-all` | `i`, `tp`, `lra` optional. |
-| `volume` | `factor` required — there is nothing to do without it. |
-| `fade` | `duration` optional. |
-| `speed` | `factor` required. |
-| `gif` | `fps`, `width` optional. |
-| `retitle` | `title`, `artist` optional via `COALESCE(:'title', f.title)` — see 1.5. |
-| `thumbnail`, `extract-frames` | stay separate: one image vs a sequence is a different query shape, not a default. |
-| the rest | source and destination required, nothing else to generalize. |
+| `transcode` ← `compress` | the same program with different knobs exposed. One `transcode`: all tracks by default (`f.video`, `f.audio`, subtitles carried), and `vcodec`, `acodec`, `crf`, `video_bitrate`, `audio_bitrate`, `preset` all optional — unset drops the COPY option and ffmpeg decides. |
+| `extract-audio` ← `extract-languages` | one program: `language` set writes one file, unset groups by language and fans out to `TO (:'prefix' || t.language || '.m4a')`. The cost is that the single-language case is named by pattern rather than an exact `dest`. |
+| `strip-audio` → renamed `extract-video` | "drop the audio, keep the picture" and "extract the video track" produce the identical file. It was the video extraction all along, named for what it removes. |
+| `remote-tracks` dropped | a technique demo — it exists to show that selection works over a URL. That is a docs job; nobody installs it. Stays in `docs/examples.md`. |
 
-One genuine merge falls out. The rest of the redundancy was in
-hard-coded knobs, and absence fixes that without merging anything.
+**`extract` cannot become one program.** A stream type is a COLUMN in
+this dialect (`f.audio`, `f.subtitle`), not a value, so there is no
+`f.streams[:type]` to select and the SELECT list differs per type.
+`extract-audio`, `extract-video` and `extract-subtitles` stay three
+programs however alike they are. Worth knowing before the sweep goes
+looking for a merge that is not there.
 
-### 4.1 Grouping
+31 programs from 34.
 
-After the sweep, seven packages under `imbcmdth`, default `bin` first:
+### 4.2 Optional variables
+
+| program | optional |
+| --- | --- |
+| `transcode` | `vcodec`, `acodec`, `crf`, `video_bitrate`, `audio_bitrate`, `preset` |
+| `abr-ladder` | rung sizes |
+| `clip` | `start`, `end` — each alone is an open-ended trim, which already works |
+| `extract-audio` | `language` — unset fans out per language |
+| `resize` | `height`, defaulting to `-2` |
+| `rotate` | `dir` |
+| `watermark` | `x`, `y`, `scale` |
+| `loudnorm-all` | `i`, `tp`, `lra` |
+| `fade` | `duration` |
+| `gif` | `fps`, `width` |
+| `retitle` | `title`, `artist`, via `COALESCE(:'title', f.title)` — see 1.5 |
+| `volume`, `speed` | nothing: `factor` is required, there is no operation without it |
+| the rest | source and destination required, nothing else to generalize |
+
+`thumbnail` and `extract-frames` stay separate: one image versus a
+sequence is a different query shape, not a default.
+
+### 4.3 Grouping
+
+Two taxonomies are in play — verbs (`split`, `join`, `encode`) and
+mediums (`video`, `audio`, `subtitles`, `images`) — and every case that
+felt arguable sat where they overlap. The tie-break: **a verb package
+takes what changes the container's shape; a medium package takes what
+keeps it and changes the content.** So extraction is a split whatever
+it extracts, and `volume` is audio because the streams come out the
+same shape they went in.
 
 | package | `bin` | `bins` |
 | --- | --- | --- |
-| `encode` | encode | abr-ladder |
-| `edit` | clip | ad-insert, concat-fill, crossfade, fade, speed, split-chapters |
-| `picture` | resize | crop, rotate, pip, side-by-side, watermark, blur-region |
-| `audio` | volume | loudnorm-all, duck, replace-audio, strip-audio, split-channels |
-| `tracks` | tracks-to-csv | extract-audio, extract-languages, remote-tracks, retitle |
-| `subtitles` | burn-subtitles | mux-subtitles, extract-subtitles |
-| `images` | thumbnail | extract-frames, gif |
+| `imbcmdth/split` | clip | split-chapters, split-channels, extract-audio, extract-video, extract-subtitles |
+| `imbcmdth/join` | insert | concat-fill, crossfade |
+| `imbcmdth/video` | resize | crop, rotate, pip, side-by-side, blur-region, watermark, fade, speed |
+| `imbcmdth/audio` | volume | loudnorm-all, duck, replace-audio |
+| `imbcmdth/subtitles` | burn-subtitles | mux-subtitles |
+| `imbcmdth/images` | thumbnail | extract-frames, gif |
+| `imbcmdth/metadata` | tracks-to-csv | retitle |
+| `imbcmdth/encode` | transcode | abr-ladder |
 
-Judgment calls: `retitle` is container-level and sits in `tracks` as
-the loosest fit; `split-chapters` is in `edit` because it cuts on time.
-Sign-off pending on this table.
+`ad-insert` is renamed `insert`.
 
-### 4.2 What `list` and the site show
+**`subtitles` is a deliberate exception to the tie-break.** By the rule,
+`burn-subtitles` is a video operation and `mux-subtitles` is a join, and
+the package would not exist. It exists because "I need to deal with
+subtitles" is a thing people set out to do, and two findable programs
+beat consistency here. Written down as an exception rather than left to
+be rediscovered as an inconsistency.
+
+`fade` and `speed` are in `video` because they change content, not
+shape; `speed` touches picture and sound together and is the one real
+compromise — `video` is where a person looks for slow motion.
+`watermark` is in `video` beside `pip`: the same overlay with an image
+source instead of a video one, and splitting the pair would be worse
+than either home. `images` is therefore producers only — video in,
+picture out.
+
+### 4.4 What `list` and the site show
 
 Required versus optional is derived, so `sqlmpeg list` derives it:
 compile each program with nothing set and collect the required
@@ -324,7 +365,7 @@ registry build compiles each program with.
 
 Plan 102 stands (main is source, `gh-pages` accumulates). Changes:
 
-- the seed is the seven packages in 4.1, not `sqlmpeg/queries`;
+- the seed is the eight packages in 4.3, not `sqlmpeg/queries`;
 - the reserved first segments are refused at submission;
 - `owners.json` is keyed by namespace — `{"imbcmdth": ["imbcmdth"]}`;
 - the build reads `libs` for the export list and still parses
@@ -344,7 +385,7 @@ Each wave lands green, with its recipes in `docs/examples.md` first.
 | B | Part 2: `DEFAULT` in signatures, the NULL-takes-default deviation, `list` showing defaults | A |
 | C | 3.1–3.2: the manifest, the lockfile v2, `--as` deleted, reserved first segment | — |
 | D | 3.3–3.4: three-segment and alias resolution | C |
-| E | Part 4: the sweep, the cull, the grouping; `list` deriving required-ness | A, B |
+| E | Part 4: the culls, the optional sweep, the grouping; `list` deriving required-ness | A, B |
 | F | Part 5: the registry seed and build | C, D, E |
 
 A and C are independent and can run in parallel. Everything stays on
