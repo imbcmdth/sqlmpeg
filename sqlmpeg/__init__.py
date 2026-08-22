@@ -23,6 +23,8 @@
 - ``build_system_prompt`` -- a :class:`~sqlmpeg.registry.Registry` in, an LLM
   system prompt describing the dialect out.
 - ``SqlmpegError`` / ``ErrorCode`` -- the typed exception every rejection raises.
+- ``SqlmpegWarning`` / ``WarningCode`` -- what a compile says without refusing it,
+  through ``compile_sql``'s optional ``on_warning`` callback.
 
 Usage::
 
@@ -45,6 +47,7 @@ from .prompt import build_system_prompt
 from .registry import Registry
 from .registry import load as load_registry
 from .table import TableSink, render_csv, render_table
+from .warnings import SqlmpegWarning, WarningCode
 
 try:
     __version__ = version("sqlmpeg")
@@ -58,7 +61,9 @@ __all__ = [
     "PackageSet",
     "Registry",
     "SqlmpegError",
+    "SqlmpegWarning",
     "TableSink",
+    "WarningCode",
     "build_ffmpeg_commands",
     "build_system_prompt",
     "classify",

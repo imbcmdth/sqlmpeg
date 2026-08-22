@@ -10,6 +10,13 @@ the SDK turns into a failed tool call. :func:`validate_query` is the
 deliberate exception: it NEVER raises and returns the error as data
 (`SqlmpegError.to_dict()`, the shape ``docs/error-schema.json`` pins),
 because it is the structured half of the repair loop.
+
+What a compile has to say short of refusing comes back the same way, in a
+``warnings`` array beside the answer: a package resolved from the machine-wide
+lockfile instead of the project's, or one linked to a directory no lockfile
+pins. Each warning is a code, a message, the namespace it is about, an anchor
+and a hint. ``validate`` adds the array only when there is one, so a valid
+query with nothing to say still answers with an empty object.
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ from ..project import PackageSet, discover
 from ..prompt import build_system_prompt
 from ..table import TableResult, render_csv, render_table
 from ..vars import substitute
+from ..warnings import OnWarning, WarningLog
 
 __all__ = [
     "STDERR_LIMIT",
@@ -74,23 +82,45 @@ def _sinks(graphs: list[Graph]) -> list[SinkUnit]:
     return [unit for graph in graphs for unit in graph.sinks]
 
 
-def _is_table_query(text: str, packages: PackageSet | None = None) -> bool:
+def _is_table_query(
+    text: str, packages: PackageSet | None = None, on_warning: OnWarning | None = None
+) -> bool:
     """True if `text` succeeds as a table/csv query.
 
     A table query compiles through its own lenient pipeline, so "compiles =
     valid" still holds for one ``compile_commands`` rejected.
     """
     try:
-        is_table_capable, _has_copy = classify(text, packages=packages)
+        is_table_capable, _has_copy = classify(text, packages=packages, on_warning=on_warning)
     except SqlmpegError:
         return False
     if not is_table_capable:
         return False
     try:
-        compile_table_sql(text, packages=packages)
+        compile_table_sql(text, packages=packages, on_warning=on_warning)
     except SqlmpegError:
         return False
     return True
+
+
+def _reported(warnings: WarningLog) -> list[dict[str, object]]:
+    """What the compile had to say, as the tool result's ``warnings`` array.
+
+    stdout is the protocol stream here, so a diagnostic has nowhere to be
+    printed: it comes back as data, next to the answer it is about.
+    """
+    return [warning.to_dict() for warning in warnings.warnings]
+
+
+def _warnings_only(warnings: WarningLog) -> dict[str, Any]:
+    """`validate`'s success answer: empty, unless there is something to say.
+
+    The tool's contract is that a valid query returns nothing; a warning is
+    not an error, so what tells the two apart is the ``code`` an error
+    carries, which this never has.
+    """
+    reported = _reported(warnings)
+    return {"warnings": reported} if reported else {}
 
 
 def _table_error() -> SqlmpegError:
@@ -103,13 +133,14 @@ def compile_query(
     """The ffmpeg command(s) `query` compiles to."""
     text = _prepare(query, variables)
     packages = _packages(project)
+    warnings = WarningLog()
     try:
-        graphs = compile_commands(text, packages=packages)
+        graphs = compile_commands(text, packages=packages, on_warning=warnings)
     except SqlmpegError:
         # A query with no streaming representation fails here; table mode is
         # the fallback, tried only for a query that could BE one. If it is,
         # the refusal names the tool that handles it.
-        if _is_table_query(text, packages):
+        if _is_table_query(text, packages, warnings):
             raise _table_error() from None
         raise
     # A bare SELECT compiles, but names no destination -- compile never
@@ -128,29 +159,35 @@ def compile_query(
         # loudnorm2: the first command measures, and the next carries
         # ${SQLMPEG_LN_*} placeholders only `run` fills in.
         "needs_measurement": any(bool(e.measure_filter_complex) for e in emitted),
+        "warnings": _reported(warnings),
     }
 
 
 def validate_query(
     query: str, variables: dict[str, str] | None = None, project: str | None = None
 ) -> dict[str, Any]:
-    """Empty if `query` compiles, else the typed error object. Never raises."""
+    """Empty if `query` compiles, else the typed error object. Never raises.
+
+    A query that compiled with something to say answers with a ``warnings``
+    array and no ``code``; an error always carries one.
+    """
     text: str | None = None
     packages: PackageSet | None = None
     compiling = False
+    warnings = WarningLog()
     try:
         text = _prepare(query, variables)
         # Inside the try: a malformed manifest is a rejection like any other,
         # and this tool returns every rejection as data.
         packages = _packages(project)
         compiling = True
-        compile_commands(text, packages=packages)
+        compile_commands(text, packages=packages, on_warning=warnings)
     except SqlmpegError as err:
         # The table fallback answers only for a query that failed to COMPILE.
         # An undefined :name or a malformed manifest failed before that, and
         # is the answer itself.
-        if compiling and text is not None and _is_table_query(text, packages):
-            return {}
+        if compiling and text is not None and _is_table_query(text, packages, warnings):
+            return _warnings_only(warnings)
         return err.to_dict()
     except Exception as err:  # no input may make a validate call fail
         return SqlmpegError(
@@ -160,15 +197,18 @@ def validate_query(
             col=1,
             hint="please report this query as a bug",
         ).to_dict()
-    return {}
+    return _warnings_only(warnings)
 
 
 def explain_query(
     query: str, variables: dict[str, str] | None = None, project: str | None = None
 ) -> dict[str, Any]:
     """The IR graph `query` compiles to, one per ffmpeg command."""
-    graphs = compile_commands(_prepare(query, variables), packages=_packages(project))
-    return {"graphs": [graph.to_dict() for graph in graphs]}
+    warnings = WarningLog()
+    graphs = compile_commands(
+        _prepare(query, variables), packages=_packages(project), on_warning=warnings
+    )
+    return {"graphs": [graph.to_dict() for graph in graphs], "warnings": _reported(warnings)}
 
 
 def _row_text(result: TableResult) -> list[list[str]]:
@@ -186,13 +226,15 @@ def inspect_query(
     """The rows of a table query: what tracks, chapters, cues or attachments a file has."""
     text = _prepare(query, variables)
     packages = _packages(project)
-    is_table_capable, _has_copy = classify(text, packages=packages)
+    warnings = WarningLog()
+    is_table_capable, _has_copy = classify(text, packages=packages, on_warning=warnings)
     if not is_table_capable:
         raise SqlmpegError(
             ErrorCode.UNSUPPORTED_SQL, _MEDIA_MESSAGE, line=1, col=1, hint=_MEDIA_HINT
         )
-    sinks = compile_table_sql(text, packages=packages)
+    sinks = compile_table_sql(text, packages=packages, on_warning=warnings)
     return {
+        "warnings": _reported(warnings),
         "results": [
             {
                 "columns": list(sink.result.columns),
@@ -280,11 +322,12 @@ def run_query(
     """Compile `query` and run ffmpeg, writing the files its COPY names."""
     text = _prepare(query, variables)
     packages = _packages(project)
-    is_table_capable, _has_copy = classify(text, packages=packages)
+    warnings = WarningLog()
+    is_table_capable, _has_copy = classify(text, packages=packages, on_warning=warnings)
     if is_table_capable:
         raise _table_error()
 
-    graphs = compile_commands(text, packages=packages)
+    graphs = compile_commands(text, packages=packages, on_warning=warnings)
     if any(unit.path is None for unit in _sinks(graphs)):
         raise SqlmpegError(
             ErrorCode.UNSUPPORTED_SQL, _NO_PATH_MESSAGE, line=1, col=1, hint=_NO_PATH_HINT
@@ -306,6 +349,7 @@ def run_query(
             for c in result.commands
         ],
         "outputs": [unit.path for unit in _sinks(graphs) if unit.path is not None],
+        "warnings": _reported(warnings),
     }
 
 

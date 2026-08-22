@@ -77,6 +77,44 @@ rejected as it always was. Library callers pass
 relying on a working directory, and the MCP tools take the same path as
 a `project` argument.
 
+### Installed packages
+
+`sqlmpeg.lock`, beside the manifest, records what the project
+installed. It is machine-owned: installing writes it, nothing else
+should. Each entry is one of two kinds.
+
+```json
+{ "format_version": 1,
+  "reproducible": false,
+  "not_reproducible_because": "a package is linked to a working directory, so its files are not pinned here",
+  "packages": [
+    { "kind": "registry", "name": "broadcast/tracks", "version": "1.2.0",
+      "namespace": "tracks", "sha256": "<64 hex>", "store": "v1/ab/<64 hex>" },
+    { "kind": "link", "namespace": "dev", "path": "../my-lib" }
+  ] }
+```
+
+A **registry** entry pins a version and the sha256 of the content in
+the store under `~/.cache/sqlmpeg/packages/`. That content is hashed
+again every time it is read, and content that does not match the digest
+is a rejection naming the package, never a fall back to what is there.
+
+A **link** entry names a directory and nothing else. Its
+`sqlmpeg.json` is read like any other manifest, so an edit lands in the
+next compile - which is the point, and which no digest could survive.
+A lockfile holding a link is therefore not reproducible, and says so in
+its own text.
+
+A namespace resolves through three layers, the first claim winning: the
+project's own manifest, then its lockfile, then the machine-wide
+lockfile a global install writes. Two of those are worth saying out
+loud, so a compile reports them without refusing: resolving inside a
+project but landing on the machine-wide layer, and compiling against a
+link. Each is reported once per package - as a `warning:` line on
+stderr from the CLI, in the `warnings` array of an MCP tool result, and
+through `compile_sql`'s optional `on_warning` callback for a library
+caller.
+
 ## FROM items
 
 Every FROM item is a compile-time table; the column model per shape is
@@ -218,6 +256,14 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   identifier; a source pattern matching no file or leaving the project
   directory; one name defined twice across a package's sources; a
   package source holding anything but `CREATE FUNCTION`.
+- **Lockfiles**: a lockfile that is not one JSON object with its three
+  required keys, or is written in another format version; an entry of
+  no known kind, missing a key, or holding an unknown one; two entries
+  claiming one namespace; a lockfile claiming to be reproducible while
+  linking a directory; a linked directory with no manifest; stored
+  content that is missing, was written by another store layout, or does
+  not hash to what the entry pins; an entry the package it points at
+  disagrees with.
 - **Identifiers**: double-quoted identifiers (except tag-key aliases);
   the reserved names `ffmpeg` and `sqlmpeg` as aliases.
 - **Written records**: a chapter whose span ends at or before it starts,

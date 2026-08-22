@@ -199,6 +199,7 @@ from sqlmpeg.types import (
     UNNEST_COLUMNS,
     is_array,
 )
+from sqlmpeg.warnings import OnWarning
 
 if TYPE_CHECKING:  # sqlmpeg.project imports this module for its namespace names
     from sqlmpeg.project import PackageSet
@@ -5126,21 +5127,27 @@ class _Resolver:
         out.append(node)
 
 
-def resolve(tree: exp.Expression, *, packages: PackageSet | None = None) -> Resolved:
+def resolve(
+    tree: exp.Expression,
+    *,
+    packages: PackageSet | None = None,
+    on_warning: OnWarning | None = None,
+) -> Resolved:
     """Validate the AST against the v0 dialect and build the input table.
 
     User-defined functions are lifted out and inlined first
     (:func:`sqlmpeg.functions.expanded`), so what the resolver validates is
     always a script with no ``CREATE FUNCTION`` and no call to one left in it.
     `packages` is where a namespaced call resolves; None means the caller named
-    no project, and the query sees only its own definitions.
+    no project, and the query sees only its own definitions. `on_warning`
+    hears the diagnostics resolving in a package raises without refusing it.
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     from .functions import expanded  # deferred: functions.py imports this module
 
     try:
-        with expanded(tree, packages=packages) as script:
+        with expanded(tree, packages=packages, on_warning=on_warning) as script:
             return _Resolver().run(script)
     except SqlmpegError:
         raise

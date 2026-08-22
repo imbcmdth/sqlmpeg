@@ -96,6 +96,7 @@ from .parser import (
 )
 from .project import RESERVED_NAMESPACES, Package, PackageSet
 from .types import TYPES, element_type, is_array
+from .warnings import OnWarning, SqlmpegWarning, WarningCode
 
 __all__ = ["NAMEABLE_TYPES", "expanded"]
 
@@ -254,11 +255,18 @@ class _Expansion:
 
 
 @contextmanager
-def expanded(tree: exp.Expression, *, packages: PackageSet | None = None) -> Iterator[exp.Expr]:
+def expanded(
+    tree: exp.Expression,
+    *,
+    packages: PackageSet | None = None,
+    on_warning: OnWarning | None = None,
+) -> Iterator[exp.Expr]:
     """Yield `tree` with every function definition lifted out and every call inlined.
 
     `packages` is where a namespaced call resolves; None means the caller named
     no project, and a qualified call is then whatever it always was.
+    `on_warning` hears what a resolution cost -- a global package, a linked one
+    -- once per package; None is silence.
 
     A rejection raised while the block runs is re-anchored: one landing inside
     an expanded body comes back pointing at the call site, saying which body
@@ -269,7 +277,7 @@ def expanded(tree: exp.Expression, *, packages: PackageSet | None = None) -> Ite
     A script with no ``CREATE FUNCTION`` and no packages to call into yields
     the tree untouched.
     """
-    expander = _Expander(packages=packages)
+    expander = _Expander(packages=packages, on_warning=on_warning)
     try:
         # Expansion's own rejections need translating too: a call written
         # inside a body was already stamped by the expansion around it.
@@ -985,6 +993,8 @@ class _Expander:
     # sources define once they have been read.
     packages: PackageSet | None = None
     exports: dict[str, dict[str, _Function]] = field(default_factory=dict)
+    # Where a diagnostic that is not a rejection goes; None is silence.
+    on_warning: OnWarning | None = None
     # Whose definitions a BARE call name sees; "" is the script's own.
     scope: str = ""
 
@@ -1129,6 +1139,45 @@ class _Expander:
             )
         return function
 
+    def _warn_about(self, package: Package, anchor: exp.Expr) -> None:
+        """Say what resolving in `package` cost, at the first call that reaches it.
+
+        Once per package: this runs where a namespace's sources are read, and
+        they are read once per compile. Both warnings are about where the
+        definition came FROM, so a query that never calls into the package
+        hears nothing.
+        """
+        if self.on_warning is None:
+            return
+        line, col = _pos(anchor)
+        if package.linked:
+            self.on_warning(
+                SqlmpegWarning(
+                    WarningCode.LINKED_PACKAGE,
+                    package.namespace,
+                    f"package '{package.namespace}' is linked to {package.root}, so this "
+                    "command depends on files no lockfile pins",
+                    line=line,
+                    col=col,
+                    hint="a linked package is edited in place; install a version of it to "
+                    "get a build that can be reproduced",
+                )
+            )
+        packages = self.packages
+        if package.layer == "global" and packages is not None and packages.in_project:
+            self.on_warning(
+                SqlmpegWarning(
+                    WarningCode.GLOBAL_PACKAGE,
+                    package.namespace,
+                    f"package '{package.namespace}' was resolved from the machine-wide "
+                    f"lockfile, not from the project at {packages.root}",
+                    line=line,
+                    col=col,
+                    hint=f"install '{package.name}' in this project so its own lockfile "
+                    "pins the version this query compiles against",
+                )
+            )
+
     def _exports_of(self, package: Package, anchor: exp.Expr) -> dict[str, _Function]:
         """Every definition `package`'s sources hold, read and parsed once per compile.
 
@@ -1139,6 +1188,7 @@ class _Expander:
         cached = self.exports.get(package.namespace)
         if cached is not None:
             return cached
+        self._warn_about(package, anchor)
         exports: dict[str, _Function] = {}
         origin: dict[str, Path] = {}
         # Registered before the sources are read so a body calling a sibling

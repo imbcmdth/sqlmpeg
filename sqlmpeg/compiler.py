@@ -20,6 +20,13 @@ resolves in it and nowhere else. :func:`sqlmpeg.registry.load` never raises
 and degrades to an empty registry when ffmpeg is missing, so a compile without
 ffmpeg is not an error — it is one where every call name is UNKNOWN_FUNCTION.
 
+Every entry point takes two optional keywords beyond the SQL: `packages`, the
+:class:`~sqlmpeg.project.PackageSet` a namespaced call resolves in, and
+`on_warning`, the callback that hears what a compile has to say short of
+refusing it (:mod:`sqlmpeg.warnings`). Both default to None, and None for
+either is what a compile was before packages existed: no namespace to resolve
+in, nothing to report.
+
 Guardrail #7 lives here: no input, however malformed, may produce anything but
 a compile result or a :class:`~sqlmpeg.errors.SqlmpegError`. Each pass carries
 its own backstop; this one catches the rest (recursion limits, sqlglot
@@ -38,6 +45,7 @@ from .probe import probe as probe_path
 from .project import PackageSet
 from .split import insert_splits
 from .table import TableSink
+from .warnings import OnWarning
 
 __all__ = ["classify", "compile_commands", "compile_sql", "compile_table_sql"]
 
@@ -54,7 +62,9 @@ def _probe_inputs(res: Resolved) -> dict[str, ProbeResult | None]:
     return by_alias
 
 
-def compile_sql(text: str, *, packages: PackageSet | None = None) -> Graph:
+def compile_sql(
+    text: str, *, packages: PackageSet | None = None, on_warning: OnWarning | None = None
+) -> Graph:
     """Compile SQL `text` into a split-complete IR graph.
 
     The FIRST command's graph, which is the whole query except for the one
@@ -69,10 +79,12 @@ def compile_sql(text: str, *, packages: PackageSet | None = None) -> Graph:
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
-    return compile_commands(text, packages=packages)[0]
+    return compile_commands(text, packages=packages, on_warning=on_warning)[0]
 
 
-def compile_commands(text: str, *, packages: PackageSet | None = None) -> list[Graph]:
+def compile_commands(
+    text: str, *, packages: PackageSet | None = None, on_warning: OnWarning | None = None
+) -> list[Graph]:
     """Compile SQL `text` into one split-complete IR graph per ffmpeg COMMAND.
 
     Usually one graph, a fan-out ``COPY ... TO (<expression>)`` included: its
@@ -84,7 +96,7 @@ def compile_commands(text: str, *, packages: PackageSet | None = None) -> list[G
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     try:
-        res = resolve(parse(text), packages=packages)
+        res = resolve(parse(text), packages=packages, on_warning=on_warning)
         probes = _probe_inputs(res)
         graphs = lower_commands(res, probes, registry=registry_module.load())
         return [insert_splits(graph) for graph in graphs]
@@ -108,7 +120,9 @@ def compile_commands(text: str, *, packages: PackageSet | None = None) -> list[G
         ) from err
 
 
-def classify(text: str, *, packages: PackageSet | None = None) -> tuple[bool, bool]:
+def classify(
+    text: str, *, packages: PackageSet | None = None, on_warning: OnWarning | None = None
+) -> tuple[bool, bool]:
     """``(is_table_capable, has_copy)`` for `text`.
 
     Cheap and static: parse + resolve only, no probing. ``is_table_capable``
@@ -119,11 +133,13 @@ def classify(text: str, *, packages: PackageSet | None = None) -> tuple[bool, bo
 
     Raises ``SqlmpegError`` on a query that does not even resolve.
     """
-    res = resolve(parse(text), packages=packages)
+    res = resolve(parse(text), packages=packages, on_warning=on_warning)
     return all(sink.is_csv for sink in res.sinks), bool(res.sinks)
 
 
-def compile_table_sql(text: str, *, packages: PackageSet | None = None) -> list[TableSink]:
+def compile_table_sql(
+    text: str, *, packages: PackageSet | None = None, on_warning: OnWarning | None = None
+) -> list[TableSink]:
     """Compile SQL `text` into its printable table/csv result set(s).
 
     The sibling of :func:`compile_sql` for a table query: one
@@ -135,7 +151,7 @@ def compile_table_sql(text: str, *, packages: PackageSet | None = None) -> list[
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     try:
-        res = resolve(parse(text), packages=packages)
+        res = resolve(parse(text), packages=packages, on_warning=on_warning)
         probes = _probe_inputs(res)
         return lower_table(res, probes, registry=registry_module.load())
     except SqlmpegError:

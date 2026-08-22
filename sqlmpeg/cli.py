@@ -56,6 +56,13 @@ required; both or neither is a usage error, exit 2. If the positional string
 fails to compile and looks like a filename, a stderr hint suggests ``-f``
 (see ``_maybe_print_file_hint``).
 
+A compile can also have something to say short of refusing: a call that
+resolved to a machine-wide package rather than to one this project installed,
+or a call into a linked directory, which no lockfile pins. Those print as
+``warning:`` lines on stderr after the command has run -- never on stdout,
+which carries the ffmpeg command, the IR JSON or ``validate --json``'s error
+object -- and never twice for one package.
+
 Two flags are deliberately absent. ``--no-probe`` made a READABLE
 file compile as if unreadable, silently stripping provenance metadata -- a
 determinism switch that changed the result; opportunistic probing already
@@ -86,6 +93,7 @@ from .project import PackageSet, discover
 from .prompt import build_system_prompt
 from .table import TableSink, render_csv, render_table
 from .vars import substitute
+from .warnings import OnWarning, WarningLog
 
 __all__ = ["main"]
 
@@ -127,7 +135,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     handler = _HANDLERS[args.command]
-    return handler(args)
+    # One sink per invocation: `compile` and `validate` compile the same text
+    # twice (the table-query fallback), and the reader wants each warning once.
+    warnings = WarningLog()
+    try:
+        return handler(args, warnings)
+    finally:
+        _print_warnings(warnings)
 
 
 _QUERY_HELP = "SQL query text (exactly one of this or -f/--file is required)"
@@ -305,6 +319,19 @@ def _maybe_print_file_hint(err: SqlmpegError, source: str | None) -> None:
         )
 
 
+def _print_warnings(warnings: WarningLog) -> None:
+    """Print what the compile had to say, to stderr.
+
+    stderr and not stdout: `compile`'s stdout is the ffmpeg command, and
+    `validate --json` is the repair loop's JSON. Printed after the command has
+    run, so nothing interleaves with what it wrote.
+    """
+    for warning in warnings.warnings:
+        print(f"warning: {warning.message}", file=sys.stderr)
+        if warning.hint is not None:
+            print(f"hint: {warning.hint}", file=sys.stderr)
+
+
 def _print_error(err: SqlmpegError, *, source: str | None = None) -> None:
     print(f"error: {err}", file=sys.stderr)
     _maybe_print_file_hint(err, source)
@@ -339,17 +366,19 @@ def _output_paths(graphs: list[Graph]) -> list[str]:
     return [unit.path for unit in _sinks(graphs) if unit.path is not None]
 
 
-def _is_table_capable_query(text: str, packages: PackageSet | None) -> bool:
+def _is_table_capable_query(
+    text: str, packages: PackageSet | None, on_warning: OnWarning
+) -> bool:
     """True if `text` succeeds as a table/csv query -- the fallback `compile`
     and `validate` try before giving up on a `compile_sql` error."""
     try:
-        is_table_capable, _has_copy = classify(text, packages=packages)
+        is_table_capable, _has_copy = classify(text, packages=packages, on_warning=on_warning)
     except SqlmpegError:
         return False
     if not is_table_capable:
         return False
     try:
-        compile_table_sql(text, packages=packages)
+        compile_table_sql(text, packages=packages, on_warning=on_warning)
     except SqlmpegError:
         return False
     return True
@@ -381,14 +410,14 @@ def _print_table_sinks(sinks: list[TableSink]) -> int:
     return 0
 
 
-def _cmd_compile(args: argparse.Namespace) -> int:
+def _cmd_compile(args: argparse.Namespace, on_warning: OnWarning) -> int:
     text: str | None = None
     packages: PackageSet | None = None
     try:
         text, packages, code = _resolve_query(args)
         if text is None:
             return code
-        graphs = compile_commands(text, packages=packages)
+        graphs = compile_commands(text, packages=packages, on_warning=on_warning)
         emitted = [emit(graph) for graph in graphs]
     except SqlmpegError as err:
         # A query with no streaming representation at all (metadata
@@ -398,7 +427,7 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         # error surfaces; it is usually more informative.
         # `text` is None only when `err` came from `-v` substitution, which
         # cannot be table-capable either, so it is guarded out of `classify`.
-        if text is not None and _is_table_capable_query(text, packages):
+        if text is not None and _is_table_capable_query(text, packages, on_warning):
             print(_TABLE_USAGE_HINT, file=sys.stderr)
             return 2
         _print_error(err, source=args.query)
@@ -440,12 +469,12 @@ def _shell_commands(emitted: list[Emitted]) -> list[str]:
     return lines
 
 
-def _cmd_explain(args: argparse.Namespace) -> int:
+def _cmd_explain(args: argparse.Namespace, on_warning: OnWarning) -> int:
     try:
         text, packages, code = _resolve_query(args)
         if text is None:
             return code
-        graphs = compile_commands(text, packages=packages)
+        graphs = compile_commands(text, packages=packages, on_warning=on_warning)
     except SqlmpegError as err:
         _print_error(err, source=args.query)
         return 1
@@ -458,18 +487,18 @@ def _cmd_explain(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_validate(args: argparse.Namespace) -> int:
+def _cmd_validate(args: argparse.Namespace, on_warning: OnWarning) -> int:
     text: str | None = None
     packages: PackageSet | None = None
     try:
         text, packages, code = _resolve_query(args)
         if text is None:
             return code
-        compile_commands(text, packages=packages)
+        compile_commands(text, packages=packages, on_warning=on_warning)
     except SqlmpegError as err:
         # "compiles = valid" still holds: a table/csv query compiles through
         # its own lenient pipeline, tried here exactly as in `_cmd_compile`.
-        if text is not None and _is_table_capable_query(text, packages):
+        if text is not None and _is_table_capable_query(text, packages, on_warning):
             return 0
         if args.as_json:
             # Machine contract: stdout is pure JSON, the library error
@@ -483,12 +512,12 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_run(args: argparse.Namespace) -> int:
+def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
     try:
         text, packages, code = _resolve_query(args)
         if text is None:
             return code
-        is_table_capable, _has_copy = classify(text, packages=packages)
+        is_table_capable, _has_copy = classify(text, packages=packages, on_warning=on_warning)
     except SqlmpegError as err:
         _print_error(err, source=args.query)
         return 1
@@ -497,14 +526,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # table query, always: the table/csv path, which needs no ffmpeg.
     if is_table_capable:
         try:
-            sinks = compile_table_sql(text, packages=packages)
+            sinks = compile_table_sql(text, packages=packages, on_warning=on_warning)
         except SqlmpegError as err:
             _print_error(err, source=args.query)
             return 1
         return _print_table_sinks(sinks)
 
     try:
-        graphs: list[Graph] = compile_commands(text, packages=packages)
+        graphs: list[Graph] = compile_commands(text, packages=packages, on_warning=on_warning)
         emitted: list[Emitted] = [emit(graph) for graph in graphs]
     except SqlmpegError as err:
         _print_error(err, source=args.query)
@@ -556,12 +585,12 @@ def _echo_command(argv: list[str]) -> None:
     print("$", shlex.join(argv))
 
 
-def _cmd_prompt(args: argparse.Namespace) -> int:
+def _cmd_prompt(args: argparse.Namespace, on_warning: OnWarning) -> int:
     print(build_system_prompt(registry_module.load()))
     return 0
 
 
-def _cmd_mcp(args: argparse.Namespace) -> int:
+def _cmd_mcp(args: argparse.Namespace, on_warning: OnWarning) -> int:
     """Serve MCP over stdin/stdout; takes no query.
 
     stdout is the protocol stream from here on, so this handler prints
@@ -577,7 +606,7 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_loudnorm2env(args: argparse.Namespace) -> int:
+def _cmd_loudnorm2env(args: argparse.Namespace, on_warning: OnWarning) -> int:
     """stdin (ffmpeg's stderr) -> the ``export SQLMPEG_LN_*=`` block.
 
     The other half of the printed ``loudnorm2`` command line. Nothing else

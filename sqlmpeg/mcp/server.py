@@ -62,8 +62,9 @@ def compile(
     `vars` supplies :name / :'name' / :"name" substitutions.
 
     `project` is the directory (or query file path) the query belongs to;
-    sqlmpeg walks up from it for a `sqlmpeg.json` and makes that project's
-    namespaced functions callable. Omit it for a query that stands alone.
+    sqlmpeg walks up from it for a `sqlmpeg.json` and a `sqlmpeg.lock`, and
+    makes the namespaced functions of that project and of everything it (or
+    this machine) installed callable. Omit it for a query that stands alone.
     """
     return tools.compile_query(query, vars, project)
 
@@ -76,13 +77,16 @@ def validate(
     Returns an empty object when the query is valid, otherwise the error:
     `code` (the error kind), `line` and `col` (where in the query, 1-based,
     or null), `message`, and `hint` (how to fix it, or null). Never fails --
-    an invalid query is a result, not an error.
+    an invalid query is a result, not an error. A valid query that resolved a
+    package worth mentioning answers with only a `warnings` array, which has
+    no `code`: that is what tells a warning from an error.
 
     `vars` supplies :name / :'name' / :"name" substitutions.
 
     `project` is the directory (or query file path) the query belongs to;
-    sqlmpeg walks up from it for a `sqlmpeg.json` and makes that project's
-    namespaced functions callable. Omit it for a query that stands alone.
+    sqlmpeg walks up from it for a `sqlmpeg.json` and a `sqlmpeg.lock`, and
+    makes the namespaced functions of that project and of everything it (or
+    this machine) installed callable. Omit it for a query that stands alone.
     """
     return tools.validate_query(query, vars, project)
 
@@ -98,8 +102,9 @@ def explain(
     `vars` supplies :name / :'name' / :"name" substitutions.
 
     `project` is the directory (or query file path) the query belongs to;
-    sqlmpeg walks up from it for a `sqlmpeg.json` and makes that project's
-    namespaced functions callable. Omit it for a query that stands alone.
+    sqlmpeg walks up from it for a `sqlmpeg.json` and a `sqlmpeg.lock`, and
+    makes the namespaced functions of that project and of everything it (or
+    this machine) installed callable. Omit it for a query that stands alone.
     """
     return tools.explain_query(query, vars, project)
 
@@ -117,8 +122,9 @@ def inspect(
     `vars` supplies :name / :'name' / :"name" substitutions.
 
     `project` is the directory (or query file path) the query belongs to;
-    sqlmpeg walks up from it for a `sqlmpeg.json` and makes that project's
-    namespaced functions callable. Omit it for a query that stands alone.
+    sqlmpeg walks up from it for a `sqlmpeg.json` and a `sqlmpeg.lock`, and
+    makes the namespaced functions of that project and of everything it (or
+    this machine) installed callable. Omit it for a query that stands alone.
     """
     return tools.inspect_query(query, vars, project)
 
@@ -153,8 +159,9 @@ def run(
     `vars` supplies :name / :'name' / :"name" substitutions.
 
     `project` is the directory (or query file path) the query belongs to;
-    sqlmpeg walks up from it for a `sqlmpeg.json` and makes that project's
-    namespaced functions callable. Omit it for a query that stands alone.
+    sqlmpeg walks up from it for a `sqlmpeg.json` and a `sqlmpeg.lock`, and
+    makes the namespaced functions of that project and of everything it (or
+    this machine) installed callable. Omit it for a query that stands alone.
     """
     return tools.run_query(query, vars, timeout, overwrite, project)
 

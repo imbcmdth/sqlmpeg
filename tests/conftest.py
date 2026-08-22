@@ -70,6 +70,25 @@ def pinned_ffmpeg() -> None:
         pytest.skip(message)
 
 
+@pytest.fixture(scope="session")
+def _store_home(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return tmp_path_factory.mktemp("store-home")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_store(_store_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reads or writes the real ``~/.cache/sqlmpeg``.
+
+    `discover` consults the machine-wide lockfile, so without this a developer
+    who has installed a package globally would compile against it here and get
+    results nobody else gets. Tests that want a global lockfile point the same
+    seam at a directory of their own.
+    """
+    from sqlmpeg import store
+
+    monkeypatch.setattr(store, "_cache_dir", lambda: _store_home)
+
+
 @pytest.fixture(autouse=True)
 def _snapshot_function_surface(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
