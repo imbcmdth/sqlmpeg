@@ -341,6 +341,28 @@ _DIALECT_TAIL = """\
   input('film.mkv') f, marks m`. Its columns take the type their literals
   wrote, and a column written with two types is rejected.
 
+### Functions
+- `CREATE FUNCTION <name>(<param> <type>, ...) RETURNS <type> AS $$ <one
+  SELECT> $$ LANGUAGE sql;` defines a reusable expression, expanded at
+  compile time -- it is the query you could have typed by hand. Define it
+  before it is used and before the first `COPY`; every definition must be
+  called (an uncalled one is a rejection).
+- Parameter and `RETURNS` types are the dialect's own: `text`, `number`,
+  `boolean`, `video_stream`/`audio_stream`/`subtitle_stream`/`data_stream`,
+  `chapter`, `cue`, `attachment`, any of those with `[]`, or
+  `TABLE(<col> <type>, ...)`.
+- A VALUE-returning function is legal anywhere a value of its type is: a
+  SELECT column, `WHERE`, a tag column, a fan-out `TO`. A
+  `<kind>_stream[]` return splats like a bare array column.
+- A `TABLE`-returning function is a `FROM` row source, aliased like a
+  CTE: `FROM input('v.mp4') v, spoken('a.mka', 'eng') AS t` then `t.track`.
+  It contributes its body rows, so cross joins, `WHERE`, grouping and the
+  one-row rule all apply. Calling one in the SELECT list is a rejection.
+- The body is ONE `SELECT` with no `WITH`, no `GROUP BY`/`ORDER BY`/
+  `LIMIT`, referencing only its parameters and its own `FROM` aliases. No
+  `OR REPLACE`, no `IF NOT EXISTS`, no schema-qualified name, no
+  overloading, no recursion, no language but `sql`.
+
 ### Cues
 - `cues` is a second record array of the input alias, the cues of a WebVTT
   document: `FROM input('subs.en.vtt') v, unnest(v.cues) c`. ffprobe does

@@ -1551,3 +1551,52 @@ $ sqlmpeg -f query.sql
 (1 row)
 ```
 
+## 67. Write a function and reuse it
+
+`CREATE FUNCTION` defines a reusable expression. It takes typed parameters, returns one of the dialect's types, and its body is a single `SELECT` in a `$$` block. Calls are expanded at compile time, so a function is exactly the query you could have typed by hand:
+
+```pgsql
+CREATE FUNCTION normalize_lang(raw text) RETURNS text AS $$
+  SELECT CASE WHEN raw IN ('en', 'eng', 'english') THEN 'eng' ELSE raw END
+$$ LANGUAGE sql;
+
+COPY (
+  SELECT t, normalize_lang(t.tags.language) AS language
+  FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
+) TO (normalize_lang(t.tags.language) || '.mka')
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng eng.mka \
+  -map 0:a:1 -c:0 copy -metadata:s:0 language=fra fra.mka
+```
+
+One definition, two uses - the tag it writes and the filename it picks. A function is legal anywhere a value of its return type is: `SELECT` columns, `WHERE`, tag columns, fan-out destinations.
+
+## 68. A function that returns rows
+
+`RETURNS TABLE(...)` makes a function a row source: call it in `FROM`, give it an alias, and read its columns off that alias. It is a view that takes arguments - the thing a view cannot be:
+
+```pgsql
+CREATE FUNCTION spoken(file text, lang text) RETURNS TABLE(track audio_stream) AS $$
+  SELECT a FROM input(file) f, unnest(f.audio) a WHERE a.tags.language = lang
+$$ LANGUAGE sql;
+
+COPY (
+  SELECT v.video[1], array_agg(t.track)
+  FROM input('tests/fixtures/av2.mp4') v,
+       spoken('tests/fixtures/av-2eng.mp4', 'eng') AS t
+  GROUP BY v.video[1]
+) TO 'out.mkv'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av-2eng.mp4 -i tests/fixtures/av2.mp4 -map 1:v:0 -c:0 copy -map \
+  0:a:0 -c:1 copy -metadata:s:1 language=eng -map 0:a:1 -c:2 copy -metadata:s:2 \
+  language=eng out.mkv
+```
+
+The call contributes its body's rows, so everything that applies to a CTE applies here - cross joins, `WHERE`, grouping, the one-row rule. Calling a table-returning function in the `SELECT` list is rejected: reading a field off the call would read it once per field, minting one input per read.
+

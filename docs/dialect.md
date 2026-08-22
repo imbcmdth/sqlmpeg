@@ -12,7 +12,11 @@ A query is ONE statement, or a script:
 
 ```
 query   := select | copy
-script  := (CREATE VIEW name AS select ;)* (copy ;)* copy?
+script  := (function ;)* (CREATE VIEW name AS select ;)* (copy ;)* copy?
+function := CREATE FUNCTION name(param type, ...) RETURNS rtype
+            AS $$ select $$ LANGUAGE sql
+rtype   := text | number | boolean | <kind>_stream | chapter | cue
+         | attachment | any of those with [] | TABLE(col type, ...)
 select  := [WITH cte (, cte)*] SELECT columns FROM from [WHERE pred]
            [GROUP BY exprs] [ORDER BY exprs]
            (UNION ALL select)*
@@ -27,6 +31,12 @@ dest    := 'path' | STDOUT | ( value-expression )
 - A `copy` with a media destination compiles to the ffmpeg command(s).
 - A script's views compile into ONE ffmpeg invocation, one output per
   COPY. A view nothing reads is rejected.
+- A **function** is a reusable expression, expanded at compile time -
+  it is the query you could have typed by hand. It must be defined
+  before it is used and before the first `COPY`, every definition must
+  be called, and a value-returning one is legal anywhere a value of its
+  type is while a `TABLE`-returning one is a `FROM` row source only.
+  Recipes [67-68](examples.md#67-write-a-function-and-reuse-it).
 - Trailing `;` allowed; `--` and `/* */` comments allowed. Unquoted
   identifiers fold to lowercase. View, CTE, and alias names share one
   flat namespace across the whole script.
@@ -159,6 +169,13 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   runtime filter commands (`sendcmd`, `zmq`). The N-input escape:
   `amix`, `hstack`, `vstack`, `amerge`, `ffmpeg.join`, `interleave`,
   `ainterleave` take any stream count.
+- **Functions**: `OR REPLACE`, `IF NOT EXISTS`, a schema-qualified
+  name, any property but `RETURNS`/`LANGUAGE`, a language other than
+  `sql`, parameter defaults or `OUT`/`VARIADIC`, overloading, recursion,
+  a body with its own `WITH` or `GROUP BY`/`ORDER BY`/`LIMIT`, a body
+  referencing anything but its parameters and its own `FROM` aliases, a
+  definition nothing calls, and a `TABLE`-returning call in the `SELECT`
+  list.
 - **Identifiers**: double-quoted identifiers (except tag-key aliases);
   the reserved names `ffmpeg` and `sqlmpeg` as aliases.
 - **Written records**: a chapter whose span ends at or before it starts,
