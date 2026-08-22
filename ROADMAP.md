@@ -125,6 +125,23 @@ unchanged at rung 3.
 
    A process per stage is also exactly the unit a distributed engine
    schedules.
+
+   **Both hosts, one module.** Rungs 1 and 2 are not alternatives -
+   they are two deployments of the same artifact, which is the whole
+   argument for wasm. The query says `wasm.denoise(...)` either way and
+   only the emission differs, so the host is a COMPILE-TIME POLICY
+   (`--host`, with an automatic default), not a second feature.
+   They are not peers, though: frei0r is a capability-limited fast path
+   (video only, packed RGBA, one input, fixed size), so a module whose
+   `describe()` needs audio, several inputs, high bit depth or another
+   pixel format has no choice. Where there IS a choice, in-process wins
+   for a cheap filter on a large frame (no uncompressed pipe at all)
+   and the sidecar wins when per-frame cost dwarfs the copy - CV
+   inference being the obvious case.
+   The hosts must be VERIFIABLY interchangeable: same module, same
+   frames, both ways, checked by frame md5 the way the exec tier
+   already compares decodes. If they can diverge, the policy stops
+   being transparent and becomes a correctness hazard.
 3. **A native `vf_wasm`/`af_wasm`.** wasmtime linked into libavfilter
    in the engine's own ffmpeg builds, frame planes mapped into WASM
    memory, full pixel-format and timeline support. Same WIT world; the
