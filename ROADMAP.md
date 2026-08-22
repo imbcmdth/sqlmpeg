@@ -99,11 +99,23 @@ features with three surfaces.
 
 Three consequences worth holding onto:
 
-- **Rows, not buffers.** A video stream is a relation of frames - pts,
-  dimensions, the stream's tags, the planes. Handing a module a
-  frame-row is what lets one signature describe both "returns frames"
-  and "returns facts", and it is the same operator-over-stream model the
-  engine wants later.
+- **Frames are rows to the MODULE, never to SQL.** A module iterates
+  frame-rows - pts, dimensions, the stream's tags, the planes - and
+  that belongs to the WIT world's `process-frame`, not to the dialect.
+  The SQL signature passes a `video_stream`, the handle it already
+  has, and receives a declared table back.
+  This is deliberate. Every relation the compiler sees today is
+  countable at compile time, which is what makes `WHERE` filter tracks
+  during compilation, the one-row rule decidable, and `GROUP BY` a
+  compile-time partition. A frame relation would be the first whose
+  cardinality is unknown until ffmpeg runs, and admitting one costs all
+  three. Nothing is gained at the SQL level: the module's contract
+  already says it sees frames.
+  If frame-level PREDICATES are ever wanted, the precedent is `f.t` - a
+  runtime timeline you may constrain in a `WHERE` but never enumerate,
+  compiled to `-ss`/`-to`. Its honest extension is ffmpeg's `select`
+  filter, a runtime `WHERE` over frames. Narrowing a runtime stream is
+  fine; counting one at compile time is not.
 - **Compilation belongs to the registry.** `LANGUAGE rust` implies a
   toolchain. A package ships the compiled `.wasm` with its source
   alongside for provenance, and the registry CI compiles it, so nobody
