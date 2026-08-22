@@ -93,10 +93,21 @@ part of a URL or a path.
 ## The site
 
 Built from the same JSON by the same CI run: a search page reading
-`index.json`, and a page per package reading its detail file — install
+`index.json` client-side, and a real HTML page per package — install
 command, function signatures, programs and their variables, versions.
-No backend, no build-time templating of package content into HTML that
-could drift from the JSON the client reads.
+A registry people find through web search wants pages a crawler can
+read, so the package pages are rendered, not fetched. The rule is that
+they are rendered from the JSON the client reads, in the same run that
+writes it; HTML maintained alongside that data is what drifts from it.
+
+**No static site generator** (maintainer, 2026-08-22). The build already
+has to be Python: it runs `sqlmpeg` from PyPI to validate manifests,
+compile bins and pack archives, and it emits the JSON whether or not
+there is a website. An SSG would be a second toolchain rendering two
+templates from data the first one already produced, and every SSG wants
+to own the content model — which here is
+`packages/<owner>/<name>/sqlmpeg.json`, validated by sqlmpeg itself. So:
+one `build.py`, Jinja2, one CI job.
 
 ## The client's base URL
 
@@ -126,9 +137,16 @@ hatch is installing under a different one, which is a client feature
 ## First package
 
 `sqlmpeg`'s own `queries/` — 34 programs with `-- variables:` headers,
-already exercised by this repo's CI. It makes the registry useful to the
+already exercised by that repo's CI. It makes the registry useful to the
 first person who runs `sqlmpeg search`, rather than empty until authors
-show up.
+show up. Published as `sqlmpeg/queries`, namespace `queries`; programs
+only, no exports.
+
+The files are COPIED into the registry, not mirrored from the sqlmpeg
+repo. A registry package is a directory in this repo — that is the whole
+model, and a build that reaches into another repository to assemble one
+is not it. A published version is frozen anyway, so a later divergence
+is a new version, not drift.
 
 ## Not in v0
 
