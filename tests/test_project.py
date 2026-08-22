@@ -2082,6 +2082,23 @@ def test_a_failing_query_is_not_offered_a_program(
     assert "installed programs" not in err
 
 
+BAD_PROGRAM = "SELECT nope(1)\n"
+
+
+def test_a_program_that_resolved_is_not_offered_the_other_programs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The rejection came from inside the program; listing the others is noise."""
+    _project(
+        tmp_path,
+        files={"src/own.sql": NORMALIZE, "queries/split.sql": BAD_PROGRAM},
+        manifest=_BIN,
+    )
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "compile", "split-chapters")
+    assert code == 1
+    assert "installed programs" not in err
+
+
 def test_a_program_named_for_a_statement_word_is_refused(tmp_path: Path) -> None:
     _project(
         tmp_path,

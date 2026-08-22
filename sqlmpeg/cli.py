@@ -564,8 +564,10 @@ def _maybe_print_file_hint(
     bare filename like `query.sql` parses as a SQL column reference and fails
     as UNSUPPORTED_SQL. CLI sugar only -- never touches `err`.
 
-    A positional that does not begin a statement was a program name that
-    matched nothing, so the programs there ARE to run are named too."""
+    A positional that does not begin a statement and names no program is a
+    program name that matched nothing, so the programs there ARE to run are
+    named too. One that DID match is not: the rejection came from inside that
+    program, and a list of the others is noise over it."""
     if source is None:
         return
     if os.path.exists(source) or source.lower().endswith(".sql"):
@@ -573,7 +575,7 @@ def _maybe_print_file_hint(
             f"hint: '{source}' looks like a file; did you mean -f '{source}'?",
             file=sys.stderr,
         )
-    if _starts_a_statement(source):
+    if _starts_a_statement(source) or _matching_programs(source, packages):
         return
     shipped = _program_names(packages)
     if shipped:
