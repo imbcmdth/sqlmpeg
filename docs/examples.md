@@ -1471,3 +1471,43 @@ ffmpeg -i film.mkv -f ffmetadata -i \
 'O0ZGTUVUQURBVEExCltDSEFQVEVSXQpUSU1FQkFTRT0xLzEKU1RBUlQ9MApFTkQ9NjAKdGl0bGU9SW50cm8KW0NIQVBURVJdClRJTUVCQVNFPTEvMQpTVEFSVD02MApFTkQ9MzAwCnRpdGxlPUFjdCBPbmUK' \
   -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map_chapters 1 chaptered.mkv
 ```
+
+## 64. Read a subtitle file's cues
+
+A WebVTT track's cues are rows, the way a container's chapters are - `index`, `start_t`, `end_t` and the cue `text`. ffprobe does not enumerate them, so sqlmpeg reads the file itself:
+
+```pgsql
+SELECT c.index, c.start_t, c.end_t, c.text
+FROM input('tests/fixtures/subs.en.vtt') v, unnest(v.cues) c
+```
+
+```
+$ sqlmpeg -f query.sql
+ index | start_t | end_t | text
+-------+---------+-------+------------
+ 1     | 0.0     | 0.6   | Cue one.
+ 2     | 0.7     | 1.3   | Cue two.
+ 3     | 1.4     | 2.0   | Cue three.
+(3 rows)
+```
+
+## 65. Turn chapters into a subtitle track, and back
+
+Cues and chapters are the same shape - a title over a time span - so converting either way is an `array_agg` over the other's rows. WebVTT is what HLS uses for chapter metadata, so this is the canonical export:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1],
+         array_agg(ROW(c.title, c.start_t, c.end_t)::cue)
+  FROM input('tests/fixtures/av-chapters.mkv') f, unnest(f.chapters) c
+  GROUP BY f.video[1], f.audio[1]
+) TO 'with-cues.mkv'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av-chapters.mkv -f webvtt -i   'data:text/vtt;''base64,''V0VCVlRUCgowMDowMDowMC4wMDAgLS0+IDAwOjAwOjAxLjAwMApJbnRybwoKMDA6MDA6MDEuMDAwIC0tPiAwMDowMDowMi4wMDAKQ2hhcHRlciAxCgowMDowMDowMi4wMDAgLS0+IDAwOjAwOjAzLjAwMApDaGFwdGVyIDIKCjAwOjAwOjAzLjAwMCAtLT4gMDA6MDA6MDQuMDAwCkNyZWRpdHMK'   -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 1:s:0 -c:2 webvtt with-cues.mkv
+```
+
+The reverse - a `.vtt` file's cues becoming a chapter list - is the same expression with the types swapped: `array_agg(ROW(c.text, c.start_t, c.end_t)::chapter) AS chapters` over `unnest(v.cues) c`.
+
