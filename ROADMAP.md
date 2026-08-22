@@ -127,9 +127,29 @@ Every piece of that shape exists today: a table-returning function is a
 row source (096), its rows become a chapter list (094), and running an
 analysis pass before the real command is what `sqlmpeg.loudnorm2`
 already does - `run` executes it in process, `compile` prints the shell
-chain. What is missing is the plugin surface: a second WIT world beside
-the filter one, taking decoded frames (and samples) and returning rows.
-Silence detection, speech to captions, face or shot tracks, and
+chain.
+
+And the FIRST BATCH needs no plugin at all, because ffmpeg is already
+the analysis engine. A detect filter attaches its results as frame
+metadata and `metadata=mode=print` prints them (verified):
+
+    ffmpeg -i film.mkv -vf 'scdet=threshold=5,metadata=mode=print:file=-' -f null -
+    frame:1    pts:67      pts_time:0.067
+    lavfi.scd.score=1.361
+
+So `analyze.scenes` over `scdet`, `analyze.silence` over
+`silencedetect`, ad boundaries over `blackdetect`, and crop arguments
+over `cropdetect` are all buildable on the loudnorm2 machinery with no
+new extension surface - near-term work, not a moonshot. ffprobe has no
+plugin model and is the wrong place to look: it reports what the
+demuxer already knows.
+
+For USER-DEFINED analysis, frame metadata is the channel and it names
+the plugin hook precisely: frei0r cannot reach it (pixels in, pixels
+out), a native wasm filter can set it (rung 3), and an out-of-process
+host can skip the ceremony and emit rows directly (rung 2). A second
+WIT world beside the filter one - decoded frames and samples in, rows
+out - is the surface. Speech to captions, face or shot tracks and
 loudness all become the same shape.
 
 Multi-modal TRANSFORMS - the moonshot, e.g. re-timing lips to a
