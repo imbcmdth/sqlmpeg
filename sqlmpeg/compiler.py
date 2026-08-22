@@ -35,6 +35,7 @@ from .lower import lower_commands, lower_table
 from .parser import Resolved, parse, resolve
 from .probe import ProbeResult
 from .probe import probe as probe_path
+from .project import PackageSet
 from .split import insert_splits
 from .table import TableSink
 
@@ -53,7 +54,7 @@ def _probe_inputs(res: Resolved) -> dict[str, ProbeResult | None]:
     return by_alias
 
 
-def compile_sql(text: str) -> Graph:
+def compile_sql(text: str, *, packages: PackageSet | None = None) -> Graph:
     """Compile SQL `text` into a split-complete IR graph.
 
     The FIRST command's graph, which is the whole query except for the one
@@ -68,10 +69,10 @@ def compile_sql(text: str) -> Graph:
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
-    return compile_commands(text)[0]
+    return compile_commands(text, packages=packages)[0]
 
 
-def compile_commands(text: str) -> list[Graph]:
+def compile_commands(text: str, *, packages: PackageSet | None = None) -> list[Graph]:
     """Compile SQL `text` into one split-complete IR graph per ffmpeg COMMAND.
 
     Usually one graph, a fan-out ``COPY ... TO (<expression>)`` included: its
@@ -83,7 +84,7 @@ def compile_commands(text: str) -> list[Graph]:
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     try:
-        res = resolve(parse(text))
+        res = resolve(parse(text), packages=packages)
         probes = _probe_inputs(res)
         graphs = lower_commands(res, probes, registry=registry_module.load())
         return [insert_splits(graph) for graph in graphs]
@@ -107,7 +108,7 @@ def compile_commands(text: str) -> list[Graph]:
         ) from err
 
 
-def classify(text: str) -> tuple[bool, bool]:
+def classify(text: str, *, packages: PackageSet | None = None) -> tuple[bool, bool]:
     """``(is_table_capable, has_copy)`` for `text`.
 
     Cheap and static: parse + resolve only, no probing. ``is_table_capable``
@@ -118,11 +119,11 @@ def classify(text: str) -> tuple[bool, bool]:
 
     Raises ``SqlmpegError`` on a query that does not even resolve.
     """
-    res = resolve(parse(text))
+    res = resolve(parse(text), packages=packages)
     return all(sink.is_csv for sink in res.sinks), bool(res.sinks)
 
 
-def compile_table_sql(text: str) -> list[TableSink]:
+def compile_table_sql(text: str, *, packages: PackageSet | None = None) -> list[TableSink]:
     """Compile SQL `text` into its printable table/csv result set(s).
 
     The sibling of :func:`compile_sql` for a table query: one
@@ -134,7 +135,7 @@ def compile_table_sql(text: str) -> list[TableSink]:
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     try:
-        res = resolve(parse(text))
+        res = resolve(parse(text), packages=packages)
         probes = _probe_inputs(res)
         return lower_table(res, probes, registry=registry_module.load())
     except SqlmpegError:

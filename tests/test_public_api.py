@@ -32,6 +32,8 @@ def test_all_is_sorted_and_complete() -> None:
         "ExecutionResult",
         "CommandResult",
         "probe",
+        "discover",
+        "PackageSet",
         "load_registry",
         "Registry",
         "render_table",
@@ -49,6 +51,7 @@ def test_exports_are_the_source_module_objects() -> None:
     execute_module = importlib.import_module("sqlmpeg.execute")
     probe_module = importlib.import_module("sqlmpeg.probe")
     prompt_module = importlib.import_module("sqlmpeg.prompt")
+    project_module = importlib.import_module("sqlmpeg.project")
     registry_module = importlib.import_module("sqlmpeg.registry")
     table_module = importlib.import_module("sqlmpeg.table")
 
@@ -64,6 +67,8 @@ def test_exports_are_the_source_module_objects() -> None:
     assert sqlmpeg.ExecutionResult is execute_module.ExecutionResult
     assert sqlmpeg.CommandResult is execute_module.CommandResult
     assert sqlmpeg.probe is probe_module.probe
+    assert sqlmpeg.discover is project_module.discover
+    assert sqlmpeg.PackageSet is project_module.PackageSet
     assert sqlmpeg.build_system_prompt is prompt_module.build_system_prompt
     assert sqlmpeg.load_registry is registry_module.load
     assert sqlmpeg.Registry is registry_module.Registry

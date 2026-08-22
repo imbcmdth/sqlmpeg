@@ -15,6 +15,9 @@
   :class:`~sqlmpeg.table.TableSink`'s result in, its printable text out.
 - ``probe`` -- a media path in, its :class:`~sqlmpeg.probe.ProbeResult` out (None
   if it cannot be read).
+- ``discover`` -- a directory or query file path in, the
+  :class:`~sqlmpeg.project.PackageSet` of the ``sqlmpeg.json`` project above it
+  out (None outside a project), for ``compile_sql``'s ``packages`` argument.
 - ``load_registry`` -- this machine's ffmpeg described as a
   :class:`~sqlmpeg.registry.Registry`, the argument ``build_system_prompt`` takes.
 - ``build_system_prompt`` -- a :class:`~sqlmpeg.registry.Registry` in, an LLM
@@ -37,6 +40,7 @@ from .emit import build_ffmpeg_commands, emit
 from .errors import ErrorCode, SqlmpegError
 from .execute import CommandResult, ExecutionResult, execute
 from .probe import probe
+from .project import PackageSet, discover
 from .prompt import build_system_prompt
 from .registry import Registry
 from .registry import load as load_registry
@@ -51,6 +55,7 @@ __all__ = [
     "CommandResult",
     "ErrorCode",
     "ExecutionResult",
+    "PackageSet",
     "Registry",
     "SqlmpegError",
     "TableSink",
@@ -60,6 +65,7 @@ __all__ = [
     "compile_commands",
     "compile_sql",
     "compile_table_sql",
+    "discover",
     "emit",
     "execute",
     "load_registry",

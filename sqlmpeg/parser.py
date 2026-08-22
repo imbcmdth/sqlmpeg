@@ -172,6 +172,7 @@ import difflib
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import sqlglot
 from sqlglot import exp
@@ -198,6 +199,9 @@ from sqlmpeg.types import (
     UNNEST_COLUMNS,
     is_array,
 )
+
+if TYPE_CHECKING:  # sqlmpeg.project imports this module for its namespace names
+    from sqlmpeg.project import PackageSet
 
 __all__ = [
     "DISPOSITION_COLUMN",
@@ -5122,19 +5126,21 @@ class _Resolver:
         out.append(node)
 
 
-def resolve(tree: exp.Expression) -> Resolved:
+def resolve(tree: exp.Expression, *, packages: PackageSet | None = None) -> Resolved:
     """Validate the AST against the v0 dialect and build the input table.
 
     User-defined functions are lifted out and inlined first
     (:func:`sqlmpeg.functions.expanded`), so what the resolver validates is
     always a script with no ``CREATE FUNCTION`` and no call to one left in it.
+    `packages` is where a namespaced call resolves; None means the caller named
+    no project, and the query sees only its own definitions.
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     from .functions import expanded  # deferred: functions.py imports this module
 
     try:
-        with expanded(tree) as script:
+        with expanded(tree, packages=packages) as script:
             return _Resolver().run(script)
     except SqlmpegError:
         raise

@@ -82,6 +82,7 @@ from .emit import Emitted, build_ffmpeg_commands, emit
 from .errors import SqlmpegError
 from .execute import DEFAULT_TIMEOUT, execute
 from .ir import Graph, SinkUnit
+from .project import PackageSet, discover
 from .prompt import build_system_prompt
 from .table import TableSink, render_csv, render_table
 from .vars import substitute
@@ -232,17 +233,35 @@ def _parse_set_vars(pairs: list[str], command: str) -> tuple[dict[str, str] | No
     return variables, 0
 
 
-def _resolve_query(args: argparse.Namespace) -> tuple[str | None, int]:
-    """Resolve the query text for compile/explain/validate/run.
+def _project_start(args: argparse.Namespace) -> Path:
+    """Where the upward walk for ``sqlmpeg.json`` starts.
+
+    A ``-f PATH`` query is read from a file, and the project it belongs to is
+    the one above that file's own directory. A positional query and ``-f -``
+    were typed at the shell, so the walk starts at the working directory.
+    """
+    if args.file is not None and args.file != "-":
+        return Path(args.file).parent
+    return Path.cwd()
+
+
+def _resolve_query(args: argparse.Namespace) -> tuple[str | None, PackageSet | None, int]:
+    """Resolve the query text and its project for compile/explain/validate/run.
 
     Exactly one of the positional ``query`` (inline SQL) or ``-f/--file`` is
-    required. Returns ``(text, 0)`` on success, or ``(None, exit_code)`` with
-    the error already printed to stderr: 2 for a usage violation (both or
-    neither given; a malformed ``-v``), 1 for a file that could not be read.
+    required. Returns ``(text, packages, 0)`` on success, or
+    ``(None, None, exit_code)`` with the error already printed to stderr: 2 for
+    a usage violation (both or neither given; a malformed ``-v``), 1 for a file
+    that could not be read.
+
+    ``packages`` is the project the query was written in, or None when the walk
+    finds no manifest -- the ordinary case, and the one where a compile is
+    exactly what it was before projects existed.
 
     ``-v/--set`` substitution runs here, once, so every handler inherits it.
-    A `SqlmpegError` from an undefined variable reference is not caught here;
-    it propagates to the caller's own handling, like any other rejection.
+    A `SqlmpegError` from an undefined variable reference or a malformed
+    manifest is not caught here; it propagates to the caller's own handling,
+    like any other rejection.
     """
     has_query = args.query is not None
     has_file = args.file is not None
@@ -251,25 +270,25 @@ def _resolve_query(args: argparse.Namespace) -> tuple[str | None, int]:
             f"error: {args.command}: give a SQL string or -f/--file, not both",
             file=sys.stderr,
         )
-        return None, 2
+        return None, None, 2
     if not has_query and not has_file:
         print(
             f"error: {args.command}: give a SQL string or -f/--file",
             file=sys.stderr,
         )
-        return None, 2
+        return None, None, 2
     if has_file:
         text = _read_file(args.file)
         if text is None:
-            return None, 1
+            return None, None, 1
     else:
         assert args.query is not None
         text = args.query
 
     variables, code = _parse_set_vars(args.set_vars, args.command)
     if variables is None:
-        return None, code
-    return substitute(text, variables), 0
+        return None, None, code
+    return substitute(text, variables), discover(_project_start(args)), 0
 
 
 def _maybe_print_file_hint(err: SqlmpegError, source: str | None) -> None:
@@ -320,17 +339,17 @@ def _output_paths(graphs: list[Graph]) -> list[str]:
     return [unit.path for unit in _sinks(graphs) if unit.path is not None]
 
 
-def _is_table_capable_query(text: str) -> bool:
+def _is_table_capable_query(text: str, packages: PackageSet | None) -> bool:
     """True if `text` succeeds as a table/csv query -- the fallback `compile`
     and `validate` try before giving up on a `compile_sql` error."""
     try:
-        is_table_capable, _has_copy = classify(text)
+        is_table_capable, _has_copy = classify(text, packages=packages)
     except SqlmpegError:
         return False
     if not is_table_capable:
         return False
     try:
-        compile_table_sql(text)
+        compile_table_sql(text, packages=packages)
     except SqlmpegError:
         return False
     return True
@@ -364,11 +383,12 @@ def _print_table_sinks(sinks: list[TableSink]) -> int:
 
 def _cmd_compile(args: argparse.Namespace) -> int:
     text: str | None = None
+    packages: PackageSet | None = None
     try:
-        text, code = _resolve_query(args)
+        text, packages, code = _resolve_query(args)
         if text is None:
             return code
-        graphs = compile_commands(text)
+        graphs = compile_commands(text, packages=packages)
         emitted = [emit(graph) for graph in graphs]
     except SqlmpegError as err:
         # A query with no streaming representation at all (metadata
@@ -378,7 +398,7 @@ def _cmd_compile(args: argparse.Namespace) -> int:
         # error surfaces; it is usually more informative.
         # `text` is None only when `err` came from `-v` substitution, which
         # cannot be table-capable either, so it is guarded out of `classify`.
-        if text is not None and _is_table_capable_query(text):
+        if text is not None and _is_table_capable_query(text, packages):
             print(_TABLE_USAGE_HINT, file=sys.stderr)
             return 2
         _print_error(err, source=args.query)
@@ -422,10 +442,10 @@ def _shell_commands(emitted: list[Emitted]) -> list[str]:
 
 def _cmd_explain(args: argparse.Namespace) -> int:
     try:
-        text, code = _resolve_query(args)
+        text, packages, code = _resolve_query(args)
         if text is None:
             return code
-        graphs = compile_commands(text)
+        graphs = compile_commands(text, packages=packages)
     except SqlmpegError as err:
         _print_error(err, source=args.query)
         return 1
@@ -440,15 +460,16 @@ def _cmd_explain(args: argparse.Namespace) -> int:
 
 def _cmd_validate(args: argparse.Namespace) -> int:
     text: str | None = None
+    packages: PackageSet | None = None
     try:
-        text, code = _resolve_query(args)
+        text, packages, code = _resolve_query(args)
         if text is None:
             return code
-        compile_commands(text)
+        compile_commands(text, packages=packages)
     except SqlmpegError as err:
         # "compiles = valid" still holds: a table/csv query compiles through
         # its own lenient pipeline, tried here exactly as in `_cmd_compile`.
-        if text is not None and _is_table_capable_query(text):
+        if text is not None and _is_table_capable_query(text, packages):
             return 0
         if args.as_json:
             # Machine contract: stdout is pure JSON, the library error
@@ -464,10 +485,10 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
 def _cmd_run(args: argparse.Namespace) -> int:
     try:
-        text, code = _resolve_query(args)
+        text, packages, code = _resolve_query(args)
         if text is None:
             return code
-        is_table_capable, _has_copy = classify(text)
+        is_table_capable, _has_copy = classify(text, packages=packages)
     except SqlmpegError as err:
         _print_error(err, source=args.query)
         return 1
@@ -476,14 +497,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # table query, always: the table/csv path, which needs no ffmpeg.
     if is_table_capable:
         try:
-            sinks = compile_table_sql(text)
+            sinks = compile_table_sql(text, packages=packages)
         except SqlmpegError as err:
             _print_error(err, source=args.query)
             return 1
         return _print_table_sinks(sinks)
 
     try:
-        graphs: list[Graph] = compile_commands(text)
+        graphs: list[Graph] = compile_commands(text, packages=packages)
         emitted: list[Emitted] = [emit(graph) for graph in graphs]
     except SqlmpegError as err:
         _print_error(err, source=args.query)

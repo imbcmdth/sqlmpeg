@@ -41,6 +41,42 @@ dest    := 'path' | STDOUT | ( value-expression )
   identifiers fold to lowercase. View, CTE, and alias names share one
   flat namespace across the whole script.
 
+## Projects and packages
+
+A directory holding a `sqlmpeg.json` is a project, and the project is a
+package: it claims a namespace, and the SQL files it lists export their
+functions under it.
+
+```json
+{ "name": "my-edits", "version": "0.1.0", "namespace": "me",
+  "description": "...", "sources": ["src/*.sql"] }
+```
+
+`name`, `version`, `namespace` and `sources` are required;
+`description` is optional. `namespace` is a lowercase plain identifier
+and may not be `ffmpeg`, `sqlmpeg` or `wasm`. Each `sources` pattern is
+a glob relative to the manifest, stays under it, and must match at
+least one file.
+
+A query calls into the namespace: `me.quieter(f.audio[1], 0.5)` as a
+value, `FROM me.pick('a.mka') t` as a row source. The call is expanded
+exactly as a definition written into the query would be - same
+hygiene, same arity and type checks, same command out. Nothing is
+prepended to the script, and a package's names never enter the script's
+flat namespace.
+
+A package source holds `CREATE FUNCTION` definitions and nothing else,
+and one it exports but the query never calls is fine - it is a library.
+An uncalled definition in the query's own text is still rejected.
+
+The project is found by walking up from the query file's directory, or
+from the working directory for a query typed on the command line; there
+is no flag. Outside a project nothing changes: a namespaced call is
+rejected as it always was. Library callers pass
+`compile_sql(text, packages=sqlmpeg.discover(path))` rather than
+relying on a working directory, and the MCP tools take the same path as
+a `project` argument.
+
 ## FROM items
 
 Every FROM item is a compile-time table; the column model per shape is
@@ -174,8 +210,14 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   `sql`, parameter defaults or `OUT`/`VARIADIC`, overloading, recursion,
   a body with its own `WITH` or `GROUP BY`/`ORDER BY`/`LIMIT`, a body
   referencing anything but its parameters and its own `FROM` aliases, a
-  definition nothing calls, and a `TABLE`-returning call in the `SELECT`
-  list.
+  definition in the query's own text that nothing calls, and a
+  `TABLE`-returning call in the `SELECT` list.
+- **Packages**: a namespace no manifest claims; a member the namespace
+  does not define; a manifest that is not one JSON object with the four
+  required keys; a namespace that is reserved or is not a plain
+  identifier; a source pattern matching no file or leaving the project
+  directory; one name defined twice across a package's sources; a
+  package source holding anything but `CREATE FUNCTION`.
 - **Identifiers**: double-quoted identifiers (except tag-key aliases);
   the reserved names `ffmpeg` and `sqlmpeg` as aliases.
 - **Written records**: a chapter whose span ends at or before it starts,

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import io
+from pathlib import Path
 from typing import Any
 
 from .. import binaries
@@ -25,6 +26,7 @@ from ..emit import build_ffmpeg_commands, emit
 from ..errors import ErrorCode, SqlmpegError
 from ..execute import DEFAULT_TIMEOUT, execute
 from ..ir import Graph, SinkUnit
+from ..project import PackageSet, discover
 from ..prompt import build_system_prompt
 from ..table import TableResult, render_csv, render_table
 from ..vars import substitute
@@ -58,24 +60,34 @@ def _prepare(query: str, variables: dict[str, str] | None) -> str:
     return substitute(query, dict(variables or {}))
 
 
+def _packages(project: str | None) -> PackageSet | None:
+    """The project `project` names, or None when the caller named none.
+
+    An editor's agent knows which workspace a query belongs to and the server
+    does not, so the path is an argument rather than something read out of the
+    process's working directory.
+    """
+    return None if project is None else discover(Path(project))
+
+
 def _sinks(graphs: list[Graph]) -> list[SinkUnit]:
     return [unit for graph in graphs for unit in graph.sinks]
 
 
-def _is_table_query(text: str) -> bool:
+def _is_table_query(text: str, packages: PackageSet | None = None) -> bool:
     """True if `text` succeeds as a table/csv query.
 
     A table query compiles through its own lenient pipeline, so "compiles =
     valid" still holds for one ``compile_commands`` rejected.
     """
     try:
-        is_table_capable, _has_copy = classify(text)
+        is_table_capable, _has_copy = classify(text, packages=packages)
     except SqlmpegError:
         return False
     if not is_table_capable:
         return False
     try:
-        compile_table_sql(text)
+        compile_table_sql(text, packages=packages)
     except SqlmpegError:
         return False
     return True
@@ -85,16 +97,19 @@ def _table_error() -> SqlmpegError:
     return SqlmpegError(ErrorCode.UNSUPPORTED_SQL, _TABLE_MESSAGE, line=1, col=1, hint=_TABLE_HINT)
 
 
-def compile_query(query: str, variables: dict[str, str] | None = None) -> dict[str, Any]:
+def compile_query(
+    query: str, variables: dict[str, str] | None = None, project: str | None = None
+) -> dict[str, Any]:
     """The ffmpeg command(s) `query` compiles to."""
     text = _prepare(query, variables)
+    packages = _packages(project)
     try:
-        graphs = compile_commands(text)
+        graphs = compile_commands(text, packages=packages)
     except SqlmpegError:
         # A query with no streaming representation fails here; table mode is
         # the fallback, tried only for a query that could BE one. If it is,
         # the refusal names the tool that handles it.
-        if _is_table_query(text):
+        if _is_table_query(text, packages):
             raise _table_error() from None
         raise
     # A bare SELECT compiles, but names no destination -- compile never
@@ -116,14 +131,25 @@ def compile_query(query: str, variables: dict[str, str] | None = None) -> dict[s
     }
 
 
-def validate_query(query: str, variables: dict[str, str] | None = None) -> dict[str, Any]:
+def validate_query(
+    query: str, variables: dict[str, str] | None = None, project: str | None = None
+) -> dict[str, Any]:
     """Empty if `query` compiles, else the typed error object. Never raises."""
     text: str | None = None
+    packages: PackageSet | None = None
+    compiling = False
     try:
         text = _prepare(query, variables)
-        compile_commands(text)
+        # Inside the try: a malformed manifest is a rejection like any other,
+        # and this tool returns every rejection as data.
+        packages = _packages(project)
+        compiling = True
+        compile_commands(text, packages=packages)
     except SqlmpegError as err:
-        if text is not None and _is_table_query(text):
+        # The table fallback answers only for a query that failed to COMPILE.
+        # An undefined :name or a malformed manifest failed before that, and
+        # is the answer itself.
+        if compiling and text is not None and _is_table_query(text, packages):
             return {}
         return err.to_dict()
     except Exception as err:  # no input may make a validate call fail
@@ -137,9 +163,11 @@ def validate_query(query: str, variables: dict[str, str] | None = None) -> dict[
     return {}
 
 
-def explain_query(query: str, variables: dict[str, str] | None = None) -> dict[str, Any]:
+def explain_query(
+    query: str, variables: dict[str, str] | None = None, project: str | None = None
+) -> dict[str, Any]:
     """The IR graph `query` compiles to, one per ffmpeg command."""
-    graphs = compile_commands(_prepare(query, variables))
+    graphs = compile_commands(_prepare(query, variables), packages=_packages(project))
     return {"graphs": [graph.to_dict() for graph in graphs]}
 
 
@@ -152,15 +180,18 @@ def _row_text(result: TableResult) -> list[list[str]]:
     return list(csv.reader(io.StringIO(render_csv(result, header=False))))
 
 
-def inspect_query(query: str, variables: dict[str, str] | None = None) -> dict[str, Any]:
+def inspect_query(
+    query: str, variables: dict[str, str] | None = None, project: str | None = None
+) -> dict[str, Any]:
     """The rows of a table query: what tracks, chapters, cues or attachments a file has."""
     text = _prepare(query, variables)
-    is_table_capable, _has_copy = classify(text)
+    packages = _packages(project)
+    is_table_capable, _has_copy = classify(text, packages=packages)
     if not is_table_capable:
         raise SqlmpegError(
             ErrorCode.UNSUPPORTED_SQL, _MEDIA_MESSAGE, line=1, col=1, hint=_MEDIA_HINT
         )
-    sinks = compile_table_sql(text)
+    sinks = compile_table_sql(text, packages=packages)
     return {
         "results": [
             {
@@ -244,14 +275,16 @@ def run_query(
     variables: dict[str, str] | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     overwrite: bool = False,
+    project: str | None = None,
 ) -> dict[str, Any]:
     """Compile `query` and run ffmpeg, writing the files its COPY names."""
     text = _prepare(query, variables)
-    is_table_capable, _has_copy = classify(text)
+    packages = _packages(project)
+    is_table_capable, _has_copy = classify(text, packages=packages)
     if is_table_capable:
         raise _table_error()
 
-    graphs = compile_commands(text)
+    graphs = compile_commands(text, packages=packages)
     if any(unit.path is None for unit in _sinks(graphs)):
         raise SqlmpegError(
             ErrorCode.UNSUPPORTED_SQL, _NO_PATH_MESSAGE, line=1, col=1, hint=_NO_PATH_HINT

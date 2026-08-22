@@ -54,14 +54,29 @@ comma is a cross join with real multiplicity, ``WHERE`` narrows the product,
 ``ROW_COUNT_MISMATCH``. A call in the SELECT list is a typed rejection: SQL
 reads ``(f(x)).a`` once per FIELD, and input identity here is the alias, so
 each read would mint its own ``-i`` for one file.
+
+**A definition need not be written in the script.** A call qualified by a
+namespace a package claims (``me.pick(...)``, :mod:`sqlmpeg.project`) resolves
+to a definition read out of that package's sources and inlines through this
+same expander -- same hygiene, same source map, same arity and type checks.
+Nothing is spliced into the script and the flat script namespace is untouched,
+because a package's definitions never enter it.
+
+One rule differs by where a definition was written. A package source is a
+LIBRARY: it exports more than any one query calls, so an uncalled definition
+in one is the point of it. A definition in the user's own script is a script's,
+and one nothing calls stays an error. :meth:`_Expander._uncalled` is where that
+asymmetry is spelled out.
 """
 
 from __future__ import annotations
 
 import copy
+import difflib
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import UnionType
 
 from sqlglot import exp
@@ -79,6 +94,7 @@ from .parser import (
     from_entries,
     parse,
 )
+from .project import RESERVED_NAMESPACES, Package, PackageSet
 from .types import TYPES, element_type, is_array
 
 __all__ = ["NAMEABLE_TYPES", "expanded"]
@@ -194,6 +210,7 @@ class _Function:
     statement, so a definition-level rejection anchors on the name.
     `aliases` is what the body binds and expansion has to rename.
     `columns` is the ``RETURNS TABLE`` list, and None for a value.
+    `namespace` is the package this came from, and "" for the script's own.
     """
 
     name: str
@@ -205,15 +222,26 @@ class _Function:
     position: int
     columns: tuple[_Param, ...] | None = None
     used: bool = False
+    namespace: str = ""
 
     @property
     def returns_rows(self) -> bool:
         return self.columns is not None
 
     @property
+    def library(self) -> bool:
+        """True for a definition read out of a package SOURCE, not the script."""
+        return bool(self.namespace)
+
+    @property
+    def qualified(self) -> str:
+        """The name as a call site writes it: ``ns.fn`` for a package's, ``fn`` for a script's."""
+        return f"{self.namespace}.{self.name}" if self.namespace else self.name
+
+    @property
     def signature(self) -> str:
         written = ", ".join(f"{p.name} {p.type}" for p in self.params)
-        return f"{self.name}({written}) RETURNS {self.returns}"
+        return f"{self.qualified}({written}) RETURNS {self.returns}"
 
 
 @dataclass(frozen=True)
@@ -226,8 +254,11 @@ class _Expansion:
 
 
 @contextmanager
-def expanded(tree: exp.Expression) -> Iterator[exp.Expr]:
+def expanded(tree: exp.Expression, *, packages: PackageSet | None = None) -> Iterator[exp.Expr]:
     """Yield `tree` with every function definition lifted out and every call inlined.
+
+    `packages` is where a namespaced call resolves; None means the caller named
+    no project, and a qualified call is then whatever it always was.
 
     A rejection raised while the block runs is re-anchored: one landing inside
     an expanded body comes back pointing at the call site, saying which body
@@ -235,9 +266,10 @@ def expanded(tree: exp.Expression) -> Iterator[exp.Expr]:
     call site, so nothing downstream can report a position the reader cannot
     find.
 
-    A script with no ``CREATE FUNCTION`` in it yields the tree untouched.
+    A script with no ``CREATE FUNCTION`` and no packages to call into yields
+    the tree untouched.
     """
-    expander = _Expander()
+    expander = _Expander(packages=packages)
     try:
         # Expansion's own rejections need translating too: a call written
         # inside a body was already stamped by the expansion around it.
@@ -646,6 +678,70 @@ def _define(create: exp.Create) -> _Function:
     )
 
 
+def _in_source(err: SqlmpegError, namespace: str, path: Path, anchor: exp.Expr) -> SqlmpegError:
+    """A rejection from a package source, said at the call site that reached for it.
+
+    A source file's line numbers mean nothing in the query the reader is
+    looking at, so the anchor moves to the call and the message carries the
+    file and the line it really came from.
+    """
+    line, col = _pos(anchor)
+    at = f" line {err.line}" if err.line is not None else ""
+    return SqlmpegError(
+        err.code,
+        f"package '{namespace}' source {path}{at}: {err.message}",
+        line=line,
+        col=col,
+        hint=err.hint,
+    )
+
+
+def _source_definitions(package: Package, path: Path, anchor: exp.Expr) -> list[_Function]:
+    """Every ``CREATE FUNCTION`` one package source holds, validated.
+
+    A source is a LIBRARY, so it holds definitions and nothing else: a SELECT
+    or a COPY in one is a script, and is rejected as one. Every definition it
+    yields carries the package's namespace, which is what makes it a library's
+    rather than the script's.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as err:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"package '{package.namespace}': could not read source {path}: "
+            f"{err.strerror or err}",
+            anchor,
+            hint=f"{package.manifest} lists it as a source",
+        ) from err
+    try:
+        statements = _statements(parse(text))
+    except SqlmpegError as err:
+        raise _in_source(err, package.namespace, path, anchor) from err
+
+    definitions: list[_Function] = []
+    for statement in statements:
+        if not (isinstance(statement, exp.Create) and _create_kind(statement) == "FUNCTION"):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"package '{package.namespace}' source {path} holds a statement that "
+                "is not a CREATE FUNCTION",
+                anchor,
+                hint="a package source is a library: it defines functions, and a "
+                "query of its own belongs in a script",
+            )
+        try:
+            function = _define(statement)
+        except SqlmpegError as err:
+            raise _in_source(err, package.namespace, path, anchor) from err
+        function.namespace = package.namespace
+        # Ahead of every statement of the calling script: a library is already
+        # defined when the query that calls it is written.
+        function.position = -1
+        definitions.append(function)
+    return definitions
+
+
 # -- reading and rewriting nodes ------------------------------------------
 
 # A column's qualifiers, outermost first: the arg holding the LEFTMOST written
@@ -828,6 +924,24 @@ class _Site:
     before: exp.Expr | None
 
 
+@dataclass(frozen=True)
+class _CallSite:
+    """One call to expand: which definition, its arguments, and what it replaces.
+
+    `node` is the node expansion swaps out, which is not always the call: a
+    namespaced value call is the ``exp.Dot`` around it, and a row source is
+    the whole ``exp.Table`` FROM item.
+    """
+
+    function: _Function
+    call: exp.Anonymous
+    node: exp.Expr
+
+    @property
+    def row_source(self) -> bool:
+        return isinstance(self.node, exp.Table)
+
+
 # -- argument types --------------------------------------------------------
 
 
@@ -867,6 +981,12 @@ class _Expander:
     budget: int = _EXPANSION_BUDGET
     # Where the statement being walked keeps its generated CTEs.
     site: _Site | None = None
+    # The packages a namespaced call may resolve in, and what each one's
+    # sources define once they have been read.
+    packages: PackageSet | None = None
+    exports: dict[str, dict[str, _Function]] = field(default_factory=dict)
+    # Whose definitions a BARE call name sees; "" is the script's own.
+    scope: str = ""
 
     # -- entry point ------------------------------------------------------
 
@@ -874,7 +994,7 @@ class _Expander:
         """`tree` with the definitions lifted out and every call inlined."""
         statements = _statements(tree)
         rest = self._collect(statements)
-        if not self.functions:
+        if not self.functions and not self._claimed:
             return tree
         self.taken = {
             _ident_name(node)
@@ -884,13 +1004,12 @@ class _Expander:
         }
         for position, statement in enumerate(rest):
             self._expand_statement(statement, position)
-        for function in self.functions.values():
-            if function.used:
-                continue
+        unused = self._uncalled()
+        if unused is not None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"function '{function.name}' is never called",
-                function.node,
+                f"function '{unused.name}' is never called",
+                unused.node,
                 hint="every function must be called by a later view or COPY; "
                 "check the spelling of the name at its call sites",
             )
@@ -898,6 +1017,24 @@ class _Expander:
             return rest[0]
         tree.set("expressions", rest)
         return tree
+
+    def _uncalled(self) -> _Function | None:
+        """The first definition that had to be called and was not.
+
+        The script-versus-library asymmetry, in one place: a definition in a
+        package SOURCE is a library's, and a library exports more than any one
+        query calls, so only the script's own definitions carry the rule.
+        """
+        for function in (*self.functions.values(), *self._exported()):
+            if function.library or function.used:
+                continue
+            return function
+        return None
+
+    def _exported(self) -> Iterator[_Function]:
+        """Every definition read out of a package source so far."""
+        for functions in self.exports.values():
+            yield from functions.values()
 
     def _collect(self, statements: list[exp.Expr]) -> list[exp.Expr]:
         """Read every definition out of the script; return what is left to compile."""
@@ -926,6 +1063,100 @@ class _Expander:
             written = written or isinstance(statement, exp.Copy)
             rest.append(statement)
         return rest
+
+    # -- packages ---------------------------------------------------------
+
+    @property
+    def _claimed(self) -> bool:
+        """True when some package claims a namespace this compile may resolve in."""
+        return self.packages is not None and bool(self.packages.packages)
+
+    @contextmanager
+    def _scoped(self, namespace: str) -> Iterator[None]:
+        """Whose definitions a bare call name sees while `namespace`'s body expands.
+
+        A package source is its own flat namespace: a library body calling
+        ``helper()`` means the package's own helper, never the script's, and a
+        script body never sees a package's.
+        """
+        previous = self.scope
+        self.scope = namespace
+        try:
+            yield
+        finally:
+            self.scope = previous
+
+    def _visible(self, name: str) -> _Function | None:
+        """The definition a BARE call name resolves to where it is written."""
+        if self.scope:
+            return self.exports.get(self.scope, {}).get(name)
+        return self.functions.get(name)
+
+    def _member(self, namespace: str, call: exp.Anonymous, anchor: exp.Expr) -> _Function | None:
+        """The definition `namespace.<call>` names, or None if there is no project.
+
+        None keeps a qualified call exactly what it was before packages
+        existed: outside a project, ``me.pick(...)`` is not a package call and
+        the rejection it earns downstream is the one it has always earned.
+        """
+        packages = self.packages
+        if packages is None or not packages.packages:
+            return None
+        name = _call_name(call)
+        package = packages.get(namespace)
+        if package is None:
+            known = packages.namespaces()
+            near = difflib.get_close_matches(namespace, list(known), n=1, cutoff=0.6)
+            raise _error(
+                ErrorCode.UNKNOWN_FUNCTION,
+                f"unknown namespace '{namespace}'",
+                anchor,
+                hint=f"did you mean {near[0]}.{name}()?"
+                if near
+                else f"namespaces this project can call: {', '.join(known)}",
+            )
+        exports = self._exports_of(package, anchor)
+        function = exports.get(name)
+        if function is None:
+            near = difflib.get_close_matches(name, sorted(exports), n=1, cutoff=0.6)
+            raise _error(
+                ErrorCode.UNKNOWN_FUNCTION,
+                f"package '{namespace}' has no function '{name}'",
+                anchor,
+                hint=f"did you mean {namespace}.{near[0]}()?"
+                if near
+                else f"{namespace} defines: {', '.join(sorted(exports)) or 'nothing'}",
+            )
+        return function
+
+    def _exports_of(self, package: Package, anchor: exp.Expr) -> dict[str, _Function]:
+        """Every definition `package`'s sources hold, read and parsed once per compile.
+
+        Read on FIRST use of the namespace rather than up front: a package
+        whose sources this query never calls into costs nothing, and a broken
+        source only blocks the queries that reach for it.
+        """
+        cached = self.exports.get(package.namespace)
+        if cached is not None:
+            return cached
+        exports: dict[str, _Function] = {}
+        origin: dict[str, Path] = {}
+        # Registered before the sources are read so a body calling a sibling
+        # resolves against the same dict this loop is filling.
+        self.exports[package.namespace] = exports
+        for path in package.sources:
+            for function in _source_definitions(package, path, anchor):
+                if function.name in exports:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"package '{package.namespace}' defines '{function.name}' twice: "
+                        f"{origin[function.name]} and {path}",
+                        anchor,
+                        hint="one name, one definition, across all of a package's sources",
+                    )
+                exports[function.name] = function
+                origin[function.name] = path
+        return exports
 
     # -- finding calls ----------------------------------------------------
 
@@ -962,63 +1193,110 @@ class _Expander:
         and the scan continues over what took its place.
         """
         while True:
-            call = self._next_call(root, position)
-            if call is None:
+            site = self._next_call(root, position)
+            if site is None:
                 return root
-            if isinstance(call, exp.Table):
-                self._expand_row_source(call, host, position, stack)
+            if site.row_source:
+                self._expand_row_source(site, host, position, stack)
                 continue
-            replacement = self._expand_call(call, host, position, stack)
-            call.replace(replacement)
-            if call is root:
+            replacement = self._expand_call(site, host, position, stack)
+            site.node.replace(replacement)
+            if site.node is root:
                 root = replacement
 
-    def _next_call(self, root: exp.Expr, position: int) -> exp.Anonymous | exp.Table | None:
+    def _next_call(self, root: exp.Expr, position: int) -> _CallSite | None:
         """The first call to a defined function in `root`'s own query, if any.
 
         A FROM item comes back as the ``exp.Table`` around the call, since that
-        whole item is what a row source replaces.
+        whole item is what a row source replaces, and a namespaced value call
+        as the ``exp.Dot`` that qualifies it.
         """
         # A nested SELECT is its own query and gets its own pass, so the scan
         # stops at one -- but not at `root` itself, which is where it starts.
         stop = exp.Select if isinstance(root, exp.Select) else None
         for node in _preorder(root, stop=stop):
             if isinstance(node, exp.Table):
-                function = self.functions.get(_call_name(node.this))
-                if function is None:
-                    continue
-                if not function.returns_rows:
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        f"function '{function.name}' returns a value, not a table",
-                        node,
-                        hint="call it where its value belongs: a SELECT column, a "
-                        "WHERE predicate, a tag column",
-                    )
-                self._check_defined(function, node, position)
-                return node
-            if not isinstance(node, exp.Anonymous):
+                site = self._row_source_site(node)
+            elif isinstance(node, exp.Dot):
+                site = self._qualified_site(node)
+            elif isinstance(node, exp.Anonymous):
+                site = self._bare_site(node)
+            else:
                 continue
-            function = self.functions.get(_call_name(node))
-            if function is None:
+            if site is None:
                 continue
-            if function.returns_rows:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"function '{function.name}' returns a table, not a value",
-                    node,
-                    hint=f"call it in FROM: FROM {function.name}(...) AS t, then read "
-                    f"{_listed(function.columns)} off the alias; a field read off the "
-                    "call itself reads it once per field, which would mint one input "
-                    "per read",
-                )
-            self._check_defined(function, node, position)
-            return node
+            self._check_shape(site)
+            self._check_defined(site.function, site.node, position)
+            return site
         return None
 
+    def _bare_site(self, call: exp.Anonymous) -> _CallSite | None:
+        """An unqualified ``fn(...)`` value call, if something in scope defines `fn`."""
+        # A qualifier owns the name under it: the Anonymous inside a Dot or a
+        # FROM item was already offered to the branch that reads the qualifier,
+        # and a definition may not shadow what `ffmpeg.` or `me.` resolves.
+        if isinstance(call.parent, exp.Dot | exp.Table):
+            return None
+        function = self._visible(_call_name(call))
+        return None if function is None else _CallSite(function, call, call)
+
+    def _qualified_site(self, node: exp.Dot) -> _CallSite | None:
+        """A ``ns.fn(...)`` value call, if `ns` is a namespace a package claims."""
+        call, qualifier = node.expression, node.this
+        if not isinstance(call, exp.Anonymous) or not isinstance(qualifier, exp.Identifier):
+            return None
+        namespace = _ident_name(qualifier)
+        if namespace in RESERVED_NAMESPACES:  # a filter or a macro; lower resolves it
+            return None
+        function = self._member(namespace, call, node)
+        return None if function is None else _CallSite(function, call, node)
+
+    def _row_source_site(self, item: exp.Table) -> _CallSite | None:
+        """A FROM-position call, bare or namespaced, if something defines it."""
+        call = item.this
+        if not isinstance(call, exp.Anonymous):
+            return None
+        if item.args.get("catalog"):  # `x.ns.fn()` names a schema, not a namespace
+            return None
+        db = item.args.get("db")
+        if not isinstance(db, exp.Identifier):
+            function = self._visible(_call_name(call))
+        else:
+            namespace = _ident_name(db)
+            if namespace in RESERVED_NAMESPACES:  # `ffmpeg.<source>()`; lower resolves it
+                return None
+            function = self._member(namespace, call, item)
+        return None if function is None else _CallSite(function, call, item)
+
+    def _check_shape(self, site: _CallSite) -> None:
+        """A call has to be written where what the function returns belongs."""
+        function = site.function
+        if site.row_source and not function.returns_rows:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{function.qualified}' returns a value, not a table",
+                site.node,
+                hint="call it where its value belongs: a SELECT column, a "
+                "WHERE predicate, a tag column",
+            )
+        if not site.row_source and function.returns_rows:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{function.qualified}' returns a table, not a value",
+                site.node,
+                hint=f"call it in FROM: FROM {function.qualified}(...) AS t, then read "
+                f"{_listed(function.columns)} off the alias; a field read off the "
+                "call itself reads it once per field, which would mint one input "
+                "per read",
+            )
+
     def _check_defined(self, function: _Function, node: exp.Expr, position: int) -> None:
-        """A call may only name a function an earlier statement defined."""
-        if function.position <= position:
+        """A call may only name a function an earlier statement defined.
+
+        A library's definitions were written before the script was, so the
+        ordering rule is the script's own alone.
+        """
+        if function.library or function.position <= position:
             return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -1029,13 +1307,14 @@ class _Expander:
 
     # -- inlining one call ------------------------------------------------
 
-    def _enter(self, function: _Function, call: exp.Anonymous, stack: tuple[str, ...]) -> None:
+    def _enter(self, function: _Function, call: exp.Expr, stack: tuple[str, ...]) -> None:
         """What every inlining costs: the cycle check, the budget, the used mark."""
-        if function.name in stack:
-            chain = " -> ".join([*stack[stack.index(function.name) :], function.name])
+        key = function.qualified
+        if key in stack:
+            chain = " -> ".join([*stack[stack.index(key) :], key])
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"function '{function.name}' is recursive: {chain}",
+                f"function '{key}' is recursive: {chain}",
                 call,
                 hint="a filtergraph is acyclic; a function may not call itself, "
                 "directly or through another",
@@ -1064,34 +1343,38 @@ class _Expander:
         return arguments
 
     def _instance(
-        self, function: _Function, call: exp.Anonymous, arguments: list[exp.Expr]
+        self, site: _CallSite, arguments: list[exp.Expr]
     ) -> tuple[exp.Select, int]:
         """One private copy of the body: aliases renamed, positions stamped, arguments bound."""
+        function = site.function
         body = copy.deepcopy(function.body)
         index = len(self.expansions)
-        line, col = _pos(call)
-        self.expansions.append(_Expansion(function.name, line, col))
+        line, col = _pos(site.node)
+        self.expansions.append(_Expansion(function.qualified, line, col))
         _rename(body, self._fresh_aliases(function, index))
         self._stamp(body, index)
         _substitute(body, {p.name: a for p, a in zip(function.params, arguments)})
         return body, index
 
     def _expand_call(
-        self, call: exp.Anonymous, host: exp.Select, position: int, stack: tuple[str, ...]
+        self, site: _CallSite, host: exp.Select, position: int, stack: tuple[str, ...]
     ) -> exp.Expr:
-        """The expression `call` stands for, with the body spliced into `host`."""
-        function = self.functions[_call_name(call)]
-        self._enter(function, call, stack)
-        arguments = self._arguments(function, call, host, position)
-        body, _ = self._instance(function, call, arguments)
-        self._expand_within(body, host, position, (*stack, function.name))
+        """The expression the call stands for, with the body spliced into `host`."""
+        function = site.function
+        self._enter(function, site.node, stack)
+        arguments = self._arguments(function, site.call, host, position)
+        body, _ = self._instance(site, arguments)
+        # The body is the package's or the script's text, so its own bare calls
+        # resolve where it was written, not where it was called from.
+        with self._scoped(function.namespace):
+            self._expand_within(body, host, position, (*stack, function.qualified))
         _splice(host, body)
         projection: exp.Expr = body.expressions[0]
         inner = projection.this if isinstance(projection, exp.Alias) else None
         return inner if isinstance(inner, exp.Expr) else projection
 
     def _expand_row_source(
-        self, item: exp.Table, host: exp.Select, position: int, stack: tuple[str, ...]
+        self, site: _CallSite, host: exp.Select, position: int, stack: tuple[str, ...]
     ) -> None:
         """Turn one FROM-position call into a generated CTE, and read that instead.
 
@@ -1099,22 +1382,25 @@ class _Expander:
         site carry the body's ROW COUNT: splicing its FROM items into the host
         would hand the host a product it never wrote.
         """
-        call = item.this
-        if not isinstance(call, exp.Anonymous):  # unreachable: _next_call matched one
+        item = site.node
+        if not isinstance(item, exp.Table):  # unreachable: only a Table is a row source
             return
-        function = self.functions[_call_name(call)]
-        _check_query_args(item, frozenset({"this", "alias"}), "a table function call")
-        self._enter(function, call, stack)
-        arguments = self._arguments(function, call, host, position)
-        body, index = self._instance(function, call, arguments)
+        function = site.function
+        # `db` is the namespace qualifier of a package call, and nothing else
+        # reaches here with one: an unclaimed qualifier never resolves.
+        _check_query_args(item, frozenset({"this", "alias", "db"}), "a table function call")
+        self._enter(function, item, stack)
+        arguments = self._arguments(function, site.call, host, position)
+        body, index = self._instance(site, arguments)
         # The body is its own query now, so its own calls expand into it.
-        self._expand_within(body, body, position, (*stack, function.name))
+        with self._scoped(function.namespace):
+            self._expand_within(body, body, position, (*stack, function.qualified))
         _name_columns(body, function.columns or ())
         name = self._fresh_name(f"{function.name}_{index + 1}")
         self._add_cte(name, body)
 
         identifier = exp.Identifier(this=name, quoted=False)
-        line, col = _pos(call)
+        line, col = _pos(item)
         identifier.meta.update({"line": line, "col": col, "start": 0, "end": 0})
         alias = item.args.get("alias")
         if alias is None:
@@ -1169,7 +1455,7 @@ class _Expander:
             plural = "" if len(arguments) == 1 else "s"
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
-                f"{function.name}() got {len(arguments)} argument{plural}, but it "
+                f"{function.qualified}() got {len(arguments)} argument{plural}, but it "
                 f"declares {len(function.params)}",
                 call,
                 hint=function.signature,
@@ -1178,7 +1464,7 @@ class _Expander:
             if _call_name(argument) == _INPUT:
                 raise _error(
                     ErrorCode.UDF_ARG_TYPE,
-                    f"{function.name}() cannot take input() as its '{param.name}' "
+                    f"{function.qualified}() cannot take input() as its '{param.name}' "
                     "argument: input() mints a FROM item, not a value",
                     argument,
                     fallback=call,
@@ -1189,7 +1475,7 @@ class _Expander:
                 continue
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
-                f"{function.name}() takes {param.type} as its '{param.name}' "
+                f"{function.qualified}() takes {param.type} as its '{param.name}' "
                 f"argument, got {_KIND_NAMES.get(written, written)}",
                 argument,
                 fallback=call,

@@ -49,7 +49,9 @@ exist in the local ffmpeg build rather than assuming.\
 # rename here renames the tool.
 
 
-def compile(query: str, vars: dict[str, str] | None = None) -> dict[str, Any]:
+def compile(
+    query: str, vars: dict[str, str] | None = None, project: str | None = None
+) -> dict[str, Any]:
     """Compile a query into the ffmpeg command(s) it runs as, without running them.
 
     Returns `commands` (each an argv list, run in order), `filter_complex`
@@ -58,11 +60,17 @@ def compile(query: str, vars: dict[str, str] | None = None) -> dict[str, Any]:
     the next, whose ${SQLMPEG_LN_*} placeholders only the run tool fills in).
 
     `vars` supplies :name / :'name' / :"name" substitutions.
+
+    `project` is the directory (or query file path) the query belongs to;
+    sqlmpeg walks up from it for a `sqlmpeg.json` and makes that project's
+    namespaced functions callable. Omit it for a query that stands alone.
     """
-    return tools.compile_query(query, vars)
+    return tools.compile_query(query, vars, project)
 
 
-def validate(query: str, vars: dict[str, str] | None = None) -> dict[str, Any]:
+def validate(
+    query: str, vars: dict[str, str] | None = None, project: str | None = None
+) -> dict[str, Any]:
     """Check that a query compiles; the repair loop's tool.
 
     Returns an empty object when the query is valid, otherwise the error:
@@ -71,22 +79,34 @@ def validate(query: str, vars: dict[str, str] | None = None) -> dict[str, Any]:
     an invalid query is a result, not an error.
 
     `vars` supplies :name / :'name' / :"name" substitutions.
+
+    `project` is the directory (or query file path) the query belongs to;
+    sqlmpeg walks up from it for a `sqlmpeg.json` and makes that project's
+    namespaced functions callable. Omit it for a query that stands alone.
     """
-    return tools.validate_query(query, vars)
+    return tools.validate_query(query, vars, project)
 
 
-def explain(query: str, vars: dict[str, str] | None = None) -> dict[str, Any]:
+def explain(
+    query: str, vars: dict[str, str] | None = None, project: str | None = None
+) -> dict[str, Any]:
     """The compiled filter graph as JSON: nodes, edges, inputs and sinks.
 
     One graph per ffmpeg command. Use it to see which filter a column
     expression became and how the streams were wired.
 
     `vars` supplies :name / :'name' / :"name" substitutions.
+
+    `project` is the directory (or query file path) the query belongs to;
+    sqlmpeg walks up from it for a `sqlmpeg.json` and makes that project's
+    namespaced functions callable. Omit it for a query that stands alone.
     """
-    return tools.explain_query(query, vars)
+    return tools.explain_query(query, vars, project)
 
 
-def inspect(query: str, vars: dict[str, str] | None = None) -> dict[str, Any]:
+def inspect(
+    query: str, vars: dict[str, str] | None = None, project: str | None = None
+) -> dict[str, Any]:
     """Run a query that returns rows: what is inside a media file.
 
     For a query with no media COPY -- a bare SELECT, or a COPY ... WITH
@@ -95,8 +115,12 @@ def inspect(query: str, vars: dict[str, str] | None = None) -> dict[str, Any]:
     (the same rows as a printable table).
 
     `vars` supplies :name / :'name' / :"name" substitutions.
+
+    `project` is the directory (or query file path) the query belongs to;
+    sqlmpeg walks up from it for a `sqlmpeg.json` and makes that project's
+    namespaced functions callable. Omit it for a query that stands alone.
     """
-    return tools.inspect_query(query, vars)
+    return tools.inspect_query(query, vars, project)
 
 
 def filters(pattern: str | None = None) -> dict[str, Any]:
@@ -116,6 +140,7 @@ def run(
     vars: dict[str, str] | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     overwrite: bool = False,
+    project: str | None = None,
 ) -> dict[str, Any]:
     """Compile a query and execute ffmpeg, WRITING the files its COPY ... TO names.
 
@@ -126,8 +151,12 @@ def run(
     file.
 
     `vars` supplies :name / :'name' / :"name" substitutions.
+
+    `project` is the directory (or query file path) the query belongs to;
+    sqlmpeg walks up from it for a `sqlmpeg.json` and makes that project's
+    namespaced functions callable. Omit it for a query that stands alone.
     """
-    return tools.run_query(query, vars, timeout, overwrite)
+    return tools.run_query(query, vars, timeout, overwrite, project)
 
 
 def build_server(*, allow_run: bool = False) -> MCPServer[Any]:

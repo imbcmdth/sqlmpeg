@@ -137,7 +137,7 @@ def test_compile_file_dash_reads_stdin(
 def test_compile_uses_sink_path(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(cli, "compile_commands", lambda text: [_sinked_graph("sink.mkv")])
+    monkeypatch.setattr(cli, "compile_commands", lambda text, **kw: [_sinked_graph("sink.mkv")])
     code = cli.main(["compile", VALID_QUERY])
     out = capsys.readouterr().out
     assert code == 0
@@ -151,7 +151,7 @@ def test_compile_prints_every_sink_path_of_a_script(
     monkeypatch.setattr(
         cli,
         "compile_commands",
-        lambda text: [_multi_sink_graph(("720.mp4", {}), ("360.mp4", {}))],
+        lambda text, **kw: [_multi_sink_graph(("720.mp4", {}), ("360.mp4", {}))],
     )
     code = cli.main(["compile", VALID_QUERY])
     out = capsys.readouterr().out
@@ -168,7 +168,7 @@ def test_compile_graph_only_still_works_for_a_multi_sink_script(
     monkeypatch.setattr(
         cli,
         "compile_commands",
-        lambda text: [_multi_sink_graph(("720.mp4", {}), ("360.mp4", {}))],
+        lambda text, **kw: [_multi_sink_graph(("720.mp4", {}), ("360.mp4", {}))],
     )
     code = cli.main(["compile", "--graph-only", VALID_QUERY])
     assert code == 0
@@ -592,7 +592,7 @@ def test_run_uses_sink_path(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """compile_commands is monkeypatched -- see `_sinked_graph`'s docstring."""
-    monkeypatch.setattr(cli, "compile_commands", lambda text: [_sinked_graph("sink.mkv")])
+    monkeypatch.setattr(cli, "compile_commands", lambda text, **kw: [_sinked_graph("sink.mkv")])
     monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: None)
 
     code = cli.main(["run", SINKED_QUERY])
@@ -662,7 +662,9 @@ def test_run_of_a_multi_sink_script_reaches_the_ffmpeg_check(
 ) -> None:
     """Every COPY's path is the query's own -- `run` needs no override at all."""
     monkeypatch.setattr(
-        cli, "compile_commands", lambda text: [_multi_sink_graph(("720.mp4", {}), ("360.mp4", {}))]
+        cli,
+        "compile_commands",
+        lambda text, **kw: [_multi_sink_graph(("720.mp4", {}), ("360.mp4", {}))],
     )
     monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: None)
     code = cli.main(["run", SINKED_QUERY])
@@ -684,7 +686,7 @@ def test_run_reports_no_output_path_for_a_sink_with_none(
         nodes={},
         sinks=[SinkUnit(outputs=[Output(ref="src:a:v:0", type="video", name=None, metadata={})])],
     )
-    monkeypatch.setattr(cli, "compile_commands", lambda text: [graph])
+    monkeypatch.setattr(cli, "compile_commands", lambda text, **kw: [graph])
     code = cli.main(["run", SINKED_QUERY])
     captured = capsys.readouterr()
     assert code == 2
@@ -696,7 +698,9 @@ def test_run_checks_every_sinks_output_directory(
 ) -> None:
     missing = str(tmp_path / "does_not_exist" / "360.mp4")
     monkeypatch.setattr(
-        cli, "compile_commands", lambda text: [_multi_sink_graph(("720.mp4", {}), (missing, {}))]
+        cli,
+        "compile_commands",
+        lambda text, **kw: [_multi_sink_graph(("720.mp4", {}), (missing, {}))],
     )
     monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
     code = cli.main(["run", SINKED_QUERY])
