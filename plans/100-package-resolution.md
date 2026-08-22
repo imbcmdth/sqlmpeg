@@ -71,6 +71,19 @@ B. **The lockfile layers.** Local then global, reading blobs from the
    under `~/.cache/sqlmpeg/`, sha256-addressed, atomic replace, every
    OSError swallowed, format-versioned.
 
+   **Linked packages** (the read side; `sqlmpeg link` itself is 101).
+   A lock entry comes in two kinds and they must be visibly different:
+   a REGISTRY entry pins name, version, sha256 and a store path; a LINK
+   entry names a DIRECTORY and nothing else. A link deliberately breaks
+   content addressing - live edits are the entire point - so a lockfile
+   holding one is not reproducible, and the file should say that in its
+   own text rather than implying otherwise. Resolution for a link is
+   wave A's local-manifest layer with a different root: read that
+   directory's `sqlmpeg.json`, take its namespace and sources. Compiling
+   against a link warns once on stderr, the way the global-shadowing
+   warning does, because a non-reproducible build should never be
+   silent.
+
 ## Checks
 
 A package function called from a query compiles to the SAME command as
