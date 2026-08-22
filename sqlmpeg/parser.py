@@ -180,13 +180,18 @@ from sqlglot.errors import ParseError, SqlglotError
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.types import (
     CHAPTERS_COLUMN,
+    CONTAINER_READONLY_FIELDS,
     DISPOSITION_COLUMN,
     DISPOSITION_KEYS,
     INPUT_COLUMNS,
     INPUT_DURATION_COLUMN,
     MAP_ELEMENTS,
+    RECORD_ARRAY_COLUMNS,
+    RECORD_COLUMNS,
+    RECORD_ELEMENTS,
     RECORD_FIELDS,
     ROW_SCHEMAS,
+    ROW_STAR_COLUMNS,
     STREAM_ARRAY_COLUMNS,
     STREAM_TAG_COLUMNS,
     TAGS_COLUMN,
@@ -418,10 +423,17 @@ _GROUP_VALUE_HINT = (
     "add it to the GROUP BY to make it the group's key, or tag the tracks "
     "inside a CTE and aggregate the CTE's streams outside it"
 )
-_CHAPTER_NOT_STREAM_HINT = (
-    "a chapter is not a track, so a chapter row has no stream to select; read "
-    "its metadata columns instead, e.g. {alias}.title"
-)
+
+
+def _record_not_stream_hint(alias: str, record: str) -> str:
+    """Why a record row has nothing to select, and what to read instead."""
+    first = RECORD_FIELDS[record][0].name
+    return (
+        f"a {record} is not a track, so a {record} row has no stream to "
+        f"select; read its metadata columns instead, e.g. {alias}.{first}"
+    )
+
+
 _GROUP_FANOUT_HINT = (
     "one group is one file, so the destination has to name the group, "
     "e.g. TO (t.tags.language || '.mka')"
@@ -1376,12 +1388,11 @@ def _listed_columns(names: Iterable[str]) -> str:
     return ", ".join(sorted(names))
 
 
-def chapters_unnest_hint(alias: str) -> str:
-    """What to write instead of reaching into ``<alias>.chapters`` directly."""
-    return (
-        f"unnest it into rows: unnest({alias}.{CHAPTERS_COLUMN}) c, then read "
-        "c.index, c.title, c.start_t and c.end_t"
-    )
+def record_unnest_hint(alias: str, column: str = CHAPTERS_COLUMN) -> str:
+    """What to write instead of reaching into a record array column directly."""
+    names = [f"c.{name}" for name in ROW_STAR_COLUMNS[column]]
+    listed = ", ".join(names[:-1]) + f" and {names[-1]}"
+    return f"unnest it into rows: unnest({alias}.{column}) c, then read {listed}"
 
 
 def _unwrap_paren(node: exp.Expr) -> exp.Expr:
@@ -1449,13 +1460,13 @@ def _bare_array_error(sub: exp.Column, fallback: exp.Expr) -> SqlmpegError | Non
     ):
         alias = _ident_name(db_node)
         array_column = _ident_name(table_node)
-        if array_column == CHAPTERS_COLUMN:
+        if array_column in RECORD_ARRAY_COLUMNS:
             message = (
-                f"'{alias}.{CHAPTERS_COLUMN}.{sub.name}' needs a row: an array "
+                f"'{alias}.{array_column}.{sub.name}' needs a row: an array "
                 "has no metadata of its own"
             )
             hint = (
-                f"unnest the array (unnest({alias}.{CHAPTERS_COLUMN}) c) and read "
+                f"unnest the array (unnest({alias}.{array_column}) c) and read "
                 f"c.{sub.name}"
             )
         else:
@@ -3842,17 +3853,19 @@ class _Resolver:
         array_column = self.track_rows[alias].column
         schema = ROW_SCHEMAS[array_column]
         name = _ident_name(column.this)
+        record_row = array_column in RECORD_ARRAY_COLUMNS
         if name == ROW_STREAM and not column.this.args.get("quoted"):
-            if array_column == CHAPTERS_COLUMN:
+            if record_row:
+                record = RECORD_ELEMENTS[array_column]
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"'{alias}' is a chapter row, not a stream",
+                    f"'{alias}' is a {record} row, not a stream",
                     column,
                     fallback=select,
-                    hint=_CHAPTER_NOT_STREAM_HINT.format(alias=alias),
+                    hint=_record_not_stream_hint(alias, record),
                 )
             return "stream"
-        if name == _REMOVED_ROW_STREAM and array_column != CHAPTERS_COLUMN:
+        if name == _REMOVED_ROW_STREAM and not record_row:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"'{alias}.{_REMOVED_ROW_STREAM}' is not a column",
@@ -3862,27 +3875,32 @@ class _Resolver:
             )
         ref = map_ref(name)
         if ref is not None:
-            if array_column == CHAPTERS_COLUMN:
+            if record_row:
+                record = RECORD_ELEMENTS[array_column]
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"'{alias}' is a chapter row, and a chapter carries no "
+                    f"'{alias}' is a {record} row, and a {record} carries no "
                     f"{ref[0]}",
                     column,
                     fallback=select,
-                    hint=f"a chapter row exposes {_listed_columns(schema)}",
+                    hint=f"a {record} row exposes {_listed_columns(schema)}",
                 )
             return _map_column_type(ref, alias, column, select)
-        if name in _REMOVED_STREAM_TAGS and name not in schema:
+        if name in _REMOVED_STREAM_TAGS and name not in schema and not record_row:
             raise _removed_tag_error(alias, name, column, select)
         column_type = schema.get(name)
         if column_type is None:
+            exposes = (
+                f"a {RECORD_ELEMENTS[array_column]} row exposes"
+                if record_row
+                else f"{array_column} track rows expose"
+            )
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"unknown column '{alias}.{column.name}'",
                 column,
                 fallback=select,
-                hint=f"{self.track_rows[alias].column} track rows expose "
-                f"{_listed_columns(schema)}",
+                hint=f"{exposes} {_listed_columns(schema)}",
             )
         return column_type
 
@@ -3963,14 +3981,15 @@ class _Resolver:
             raise self._accessor_alias_error(
                 alias, kind, array_column, name, table_node, scope, fallback
             )
-        if array_column == CHAPTERS_COLUMN:
+        if array_column in RECORD_ARRAY_COLUMNS:
+            record = RECORD_ELEMENTS[array_column]
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{alias}.{CHAPTERS_COLUMN}' cannot be subscripted: a chapter "
+                f"'{alias}.{array_column}' cannot be subscripted: a {record} "
                 "is not a stream",
                 inner,
                 fallback=fallback,
-                hint=chapters_unnest_hint(alias),
+                hint=record_unnest_hint(alias, array_column),
             )
         if array_column not in STREAM_ARRAY_COLUMNS:
             raise _error(
@@ -4690,14 +4709,15 @@ class _Resolver:
                     fallback=where,
                     hint=f"name the key: '{alias}.{TAGS_COLUMN}.title'",
                 )
-            if scope[alias] == "input" and _ident_name(column.this) == CHAPTERS_COLUMN:
+            if scope[alias] == "input" and _ident_name(column.this) in RECORD_ARRAY_COLUMNS:
+                name = _ident_name(column.this)
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"'{alias}.{CHAPTERS_COLUMN}' is an array of chapter "
-                    "records, not a single value",
+                    f"'{alias}.{name}' is an array of "
+                    f"{RECORD_ELEMENTS[name]} records, not a single value",
                     column,
                     fallback=where,
-                    hint=chapters_unnest_hint(alias),
+                    hint=record_unnest_hint(alias, name),
                 )
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -4906,13 +4926,21 @@ class _Resolver:
         if target != exp.DataType.Type.TEXT:
             record = record_cast_type(node)
             if record is not None:
+                column = RECORD_COLUMNS[record]
+                literal = f"ARRAY[ROW(...)::{record}, ...]"
+                # A cue array is written in a STREAM position: it IS the
+                # track, so there is no column to name it as.
+                gathered = (
+                    literal
+                    if column in CONTAINER_READONLY_FIELDS
+                    else f"{literal} AS {column}"
+                )
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
                     f"a {record} record is not a value on its own",
                     node,
                     fallback=fallback,
-                    hint=f"gather records into an array column, e.g. "
-                    f"ARRAY[ROW(...)::{record}, ...] AS {CHAPTERS_COLUMN}",
+                    hint=f"gather records into an array, e.g. {gathered}",
                 )
             spelled = str(getattr(target, "value", target or "")).lower()
             raise _error(

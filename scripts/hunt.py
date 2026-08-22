@@ -40,7 +40,7 @@ from sqlmpeg import vars as vars_module  # noqa: E402
 from sqlmpeg.errors import ErrorCode, SqlmpegError  # noqa: E402
 from sqlmpeg.inputs import INPUT_OPTIONS  # noqa: E402
 from sqlmpeg.ir import Graph  # noqa: E402
-from sqlmpeg.probe import ChapterMeta, ProbeResult, StreamMeta  # noqa: E402
+from sqlmpeg.probe import ChapterMeta, CueMeta, ProbeResult, StreamMeta  # noqa: E402
 from sqlmpeg.registry import load_reference  # noqa: E402
 from sqlmpeg.sink import SINK_OPTIONS  # noqa: E402
 from sqlmpeg.types import DISPOSITION_KEYS  # noqa: E402
@@ -270,6 +270,7 @@ TRACK_COLS = [
 VIDEO_ROW_COLS = TRACK_COLS + ["width", "height", "fps"]
 AUDIO_ROW_COLS = TRACK_COLS + ["channels", "channel_layout", "sample_rate"]
 CHAPTER_COLS = ["index", "title", "start_t", "end_t"]
+CUE_COLS = ["index", "text", "start_t", "end_t"]
 
 # Aliases that name a probed field rather than a tag key.
 TAG_ALIASES = ["codec", "index", "width", "channels", "duration", "sample_rate"]
@@ -346,7 +347,7 @@ BAD_LITERALS = [
 class Item:
     def __init__(self, alias: str, kind: str, base: str | None = None) -> None:
         self.alias = alias
-        self.kind = kind  # input | vrow | arow | srow | chapter | source-v | source-a | rel
+        self.kind = kind  # input | vrow | arow | srow | chapter | cue | source-* | rel
         self.base = base
 
 
@@ -523,6 +524,8 @@ def gen_row_col(ctx: Ctx) -> str:
         col = ctx.pick(AUDIO_ROW_COLS)
     elif it.kind == "chapter":
         col = ctx.pick(CHAPTER_COLS)
+    elif it.kind == "cue":
+        col = ctx.pick(CUE_COLS)
     else:
         col = ctx.pick(["index", "t", "duration"])
     if ctx.bad():
@@ -560,6 +563,7 @@ _ARRAY_KIND = {
     "audio": "arow",
     "subtitle": "srow",
     "chapters": "chapter",
+    "cues": "cue",
     "data": "srow",
 }
 
@@ -611,9 +615,13 @@ def gen_from(ctx: Ctx) -> str:
             ctx.items.append(Item(alias, kind))
         elif r < 0.9 and inputs:
             base = ctx.pick(inputs).alias
-            arr = ctx.pick(["video", "audio", "subtitle", "chapters", "data"])
+            arr = ctx.pick(["video", "audio", "subtitle", "chapters", "cues", "data"])
             piece = f"unnest({base}.{arr}) {alias}"
-            rows = [it for it in ctx.items if it.kind in ("vrow", "arow", "srow", "chapter")]
+            rows = [
+                it
+                for it in ctx.items
+                if it.kind in ("vrow", "arow", "srow", "chapter", "cue")
+            ]
             if rows and rng.random() < 0.3:
                 kind = ctx.pick(
                     ["JOIN", "INNER JOIN", "LEFT JOIN", "LEFT OUTER JOIN", "FULL OUTER JOIN"]
@@ -738,6 +746,7 @@ def gen_copy(ctx: Ctx) -> str:
 
 _CHAPTER_BOUNDS = ["0", "30", "60", "120", "-5", "0.5", "NULL", "'x'", "true"]
 _CHAPTER_TITLES = ["'Intro'", "NULL", "'a=b'", "1", "'x' || 'y'"]
+_CUE_TEXTS = ["'Hello'", "NULL", "''", "'a --> b'", "'Tom & <b>'", "1", "'x' || 'y'"]
 
 
 def gen_chapters_copy(ctx: Ctx) -> str:
@@ -784,11 +793,51 @@ def gen_chapters_copy(ctx: Ctx) -> str:
     )
 
 
+def gen_cues_copy(ctx: Ctx) -> str:
+    """A cue array in a STREAM position, written as a literal or gathered.
+
+    Same deviation rate as the chapter list: bounds out of order, mistyped,
+    and payloads WebVTT cannot carry, so the span and text checks are
+    exercised alongside the ones that compile.
+    """
+    rng = ctx.rng
+    records = []
+    for _ in range(rng.randint(1, 3)):
+        cells = [
+            ctx.pick(_CUE_TEXTS),
+            ctx.pick(_CHAPTER_BOUNDS),
+            ctx.pick(_CHAPTER_BOUNDS),
+        ]
+        if ctx.bad():
+            cells = cells[: rng.randint(0, 4)]
+        records.append(f"ROW({', '.join(cells)})::cue")
+    if rng.random() < 0.5:
+        column = f"ARRAY[{', '.join(records)}]"
+        if ctx.bad():
+            column = ctx.pick(["ARRAY[]", "ARRAY[] AS cues", f"{records[0]}"])
+        return (
+            f"COPY (\n  SELECT a0.video[1], {column} FROM input('in.mp4') a0\n"
+            ") TO 'out.mkv'"
+        )
+    source = ctx.pick(["a0.chapters", "a1.cues"])
+    if ctx.bad():
+        source = ctx.pick(["a0.audio", "a0.cues", "a0.nosuch"])
+    return (
+        "COPY (\n  SELECT a0.video[1], "
+        "array_agg(ROW(c.title, c.start_t, c.end_t)::cue)\n"
+        f"  FROM input('in.mp4') a0, input('subs.vtt') a1, unnest({source}) c\n"
+        "  GROUP BY a0.video[1]\n"
+        ") TO 'out.mkv'"
+    )
+
+
 def gen_query(rng: random.Random, p_bad: float) -> str:
     ctx = Ctx(rng, p_bad)
     r = rng.random()
     if r < 0.04:
         return gen_chapters_copy(ctx)
+    if r < 0.08:
+        return gen_cues_copy(ctx)
     if r < 0.25:
         return gen_select(ctx)
     if r < 0.75:
@@ -862,10 +911,26 @@ def rand_probe(rng):
     tags = {}
     if rng.random() < 0.5:
         tags = {"title": rng.choice(["T", ""]), "artist": "A"}
+    # A WebVTT sidecar is the only thing that has cues, so it is also the only
+    # probe that carries any; everything else exercises the rejection.
+    webvtt = rng.random() < 0.3
+    cues = []
+    if webvtt:
+        for i in range(rng.choice([0, 1, 2, 4])):
+            cues.append(
+                CueMeta(
+                    index=i + 1,
+                    text=rng.choice(["", f"Cue {i}", "x" * 100, "a --> b"]),
+                    start_t=rng.choice([0.0, float(i), -1.0]),
+                    end_t=rng.choice([1.0, float(i) + 0.5, 0.0]),
+                )
+            )
     return ProbeResult(
         streams=streams,
         duration=rng.choice([None, 0.0, 4.0, 1e9]),
         chapters=chapters,
+        format_name="webvtt" if webvtt else rng.choice([None, "matroska,webm"]),
+        cues=cues,
         tags=tags,
     )
 

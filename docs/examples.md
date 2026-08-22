@@ -1506,7 +1506,12 @@ COPY (
 
 ```
 $ sqlmpeg compile -f query.sql
-ffmpeg -i tests/fixtures/av-chapters.mkv -f webvtt -i   'data:text/vtt;''base64,''V0VCVlRUCgowMDowMDowMC4wMDAgLS0+IDAwOjAwOjAxLjAwMApJbnRybwoKMDA6MDA6MDEuMDAwIC0tPiAwMDowMDowMi4wMDAKQ2hhcHRlciAxCgowMDowMDowMi4wMDAgLS0+IDAwOjAwOjAzLjAwMApDaGFwdGVyIDIKCjAwOjAwOjAzLjAwMCAtLT4gMDA6MDA6MDQuMDAwCkNyZWRpdHMK'   -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map 1:s:0 -c:2 webvtt with-cues.mkv
+ffmpeg -i tests/fixtures/av-chapters.mkv -f webvtt -i \
+  'data:text/vtt;'\
+'base64,'\
+'V0VCVlRUCgowMDowMDowMC4wMDAgLS0+IDAwOjAwOjAxLjAwMApJbnRybwoKMDA6MDA6MDEuMDAwIC0tPiAwMDowMDowMi4wMDAKQ2hhcHRlciAxCgowMDowMDowMi4wMDAgLS0+IDAwOjAwOjAzLjAwMApDaGFwdGVyIDIKCjAwOjAwOjAzLjAwMCAtLT4gMDA6MDA6MDQuMDAwCkNyZWRpdHMK' \
+  -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -map 1:s:0 -c:2 \
+  copy with-cues.mkv
 ```
 
 The reverse - a `.vtt` file's cues becoming a chapter list - is the same expression with the types swapped: `array_agg(ROW(c.text, c.start_t, c.end_t)::chapter) AS chapters` over `unnest(v.cues) c`.

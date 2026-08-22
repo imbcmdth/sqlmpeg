@@ -17,7 +17,13 @@ from pathlib import Path
 import pytest
 
 from sqlmpeg import probe as probe_mod
-from sqlmpeg.probe import ProbeResult, StreamMeta, clear_cache, probe
+from sqlmpeg.probe import (
+    ProbeResult,
+    StreamMeta,
+    clear_cache,
+    parse_webvtt,
+    probe,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
@@ -975,6 +981,88 @@ def test_probe_result_dataclass_shape() -> None:
     assert r.by_type("audio") == []
     with pytest.raises(Exception):
         r.streams = []  # type: ignore[misc]
+
+
+# --- WebVTT cues, which ffprobe never enumerates ---------------------------
+
+_VTT = """WEBVTT
+
+00:00:00.000 --> 00:00:00.600
+Cue one.
+
+00:00:01.400 --> 00:00:02.000
+Cue three.
+"""
+
+
+def test_parse_webvtt_reads_every_cue_in_document_order() -> None:
+    cues = parse_webvtt(_VTT)
+    assert [(c.index, c.start_t, c.end_t, c.text) for c in cues] == [
+        (1, 0.0, 0.6, "Cue one."),
+        (2, 1.4, 2.0, "Cue three."),
+    ]
+
+
+def test_parse_webvtt_skips_the_header_notes_styles_and_regions() -> None:
+    text = (
+        "WEBVTT - with a title\n\nNOTE this is a comment\nover two lines\n\n"
+        "STYLE\n::cue { color: peachpuff }\n\nREGION\nid:fred\n\n"
+        "00:00.000 --> 00:01.000\nOnly cue.\n"
+    )
+    assert [(c.index, c.text) for c in parse_webvtt(text)] == [(1, "Only cue.")]
+
+
+def test_parse_webvtt_reads_a_cue_identifier_and_cue_settings() -> None:
+    text = "WEBVTT\n\nintro\n00:00:01.500 --> 00:00:02.250 line:0 align:start\nHi\n"
+    (cue,) = parse_webvtt(text)
+    assert (cue.start_t, cue.end_t, cue.text) == (1.5, 2.25, "Hi")
+
+
+def test_parse_webvtt_reads_an_hours_timestamp_and_a_multi_line_payload() -> None:
+    text = "WEBVTT\n\n01:02:03.400 --> 01:02:04.000\nfirst\nsecond\n"
+    (cue,) = parse_webvtt(text)
+    assert cue.start_t == 3723.4
+    assert cue.text == "first\nsecond"
+
+
+def test_parse_webvtt_reads_the_character_references_back() -> None:
+    text = "WEBVTT\n\n00:00.000 --> 00:01.000\nTom &amp; &lt;b&gt;\n"
+    assert parse_webvtt(text)[0].text == "Tom & <b>"
+
+
+def test_parse_webvtt_drops_a_block_whose_timing_does_not_parse() -> None:
+    text = "WEBVTT\n\nnot a cue at all\n\n00:00.000 --> 00:01.000\nreal\n"
+    assert [c.text for c in parse_webvtt(text)] == ["real"]
+
+
+def test_parse_webvtt_of_a_document_with_no_cues_is_empty() -> None:
+    assert parse_webvtt("WEBVTT\n\n") == []
+
+
+def test_parse_webvtt_normalizes_windows_newlines() -> None:
+    text = "WEBVTT\r\n\r\n00:00.000 --> 00:01.000\r\nCue.\r\n"
+    assert [c.text for c in parse_webvtt(text)] == ["Cue."]
+
+
+@pytest.mark.exec
+def test_probe_reads_a_vtt_inputs_cues_and_its_format_name(_fixtures: Path) -> None:
+    result = probe(str(_fixtures / "subs.en.vtt"))
+    assert result is not None
+    assert result.format_name == "webvtt"
+    assert [(c.index, c.start_t, c.end_t, c.text) for c in result.cues] == [
+        (1, 0.0, 0.6, "Cue one."),
+        (2, 0.7, 1.3, "Cue two."),
+        (3, 1.4, 2.0, "Cue three."),
+    ]
+
+
+@pytest.mark.exec
+def test_probe_reads_no_cues_out_of_a_container(_fixtures: Path) -> None:
+    """A container is never demuxed for cues, webvtt track or not."""
+    result = probe(str(_fixtures / "avs.mkv"))
+    assert result is not None
+    assert result.format_name != "webvtt"
+    assert result.cues == []
 
 
 # --- remote specs against a real ffprobe (localhost, no external network) ---

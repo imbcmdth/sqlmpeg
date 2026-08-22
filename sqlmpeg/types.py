@@ -53,11 +53,16 @@ __all__ = [
     "CHAPTER_TYPE",
     "COLUMN_TYPES",
     "CONTAINER_READONLY_FIELDS",
+    "CUES_COLUMN",
+    "CUE_TYPE",
     "DISPOSITION_COLUMN",
     "DISPOSITION_KEYS",
     "INPUT_COLUMNS",
     "INPUT_DURATION_COLUMN",
     "MAP_ELEMENTS",
+    "RECORD_ARRAY_COLUMNS",
+    "RECORD_COLUMNS",
+    "RECORD_ELEMENTS",
     "RECORD_FIELDS",
     "ROW_COMMON",
     "ROW_READONLY_FIELDS",
@@ -274,14 +279,17 @@ _DECLARED: tuple[Type, ...] = (
             _w("path", "text", exposed=False),
         ),
     ),
+    # A cue is a chapter's twin: a caption over a time span. Same field order,
+    # so the two convert into each other by swapping the cast. `index` is the
+    # cue's place in the WebVTT document, 1-based.
     Type(
         "cue",
         "record",
         (
-            _ro("index", "number", exposed=False),
-            _w("start_t", "number", exposed=False),  # seconds
-            _w("end_t", "number", exposed=False),  # seconds
-            _w("text", "text", exposed=False),
+            _ro("index", "number"),
+            _w("text", "text"),
+            _w("start_t", "number"),  # seconds
+            _w("end_t", "number"),  # seconds
         ),
     ),
     Type(
@@ -295,6 +303,10 @@ _DECLARED: tuple[Type, ...] = (
             _w("subtitle", "subtitle_stream[]"),
             _w("data", "data_stream[]"),
             _w("chapters", "chapter[]"),
+            # Read-only: a WebVTT document's cues, parsed by sqlmpeg itself.
+            # A cue array is WRITTEN in a stream position (it IS a subtitle
+            # track), never as a column named `cues`.
+            _ro("cues", "cue[]"),
             _w("attachments", "attachment[]", exposed=False),
             # The seek handle: legal only in a WHERE trim window, never a
             # value and never part of SELECT *.
@@ -331,10 +343,18 @@ def _container_fields() -> tuple[Field, ...]:
     return tuple(f for f in _CONTAINER.fields if f.exposed)
 
 
-def _array_columns(*kinds: TypeKind) -> tuple[str, ...]:
-    """The exposed container array columns whose elements have those kinds."""
+def _array_columns(*kinds: TypeKind, writable: bool | None = None) -> tuple[str, ...]:
+    """The exposed container array columns whose elements have those kinds.
+
+    `writable` narrows to the columns a query may assert (or, False, to the
+    ones it may not); None takes both.
+    """
     return tuple(
-        f.name for f in _container_fields() if is_array(f.type) and resolve(f.type).kind in kinds
+        f.name
+        for f in _container_fields()
+        if is_array(f.type)
+        and resolve(f.type).kind in kinds
+        and (writable is None or f.writable == writable)
     )
 
 
@@ -348,13 +368,32 @@ CHAPTERS_COLUMN = _sole(
     "the chapter array column",
 )
 
-# The record type that column holds, and the one a written chapter casts to.
-CHAPTER_TYPE = element_type(
-    _sole(
-        tuple(f.type for f in _CONTAINER.fields if f.name == CHAPTERS_COLUMN),
-        "the chapter array column's element",
-    )
+# Each record-array column of a container and the record it holds: `chapters`
+# holds chapters, `cues` holds cues. Unnesting one gives STREAMLESS rows -- a
+# record is metadata the container carries, never a track.
+RECORD_ELEMENTS: dict[str, str] = {
+    f.name: element_type(f.type)
+    for f in _container_fields()
+    if is_array(f.type) and resolve(f.type).kind == "record"
+}
+
+RECORD_ARRAY_COLUMNS = frozenset(RECORD_ELEMENTS)
+
+# The same pairing read the other way: which column each record type lives in.
+RECORD_COLUMNS: dict[str, str] = {
+    record: column for column, record in RECORD_ELEMENTS.items()
+}
+
+# The record type the chapter column holds, and the one a written chapter
+# casts to.
+CHAPTER_TYPE = RECORD_ELEMENTS[CHAPTERS_COLUMN]
+
+# The container column an input's cue list lives in, and the record it holds.
+CUES_COLUMN = _sole(
+    tuple(name for name, record in RECORD_ELEMENTS.items() if record == "cue"),
+    "the cue array column",
 )
+CUE_TYPE = RECORD_ELEMENTS[CUES_COLUMN]
 
 # The scalar pseudo-column every INPUT alias carries.
 INPUT_DURATION_COLUMN = _sole(
@@ -426,10 +465,12 @@ STREAM_ARRAY_COLUMNS = frozenset(_STREAM_ARRAYS)
 # `t` is a timeline and `duration` is a scalar, and neither is a set of rows.
 UNNEST_COLUMNS = frozenset(_array_columns("stream", "record"))
 
-# What `SELECT *` expands a container into: its array columns, in declaration
-# order -- the four stream arrays, then the record arrays. Never the scalars:
-# `duration` is a value, `t` a seek handle, `tags` a map read by key.
-STAR_COLUMNS: tuple[str, ...] = _array_columns("stream", "record")
+# What `SELECT *` expands a container into: the array columns a copy carries
+# through, in declaration order -- the four stream arrays, then the record
+# arrays. Never the scalars (`duration` is a value, `t` a seek handle, `tags`
+# a map read by key), and never a READ-ONLY array: `cues` are read out of a
+# WebVTT document by name, and a file that is not one has none to show.
+STAR_COLUMNS: tuple[str, ...] = _array_columns("stream", "record", writable=True)
 
 # The container fields a query may not assert: probed facts and handles. The
 # reserved set an aliased column is checked against before it counts as a

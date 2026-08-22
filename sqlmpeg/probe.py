@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from sqlmpeg import binaries
 from sqlmpeg.ir import StreamType
@@ -32,6 +32,16 @@ _TIMEOUT_SECONDS = 5.0
 # Remote specs fetch a manifest and often an init segment per stream before
 # ffprobe can report anything; 5s flakes on real networks, so they get more.
 _REMOTE_TIMEOUT_SECONDS = 15.0
+
+# ffprobe's own name for the WebVTT demuxer, and the document's first word.
+WEBVTT_FORMAT = "webvtt"
+_WEBVTT_MAGIC = "WEBVTT"
+_CUE_ARROW = "-->"
+# Blocks that are not cues: comments, styling, regions.
+_NOT_CUE_BLOCKS = ("NOTE", "STYLE", "REGION", _WEBVTT_MAGIC)
+# WebVTT writes its payload with HTML's character references. `&amp;` is read
+# LAST so that an escaped ampersand does not turn a following name into one.
+_WEBVTT_UNESCAPES = (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
 
 
 @dataclass(frozen=True)
@@ -81,10 +91,32 @@ class ChapterMeta:
 
 
 @dataclass(frozen=True)
+class CueMeta:
+    """One WebVTT cue, read from the document itself.
+
+    ffprobe does not enumerate cues, so these come from parsing the ``.vtt``
+    file: see :func:`parse_webvtt`. `index` is the cue's place in the
+    document, 1-based; `start_t`/`end_t` are seconds; `text` is the payload
+    with its lines joined by newlines and WebVTT's escapes read back.
+    """
+
+    index: int
+    text: str
+    start_t: float
+    end_t: float
+
+
+@dataclass(frozen=True)
 class ProbeResult:
     streams: list[StreamMeta]  # file order
     duration: float | None = None  # container-level, from -show_format
     chapters: list[ChapterMeta] = field(default_factory=list)
+    # ffprobe's own name for the demuxer that read the file ("webvtt",
+    # "matroska,webm", ...), verbatim. It is what says a file IS a WebVTT
+    # document and so has cues to read.
+    format_name: str | None = None
+    # The document's cues, for a WebVTT input and nothing else.
+    cues: list[CueMeta] = field(default_factory=list)
     # Container-level tags from -show_format, keys lowercased, values verbatim.
     # The WHOLE tag dict, not a whitelist: which keys a query may read is
     # decided where they resolve, not here.
@@ -177,8 +209,30 @@ def _cached_ffprobe(
     if parsed is None:
         return None
 
+    parsed = _with_cues(parsed, spec)
     _cache[cache_key] = parsed
     return parsed
+
+
+def _with_cues(parsed: ProbeResult, spec: str) -> ProbeResult:
+    """`parsed` plus the cues of a WebVTT document, and nothing else.
+
+    ffprobe reports a WebVTT file's ONE subtitle stream and stops there -- it
+    never lists cues -- so the document is read a second time, as text, by
+    :func:`parse_webvtt`. Only a local file ffprobe already identified as
+    ``webvtt`` is read: a remote spec is not fetched, and a container that
+    merely CARRIES a webvtt track is not demuxed, so neither has cues here.
+    Unreadable or undecodable text leaves the list empty, like every other
+    failure in this module.
+    """
+    if parsed.format_name != WEBVTT_FORMAT or "://" in spec:
+        return parsed
+    try:
+        with open(spec, encoding="utf-8-sig") as handle:
+            text = handle.read()
+    except (OSError, UnicodeDecodeError):
+        return parsed
+    return replace(parsed, cues=parse_webvtt(text))
 
 
 def _parse_streams(data: object) -> ProbeResult | None:
@@ -292,10 +346,12 @@ def _parse_streams(data: object) -> ProbeResult | None:
 
         container_duration = None
         container_tags: dict[str, str] = {}
+        format_name: str | None = None
         raw_format = data.get("format")
         if isinstance(raw_format, dict):
             container_duration = _float_opt(raw_format, "duration")
             container_tags = _tags(raw_format)
+            format_name = _str_opt(raw_format, "format_name")
 
         chapters = _parse_chapters(data.get("chapters"))
 
@@ -303,6 +359,7 @@ def _parse_streams(data: object) -> ProbeResult | None:
             streams=streams,
             duration=container_duration,
             chapters=chapters,
+            format_name=format_name,
             tags=container_tags,
         )
     except (KeyError, TypeError, ValueError):
@@ -333,6 +390,86 @@ def _parse_chapters(raw_chapters: object) -> list[ChapterMeta]:
             )
         )
     return chapters
+
+
+def parse_webvtt(text: str) -> list[CueMeta]:
+    """Every cue of a WebVTT document, in document order, numbered from 1.
+
+    Permissive like the rest of this module: a block whose timing line does
+    not parse is skipped rather than failing the read, and so are the
+    ``WEBVTT`` header and the ``NOTE``/``STYLE``/``REGION`` blocks. Cue
+    settings after the end timestamp (``line:0``, ``align:start``) are read
+    and dropped -- they position the text, and sqlmpeg exposes the text.
+    """
+    cues: list[CueMeta] = []
+    for block in _blocks(text):
+        cue = _parse_cue(block, len(cues) + 1)
+        if cue is not None:
+            cues.append(cue)
+    return cues
+
+
+def _blocks(text: str) -> list[list[str]]:
+    """A document's blocks: the runs of non-blank lines a blank line separates."""
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if line.strip():
+            current.append(line)
+        elif current:
+            blocks.append(current)
+            current = []
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _parse_cue(block: list[str], index: int) -> CueMeta | None:
+    """One block as a cue, or None when it is not one.
+
+    The timing line is the first or the second line -- a cue may carry an
+    identifier line ahead of it -- and everything after it is the payload.
+    """
+    if block[0].split()[0] in _NOT_CUE_BLOCKS:
+        return None
+    position = next((n for n in (0, 1) if n < len(block) and _CUE_ARROW in block[n]), None)
+    if position is None:
+        return None
+    left, _, right = block[position].partition(_CUE_ARROW)
+    start = _cue_time(left.strip())
+    settings = right.split()
+    end = _cue_time(settings[0]) if settings else None
+    if start is None or end is None:
+        return None
+    return CueMeta(
+        index=index,
+        text=_unescaped("\n".join(block[position + 1 :])),
+        start_t=start,
+        end_t=end,
+    )
+
+
+def _cue_time(value: str) -> float | None:
+    """``HH:MM:SS.mmm`` or ``MM:SS.mmm`` as seconds, or None if it is neither."""
+    parts = value.split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        seconds = float(parts[-1])
+        minutes = int(parts[-2])
+        hours = int(parts[-3]) if len(parts) == 3 else 0
+    except ValueError:
+        return None
+    if min(hours, minutes, seconds) < 0:
+        return None
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _unescaped(payload: str) -> str:
+    """A cue payload with WebVTT's character references read back."""
+    for escape, character in _WEBVTT_UNESCAPES:
+        payload = payload.replace(escape, character)
+    return payload
 
 
 def _int_opt(raw: dict[str, object], key: str) -> int | None:

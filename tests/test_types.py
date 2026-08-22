@@ -80,9 +80,9 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
     },
     "cue": {
         "index": ("number", "RO"),
+        "text": ("text", "W"),
         "start_t": ("number", "W"),
         "end_t": ("number", "W"),
-        "text": ("text", "W"),
     },
     "container": {
         "video": ("video_stream[]", "W"),
@@ -90,6 +90,7 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
         "subtitle": ("subtitle_stream[]", "W"),
         "data": ("data_stream[]", "W"),
         "chapters": ("chapter[]", "W"),
+        "cues": ("cue[]", "RO"),
         "attachments": ("attachment[]", "W"),
         "t": ("seek", "RO"),
         "duration": ("number", "RO"),
@@ -103,10 +104,6 @@ EXPECTED_UNEXPOSED = {
     "attachment.filename",
     "attachment.mimetype",
     "attachment.path",
-    "cue.index",
-    "cue.start_t",
-    "cue.end_t",
-    "cue.text",
     "container.attachments",
 }
 
@@ -163,15 +160,31 @@ EXPECTED_ROW_SCHEMAS = {
         "start_t": "number",
         "end_t": "number",
     },
+    "cues": {
+        "index": "number",
+        "text": "text",
+        "start_t": "number",
+        "end_t": "number",
+    },
 }
 
 EXPECTED_INPUT_COLUMNS = frozenset(
-    {"video", "audio", "subtitle", "data", "t", "duration", "chapters", "tags"}
+    {
+        "video",
+        "audio",
+        "subtitle",
+        "data",
+        "t",
+        "duration",
+        "chapters",
+        "cues",
+        "tags",
+    }
 )
 
 EXPECTED_STREAM_ARRAY_COLUMNS = frozenset({"video", "audio", "subtitle", "data"})
 
-EXPECTED_UNNEST_COLUMNS = EXPECTED_STREAM_ARRAY_COLUMNS | {"chapters"}
+EXPECTED_UNNEST_COLUMNS = EXPECTED_STREAM_ARRAY_COLUMNS | {"chapters", "cues"}
 
 EXPECTED_STAR_COLUMNS = ("video", "audio", "subtitle", "data", "chapters")
 
@@ -183,6 +196,7 @@ EXPECTED_ROW_STAR_COLUMNS = {
     "subtitle": ("index", "codec"),
     "data": ("index", "codec"),
     "chapters": ("index", "title", "start_t", "end_t"),
+    "cues": ("index", "text", "start_t", "end_t"),
 }
 
 EXPECTED_ROW_READONLY_FIELDS = {
@@ -193,6 +207,7 @@ EXPECTED_ROW_READONLY_FIELDS = {
     "subtitle": frozenset({"index", "codec"}),
     "data": frozenset({"index", "codec"}),
     "chapters": frozenset({"index"}),
+    "cues": frozenset({"index"}),
 }
 
 
@@ -353,7 +368,7 @@ def test_star_column_views() -> None:
 
 def test_read_only_field_views() -> None:
     assert types.ROW_READONLY_FIELDS == EXPECTED_ROW_READONLY_FIELDS
-    assert types.CONTAINER_READONLY_FIELDS == frozenset({"t", "duration"})
+    assert types.CONTAINER_READONLY_FIELDS == frozenset({"t", "duration", "cues"})
     # On a STREAM row the writable half is exactly the maps, which have
     # spellings of their own; a chapter's title and bounds are writable too.
     for column in types.STREAM_ARRAY_COLUMNS:

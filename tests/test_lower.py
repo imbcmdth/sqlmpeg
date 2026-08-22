@@ -50,7 +50,14 @@ from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.ir import NO_CHAPTERS, Graph, StreamType
 from sqlmpeg.lower import lower, lower_table
 from sqlmpeg.parser import parse, resolve
-from sqlmpeg.probe import ChapterMeta, ProbeResult, StreamMeta
+from sqlmpeg.probe import (
+    ChapterMeta,
+    CueMeta,
+    ProbeResult,
+    StreamMeta,
+    parse_webvtt,
+    probe,
+)
 from sqlmpeg.registry import Registry, load_reference
 from sqlmpeg.split import insert_splits
 from sqlmpeg.table import ArrayCell, RecordCell, StreamCell, render_csv, render_table
@@ -6731,7 +6738,10 @@ def test_a_chapter_records_bounds_may_read_an_inputs_duration() -> None:
         {"f": ProbeResult(streams=[_track("video", 0)], duration=12.5)},
     )
     payload = base64.b64decode(g.input_paths[1].split(",", 1)[1]).decode()
-    assert "END=12.5" in payload
+    # A fractional bound counts in milliseconds: ffmetadata's START/END are
+    # integers, and 1/1 would truncate 12.5 seconds to 12.
+    assert "TIMEBASE=1/1000" in payload
+    assert "END=12500" in payload
 
 
 def test_array_agg_over_a_values_table_builds_the_same_document() -> None:
@@ -6864,6 +6874,283 @@ def test_a_tag_column_over_chapter_rows_tags_the_container() -> None:
         _chapter_probes(*_TWO_CHAPTERS),
     )
     assert g.sinks[0].tags == {"title": "Ch: Intro"}
+
+
+
+# ---------------------------------------------------------------------------
+# unnest(v.cues) read, and a cue[] written as a WebVTT subtitle track
+# ---------------------------------------------------------------------------
+
+_THREE_CUES = [
+    CueMeta(index=1, text="Cue one.", start_t=0.0, end_t=0.6),
+    CueMeta(index=2, text="Cue two.", start_t=0.7, end_t=1.3),
+    CueMeta(index=3, text="Cue three.", start_t=1.4, end_t=2.0),
+]
+
+
+def _cue_probes() -> dict[str, ProbeResult | None]:
+    """One WebVTT sidecar beside an ordinary file, the shape both recipes use."""
+    return {
+        "f": ProbeResult(
+            streams=[_track("video", 0), _track("audio", 0)],
+            format_name="matroska,webm",
+        ),
+        "v": ProbeResult(
+            streams=[_track("subtitle", 0)],
+            format_name="webvtt",
+            cues=list(_THREE_CUES),
+        ),
+    }
+
+
+_FROM_VTT = "FROM input('f.mkv') f, input('subs.en.vtt') v, unnest(v.cues) c"
+
+
+def _vtt_payload(g: Graph, index: int) -> str:
+    return base64.b64decode(g.input_paths[index].split(",", 1)[1]).decode()
+
+
+def test_cue_rows_read_the_documents_own_order_and_fields() -> None:
+    sinks = lower_table(
+        resolve(parse("SELECT c.index, c.text, c.start_t, c.end_t " + _FROM_VTT)),
+        _cue_probes(),
+    )
+    assert sinks[0].result.columns == ["index", "text", "start_t", "end_t"]
+    assert sinks[0].result.rows == [
+        [1, "Cue one.", 0.0, 0.6],
+        [2, "Cue two.", 0.7, 1.3],
+        [3, "Cue three.", 1.4, 2.0],
+    ]
+
+
+def test_cue_rows_filter_and_order_like_any_other_rows() -> None:
+    sinks = lower_table(
+        resolve(
+            parse(
+                "SELECT c.text " + _FROM_VTT + " WHERE c.start_t >= 0.7 "
+                "ORDER BY c.start_t DESC"
+            )
+        ),
+        _cue_probes(),
+    )
+    assert sinks[0].result.rows == [["Cue three."], ["Cue two."]]
+
+
+def test_a_bare_cues_column_prints_as_one_array_cell() -> None:
+    sinks = lower_table(
+        resolve(parse("SELECT v.cues FROM input('subs.en.vtt') v")), _cue_probes()
+    )
+    cell = sinks[0].result.rows[0][0]
+    assert isinstance(cell, ArrayCell)
+    assert cell.elements[0] == RecordCell(fields=(1, "Cue one.", 0.0, 0.6))
+
+
+def test_cues_stay_out_of_a_container_star() -> None:
+    """`cues` is read-only, and a star names what a copy carries through."""
+    sinks = lower_table(resolve(parse("SELECT f.* FROM input('f.mkv') f")), _cue_probes())
+    assert sinks[0].result.columns == ["video", "audio", "subtitle", "data", "chapters"]
+
+
+def test_reading_cues_of_a_file_that_is_not_webvtt_is_a_typed_rejection() -> None:
+    err = _reject_lower_table(
+        "SELECT c.text FROM input('f.mkv') f, unnest(f.cues) c", _cue_probes()
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'f.mkv' is matroska,webm, not WebVTT" in err.message
+    assert "a webvtt track inside a container is not read" in (err.hint or "")
+
+
+def test_a_bare_cues_column_rejects_a_file_that_is_not_webvtt_too() -> None:
+    err = _reject_lower_table("SELECT f.cues FROM input('f.mkv') f", _cue_probes())
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "not WebVTT" in err.message
+
+
+def test_an_unreadable_input_rejects_cues_like_any_other_unnest() -> None:
+    err = _reject_lower_table(
+        "SELECT c.text FROM input('v.vtt') v, unnest(v.cues) c", {"v": None}
+    )
+    assert err.code is ErrorCode.INPUT_NOT_FOUND
+    assert "cannot read cues of 'v.vtt'" in err.message
+
+
+def test_a_webvtt_input_with_no_cues_reads_no_rows() -> None:
+    sinks = lower_table(
+        resolve(parse("SELECT c.text FROM input('v.vtt') v, unnest(v.cues) c")),
+        {"v": ProbeResult(streams=[_track("subtitle", 0)], format_name="webvtt")},
+    )
+    assert sinks[0].result.rows == []
+
+
+def test_a_cue_row_carries_no_stream_to_select() -> None:
+    err = _reject_lower(
+        "COPY (SELECT c FROM input('subs.en.vtt') v, unnest(v.cues) c) TO 'o.mkv'",
+        _cue_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'c' is a cue row, not a stream" in err.message
+    assert "a cue row has no stream to select" in (err.hint or "")
+
+
+def test_a_cue_array_literal_mints_one_webvtt_input_and_maps_it() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], ARRAY[ROW('Hello', 0, 2.5)::cue] "
+        "FROM input('f.mkv') f) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    minted = "sqlmpeg.cues#2"
+    assert g.sources[minted] == 1
+    assert g.input_options[minted] == {"format": "webvtt"}
+    assert _vtt_payload(g, 1) == (
+        "WEBVTT\n\n00:00:00.000 --> 00:00:02.500\nHello\n"
+    )
+    assert _refs(g) == ["src:f:v:0", f"src:{minted}:s:0"]
+
+
+def test_a_cue_array_is_a_subtitle_stream_and_not_a_chapters_column() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], ARRAY[ROW('Hello', 0, 2.5)::cue] "
+        "FROM input('f.mkv') f) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert g.sinks[0].chapters is None
+    assert [output.type for output in g.outputs] == ["video", "subtitle"]
+
+
+def test_array_agg_over_chapter_rows_writes_the_chapter_list_as_cues() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], "
+        "array_agg(ROW(c.title, c.start_t, c.end_t)::cue) "
+        "FROM input('f.mkv') f, unnest(f.chapters) c GROUP BY f.video[1]) "
+        "TO 'out.mkv'",
+        {
+            "f": ProbeResult(
+                streams=[_track("video", 0)],
+                chapters=[
+                    ChapterMeta(index=1, start_t=0.0, end_t=1.0, title="Intro"),
+                    ChapterMeta(index=2, start_t=1.0, end_t=2.0, title="Credits"),
+                ],
+            )
+        },
+    )
+    assert _vtt_payload(g, 1) == (
+        "WEBVTT\n\n"
+        "00:00:00.000 --> 00:00:01.000\nIntro\n\n"
+        "00:00:01.000 --> 00:00:02.000\nCredits\n"
+    )
+
+
+def test_array_agg_over_cue_rows_writes_them_back_as_a_chapter_list() -> None:
+    """The mirror: a .vtt file imported as chapters, milliseconds intact."""
+    g = _lower(
+        "COPY (SELECT f.video[1], "
+        "array_agg(ROW(c.text, c.start_t, c.end_t)::chapter) AS chapters "
+        + _FROM_VTT
+        + " GROUP BY f.video[1]) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    payload = base64.b64decode(g.input_paths[2].split(",", 1)[1]).decode()
+    assert g.sinks[0].chapters == 2
+    assert "TIMEBASE=1/1000" in payload
+    assert "START=700\nEND=1300\ntitle=Cue two." in payload
+
+
+def test_a_cue_list_may_overlap_where_a_chapter_list_may_not() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], "
+        "ARRAY[ROW('a', 0, 6)::cue, ROW('b', 1, 2)::cue] "
+        "FROM input('f.mkv') f) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert _vtt_payload(g, 1).count(" --> ") == 2
+
+
+def test_a_cue_list_that_goes_backwards_is_rejected() -> None:
+    err = _reject_lower(
+        "COPY (SELECT f.video[1], "
+        "ARRAY[ROW('a', 5, 6)::cue, ROW('b', 1, 2)::cue] "
+        "FROM input('f.mkv') f) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cue 2 starts at 1, before cue 1 at 5" in err.message
+
+
+def test_a_cue_that_ends_before_it_starts_is_rejected() -> None:
+    err = _reject_lower(
+        "COPY (SELECT f.video[1], ARRAY[ROW('a', 2.5, 1)::cue] "
+        "FROM input('f.mkv') f) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "cue 1 ends at 1, which is not after its start 2.5" in err.message
+
+
+def test_a_cue_record_takes_the_declared_field_count() -> None:
+    err = _reject_lower(
+        "COPY (SELECT f.video[1], ARRAY[ROW('a', 0)::cue] "
+        "FROM input('f.mkv') f) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert "a cue takes 3 values (text, start_t, end_t), got 2" in err.message
+
+
+def test_a_cues_text_may_not_be_null_or_empty() -> None:
+    for written in ("NULL", "''"):
+        err = _reject_lower(
+            f"COPY (SELECT f.video[1], ARRAY[ROW({written}, 0, 1)::cue] "
+            "FROM input('f.mkv') f) TO 'out.mkv'",
+            _cue_probes(),
+        )
+        assert err.code is ErrorCode.UNSUPPORTED_SQL
+        assert "'cue.text'" in err.message
+
+
+def test_a_cues_text_may_not_hold_an_arrow_or_a_blank_line() -> None:
+    err = _reject_lower(
+        "COPY (SELECT f.video[1], ARRAY[ROW('a --> b', 0, 1)::cue] "
+        "FROM input('f.mkv') f) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "WebVTT cannot represent inside a cue" in err.message
+
+
+def test_a_cues_text_escapes_what_webvtt_reads_as_markup() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], ARRAY[ROW('Tom & <b>', 0, 1)::cue] "
+        "FROM input('f.mkv') f) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert "Tom &amp; &lt;b>" in _vtt_payload(g, 1)
+
+
+def test_a_cues_start_must_be_a_number() -> None:
+    err = _reject_lower(
+        "COPY (SELECT f.video[1], ARRAY[ROW('a', 'x', 1)::cue] "
+        "FROM input('f.mkv') f) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert "'cue.start_t' must be a number" in err.message
+
+
+def test_a_cues_column_alias_is_not_something_a_query_can_set() -> None:
+    err = _reject_lower(
+        "COPY (SELECT f.video[1], 'x' AS cues FROM input('f.mkv') f) TO 'out.mkv'",
+        _cue_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'cues' is a probed field of the container" in err.message
+
+
+def test_a_bare_cues_column_in_a_media_copy_is_a_typed_rejection() -> None:
+    err = _reject_lower(
+        "COPY (SELECT v.subtitle[1], v.cues FROM input('subs.en.vtt') v) TO 'o.mkv'",
+        _cue_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'v.cues' carries no streams" in err.message
+    assert "unnest(v.cues) c" in (err.hint or "")
 
 
 # ---------------------------------------------------------------------------
@@ -7533,6 +7820,65 @@ def test_an_empty_captions_fill_muxes_a_real_track(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert out.exists()
 
+
+
+@pytest.mark.exec
+def test_a_written_cue_track_muxes_and_reads_back(tmp_path: Path) -> None:
+    """The whole round trip against a real ffmpeg: a chapter list written as a
+    WebVTT track, muxed, then read back out as cues."""
+    out = tmp_path / "with-cues.mkv"
+    query = (
+        "COPY (SELECT f.video[1], "
+        "array_agg(ROW(c.title, c.start_t, c.end_t)::cue) "
+        f"FROM input('{(FIXTURES_DIR / 'av-chapters.mkv').as_posix()}') f, "
+        "unnest(f.chapters) c GROUP BY f.video[1]) TO 'x.mkv'"
+    )
+    args = build_ffmpeg_args(emit(compile_sql(query)), str(out))
+    args.insert(1, "-y")
+    result = subprocess.run(args, capture_output=True, text=True, timeout=60.0)
+    assert result.returncode == 0, result.stderr
+
+    written = tmp_path / "cues.vtt"
+    extract = build_ffmpeg_args(
+        emit(compile_sql(f"SELECT f.subtitle[1] FROM input('{out.as_posix()}') f")),
+        str(written),
+    )
+    extract.insert(1, "-y")
+    assert subprocess.run(extract, capture_output=True, timeout=60.0).returncode == 0
+    cues = parse_webvtt(written.read_text(encoding="utf-8"))
+    assert [(c.text, c.start_t, c.end_t) for c in cues] == [
+        ("Intro", 0.0, 1.0),
+        ("Chapter 1", 1.0, 2.0),
+        ("Chapter 2", 2.0, 3.0),
+        ("Credits", 3.0, 4.0),
+    ]
+
+
+@pytest.mark.exec
+def test_a_chapter_list_built_from_cues_keeps_its_fractional_bounds(
+    tmp_path: Path,
+) -> None:
+    """ffmetadata counts START/END in whole units of its timebase, so a
+    sub-second cue bound needs the millisecond one to survive the trip."""
+    out = tmp_path / "chaptered.mkv"
+    query = (
+        "COPY (SELECT f.video[1], "
+        "array_agg(ROW(c.text, c.start_t, c.end_t)::chapter) AS chapters "
+        f"FROM input('{(FIXTURES_DIR / 'av2.mp4').as_posix()}') f, "
+        f"input('{(FIXTURES_DIR / 'subs.en.vtt').as_posix()}') v, "
+        "unnest(v.cues) c GROUP BY f.video[1]) TO 'x.mkv'"
+    )
+    args = build_ffmpeg_args(emit(compile_sql(query)), str(out))
+    args.insert(1, "-y")
+    result = subprocess.run(args, capture_output=True, text=True, timeout=60.0)
+    assert result.returncode == 0, result.stderr
+    probed = probe(str(out))
+    assert probed is not None
+    assert [(c.title, c.start_t, c.end_t) for c in probed.chapters] == [
+        ("Cue one.", 0.0, 0.6),
+        ("Cue two.", 0.7, 1.3),
+        ("Cue three.", 1.4, 2.0),
+    ]
 
 # ---------------------------------------------------------------------------
 # metadata tag columns: CASE, ||, row-scoped overrides

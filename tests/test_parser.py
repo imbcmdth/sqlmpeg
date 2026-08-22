@@ -2545,6 +2545,65 @@ def test_a_chapter_row_is_not_a_stream() -> None:
     assert "'c' is a chapter row, not a stream" in err.message
 
 
+def test_cues_bind_a_row_table_the_same_way_chapters_do() -> None:
+    res = _resolve(
+        "SELECT c.index, c.text, c.start_t, c.end_t "
+        "FROM input('subs.en.vtt') v, unnest(v.cues) c"
+    )
+    rows = res.track_rows["c"]
+    assert (rows.alias, rows.source, rows.column) == ("c", "v", "cues")
+
+
+def test_a_cue_row_has_no_title_column() -> None:
+    err = _reject("SELECT c.title FROM input('subs.en.vtt') v, unnest(v.cues) c")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 'c.title'" in err.message
+
+
+def test_a_cue_row_is_not_a_stream() -> None:
+    err = _reject("SELECT c FROM input('subs.en.vtt') v, unnest(v.cues) c")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'c' is a cue row, not a stream" in err.message
+
+
+def test_a_cue_row_carries_no_tags() -> None:
+    err = _reject("SELECT c.tags.title FROM input('subs.en.vtt') v, unnest(v.cues) c")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'c' is a cue row, and a cue carries no tags" in err.message
+
+
+def test_a_cues_subscript_is_rejected_with_an_unnest_hint() -> None:
+    err = _reject("SELECT v.cues[1].text FROM input('subs.en.vtt') v")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'v.cues' cannot be subscripted" in err.message
+    assert "unnest(v.cues) c" in (err.hint or "")
+
+
+def test_a_bare_cues_accessor_names_the_unnest() -> None:
+    err = _reject("SELECT v.cues.text FROM input('subs.en.vtt') v")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'v.cues.text' needs a row" in err.message
+    assert "unnest(v.cues) c" in (err.hint or "")
+
+
+def test_a_lone_cue_record_is_not_a_value() -> None:
+    err = _reject(
+        "SELECT f.video[1], ROW('Hi', 0, 1)::cue AS x FROM input('f.mkv') f"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a cue record is not a value on its own" in err.message
+    assert err.hint == "gather records into an array, e.g. ARRAY[ROW(...)::cue, ...]"
+
+
+def test_a_lone_chapter_record_still_names_the_chapters_column() -> None:
+    err = _reject(
+        "SELECT f.video[1], ROW('Hi', 0, 1)::chapter AS x FROM input('f.mkv') f"
+    )
+    assert err.hint == (
+        "gather records into an array, e.g. ARRAY[ROW(...)::chapter, ...] AS chapters"
+    )
+
+
 def test_values_cte_binds_a_row_table_not_a_normal_cte() -> None:
     res = _resolve(
         "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro')) "

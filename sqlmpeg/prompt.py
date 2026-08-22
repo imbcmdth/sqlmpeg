@@ -231,8 +231,9 @@ _DIALECT_TAIL = """\
 - In a table/csv query, `<row alias>.*` prints the row's scalar fields in
   schema order -- the metadata table. `tags` and `disposition` are NOT in the
   star (one disposition cell is every flag ffmpeg knows); name them to print
-  them. `<input alias>.*` there prints every array column as one cell each,
-  `chapters` included.
+  them. `<input alias>.*` there prints every writable array column as one
+  cell each, `chapters` included; `cues` is read-only and stays out, so name
+  it to print it.
 - `WHERE` over row columns compares a column against a literal; `ON`
   compares a column against another row's column or a literal: `=`, `!=`,
   `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL`, `[NOT] IN (literals)`,
@@ -339,6 +340,29 @@ _DIALECT_TAIL = """\
   title) AS (VALUES (0, 60, 'Intro'), (60, 300, 'Act One')) ... FROM
   input('film.mkv') f, marks m`. Its columns take the type their literals
   wrote, and a column written with two types is rejected.
+
+### Cues
+- `cues` is a second record array of the input alias, the cues of a WebVTT
+  document: `FROM input('subs.en.vtt') v, unnest(v.cues) c`. ffprobe does
+  not list cues, so sqlmpeg reads the `.vtt` file itself -- only a WebVTT
+  input has any, and unnesting the cues of anything else is a typed
+  rejection naming what the file is. A webvtt track inside a container is
+  not read. `cues` is read-only, so it is not part of `SELECT *` and
+  `... AS cues` is a rejection.
+- Every row carries `index` (1-based, the document's own order), `text`,
+  `start_t`, `end_t` (seconds). A cue is not a stream, so the rows read
+  exactly like chapter rows.
+- To WRITE cues, put an array of `cue` records in a STREAM position -- it IS
+  a WebVTT subtitle track, not a column: `SELECT f.video[1], f.audio[1],
+  ARRAY[ROW('Hello', 0, 2.5)::cue] FROM input('film.mkv') f`. A record names
+  the writable fields positionally, `ROW(text, start_t, end_t)`, the same
+  shape a chapter has. Every cue must end after it starts and the list must
+  run in ascending order; unlike chapters, two cues MAY overlap.
+- Cues and chapters convert into each other by swapping the cast:
+  `array_agg(ROW(c.title, c.start_t, c.end_t)::cue)` over `unnest(f.chapters)
+  c` writes a chapter list as a caption track, and
+  `array_agg(ROW(c.text, c.start_t, c.end_t)::chapter) AS chapters` over
+  `unnest(v.cues) c` imports a `.vtt` file as a chapter list.
 
 ### Broadcasting
 - Passing a bare array where a function expects one stream applies the call

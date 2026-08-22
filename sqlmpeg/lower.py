@@ -315,7 +315,6 @@ from sqlmpeg.parser import (
     _pos,
     _projection_expr,
     _time_bounds,
-    chapters_unnest_hint,
     column_label,
     flag_error,
     from_entries,
@@ -328,6 +327,7 @@ from sqlmpeg.parser import (
     map_path,
     map_ref,
     record_cast_type,
+    record_unnest_hint,
     references_row_alias,
     star_qualifier,
     subscript_index,
@@ -337,7 +337,7 @@ from sqlmpeg.parser import (
     union_branches,
 )
 from sqlmpeg.parser import _ident_name as _fold
-from sqlmpeg.probe import ProbeResult, StreamMeta
+from sqlmpeg.probe import WEBVTT_FORMAT, ProbeResult, StreamMeta
 from sqlmpeg.registry import DynamicFilter, FilterOption, Registry, SourceFilter
 from sqlmpeg.sink import (
     CODEC_PARAMS_FLAGS,
@@ -358,9 +358,13 @@ from sqlmpeg.types import (
     CHAPTER_TYPE,
     CHAPTERS_COLUMN,
     CONTAINER_READONLY_FIELDS,
+    CUE_TYPE,
+    CUES_COLUMN,
     DISPOSITION_COLUMN,
     DISPOSITION_KEYS,
     INPUT_DURATION_COLUMN,
+    RECORD_ARRAY_COLUMNS,
+    RECORD_ELEMENTS,
     RECORD_FIELDS,
     ROW_READONLY_FIELDS,
     ROW_SCHEMAS,
@@ -464,11 +468,6 @@ _GROUPED_CTE_HINT = (
     "a CTE with several rows varies inside the group: wrap the column in "
     "array_agg(...), or add it to the GROUP BY to make it the group's key"
 )
-_CHAPTER_ROW_HINT = (
-    "a chapter row has no stream column at all — a chapter is not a track — "
-    "so it can only be read as a metadata query, e.g. no COPY, or COPY ... "
-    "WITH (FORMAT csv)"
-)
 _CHAPTER_LITERAL = f"ROW(title, start_t, end_t)::{CHAPTER_TYPE}"
 _CHAPTER_EXAMPLE = f"ROW('Intro', 0, 60)::{CHAPTER_TYPE}"
 _CHAPTERS_COLUMN_HINT = (
@@ -476,6 +475,13 @@ _CHAPTERS_COLUMN_HINT = (
     f"ARRAY[{_CHAPTER_EXAMPLE}] AS {CHAPTERS_COLUMN}, or "
     f"array_agg(ROW(c.title, c.start_t, c.end_t)::{CHAPTER_TYPE}) AS "
     f"{CHAPTERS_COLUMN} over rows"
+)
+_CUE_LITERAL = f"ROW(text, start_t, end_t)::{CUE_TYPE}"
+_CUE_EXAMPLE = f"ROW('Hello', 0, 2.5)::{CUE_TYPE}"
+_CUE_ARRAY_HINT = (
+    f"an array of cue records IS a WebVTT subtitle track, e.g. "
+    f"ARRAY[{_CUE_EXAMPLE}], or "
+    f"array_agg(ROW(c.title, c.start_t, c.end_t)::{CUE_TYPE}) over chapter rows"
 )
 _WRITTEN_ROW_HINT = (
     "a written row carries values, never a stream: filter, group and aggregate "
@@ -616,6 +622,15 @@ _PLANES_HINT = (
     "planes names the planes to extract, e.g. planes => 'y'; your ffmpeg types "
     "it as an enum, so only ONE plane per call is accepted here"
 )
+
+
+def _record_row_hint(record: str) -> str:
+    """What a record row can be asked for, when a query asked it for a stream."""
+    return (
+        f"a {record} row has no stream column at all — a {record} is not a "
+        "track — so it can only be read as a metadata query, e.g. no COPY, or "
+        "COPY ... WITH (FORMAT csv)"
+    )
 
 
 def _option_text(value: object) -> str:
@@ -1202,15 +1217,24 @@ class _Chapter:
     end_node: exp.Expr
 
 
+@dataclass(frozen=True)
+class _Cue:
+    """One written cue: its span, its text, and where the bounds were written."""
+
+    start: int | float
+    end: int | float
+    text: str
+    start_node: exp.Expr
+    end_node: exp.Expr
+
+
 def _chapters_ffmetadata(chapters: Sequence[_Chapter]) -> str:
     """One evaluated ``chapter[]`` as an ffmetadata document's text.
 
-    ``;FFMETADATA1`` plus one ``[CHAPTER]`` block per record, in written order,
-    ``TIMEBASE=1/1`` so ``START``/``END`` are plain seconds -- exactly what
-    the cookbook's pinned recipe expects, byte for byte. A number written as
-    an integer renders as one. `title` is nullable, and a NULL one omits the
-    line entirely.
+    ``;FFMETADATA1`` plus one ``[CHAPTER]`` block per record, in written
+    order. `title` is nullable, and a NULL one omits the line entirely.
     """
+    scale = _chapter_timebase(chapters)
     lines = [";FFMETADATA1"]
     previous: tuple[int | float, int | float] | None = None
     for position, chapter in enumerate(chapters, start=1):
@@ -1225,12 +1249,26 @@ def _chapters_ffmetadata(chapters: Sequence[_Chapter]) -> str:
         )
         previous = (chapter.start, chapter.end)
         lines.append("[CHAPTER]")
-        lines.append("TIMEBASE=1/1")
-        lines.append(f"START={chapter.start}")
-        lines.append(f"END={chapter.end}")
+        lines.append(f"TIMEBASE=1/{scale}")
+        lines.append(f"START={round(chapter.start * scale)}")
+        lines.append(f"END={round(chapter.end * scale)}")
         if chapter.title is not None:
             lines.append(f"title={chapter.title}")
     return "\n".join(lines) + "\n"
+
+
+def _chapter_timebase(chapters: Sequence[_Chapter]) -> int:
+    """The ffmetadata timebase this chapter list needs, as its denominator.
+
+    ffmetadata's ``START``/``END`` are INTEGERS counted in the block's
+    timebase, so ``1/1`` reads whole seconds and would truncate a bound of
+    0.6 down to 0. A list every bound of which is a whole number keeps
+    ``1/1`` -- the plainest thing to read -- and one with a fraction anywhere
+    counts in milliseconds instead, which is as fine as either a chapter mark
+    or a WebVTT cue is written.
+    """
+    bounds = [bound for chapter in chapters for bound in (chapter.start, chapter.end)]
+    return 1 if all(float(bound).is_integer() for bound in bounds) else 1000
 
 
 def _check_chapter_span(
@@ -1277,15 +1315,22 @@ def _check_chapter_span(
         )
 
 
-def _chapter_number(value: RowValue, column: str, node: exp.Expr) -> int | float:
-    """One evaluated ``start_t``/``end_t`` as the number it must be, never NULL."""
+def _span_number(
+    value: RowValue, label: str, column: str, node: exp.Expr, example: str
+) -> int | float:
+    """One evaluated ``start_t``/``end_t`` as the number it must be, never NULL.
+
+    `label` is how the rejection names the field the value was written for --
+    a chapter's belongs to the column that holds the list, a cue's to the
+    record itself, since a cue array is a stream rather than a column.
+    """
     if isinstance(value, bool) or not isinstance(value, int | float):
         got = "NULL" if value is None else repr(value)
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            f"'{CHAPTERS_COLUMN}.{column}' must be a number, got {got}",
+            f"'{label}' must be a number, got {got}",
             node,
-            hint=f"{column} is a number of seconds, e.g. {_CHAPTER_EXAMPLE}",
+            hint=f"{column} is a number of seconds, e.g. {example}",
         )
     return value
 
@@ -1309,6 +1354,109 @@ def _chapter_title(value: RowValue, node: exp.Expr) -> str | None:
             node,
             hint=r"avoid \ = ; # and newlines in a chapter title",
         )
+    return value
+
+
+# The document's first word, the separator between a cue's two bounds, and
+# the two characters WebVTT reads as markup inside a cue.
+_WEBVTT_MAGIC = "WEBVTT"
+_CUE_ARROW = "-->"
+_WEBVTT_ESCAPES = (("&", "&amp;"), ("<", "&lt;"))
+
+
+def _cues_webvtt(cues: Sequence[_Cue]) -> str:
+    """One evaluated ``cue[]`` as a WebVTT document's text.
+
+    ``WEBVTT`` then one block per cue, in written order, blocks separated by
+    a blank line: the format `sqlmpeg.empty_captions()` already writes, with
+    cues in it. Bounds render as ``HH:MM:SS.mmm``, which is the only
+    timestamp spelling WebVTT has.
+    """
+    blocks = [_WEBVTT_MAGIC]
+    previous: int | float | None = None
+    for position, cue in enumerate(cues, start=1):
+        _check_cue_span(position, cue.start, cue.end, previous, cue.start_node, cue.end_node)
+        previous = cue.start
+        timing = f"{_cue_timestamp(cue.start)} {_CUE_ARROW} {_cue_timestamp(cue.end)}"
+        blocks.append(f"{timing}\n{cue.text}")
+    return "\n\n".join(blocks) + "\n"
+
+
+def _cue_timestamp(seconds: int | float) -> str:
+    """One cue bound as WebVTT's ``HH:MM:SS.mmm``."""
+    total = round(seconds * 1000)
+    hours, total = divmod(total, 3_600_000)
+    minutes, total = divmod(total, 60_000)
+    whole, milliseconds = divmod(total, 1000)
+    return f"{hours:02d}:{minutes:02d}:{whole:02d}.{milliseconds:03d}"
+
+
+def _check_cue_span(
+    position: int,
+    start: int | float,
+    end: int | float,
+    previous: int | float | None,
+    start_cell: exp.Expr,
+    end_cell: exp.Expr,
+) -> None:
+    """One written cue against the two rules a WebVTT document obeys.
+
+    A cue runs forward and the document lists its cues in ascending order.
+    Overlap is NOT a rule here, unlike a chapter list: WebVTT is allowed to
+    show two captions at once, and a player draws both.
+    """
+    if start >= end:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"cue {position} ends at {end}, which is not after its start {start}",
+            end_cell,
+            hint="a cue runs from start_t to end_t: end_t must be larger",
+        )
+    if previous is not None and start < previous:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"cue {position} starts at {start}, before cue {position - 1} at "
+            f"{previous}",
+            start_cell,
+            hint="a WebVTT document lists its cues in ascending order; reorder "
+            "the rows. Two cues MAY overlap",
+        )
+
+
+def _cue_text(value: RowValue, node: exp.Expr) -> str:
+    """One evaluated ``text`` as the payload the cue block carries.
+
+    WebVTT ends a cue at the next blank line and reads ``&`` and ``<`` as
+    markup, so the two are escaped the way the format says and a payload that
+    would break the block out is rejected instead of quietly truncating it.
+    """
+    if not isinstance(value, str):
+        got = "NULL" if value is None else repr(value)
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{CUE_TYPE}.text' must be a string, got {got}",
+            node,
+            hint=f"text is what the cue shows, e.g. {_CUE_EXAMPLE}",
+        )
+    if not value.strip():
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{CUE_TYPE}.text' is empty, and a cue with nothing to show is "
+            "not a cue",
+            node,
+            hint=f"write what the cue says, e.g. {_CUE_EXAMPLE}",
+        )
+    if _CUE_ARROW in value or "\r" in value or "\n\n" in value:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{CUE_TYPE}.text' {value!r} contains a character WebVTT cannot "
+            "represent inside a cue",
+            node,
+            hint="a cue's text runs to the next blank line, so it may hold no "
+            "blank line and no arrow (-->)",
+        )
+    for character, escape in _WEBVTT_ESCAPES:
+        value = value.replace(character, escape)
     return value
 
 
@@ -1687,8 +1835,13 @@ class _RowBinding:
 
     @property
     def streamless(self) -> bool:
-        """True for rows that carry no track: chapters, and written rows."""
-        return self.values is not None or self.column == CHAPTERS_COLUMN
+        """True for rows that carry no track: records, and written rows."""
+        return self.values is not None or self.column in RECORD_ARRAY_COLUMNS
+
+    @property
+    def record(self) -> str:
+        """The record these rows are one of. Only a record array has one."""
+        return RECORD_ELEMENTS[self.column]
 
     @property
     def schema(self) -> dict[str, RowColumnType]:
@@ -1866,6 +2019,29 @@ def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
         }
     )
     return columns
+
+
+def _record_columns(result: ProbeResult, column: str) -> list[dict[str, RowValue]]:
+    """One container record array's rows, each keyed by the record's fields.
+
+    The one row table that is not built from a `StreamMeta`: a chapter comes
+    from ffprobe's own chapter list, a cue from the WebVTT document sqlmpeg
+    parsed (:func:`sqlmpeg.probe.parse_webvtt`).
+    """
+    if column == CHAPTERS_COLUMN:
+        return [
+            {
+                "index": chapter.index,
+                "title": chapter.title,
+                "start_t": chapter.start_t,
+                "end_t": chapter.end_t,
+            }
+            for chapter in result.chapters
+        ]
+    return [
+        {"index": cue.index, "text": cue.text, "start_t": cue.start_t, "end_t": cue.end_t}
+        for cue in result.cues
+    ]
 
 
 def _join_keys(on: exp.Expr) -> dict[str, list[str]]:
@@ -2533,50 +2709,90 @@ class _Lowerer:
             hint=_CHAPTERS_COLUMN_HINT,
         )
 
-    def _chapter_record(
-        self, node: exp.Expr, env: _Env, row: _RowTuple, select: exp.Select
-    ) -> _Chapter:
-        """One ``ROW(title, start_t, end_t)::chapter``, evaluated and checked.
+    def _written_record(
+        self,
+        node: exp.Expr,
+        record: str,
+        literal: str,
+        hint: str,
+        env: _Env,
+        row: _RowTuple,
+        select: exp.Select,
+    ) -> dict[str, tuple[exp.Expr, RowValue]]:
+        """One ``ROW(...)::<record>``, evaluated: each field's cell and value.
 
         The positional signature is the declared one
         (:data:`~sqlmpeg.types.RECORD_FIELDS`): a query supplies the writable
-        fields, in declaration order, and never the probed ``index``. Each
-        value takes the ordinary compile-time value grammar.
+        fields, in declaration order, and never a probed one like ``index``.
+        Each value takes the ordinary compile-time value grammar. The cell is
+        kept beside the value so a rejection anchors on what the query typed.
         """
         node = _unwrap(node)
-        record = record_cast_type(node)
-        fields = RECORD_FIELDS[CHAPTER_TYPE]
-        written = _record_args(node) if record == CHAPTER_TYPE else None
+        fields = RECORD_FIELDS[record]
+        written = _record_args(node) if record_cast_type(node) == record else None
         if written is None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"a chapter is written as {_CHAPTER_LITERAL}, got "
-                f"{_describe(node)}",
+                f"a {record} is written as {literal}, got {_describe(node)}",
                 node,
                 fallback=select,
-                hint=_CHAPTERS_COLUMN_HINT,
+                hint=hint,
             )
         if len(written) != len(fields):
             named = ", ".join(field.name for field in fields)
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"a chapter takes {len(fields)} values ({named}), got "
+                f"a {record} takes {len(fields)} values ({named}), got "
                 f"{len(written)}",
                 node,
                 fallback=select,
-                hint=_CHAPTERS_COLUMN_HINT,
+                hint=hint,
             )
-        cells = dict(zip((field.name for field in fields), written, strict=True))
-        values = {
-            name: self._eval_value(cell, env, row, select)
-            for name, cell in cells.items()
+        return {
+            field.name: (cell, self._eval_value(cell, env, row, select))
+            for field, cell in zip(fields, written, strict=True)
         }
+
+    def _chapter_record(
+        self, node: exp.Expr, env: _Env, row: _RowTuple, select: exp.Select
+    ) -> _Chapter:
+        """One ``ROW(title, start_t, end_t)::chapter``, evaluated and checked."""
+        cells = self._written_record(
+            node, CHAPTER_TYPE, _CHAPTER_LITERAL, _CHAPTERS_COLUMN_HINT, env, row, select
+        )
+        title_cell, title = cells["title"]
+        start_cell, start = cells["start_t"]
+        end_cell, end = cells["end_t"]
         return _Chapter(
-            start=_chapter_number(values["start_t"], "start_t", cells["start_t"]),
-            end=_chapter_number(values["end_t"], "end_t", cells["end_t"]),
-            title=_chapter_title(values["title"], cells["title"]),
-            start_node=cells["start_t"],
-            end_node=cells["end_t"],
+            start=_span_number(
+                start, f"{CHAPTERS_COLUMN}.start_t", "start_t", start_cell, _CHAPTER_EXAMPLE
+            ),
+            end=_span_number(
+                end, f"{CHAPTERS_COLUMN}.end_t", "end_t", end_cell, _CHAPTER_EXAMPLE
+            ),
+            title=_chapter_title(title, title_cell),
+            start_node=start_cell,
+            end_node=end_cell,
+        )
+
+    def _cue_record(
+        self, node: exp.Expr, env: _Env, row: _RowTuple, select: exp.Select
+    ) -> _Cue:
+        """One ``ROW(text, start_t, end_t)::cue``, evaluated and checked."""
+        cells = self._written_record(
+            node, CUE_TYPE, _CUE_LITERAL, _CUE_ARRAY_HINT, env, row, select
+        )
+        text_cell, text = cells["text"]
+        start_cell, start = cells["start_t"]
+        end_cell, end = cells["end_t"]
+        return _Cue(
+            start=_span_number(
+                start, f"{CUE_TYPE}.start_t", "start_t", start_cell, _CUE_EXAMPLE
+            ),
+            end=_span_number(end, f"{CUE_TYPE}.end_t", "end_t", end_cell, _CUE_EXAMPLE),
+            text=_cue_text(text, text_cell),
+            start_node=start_cell,
+            end_node=end_cell,
         )
 
     def _lower_metadata_from(self, option: RawSinkOption, path_node: exp.Expr) -> int:
@@ -3536,8 +3752,8 @@ class _Lowerer:
         The same cell a bare ``f.audio`` / ``f.chapters`` prints on its own: an
         array column is a value inside the input's single row, not a row set.
         """
-        if column == CHAPTERS_COLUMN:
-            return self._chapters_cells(alias, anchor, select, cardinality)
+        if column in RECORD_ARRAY_COLUMNS:
+            return self._record_cells(alias, column, anchor, select, cardinality)
         result = self._star_probe(alias, anchor, select)
         stream_type = _ARRAY_COLUMNS[column]
         streams = [
@@ -3608,9 +3824,9 @@ class _Lowerer:
                 fallback=select,
                 hint="unnest one input's stream array, e.g. unnest(f.audio) t",
             )
-        if raw.column == CHAPTERS_COLUMN:
-            stream_type: StreamType = "data"  # filler: a chapter row has no track
-            rows = self._chapter_rows(raw, unnest, select)
+        if raw.column in RECORD_ARRAY_COLUMNS:
+            stream_type: StreamType = "data"  # filler: a record row has no track
+            rows = self._record_rows(raw, unnest, select)
         else:
             stream_type = _ARRAY_COLUMNS[raw.column]
             result = self.probes.get(raw.source)
@@ -3716,38 +3932,67 @@ class _Lowerer:
             return alias
         return self.res.input_paths[index]
 
-    def _chapter_rows(
+    def _record_rows(
         self, raw: RawTrackRows, unnest: exp.Expr, select: exp.Select
     ) -> list[_TrackRow]:
-        """The rows of ``unnest(<input>.chapters)``: one per probed chapter.
+        """The rows of ``unnest(<input>.chapters)`` / ``unnest(<input>.cues)``.
 
-        The one array column whose elements are not streams, so every row
-        carries `_STREAMLESS_ROW` in place of a track and only the
-        `ROW_SCHEMAS["chapters"]` metadata columns are ever read.
+        The array columns whose elements are not streams, so every row carries
+        `_STREAMLESS_ROW` in place of a track and only the record's own
+        metadata columns are ever read.
         """
-        result = self.probes.get(raw.source)
+        result = self._record_probe(
+            raw.source,
+            raw.column,
+            unnest,
+            select,
+            hint=f"unnest({raw.source}.{raw.column}) lists a file's "
+            f"{raw.column}, and only a readable input has any",
+        )
+        return [
+            _TrackRow(stream=_STREAMLESS_ROW, columns=columns)
+            for columns in _record_columns(result, raw.column)
+        ]
+
+    def _record_probe(
+        self,
+        alias: str,
+        column: str,
+        anchor: exp.Expr,
+        select: exp.Select,
+        *,
+        hint: str,
+    ) -> ProbeResult:
+        """The probe a record array column reads, or the rejection for it.
+
+        Cues are the one column ffprobe does not answer: it reports a WebVTT
+        file's single subtitle stream and never the cues in it, so sqlmpeg
+        parses the document itself and only a WebVTT input has any. A
+        container that merely CARRIES a webvtt track is not read.
+        """
+        result = self.probes.get(alias)
         if result is None:
             raise _error(
                 ErrorCode.INPUT_NOT_FOUND,
-                f"cannot read chapters of '{self._path_of(raw.source)}': file "
-                "not found or unreadable",
-                unnest,
+                f"cannot read {column} of '{self._path_of(alias)}': file not "
+                "found or unreadable",
+                anchor,
                 fallback=select,
-                hint=f"unnest({raw.source}.{CHAPTERS_COLUMN}) lists a file's "
-                "chapters, and only a readable input has any",
+                hint=hint,
             )
-        return [
-            _TrackRow(
-                stream=_STREAMLESS_ROW,
-                columns={
-                    "index": chapter.index,
-                    "title": chapter.title,
-                    "start_t": chapter.start_t,
-                    "end_t": chapter.end_t,
-                },
+        if column == CUES_COLUMN and result.format_name != WEBVTT_FORMAT:
+            reported = result.format_name or "unreadable"
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{self._path_of(alias)}' is {reported}, not WebVTT, so it "
+                "has no cues to read",
+                anchor,
+                fallback=select,
+                hint="sqlmpeg reads cues out of a WebVTT document, so they "
+                "come from a .vtt input, e.g. input('subs.en.vtt'); a webvtt "
+                "track inside a container is not read",
             )
-            for chapter in result.chapters
-        ]
+        return result
 
     def _add_table(self, table: exp.Expr | None, env: _Env, select: exp.Select) -> None:
         if not isinstance(table, exp.Table):
@@ -5082,6 +5327,11 @@ class _Lowerer:
 
     def _lower_expr(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Value:
         node = _unwrap(node)
+        # An array of cue records IS a subtitle track, so it lowers here, in a
+        # stream position, and not as an output column the way `chapters` does.
+        cues = self._lower_cue_array(node, env, select)
+        if cues is not None:
+            return cues
         if isinstance(node, exp.Bracket | exp.Column):
             alias, value = self._base_stream(node, env, select)
             return self._access(env, alias, value, node, select)
@@ -5096,8 +5346,8 @@ class _Lowerer:
                 hint="a stream has exactly one type",
             )
         if isinstance(node, exp.Array):
-            # The one array LITERAL the language has is a chapter list, and
-            # that is a column of the file rather than a stream.
+            # A chapter list is a column of the file rather than a stream; a
+            # cue array is a stream, and was taken above.
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 "an array literal is not a stream expression",
@@ -5163,6 +5413,71 @@ class _Lowerer:
                 hint=_ARRAY_AGG_HINT,
             )
         return self._lower_expr(inner, env, select)
+
+    # -- a cue array as a subtitle track -----------------------------------
+
+    def _lower_cue_array(
+        self, node: exp.Expr, env: _Env, select: exp.Select
+    ) -> _Value | None:
+        """``ARRAY[ROW(...)::cue, ...]`` / ``array_agg(ROW(...)::cue)`` as a track.
+
+        None when the expression is not one, so every other stream expression
+        falls through untouched. The cues become one self-contained WebVTT
+        ``data:`` input -- the mechanism ``sqlmpeg.empty_captions()`` already
+        uses, with cues in the document -- and the value is that input's one
+        subtitle stream, mapped and passed through like any other.
+        """
+        cues = self._cue_records(node, env, select)
+        if cues is None:
+            return None
+        if not cues:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a cue array is empty, so there is no subtitle track to write",
+                node,
+                fallback=select,
+                hint=f"write at least one cue, e.g. ARRAY[{_CUE_EXAMPLE}], or "
+                "drop the column",
+            )
+        text = _cues_webvtt(cues)
+        uri = "data:text/vtt;base64," + base64.b64encode(text.encode()).decode()
+        ref = self._mint_stream_input(CUES_COLUMN, uri, WEBVTT_FORMAT, "subtitle")
+        return _scalar(_Stream(ref=ref, type="subtitle", source=None))
+
+    def _cue_records(
+        self, node: exp.Expr, env: _Env, select: exp.Select
+    ) -> list[_Cue] | None:
+        """The cues a cue array lists, in written order; None if it is not one.
+
+        A literal array is read element by element and an ``array_agg`` once
+        per surviving row, exactly as a chapter list is -- the two spellings
+        of "a list of records" are the same two here.
+        """
+        if isinstance(node, exp.ArrayAgg):
+            inner = node.this
+            relation = env.relation
+            if not isinstance(inner, exp.Expr) or record_cast_type(
+                _unwrap(inner)
+            ) != CUE_TYPE:
+                return None
+            if relation is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "array_agg() aggregates rows, and this query has none",
+                    node,
+                    fallback=select,
+                    hint=_CUE_ARRAY_HINT,
+                )
+            return [
+                self._cue_record(inner, env, row, select) for row in relation.tuples
+            ]
+        if isinstance(node, exp.Array):
+            elements = [item for item in node.expressions if isinstance(item, exp.Expr)]
+            if not elements or record_cast_type(_unwrap(elements[0])) != CUE_TYPE:
+                return None
+            row = _group_row(env)
+            return [self._cue_record(element, env, row, select) for element in elements]
+        return None
 
     # -- stream references -------------------------------------------------
 
@@ -5285,7 +5600,7 @@ class _Lowerer:
                 fallback=select,
                 hint=_WRITTEN_ROW_HINT
                 if binding.values is not None
-                else _CHAPTER_ROW_HINT
+                else _record_row_hint(binding.record)
                 if binding.streamless
                 else _ROW_METADATA_HINT,
             )
@@ -5297,13 +5612,13 @@ class _Lowerer:
                 fallback=select,
                 hint=_WRITTEN_ROW_HINT,
             )
-        if binding.column == CHAPTERS_COLUMN:
+        if binding.column in RECORD_ARRAY_COLUMNS:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{binding.alias}' is a chapter row, not a stream",
+                f"'{binding.alias}' is a {binding.record} row, not a stream",
                 anchor,
                 fallback=select,
-                hint=_CHAPTER_ROW_HINT,
+                hint=_record_row_hint(binding.record),
             )
         if not binding.rows:
             raise _error(
@@ -5678,7 +5993,15 @@ class _Lowerer:
         return {}
 
     def _mint_input(self, macro: InputMacro) -> FrameRef:
-        """Add the macro's own ``-i`` to the graph and ref its single stream.
+        """Add the macro's own ``-i`` to the graph and ref its single stream."""
+        return self._mint_stream_input(
+            macro.name, macro.path, macro.format, macro.output
+        )
+
+    def _mint_stream_input(
+        self, name: str, path: str, format_: str, output: StreamType
+    ) -> FrameRef:
+        """Add one compiler-minted ``-i`` and ref its single stream.
 
         The alias is spelled so no query can ever collide with it (a dot AND a
         ``#``, neither legal in an unquoted identifier), because it is not a
@@ -5688,11 +6011,11 @@ class _Lowerer:
         ``data:`` URI; see ``sqlmpeg.inputs.option_spec``.
         """
         index = len(self.graph.input_paths)
-        alias = f"{MACRO_NAMESPACE}.{macro.name}#{index + 1}"
-        self.graph.input_paths.append(macro.path)
+        alias = f"{MACRO_NAMESPACE}.{name}#{index + 1}"
+        self.graph.input_paths.append(path)
         self.graph.sources[alias] = index
-        self.minted_input_options[alias] = {"format": macro.format}
-        return f"src:{alias}:{_TYPE_MARKERS[macro.output]}:0"
+        self.minted_input_options[alias] = {"format": format_}
+        return f"src:{alias}:{_TYPE_MARKERS[output]}:0"
 
     def _source_value(
         self,
@@ -5815,24 +6138,25 @@ class _Lowerer:
                 fallback=select,
                 hint=f"read one key as a value, e.g. {alias}.{TAGS_COLUMN}.title",
             )
-        if name == CHAPTERS_COLUMN:
+        if name in RECORD_ARRAY_COLUMNS:
+            record = RECORD_ELEMENTS[name]
             if index is not None:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"'{alias}.{CHAPTERS_COLUMN}' cannot be subscripted: a "
-                    "chapter is not a stream",
+                    f"'{alias}.{name}' cannot be subscripted: a "
+                    f"{record} is not a stream",
                     anchor,
                     fallback=select,
-                    hint=chapters_unnest_hint(alias),
+                    hint=record_unnest_hint(alias, name),
                 )
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{alias}.{CHAPTERS_COLUMN}' carries no streams: it is an "
-                "array of chapter records, and a SELECT column of a media "
+                f"'{alias}.{name}' carries no streams: it is an "
+                f"array of {record} records, and a SELECT column of a media "
                 "query is an output stream",
                 anchor,
                 fallback=select,
-                hint=chapters_unnest_hint(alias),
+                hint=record_unnest_hint(alias, name),
             )
         array_type = _ARRAY_COLUMNS.get(name)
         if array_type is None:
@@ -7371,9 +7695,11 @@ class _Lowerer:
                         return self._row_metadata_cells(binding, name, expr, select)
                 elif (
                     isinstance(binding, _InputBinding)
-                    and _fold(expr.this) == CHAPTERS_COLUMN
+                    and _fold(expr.this) in RECORD_ARRAY_COLUMNS
                 ):
-                    return self._chapters_cells(binding.alias, expr, select, cardinality)
+                    return self._record_cells(
+                        binding.alias, _fold(expr.this), expr, select, cardinality
+                    )
                 elif (
                     isinstance(binding, _InputBinding)
                     and _fold(expr.this) == TAGS_COLUMN
@@ -7458,32 +7784,34 @@ class _Lowerer:
             )
         return [_tags_to_cell(result.tags)] * cardinality
 
-    def _chapters_cells(
-        self, alias: str, anchor: exp.Expr, select: exp.Select, cardinality: int
+    def _record_cells(
+        self,
+        alias: str,
+        column: str,
+        anchor: exp.Expr,
+        select: exp.Select,
+        cardinality: int,
     ) -> list[CellValue]:
-        """A bare ``<input>.chapters`` as ONE array cell, broadcast to every row.
+        """A bare ``<input>.chapters`` / ``<input>.cues`` as ONE array cell,
+        broadcast to every row.
 
-        The array's records print in schema order (index, title, start_t,
-        end_t): ``{(1,Intro,0.0,1.0),(2,Chapter 1,1.0,2.0)}``. Unnest it to
-        read the fields as columns.
+        The array's records print in schema order (a chapter is index, title,
+        start_t, end_t): ``{(1,Intro,0.0,1.0),(2,Chapter 1,1.0,2.0)}``. Unnest
+        it to read the fields as columns.
         """
-        result = self.probes.get(alias)
-        if result is None:
-            raise _error(
-                ErrorCode.INPUT_NOT_FOUND,
-                f"cannot read chapters of '{self._path_of(alias)}': file not "
-                "found or unreadable",
-                anchor,
-                fallback=select,
-                hint=f"'{alias}.{CHAPTERS_COLUMN}' is the container's own "
-                "chapter list, and only a readable input has one",
-            )
+        result = self._record_probe(
+            alias,
+            column,
+            anchor,
+            select,
+            hint=f"'{alias}.{column}' is the container's own {column}, and "
+            "only a readable input has any",
+        )
+        names = ROW_STAR_COLUMNS[column]
         cell = ArrayCell(
             elements=tuple(
-                RecordCell(
-                    fields=(chapter.index, chapter.title, chapter.start_t, chapter.end_t)
-                )
-                for chapter in result.chapters
+                RecordCell(fields=tuple(row[name] for name in names))
+                for row in _record_columns(result, column)
             )
         )
         return [cell] * cardinality
