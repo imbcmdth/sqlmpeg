@@ -44,10 +44,22 @@ it).
 
 ## MCP
 
-`search` becomes a tool (read-only, safe). `install`/`link` write to
-disk and the lockfile — a THIRD trust posture beyond `--allow-run`, so
-they need their own flag if exposed at all. Wave A already gives every
-tool a `project` argument to work in.
+`search` becomes a tool: read-only, always available.
+
+**One capability flag, not a matrix.** Rename `--allow-run` to
+`--allow-unsafe` and put every side-effecting tool behind it - `run`,
+`install`, `link`. Maintainer decision, 2026-08-22: a permissions
+matrix for a local dev tool invites passing every flag, and the
+fine-grained gating already lives in the MCP client, which prompts per
+tool call. The flag is a coarse capability switch; the precision that
+matters goes in each TOOL DESCRIPTION, since that is the text a client
+shows when it asks.
+
+Free to rename: `--allow-run` landed on main after the 0.26.0 tag and
+has never been in a release. Deferred to this plan only to avoid
+colliding with wave B, which is editing the same files.
+
+Wave A already gives every tool a `project` argument to work in.
 
 ## Checks
 
