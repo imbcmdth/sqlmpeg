@@ -41,8 +41,19 @@ rejection whose blame includes a written ARGUMENT anchors on the argument
 instead, since ``sqlmpeg.parser._pos`` takes the earliest position in the
 subtree and the caller's own text always sorts first.
 
-Not here yet: ``RETURNS TABLE(...)``, which is a row source and belongs in
-FROM. It parses far enough to be told apart and rejected by name.
+**A table-returning function is a row source, so it becomes a CTE.**
+``RETURNS TABLE(col type, ...)`` is called in FROM and nowhere else. Its body
+is not spliced into the calling query -- a body with an ``unnest`` produces
+MANY rows, and splicing would hand the host the body's FROM items without the
+body ever being a relation of its own. Each call becomes one generated CTE
+holding the whole body, its projections aliased to the declared column names,
+and the FROM item becomes a reference to that CTE under the writer's alias.
+Everything about cardinality is then the CTE row source's, already defined:
+comma is a cross join with real multiplicity, ``WHERE`` narrows the product,
+``array_agg``/``GROUP BY`` gather it, and several rows into one path is
+``ROW_COUNT_MISMATCH``. A call in the SELECT list is a typed rejection: SQL
+reads ``(f(x)).a`` once per FIELD, and input identity here is the alias, so
+each read would mint its own ``-i`` for one file.
 """
 
 from __future__ import annotations
@@ -102,6 +113,13 @@ _TYPE_HINT = (
 _FUNCTION_HINT = (
     "write CREATE FUNCTION <name>(<param> <type>, ...) RETURNS <type> "
     "AS $$ <query> $$ LANGUAGE sql"
+)
+_TABLE_HINT = (
+    "write RETURNS TABLE(<column> <type>, ...), one name per column the body selects"
+)
+_VALUE_BODY_HINT = "a value-returning function's body is one SELECT of one column"
+_TABLE_BODY_HINT = (
+    "a table-returning function's body is one SELECT, one column per RETURNS TABLE column"
 )
 _ARG_HINT = (
     "a function that needs a file takes its path as text and calls input() in "
@@ -175,6 +193,7 @@ class _Function:
     `node` is the name identifier -- the earliest positioned token of the
     statement, so a definition-level rejection anchors on the name.
     `aliases` is what the body binds and expansion has to rename.
+    `columns` is the ``RETURNS TABLE`` list, and None for a value.
     """
 
     name: str
@@ -184,7 +203,12 @@ class _Function:
     node: exp.Expr
     aliases: frozenset[str]
     position: int
+    columns: tuple[_Param, ...] | None = None
     used: bool = False
+
+    @property
+    def returns_rows(self) -> bool:
+        return self.columns is not None
 
     @property
     def signature(self) -> str:
@@ -243,6 +267,12 @@ def _written(node: exp.Expr | None) -> str:
         return node.sql(dialect="postgres")
     except Exception:  # a node sqlglot cannot render is still a rejection
         return node.__class__.__name__.upper()
+
+
+def _listed(columns: tuple[_Param, ...] | None) -> str:
+    """The columns an alias would expose, written off an example alias."""
+    names = ", ".join(f"t.{column.name}" for column in columns or ())
+    return names or "its columns"
 
 
 def _type_name(node: exp.Expr | None) -> str | None:
@@ -309,24 +339,17 @@ def _function_name(create: exp.Create) -> tuple[exp.Expr, exp.Identifier, list[e
     return signature, identifier, params
 
 
-def _properties(create: exp.Create, name: str, anchor: exp.Expr) -> tuple[exp.Expr | None, str]:
-    """The ``RETURNS`` node and the declared language; anything else is rejected."""
-    returns: exp.Expr | None = None
+def _properties(
+    create: exp.Create, name: str, anchor: exp.Expr
+) -> tuple[exp.ReturnsProperty, str]:
+    """The ``RETURNS`` property and the declared language; anything else is rejected."""
+    returns: exp.ReturnsProperty | None = None
     language = ""
     properties = create.args.get("properties")
     if isinstance(properties, exp.Properties):
         for prop in properties.expressions:
             if isinstance(prop, exp.ReturnsProperty):
-                if prop.args.get("is_table"):
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        f"function '{name}' returns a table, which is not supported yet",
-                        anchor,
-                        hint="a value-returning function is called where its value "
-                        "belongs; RETURNS TABLE(...) is a row source and has no "
-                        "FROM form yet",
-                    )
-                returns = prop.this if isinstance(prop.this, exp.Expr) else None
+                returns = prop
                 continue
             if isinstance(prop, exp.LanguageProperty):
                 language = _ident_name(prop.this) if isinstance(prop.this, exp.Expr) else ""
@@ -377,8 +400,15 @@ def _reanchor(err: SqlmpegError, name: str, anchor: exp.Expr) -> SqlmpegError:
     )
 
 
-def _body_select(text: str, name: str, anchor: exp.Expr) -> exp.Select:
-    """Parse and shape-check one body: a single SELECT of a single column."""
+def _body_select(
+    text: str, name: str, anchor: exp.Expr, columns: tuple[_Param, ...] | None
+) -> exp.Select:
+    """Parse and shape-check one body: a single SELECT of the declared width.
+
+    A value's body is one column; a table's is one per ``RETURNS TABLE`` name.
+    """
+    wanted = 1 if columns is None else len(columns)
+    shape = _VALUE_BODY_HINT if columns is None else _TABLE_BODY_HINT
     try:
         parsed = parse(text)
     except SqlmpegError as err:
@@ -388,7 +418,7 @@ def _body_select(text: str, name: str, anchor: exp.Expr) -> exp.Select:
             ErrorCode.UNSUPPORTED_SQL,
             f"the body of {name}() is not one SELECT",
             anchor,
-            hint="a value-returning function's body is one SELECT of one column",
+            hint=shape,
         )
     if parsed.args.get("with_") is not None:
         raise _error(
@@ -404,13 +434,19 @@ def _body_select(text: str, name: str, anchor: exp.Expr) -> exp.Select:
         )
     except SqlmpegError as err:
         raise _reanchor(err, name, anchor) from err
-    if len(parsed.expressions) != 1:
+    written = len(parsed.expressions)
+    if written != wanted:
+        plural = "" if written == 1 else "s"
+        said = (
+            "and a value is one column"
+            if columns is None
+            else f"but its RETURNS TABLE declares {wanted}"
+        )
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            f"the body of {name}() selects {len(parsed.expressions)} columns, "
-            "and a value is one column",
+            f"the body of {name}() selects {written} column{plural}, {said}",
             anchor,
-            hint="a value-returning function's body is one SELECT of one column",
+            hint=shape,
         )
     return parsed
 
@@ -457,6 +493,85 @@ def _check_body_scope(
         )
 
 
+@dataclass(frozen=True)
+class _Declared:
+    """What a ``<name> <type>`` list is called, and how each rejection advises."""
+
+    noun: str
+    shape: str
+    plain: str
+    once: str
+
+
+_PARAMETER = _Declared(
+    noun="parameter",
+    shape=_FUNCTION_HINT,
+    plain="a parameter is a name and a type: no defaults, no OUT, no VARIADIC",
+    once="one name, one position",
+)
+_TABLE_COLUMN = _Declared(
+    noun="RETURNS TABLE column",
+    shape=_TABLE_HINT,
+    plain="a RETURNS TABLE column is a name and a type, and nothing else",
+    once="one name, one column",
+)
+
+
+def _column_defs(
+    nodes: Sequence[exp.Expr], name: str, anchor: exp.Expr, create: exp.Create, kind: _Declared
+) -> tuple[_Param, ...]:
+    """One ``<name> <type>`` list -- a signature's, or a ``RETURNS TABLE``'s."""
+    declared: list[_Param] = []
+    for node in nodes:
+        if not isinstance(node, exp.ColumnDef) or not isinstance(node.this, exp.Identifier):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{name}' has a {kind.noun} with no name",
+                anchor,
+                fallback=create,
+                hint=kind.shape,
+            )
+        written = _ident_name(node.this)
+        # DEFAULT, OUT/INOUT, VARIADIC and COLLATE all land here.
+        constraints = node.args.get("constraints")
+        if constraints:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{name}' writes the {kind.noun} '{written}' with "
+                f"{_written(constraints[0])}, which is not supported",
+                anchor,
+                fallback=create,
+                hint=kind.plain,
+            )
+        if any(seen.name == written for seen in declared):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{name}' declares the {kind.noun} '{written}' twice",
+                anchor,
+                fallback=create,
+                hint=kind.once,
+            )
+        declared.append(_Param(written, _checked_type(node.args.get("kind"), name, anchor)))
+    return tuple(declared)
+
+
+def _table_columns(
+    prop: exp.ReturnsProperty, name: str, anchor: exp.Expr, create: exp.Create
+) -> tuple[_Param, ...]:
+    """The ``RETURNS TABLE(...)`` column list: the shape the call site's alias exposes."""
+    schema = prop.this
+    nodes = list(schema.expressions) if isinstance(schema, exp.Schema) else []
+    if not nodes:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{name}' declares RETURNS TABLE with no columns",
+            anchor,
+            fallback=create,
+            hint=_TABLE_HINT,
+        )
+    return _column_defs(nodes, name, anchor, create, _TABLE_COLUMN)
+
+
 def _define(create: exp.Create) -> _Function:
     """One validated ``CREATE FUNCTION``, body parsed and shape-checked."""
     if create.args.get("replace"):
@@ -489,39 +604,9 @@ def _define(create: exp.Create) -> _Function:
             hint="pick a name the dialect does not already use",
         )
 
-    params: list[_Param] = []
-    for node in param_nodes:
-        if not isinstance(node, exp.ColumnDef) or not isinstance(node.this, exp.Identifier):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"function '{name}' has a parameter with no name",
-                identifier,
-                fallback=create,
-                hint=_FUNCTION_HINT,
-            )
-        param_name = _ident_name(node.this)
-        # DEFAULT, OUT/INOUT, VARIADIC and COLLATE all land here.
-        constraints = node.args.get("constraints")
-        if constraints:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"function '{name}' writes the parameter '{param_name}' with "
-                f"{_written(constraints[0])}, which is not supported",
-                identifier,
-                fallback=create,
-                hint="a parameter is a name and a type: no defaults, no OUT, no VARIADIC",
-            )
-        if any(param.name == param_name for param in params):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"function '{name}' declares the parameter '{param_name}' twice",
-                identifier,
-                fallback=create,
-                hint="one name, one position",
-            )
-        params.append(_Param(param_name, _checked_type(node.args.get("kind"), name, identifier)))
+    params = _column_defs(param_nodes, name, identifier, create, _PARAMETER)
 
-    returns_node, language = _properties(create, name, identifier)
+    returns_prop, language = _properties(create, name, identifier)
     if not language:
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -538,19 +623,26 @@ def _define(create: exp.Create) -> _Function:
             fallback=create,
             hint="only a LANGUAGE sql body is a query the compiler can inline",
         )
-    returns = _checked_type(returns_node, name, identifier)
+    columns: tuple[_Param, ...] | None = None
+    if returns_prop.args.get("is_table"):
+        columns = _table_columns(returns_prop, name, identifier, create)
+        returns = "TABLE(" + ", ".join(f"{c.name} {c.type}" for c in columns) + ")"
+    else:
+        node = returns_prop.this if isinstance(returns_prop.this, exp.Expr) else None
+        returns = _checked_type(node, name, identifier)
 
-    body = _body_select(_body_text(create, name, identifier), name, identifier)
+    body = _body_select(_body_text(create, name, identifier), name, identifier, columns)
     aliases = _body_aliases(body, name, params, identifier)
     _check_body_scope(body, name, params, aliases, identifier)
     return _Function(
         name=name,
-        params=tuple(params),
+        params=params,
         returns=returns,
         body=body,
         node=identifier,
         aliases=aliases,
         position=0,
+        columns=columns,
     )
 
 
@@ -685,6 +777,57 @@ def _splice(host: exp.Select, body: exp.Select) -> None:
         _and_into(host, where.this)
 
 
+def _name_columns(body: exp.Select, columns: tuple[_Param, ...]) -> None:
+    """Alias each projection to the column ``RETURNS TABLE`` named for it, in order.
+
+    Naming the projections is what makes the generated CTE expose the declared
+    columns: a CTE exposes what its body wrote ``AS``, and nothing else.
+    """
+    named: list[exp.Expr] = []
+    for column, projection in zip(columns, body.expressions):
+        inner = projection.this if isinstance(projection, exp.Alias) else projection
+        named.append(
+            exp.Alias(this=inner, alias=exp.Identifier(this=column.name, quoted=False))
+        )
+    body.set("expressions", named)
+
+
+def _query_node(statement: exp.Expr) -> exp.Expr | None:
+    """The node whose ``WITH`` holds a statement's CTEs, read as the resolver reads it."""
+    node: object = statement
+    if isinstance(statement, exp.Copy):
+        node = statement.this
+    elif isinstance(statement, exp.Create):
+        node = statement.args.get("expression")
+    while isinstance(node, exp.Subquery | exp.Paren) and isinstance(
+        node.this, exp.Select | exp.Union
+    ):
+        node = node.this
+    return node if isinstance(node, exp.Select | exp.Union) else None
+
+
+def _containing_cte(node: exp.Expr) -> exp.Expr | None:
+    """The CTE `node` is written inside, if any."""
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, exp.CTE):
+            return parent
+        parent = parent.parent
+    return None
+
+
+@dataclass(frozen=True)
+class _Site:
+    """Where a generated CTE goes: which query's ``WITH``, and before which entry.
+
+    A CTE only sees the CTEs written before it, so a call inside a CTE body
+    puts its own CTE ahead of that one; a call in the main query appends.
+    """
+
+    query: exp.Expr
+    before: exp.Expr | None
+
+
 # -- argument types --------------------------------------------------------
 
 
@@ -722,6 +865,8 @@ class _Expander:
     expansions: list[_Expansion] = field(default_factory=list)
     taken: set[str] = field(default_factory=set)
     budget: int = _EXPANSION_BUDGET
+    # Where the statement being walked keeps its generated CTEs.
+    site: _Site | None = None
 
     # -- entry point ------------------------------------------------------
 
@@ -786,15 +931,27 @@ class _Expander:
 
     def _expand_statement(self, statement: exp.Expr, position: int) -> None:
         """Inline every call the statement writes, each into the query around it."""
+        query = _query_node(statement)
         selects = [node for node in _preorder(statement) if isinstance(node, exp.Select)]
         for select in selects:
+            self.site = self._site_of(query, select)
             self._expand_within(select, select, position, ())
         if isinstance(statement, exp.Copy) and selects:
             # A fan-out destination is written over the query's rows, so its
             # calls expand into that query.
+            self.site = self._site_of(query, selects[0])
             for destination in statement.args.get("files") or []:
                 if isinstance(destination, exp.Expr):
                     self._expand_within(destination, selects[0], position, ())
+        self.site = None
+
+    def _site_of(self, query: exp.Expr | None, select: exp.Select) -> _Site:
+        """Where a call written in `select` puts the CTE it becomes."""
+        if query is None:
+            # A statement shaped like nothing the resolver knows; it is about
+            # to be rejected, and the WITH goes somewhere it can be seen.
+            return _Site(select, None)
+        return _Site(query, _containing_cte(select))
 
     def _expand_within(
         self, root: exp.Expr, host: exp.Select, position: int, stack: tuple[str, ...]
@@ -808,20 +965,29 @@ class _Expander:
             call = self._next_call(root, position)
             if call is None:
                 return root
+            if isinstance(call, exp.Table):
+                self._expand_row_source(call, host, position, stack)
+                continue
             replacement = self._expand_call(call, host, position, stack)
             call.replace(replacement)
             if call is root:
                 root = replacement
 
-    def _next_call(self, root: exp.Expr, position: int) -> exp.Anonymous | None:
-        """The first call to a defined function in `root`'s own query, if any."""
+    def _next_call(self, root: exp.Expr, position: int) -> exp.Anonymous | exp.Table | None:
+        """The first call to a defined function in `root`'s own query, if any.
+
+        A FROM item comes back as the ``exp.Table`` around the call, since that
+        whole item is what a row source replaces.
+        """
         # A nested SELECT is its own query and gets its own pass, so the scan
         # stops at one -- but not at `root` itself, which is where it starts.
         stop = exp.Select if isinstance(root, exp.Select) else None
         for node in _preorder(root, stop=stop):
             if isinstance(node, exp.Table):
                 function = self.functions.get(_call_name(node.this))
-                if function is not None:
+                if function is None:
+                    continue
+                if not function.returns_rows:
                     raise _error(
                         ErrorCode.UNSUPPORTED_SQL,
                         f"function '{function.name}' returns a value, not a table",
@@ -829,29 +995,42 @@ class _Expander:
                         hint="call it where its value belongs: a SELECT column, a "
                         "WHERE predicate, a tag column",
                     )
-                continue
+                self._check_defined(function, node, position)
+                return node
             if not isinstance(node, exp.Anonymous):
                 continue
             function = self.functions.get(_call_name(node))
             if function is None:
                 continue
-            if function.position > position:
+            if function.returns_rows:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"function '{function.name}' is used before it is defined",
+                    f"function '{function.name}' returns a table, not a value",
                     node,
-                    hint="define every function before the statements that call it",
+                    hint=f"call it in FROM: FROM {function.name}(...) AS t, then read "
+                    f"{_listed(function.columns)} off the alias; a field read off the "
+                    "call itself reads it once per field, which would mint one input "
+                    "per read",
                 )
+            self._check_defined(function, node, position)
             return node
         return None
 
+    def _check_defined(self, function: _Function, node: exp.Expr, position: int) -> None:
+        """A call may only name a function an earlier statement defined."""
+        if function.position <= position:
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{function.name}' is used before it is defined",
+            node,
+            hint="define every function before the statements that call it",
+        )
+
     # -- inlining one call ------------------------------------------------
 
-    def _expand_call(
-        self, call: exp.Anonymous, host: exp.Select, position: int, stack: tuple[str, ...]
-    ) -> exp.Expr:
-        """The expression `call` stands for, with the body spliced into `host`."""
-        function = self.functions[_call_name(call)]
+    def _enter(self, function: _Function, call: exp.Anonymous, stack: tuple[str, ...]) -> None:
+        """What every inlining costs: the cycle check, the budget, the used mark."""
         if function.name in stack:
             chain = " -> ".join([*stack[stack.index(function.name) :], function.name])
             raise _error(
@@ -871,12 +1050,23 @@ class _Expander:
             )
         function.used = True
 
-        # An argument is the CALLER's text, so its own calls expand in the
-        # caller's context -- f(f(x)) is nesting, never recursion.
+    def _arguments(
+        self, function: _Function, call: exp.Anonymous, host: exp.Select, position: int
+    ) -> list[exp.Expr]:
+        """The written arguments, expanded and checked against the signature.
+
+        An argument is the CALLER's text, so its own calls expand in the
+        caller's context -- f(f(x)) is nesting, never recursion.
+        """
         raw = [node for node in call.expressions if isinstance(node, exp.Expr)]
         arguments = [self._expand_within(node, host, position, ()) for node in raw]
         self._check_arguments(function, call, arguments)
+        return arguments
 
+    def _instance(
+        self, function: _Function, call: exp.Anonymous, arguments: list[exp.Expr]
+    ) -> tuple[exp.Select, int]:
+        """One private copy of the body: aliases renamed, positions stamped, arguments bound."""
         body = copy.deepcopy(function.body)
         index = len(self.expansions)
         line, col = _pos(call)
@@ -884,11 +1074,81 @@ class _Expander:
         _rename(body, self._fresh_aliases(function, index))
         self._stamp(body, index)
         _substitute(body, {p.name: a for p, a in zip(function.params, arguments)})
+        return body, index
+
+    def _expand_call(
+        self, call: exp.Anonymous, host: exp.Select, position: int, stack: tuple[str, ...]
+    ) -> exp.Expr:
+        """The expression `call` stands for, with the body spliced into `host`."""
+        function = self.functions[_call_name(call)]
+        self._enter(function, call, stack)
+        arguments = self._arguments(function, call, host, position)
+        body, _ = self._instance(function, call, arguments)
         self._expand_within(body, host, position, (*stack, function.name))
         _splice(host, body)
         projection: exp.Expr = body.expressions[0]
         inner = projection.this if isinstance(projection, exp.Alias) else None
         return inner if isinstance(inner, exp.Expr) else projection
+
+    def _expand_row_source(
+        self, item: exp.Table, host: exp.Select, position: int, stack: tuple[str, ...]
+    ) -> None:
+        """Turn one FROM-position call into a generated CTE, and read that instead.
+
+        The body becomes a relation of its own, which is what makes the call
+        site carry the body's ROW COUNT: splicing its FROM items into the host
+        would hand the host a product it never wrote.
+        """
+        call = item.this
+        if not isinstance(call, exp.Anonymous):  # unreachable: _next_call matched one
+            return
+        function = self.functions[_call_name(call)]
+        _check_query_args(item, frozenset({"this", "alias"}), "a table function call")
+        self._enter(function, call, stack)
+        arguments = self._arguments(function, call, host, position)
+        body, index = self._instance(function, call, arguments)
+        # The body is its own query now, so its own calls expand into it.
+        self._expand_within(body, body, position, (*stack, function.name))
+        _name_columns(body, function.columns or ())
+        name = self._fresh_name(f"{function.name}_{index + 1}")
+        self._add_cte(name, body)
+
+        identifier = exp.Identifier(this=name, quoted=False)
+        line, col = _pos(call)
+        identifier.meta.update({"line": line, "col": col, "start": 0, "end": 0})
+        alias = item.args.get("alias")
+        if alias is None:
+            # Unwritten, the alias is the function's own name, as Postgres has it.
+            alias = exp.TableAlias(this=exp.Identifier(this=function.name, quoted=False))
+        item.replace(exp.Table(this=identifier, alias=alias))
+
+    def _fresh_name(self, base: str) -> str:
+        """A name for a generated CTE that nothing in the script has claimed."""
+        name = base
+        while name in self.taken:
+            name += "_"
+        self.taken.add(name)
+        return name
+
+    def _add_cte(self, name: str, body: exp.Select) -> None:
+        """Bind `body` as one more CTE of the query the call was written in."""
+        site = self.site
+        if site is None:  # unreachable: every expansion runs under one statement
+            raise _error(ErrorCode.UNSUPPORTED_SQL, "a table function has no query to join", body)
+        with_ = site.query.args.get("with_")
+        if not isinstance(with_, exp.With):
+            with_ = exp.With(expressions=[])
+            site.query.set("with_", with_)
+        entries = list(with_.expressions)
+        at = len(entries)
+        if site.before is not None:
+            for index, entry in enumerate(entries):
+                if entry is site.before:
+                    at = index
+                    break
+        alias = exp.TableAlias(this=exp.Identifier(this=name, quoted=False))
+        entries.insert(at, exp.CTE(this=body, alias=alias))
+        with_.set("expressions", entries)
 
     def _fresh_aliases(self, function: _Function, index: int) -> dict[str, str]:
         """A name per body alias that nothing in the script has already claimed."""

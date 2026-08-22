@@ -453,17 +453,6 @@ def test_a_parameter_name_is_declared_once() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_a_table_returning_function_is_not_supported_yet() -> None:
-    sql = (
-        "CREATE FUNCTION tagged_audio(file text, lang text)\n"
-        "RETURNS TABLE(track audio_stream, language text) AS $$\n"
-        "  SELECT g.audio[1], lang FROM input(file) g\n"
-        "$$ LANGUAGE sql;\n"
-        "COPY (SELECT t FROM tagged_audio('a.wav', 'eng') AS t) TO 'out.mka'"
-    )
-    _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "returns a table")
-
-
 def test_a_value_function_may_not_be_called_in_from() -> None:
     sql = FIRST_TRACK + "COPY (SELECT t FROM first_track('a.mka') t) TO 'out.mka'"
     _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "not a table")
@@ -713,6 +702,295 @@ def test_no_synthetic_line_survives_a_successful_resolve() -> None:
 
 
 # ---------------------------------------------------------------------------
+# table-returning functions: the row source
+# ---------------------------------------------------------------------------
+
+
+# The plan's table function, and the one-row shape beside it.
+ENG_AUDIO = (
+    "CREATE FUNCTION eng_audio(file text) RETURNS TABLE(track audio_stream) AS $$\n"
+    "  SELECT a FROM input(file) f, unnest(f.audio) a WHERE a.tags.language = 'eng'\n"
+    "$$ LANGUAGE sql;\n"
+)
+TAGGED_AUDIO = (
+    "CREATE FUNCTION tagged_audio(file text, lang text)\n"
+    "RETURNS TABLE(track audio_stream, language text) AS $$\n"
+    "  SELECT a, lang FROM input(file) f, unnest(f.audio) a\n"
+    "$$ LANGUAGE sql;\n"
+)
+ONE_TRACK = (
+    "CREATE FUNCTION one_track(path text) RETURNS TABLE(track audio_stream) AS $$\n"
+    "  SELECT g.audio[1] FROM input(path) g\n"
+    "$$ LANGUAGE sql;\n"
+)
+
+
+def test_a_table_function_is_a_row_source_in_from() -> None:
+    """The plan's target query: two eng tracks gathered beside a host video."""
+    sql = ENG_AUDIO + (
+        "COPY (SELECT v.video[1], array_agg(t.track)\n"
+        "      FROM input('a.mp4') v, eng_audio('b.mp4') AS t\n"
+        "      GROUP BY v.video[1])\n"
+        "TO 'out.mkv'"
+    )
+    probes = {"eng_audio_1_f": _audio_probe({"language": "eng"}, {"language": "eng"})}
+    assert _argv(sql, probes) == [
+        "ffmpeg", "-i", "b.mp4", "-i", "a.mp4",
+        "-map", "1:v:0", "-c:0", "copy",
+        "-map", "0:a:0", "-c:1", "copy", "-metadata:s:1", "language=eng",
+        "-map", "0:a:1", "-c:2", "copy", "-metadata:s:2", "language=eng",
+        "out.mkv",
+    ]
+
+
+def test_a_one_row_table_function_needs_no_aggregate() -> None:
+    sql = ONE_TRACK + "COPY (SELECT t.track FROM one_track('a.mka') AS t) TO 'out.mka'"
+    assert _argv(sql) == [
+        "ffmpeg", "-i", "a.mka", "-map", "0:a:0", "-c:0", "copy", "out.mka",
+    ]
+
+
+def test_a_multi_row_table_function_yields_one_row_per_body_row() -> None:
+    """The call site has the BODY's cardinality: two eng tracks are two rows."""
+    sql = ENG_AUDIO + "SELECT t.track FROM eng_audio('b.mp4') AS t"
+    probes = {
+        "eng_audio_1_f": _audio_probe(
+            {"language": "eng"}, {"language": "fra"}, {"language": "eng"}
+        )
+    }
+    assert len(_rows(sql, probes)) == 2
+
+
+def test_a_table_function_cross_joins_the_host_rows() -> None:
+    sql = ENG_AUDIO + (
+        "SELECT u.index, t.track\n"
+        "FROM input('a.mka') v, unnest(v.audio) u, eng_audio('b.mp4') AS t"
+    )
+    probes = {
+        "v": _audio_probe({}, {}),
+        "eng_audio_1_f": _audio_probe({"language": "eng"}, {"language": "eng"}),
+    }
+    assert len(_rows(sql, probes)) == 4
+
+
+def test_the_host_where_narrows_the_cross_join() -> None:
+    sql = ENG_AUDIO + (
+        "SELECT u.index, t.track\n"
+        "FROM input('a.mka') v, unnest(v.audio) u, eng_audio('b.mp4') AS t\n"
+        "WHERE u.index = 1"
+    )
+    probes = {
+        "v": _audio_probe({}, {}),
+        "eng_audio_1_f": _audio_probe({"language": "eng"}, {"language": "eng"}),
+    }
+    assert [row[0] for row in _rows(sql, probes)] == [1, 1]
+
+
+def test_a_grouped_call_gathers_the_calls_rows() -> None:
+    sql = ENG_AUDIO + (
+        "SELECT array_agg(t.track) FROM eng_audio('b.mp4') AS t"
+    )
+    probes = {"eng_audio_1_f": _audio_probe({"language": "eng"}, {"language": "eng"})}
+    rows = _rows(sql, probes)
+    assert len(rows) == 1
+    assert str(rows[0][0]).count("audio") == 2
+
+
+def test_an_ungrouped_multi_row_call_into_one_path_is_rejected() -> None:
+    sql = ENG_AUDIO + "COPY (SELECT t.track FROM eng_audio('b.mp4') AS t) TO 'out.mka'"
+    probes = {"eng_audio_1_f": _audio_probe({"language": "eng"}, {"language": "eng"})}
+    with pytest.raises(SqlmpegError) as caught:
+        _argv(sql, probes)
+    assert caught.value.code is ErrorCode.ROW_COUNT_MISMATCH, caught.value
+
+
+def test_a_table_functions_columns_are_named_by_returns_table() -> None:
+    """The alias exposes the declared names, mapped from the projections in order."""
+    sql = TAGGED_AUDIO + (
+        "COPY (SELECT array_agg(t.track) FROM tagged_audio('a.mka', 'eng') AS t)\n"
+        "TO 'out.mka'"
+    )
+    probes = {"tagged_audio_1_f": _audio_probe({}, {})}
+    assert _argv(sql, probes) == [
+        "ffmpeg", "-i", "a.mka",
+        "-map", "0:a:0", "-c:0", "copy", "-metadata:s:0", "language=eng",
+        "-map", "0:a:1", "-c:1", "copy", "-metadata:s:1", "language=eng",
+        "out.mka",
+    ]
+
+
+def test_an_undeclared_column_of_the_alias_is_rejected() -> None:
+    sql = ONE_TRACK + "SELECT t.language FROM one_track('a.mka') AS t"
+    error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "unknown column 't.language'")
+    assert error.hint is not None and "track" in error.hint
+
+
+def test_two_calls_to_one_table_function_mint_two_inputs() -> None:
+    sql = ONE_TRACK + (
+        "COPY (SELECT x.track, y.track\n"
+        "      FROM one_track('a.mka') AS x, one_track('b.mka') AS y)\n"
+        "TO 'out.mka'"
+    )
+    assert _argv(sql) == [
+        "ffmpeg", "-i", "a.mka", "-i", "b.mka",
+        "-map", "0:a:0", "-c:0", "copy",
+        "-map", "1:a:0", "-c:1", "copy",
+        "out.mka",
+    ]
+
+
+def test_a_table_function_may_be_called_without_an_alias() -> None:
+    sql = ONE_TRACK + "COPY (SELECT one_track.track FROM one_track('a.mka')) TO 'out.mka'"
+    assert _argv(sql) == [
+        "ffmpeg", "-i", "a.mka", "-map", "0:a:0", "-c:0", "copy", "out.mka",
+    ]
+
+
+def test_a_table_function_is_a_row_source_inside_a_cte() -> None:
+    sql = ONE_TRACK + (
+        "COPY (WITH picked AS (SELECT t.track AS track FROM one_track('a.mka') AS t)\n"
+        "      SELECT picked.track FROM picked)\n"
+        "TO 'out.mka'"
+    )
+    assert _argv(sql) == [
+        "ffmpeg", "-i", "a.mka", "-map", "0:a:0", "-c:0", "copy", "out.mka",
+    ]
+
+
+def test_a_call_joins_a_cte_the_query_already_wrote() -> None:
+    sql = ONE_TRACK + (
+        "COPY (WITH vid AS (SELECT v AS track FROM input('a.mkv') i, unnest(i.video) v)\n"
+        "      SELECT vid.track, t.track FROM vid, one_track('b.mka') AS t)\n"
+        "TO 'out.mkv'"
+    )
+    probes = {
+        "i": ProbeResult(
+            streams=[
+                StreamMeta(
+                    type="video", index=0, metadata={}, width=640, height=360,
+                    fps="25/1", sample_rate=None, codec="h264", channels=None,
+                    channel_layout=None, bitrate=None, duration=None, color_transfer=None,
+                )
+            ]
+        )
+    }
+    assert _argv(sql, probes) == [
+        "ffmpeg", "-i", "a.mkv", "-i", "b.mka",
+        "-map", "0:v:0", "-c:0", "copy",
+        "-map", "1:a:0", "-c:1", "copy",
+        "out.mkv",
+    ]
+
+
+def test_a_table_function_body_may_call_a_value_function() -> None:
+    sql = NORMALIZE_LANG + (
+        "CREATE FUNCTION langs(path text) RETURNS TABLE(track audio_stream, language text) AS $$\n"
+        "  SELECT a, normalize_lang(a.tags.language) FROM input(path) g, unnest(g.audio) a\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT array_agg(t.track) FROM langs('a.mka') AS t) TO 'out.mka'"
+    )
+    probes = {"langs_1_g": _audio_probe({"language": "english"})}
+    assert _argv(sql, probes) == [
+        "ffmpeg", "-i", "a.mka",
+        "-map", "0:a:0", "-c:0", "copy", "-metadata:s:0", "language=eng",
+        "out.mka",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# table-returning functions: the rejections
+# ---------------------------------------------------------------------------
+
+
+def test_a_table_function_in_the_select_list_is_rejected() -> None:
+    sql = ONE_TRACK + "COPY (SELECT one_track('a.mka')) TO 'out.mka'"
+    error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "returns a table, not a value")
+    assert error.hint is not None and "FROM" in error.hint
+
+
+def test_a_field_read_off_a_table_function_is_rejected() -> None:
+    sql = ONE_TRACK + (
+        "COPY (SELECT (one_track('a.mka')).track FROM input('b.mka') f) TO 'out.mka'"
+    )
+    error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "returns a table, not a value")
+    assert error.hint is not None and "one input per read" in error.hint
+
+
+def test_a_table_function_call_with_the_wrong_arity_is_rejected() -> None:
+    sql = ONE_TRACK + "COPY (SELECT t.track FROM one_track('a.mka', 'b') AS t) TO 'out.mka'"
+    _rejects(sql, ErrorCode.UDF_ARG_TYPE, "got 2 arguments")
+
+
+def test_a_body_column_count_must_match_returns_table() -> None:
+    sql = (
+        "CREATE FUNCTION pair(path text) RETURNS TABLE(track audio_stream, language text) AS $$\n"
+        "  SELECT g.audio[1] FROM input(path) g\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT t.track FROM pair('a.mka') AS t) TO 'out.mka'"
+    )
+    _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "selects 1 column")
+
+
+def test_a_recursive_table_function_is_rejected() -> None:
+    sql = (
+        "CREATE FUNCTION loop_rows(path text) RETURNS TABLE(track audio_stream) AS $$\n"
+        "  SELECT t.track FROM loop_rows(path) AS t\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT t.track FROM loop_rows('a.mka') AS t) TO 'out.mka'"
+    )
+    _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "recursive")
+
+
+def test_a_table_function_declares_at_least_one_column() -> None:
+    sql = (
+        "CREATE FUNCTION empty_rows(path text) RETURNS TABLE() AS $$\n"
+        "  SELECT g.audio[1] FROM input(path) g\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT t.track FROM empty_rows('a.mka') AS t) TO 'out.mka'"
+    )
+    _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "RETURNS TABLE")
+
+
+def test_a_table_column_type_comes_from_the_vocabulary() -> None:
+    sql = (
+        "CREATE FUNCTION odd(path text) RETURNS TABLE(track blob) AS $$\n"
+        "  SELECT g.audio[1] FROM input(path) g\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT t.track FROM odd('a.mka') AS t) TO 'out.mka'"
+    )
+    _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "declares an unknown type")
+
+
+def test_a_table_column_is_named_once() -> None:
+    sql = (
+        "CREATE FUNCTION twice(path text) RETURNS TABLE(track audio_stream, track text) AS $$\n"
+        "  SELECT g.audio[1], 'x' FROM input(path) g\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT t.track FROM twice('a.mka') AS t) TO 'out.mka'"
+    )
+    _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "'track' twice")
+
+
+def test_a_table_function_nothing_calls_is_rejected() -> None:
+    sql = ONE_TRACK + "COPY (SELECT f.audio[1] FROM input('a.mka') f) TO 'out.mka'"
+    _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "never called")
+
+
+def test_a_rejection_inside_a_table_body_lands_on_the_call_site() -> None:
+    sql = (
+        "CREATE FUNCTION bad_rows(path text) RETURNS TABLE(track audio_stream) AS $$\n"
+        "  SELECT g.audio[1 / 0] FROM input(path) g\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT t.track\n"
+        "      FROM bad_rows('a.mka') AS t)\n"
+        "TO 'out.mka'"
+    )
+    error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "subscript")
+    assert error.line == 5, error
+    assert "body of bad_rows()" in error.message, error.message
+
+
+# ---------------------------------------------------------------------------
 # guardrail: no panics
 # ---------------------------------------------------------------------------
 
@@ -733,6 +1011,16 @@ _MALFORMED = [
     "CREATE FUNCTION m(a text) RETURNS text AS $$ SELECT * $$ LANGUAGE sql; SELECT m('x')",
     "CREATE FUNCTION m(a text) RETURNS text AS $$ SELECT ffmpeg.sine() $$ LANGUAGE sql;"
     " SELECT m('x')",
+    "CREATE FUNCTION m(a text) RETURNS TABLE(x text) AS $$ SELECT a $$ LANGUAGE sql;"
+    " SELECT m('x')",
+    "CREATE FUNCTION m(a text) RETURNS TABLE(x text) AS $$ SELECT a $$ LANGUAGE sql;"
+    " SELECT t.x FROM m('x') AS t, m('y') AS t",
+    "CREATE FUNCTION m(a text) RETURNS TABLE(x text) AS $$ SELECT a $$ LANGUAGE sql;"
+    " SELECT t.x FROM m('x') AS t (y)",
+    "CREATE FUNCTION m(a text) RETURNS TABLE AS $$ SELECT a $$ LANGUAGE sql;"
+    " SELECT t.x FROM m('x') AS t",
+    "CREATE FUNCTION m(a text) RETURNS TABLE(x text) AS $$ SELECT a $$ LANGUAGE sql;"
+    " SELECT t.x FROM unnest(m('x')) AS t",
 ]
 
 
