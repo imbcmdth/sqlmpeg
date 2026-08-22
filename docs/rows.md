@@ -12,6 +12,8 @@ One row per input: the shape of a container file. Arrays of streams plus the con
 | --- | --- | --- |
 | `video`, `audio`, `subtitle`, `data` | stream array | splat (`f.audio` = every track), subscript (`f.audio[1]`, 1-based), or `unnest` into track rows. `subtitle`/`data` are passthrough-only |
 | `chapters` | record array | `unnest` into chapter rows; no splat, no subscript. Bare, it prints as one array cell |
+| `attachments` | record array | files riding inside the container - `unnest` into attachment rows |
+| `cues` | record array | a WebVTT file's caption cues, read-only - `unnest` into cue rows |
 | `t` | timeline | only in `WHERE` trim windows: `f.t BETWEEN 5 AND 60`, either bound alone, or against chapter bounds |
 | `duration` | number | probed container duration in seconds |
 | `tags` | tag map | the container's own tags, read by path: `f.tags.title`, `f.tags.artist`, any key. NULL when the file doesn't carry it. Bare, it prints as one array cell of `(key,value)` records |
@@ -20,11 +22,11 @@ Subscripts reach track-row columns without unnest: `f.audio[1].tags.language` (s
 
 Only an input-side read has facts to report. A field read off a FILTER OUTPUT - `scale(f.video[1], 640, -2).width`, `volume(t, 0.2).tags.language` - is a typed rejection: nothing probed that stream, and the hint names the input-side read to write instead.
 
-`SELECT *` over an input alias is its ARRAY columns, never the scalars. In a media query that is the four stream arrays in `video`, `audio`, `subtitle`, `data` order, each a passthrough - the remux shape; chapters ride through as ffmpeg's own default. In a table/CSV query it is every array column including `chapters`, one cell each. `f.*` does one alias, a bare `*` every alias in `FROM` order.
+`SELECT *` over an input alias is its ARRAY columns, never the scalars. In a media query that is the four stream arrays in `video`, `audio`, `subtitle`, `data` order, each a passthrough - the remux shape; chapters ride through as ffmpeg's own default. In a table/CSV query it is every writable array column - the four stream arrays plus `chapters` and `attachments` - one cell each; `cues` is read-only and stays out. `f.*` does one alias, a bare `*` every alias in `FROM` order.
 
 ## Track rows - `unnest(f.audio) t`
 
-One row per track. The argument is an array column of an input declared earlier in the same FROM list; alias mandatory. All five array columns unnest - the four stream arrays here, and `chapters` below. The schema varies by stream type:
+One row per track. The argument is an array column of an input declared earlier in the same FROM list; alias mandatory. All seven array columns unnest - the four stream arrays here, and `chapters`, `cues` and `attachments` below. The schema varies by stream type:
 
 The row IS the stream: a bare `t` where a stream is expected selects it, filters it, or gathers it. The columns below are the metadata ABOUT it.
 
@@ -61,9 +63,33 @@ The same shape as track rows, over the container's chapter list. A chapter is no
 | `title` | text | |
 | `start_t`, `end_t` | number | seconds |
 
-Writing chapters is the reverse shape: a `VALUES` CTE with exactly these columns handed to the sink - `WITH marks(start_t, end_t, title) AS (VALUES ...) ... WITH (chapters marks)` - compiles to one extra self-contained input carrying the list; `chapters_from <alias>` copies an input's chapters through instead. Recipes [39-40](examples.md#39-list-a-files-chapters).
+Writing chapters is the mirror: an aliased `chapters` column holding `chapter` records IS the output's chapter list - a literal `ARRAY[ROW('Intro', 0, 60)::chapter, ...]`, another input's list copied whole (`g.chapters AS chapters`), or `array_agg(ROW(...)::chapter)` gathered over any row source. `NULL AS chapters` writes none; omitting the column leaves ffmpeg's own default alone. It compiles to one extra self-contained input carrying the list. Recipes [39-40](examples.md#39-list-a-files-chapters) and [63](examples.md#63-copy-or-rebuild-a-chapter-list).
 
 Written chapters are checked at compile time: `start_t` and `end_t` must be numbers (`title` may be `NULL`), each chapter must end after it starts, and the rows must run in ascending order without overlapping. Back-to-back is fine - one may end exactly where the next begins.
+
+## Cue rows - `unnest(v.cues) c`
+
+A WebVTT file's caption cues, the same shape as chapters. ffprobe does not enumerate cues, so sqlmpeg reads the file itself; `cues` off anything but a WebVTT input is a typed rejection naming the format it found.
+
+| column | type | notes |
+| --- | --- | --- |
+| `index` | number | document order, 1-based |
+| `text` | text | the cue payload; multiple lines joined with a newline |
+| `start_t`, `end_t` | number | seconds |
+
+Writing is the mirror and needs no column name: an array of `cue` records **in a stream position** IS a WebVTT subtitle track, minted as one self-contained input. Cues must each end after they start and run in ascending order; unlike chapters they may overlap, which WebVTT allows. Because a cue and a chapter are the same shape, converting either way is one `array_agg` - [recipe 65](examples.md#65-turn-chapters-into-a-subtitle-track-and-back).
+
+## Attachment rows - `unnest(f.attachments) a`
+
+Files riding inside the container: subtitle fonts, cover art, scripts.
+
+| column | type | notes |
+| --- | --- | --- |
+| `index` | number | 1-based |
+| `filename` | text | as stored |
+| `mimetype` | text | as stored |
+
+Writing takes a third field, `path` - the file to read - which is **write-only**: it names a source at construction time and has nothing to report back, so reading `a.path` is a rejection. `ARRAY[ROW('font.ttf', 'application/x-truetype-font', :'font')::attachment] AS attachments` attaches one; `filename` and `mimetype` may be `NULL` to take ffmpeg's defaults, `path` may not. [Recipe 66](examples.md#66-attach-a-font-and-list-what-a-file-carries).
 
 ## CTE rows - `WITH x AS (...)`
 

@@ -40,8 +40,9 @@ Every FROM item is a compile-time table; the column model per shape is
 | --- | --- | --- |
 | `input('path', name => value, ...) alias` | 1 | alias mandatory; path is a literal, never computed; trailing named options are ffmpeg's per-input flags |
 | `ffmpeg.<source>(name => value, ...) alias` | 1 | generated stream (testsrc2, sine, color, anullsrc, ...), no `-i`; options named-only |
-| `unnest(alias.<array>) alias` | one per element | the four stream arrays or `chapters`, of an input declared earlier in the same FROM |
-| `cte_or_view_name [alias]` | its body's rows | a multi-row body is a multi-row source |
+| `unnest(alias.<array>) alias` | one per element | the four stream arrays, or `chapters` / `cues` / `attachments`, of an input declared earlier in the same FROM |
+| `cte_or_view_name [alias]` | its body's rows | a multi-row body is a multi-row source; a `VALUES` list is one too |
+| `function_name(args) alias` | its body's rows | a table-returning function, expanded at compile time |
 
 Comma between items is a cross join with real multiplicity.
 `JOIN ... ON` exists ONLY between two `unnest` tables (chapter rows included): `INNER`,
@@ -95,9 +96,11 @@ value := literal | NULL | row-column | input-scalar
        | value ::text | CAST(value AS text)
        | CASE WHEN pred THEN value [ELSE value] END
        | :'var' | :"var" | :var    -- CLI -v substitution, psql's forms
+       | ARRAY[ROW(...)::chapter, ...]   -- record arrays: chapter,
+       | ARRAY[ROW(...)::cue, ...]       -- cue, attachment
 ```
 
-Predicates: `= != < <= > >= BETWEEN IS [NOT] NULL IN (literals)`,
+Predicates: `= != < <= > >= BETWEEN IS [NOT] NULL [NOT] IN (literals)`,
 combined with `AND OR NOT`. A boolean value is a predicate on its own
 (`WHERE t.disposition.default`). All decided at compile time against probed
 metadata - never a runtime ffmpeg predicate. NULL follows SQL:
@@ -122,7 +125,7 @@ only over row-table queries; Postgres's grouping rule is enforced.
 `TO 'path'` writes one file; `TO STDOUT WITH (format 'csv')` prints;
 `TO (value-expression over row columns)` writes one file per row or
 group. Sink options (`WITH (...)`) cover codecs, quality, bitrate
-control, metadata copying, chapters, two-pass - the full table is
+control, metadata copying, two-pass - the full table is
 generated into the prompt (`sqlmpeg prompt`) and validated per option
 with typed errors.
 
@@ -158,6 +161,10 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   `ainterleave` take any stream count.
 - **Identifiers**: double-quoted identifiers (except tag-key aliases);
   the reserved names `ffmpeg` and `sqlmpeg` as aliases.
+- **Written records**: a chapter whose span ends at or before it starts,
+  or whose chapters overlap or run out of order (cues may overlap, but
+  must still be ascending); an attachment with no `path`; reading
+  `a.path` back.
 - **Timeline**: `WHERE t` on generated sources (give the source its
   own `duration`); selecting chapter rows as streams; a bare
   `f.chapters` in a media query, or subscripting it (`unnest` it); a data/subtitle

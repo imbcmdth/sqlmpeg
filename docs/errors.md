@@ -181,7 +181,7 @@ The output fan-out rejections land here too. `COPY (...) TO (<expression>)` writ
 - zero surviving rows, and a `TO` expression that comes out NULL for a row (naming the column that was never probed);
 - a `TO` expression that is not text;
 - a trim bound over track-row columns (`WHERE f.t BETWEEN c.start_t AND c.end_t`) under a quoted `TO`, which has one command and so one window;
-- and, in this version, fan-out combined with `two_pass`, `chapters`/`chapters_from`/`metadata_from`, `FORMAT csv`, `UNION ALL`, or another `COPY` in the same script.
+- and, in this version, fan-out combined with `two_pass`, `metadata_from`, a `chapters` column, `FORMAT csv`, `UNION ALL`, or another `COPY` in the same script.
 
 **Fires when:** (one example among many) the query selects a subtitle stream that sits inside its own alias's `WHERE` time window.
 

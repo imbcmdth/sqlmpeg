@@ -10,7 +10,7 @@ column tables are in [rows.md](rows.md).
 | --- | --- | --- |
 | scalar | `text`, `number`, `boolean` | a compile-time value. `number` follows Postgres typing (int/int truncates); `boolean` comes from a flag map and stands alone as a predicate |
 | stream record | `video_stream`, `audio_stream`, `subtitle_stream`, `data_stream` | one track: **the record IS the stream**, plus the metadata about it |
-| record | `chapter` (`attachment`, `cue` coming) | data the container carries that is not a stream |
+| record | `chapter`, `cue`, `attachment` | data the container carries that is not a stream |
 | map | `tag`, `flag` | key/value pairs read by path, never unnested |
 | container | `container` | one input file: its stream arrays, its chapter list, its scalars |
 | array | `T[]` | `unnest` turns it into rows of `T` |
@@ -35,9 +35,13 @@ NULL. Read the field on what goes in.
 Every field is one or the other, and the distinction is enforced:
 
 - **Writable** — an assertion your query may make: a stream's `tags`
-  and `disposition`, a container's `tags`, a chapter's `title`,
-  `start_t`, `end_t`. Written with a tag column (`'eng' AS language`);
-  `NULL` clears.
+  and `disposition`, a container's `tags`, a chapter's, cue's or
+  attachment's own fields. A stream's maps are written with a tag
+  column (`'eng' AS language`, `NULL` clears); a record's fields are
+  written positionally in a literal, `ROW('Intro', 0, 60)::chapter`.
+- **Write-only** — one field, `attachment.path`: it names the file to
+  attach when constructing a record and has nothing to report back, so
+  reading it is a rejection.
 - **Read-only** — a probed fact: `index`, `codec`, `width`, `height`,
   `fps`, `channels`, `sample_rate`, `channel_layout`, `bitrate`,
   `duration`, `color_transfer`. Setting one is a typed rejection
@@ -75,7 +79,8 @@ filter to the output. The rest describe the source.
 ## `SELECT *`
 
 - Over a container: its stream arrays, video/audio/subtitle/data - the
-  remux shape. In a table query the chapter list joins them.
+  remux shape. In a table query its `chapters` and `attachments` join
+  them; `cues` is read-only and stays out.
 - Over rows: the record's scalar fields, the metadata table. Map
   columns are excluded (a disposition cell is 250 characters wide);
   name them when you want them.
