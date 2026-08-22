@@ -1,29 +1,29 @@
-# 102 — The registry: a source repo, and the site it publishes (Phase 4)
+# 102 — The registry: main is source, gh-pages is the repository (Phase 4)
 
 ## Two things, both called the repository
 
 Keep them apart, because almost every mistake in this plan so far came
 from running them together.
 
-**The source repo** — `sqlmpeg-registry` on GitHub, the files on disk.
-Two directories, and the difference between them is the whole design:
+**`main`** — the source, and only the source. `packages/<owner>/<name>/`
+holds the CURRENT files of each package: one directory, no version in
+the path, no built artifact anywhere. It stays a tree of text that reads
+as a diff.
 
-- `packages/<owner>/<name>/` — the CURRENT source of each package, one
-  directory, no version in the path. Reviewed as an ordinary diff.
-- `dist/<owner>/<name>/<version>.tar.gz` — the built archive of every
-  version ever released, committed and accumulating. Never modified,
-  only added to.
+**`gh-pages`** — the package repository, and the only thing a client
+ever talks to. Built from `main`, served by GitHub Pages, and it holds
+the archives, the indexes and the HTML. No `packages/`, no raw `.sql`.
 
-**The package repository** — the built site on GitHub Pages, and the
-only thing a client ever talks to. It holds the archives and the indexes
-and nothing else: no `packages/`, no raw `.sql` anywhere. A client
-installs an archive; the site reads JSON.
+The branch ACCUMULATES: publishing adds this release's archive and
+leaves every earlier one alone. That is what makes an old pin still
+resolve, and it is why nothing in `main` has to remember what was
+published — the published thing is the record. The branch's own git
+history is the backup.
 
-So there are two builds, and they are different jobs. **Releasing**
-packs the current source at the version its manifest declares and writes
-that one file into `dist/`. **Publishing** reads `dist/`, hashes each
-archive, and lays out the package repository. Releasing happens when a
-version changes; publishing happens on every push to main.
+So publishing, on every push to `main`, is: check out `gh-pages`, pack
+each package's current source, add the archive if its digest is not
+there yet, regenerate the indexes and the HTML from the archives
+present, commit.
 
 It is not a service. Static files ARE the API: the client fetches them,
 the website fetches the same ones, and there is nothing running between
@@ -33,18 +33,17 @@ to break, rate-limit or pay for.
 
 A PR against `packages/<owner>/<name>/`, holding a `sqlmpeg.json` and
 the files it names — the same manifest the compiler already reads, so a
-package is a project someone pushed.
+package is a project someone pushed. A release is a version bump in that
+manifest and nothing else; the archive is CI's to build, so a
+contributor never runs a packaging step and there is no committed
+artifact anyone has to trust.
 
-A release bumps the manifest's `version` and adds the archive `build.py
---release` produces. `pack` is deterministic, so CI repacks the source
-and refuses a PR whose archive is not what that source packs to — the
-committed artifact cannot drift from the tree that made it, and nobody
-has to trust that the contributor ran the script honestly.
-
-An existing `dist/` file may never be modified or deleted. That is the
-one rule about which files a PR may touch, and it is the rule that makes
-a pinned digest mean something: the archive people installed is the
-archive that stays there.
+One rule protects a pinned digest, and it is checkable rather than
+procedural: **a version already published may not resolve to different
+bytes.** `pack` is deterministic, so CI packs the source, looks up that
+`name@version` in the published index, and refuses when the digest moved
+— changed content needs a new version. An archive already on `gh-pages`
+is never rewritten or deleted.
 
 `owners.json` at the root maps `<owner>` to the GitHub accounts allowed
 to touch it. First PR into an unclaimed owner directory claims it for
@@ -65,18 +64,17 @@ does not reimplement one rule of the dialect.
   every bin compiles — `sqlmpeg validate`, with the package's own
   namespace resolvable, so a bin may call its own exports.
 - Every dependency resolves to a published version.
-- The manifest's version has an archive in `dist/`, and repacking the
-  source reproduces it byte for byte.
-- No existing `dist/` file was modified or deleted.
+- Packing the source produces the digest the published index already
+  records for that `name@version`, or that version is not published
+  yet. Content that changed without a version bump is the rejection.
 
 ## What CI publishes
 
-Published from `dist/` alone. The source tree is not read here: what
-was released is what ships, and repacking at publish time would be a
-second chance for the two to disagree. What a version's page says about
-it — its signatures, its programs, its description — is read by
-unpacking that version's own archive, so an old version describes itself
-as it was rather than as the current source is.
+The indexes and the HTML are regenerated from the archives on the
+branch, never from the source tree. What a version's page says about it
+— its signatures, its programs, its description — comes from unpacking
+that version's own archive, so an old version describes itself as it
+was rather than as the current source is.
 
 
 - `index.json` — the whole catalogue: name, latest version, namespace,
@@ -86,10 +84,9 @@ as it was rather than as the current source is.
 - `p/<owner>/<name>.json` — the detail: every published version, and per
   version the archive's `sha256` and size, the function signatures and the
   programs with their variables.
-- `archives/<sha256>` — every file in `dist/`, copied under the sha256
-  of its own bytes. Content addressing is for the client; `dist/` keeps
-  the readable name so a human reviewing a PR can see what a new blob
-  is.
+- `archives/<sha256>` — one gzipped tar per published version, under
+  the sha256 of its own bytes. These are what accumulate; the indexes
+  are what make them findable.
 
 **The digest is over the archive.** A package is not only SQL: a wasm
 filter ships a binary, so packages compress and the thing that travels
@@ -184,7 +181,7 @@ only, no exports.
 The files are COPIED into the source repo, not mirrored from the
 sqlmpeg repo. A package is a directory here — that is the whole model,
 and a build that reaches into another repository to assemble one is not
-it. A released version is frozen in `dist/` anyway, so a later
+it. A published version is frozen on `gh-pages` anyway, so a later
 divergence is a new version, not drift.
 
 ## Not in v0
