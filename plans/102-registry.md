@@ -11,10 +11,19 @@ which is why the repo can be the repository for a long time.
 
 ## Submitting
 
-A PR against `packages/<owner>/<name>/`, holding a `sqlmpeg.json` and
-the files it names — the same manifest the compiler already reads, so a
-package is a project someone pushed. One directory per package; one
-directory per version is NOT the shape (see Versions).
+A PR against `packages/<owner>/<name>/<version>/`, holding a
+`sqlmpeg.json` and the files it names — the same manifest the compiler
+already reads, so a package is a project someone pushed.
+
+**One directory per version** (corrected 2026-08-22; an earlier draft of
+this plan said otherwise and was wrong). A client pins an exact version
+and refetches by digest, so every published version's files have to stay
+here or its pins die the first time anyone reinstalls. Packages are
+small text plus at most a binary, so the duplication is cheap, a version
+is auditable as a PR diff, and `pack` being deterministic means any
+version rebuilds to the digest it was published under. CI refuses a PR
+that modifies or deletes an existing version directory: that is how a
+published version stays the one people pinned.
 
 `owners.json` at the root maps `<owner>` to the GitHub accounts allowed
 to touch it. First PR into an unclaimed owner directory claims it for
@@ -29,16 +38,16 @@ does not reimplement one rule of the dialect.
 
 - The manifest parses and validates (`read_manifest`), and its
   `namespace` is not reserved.
-- The directory agrees with the manifest: `packages/<owner>/<name>/`
-  matches `"name": "<owner>/<name>"`.
+- The directory agrees with the manifest: `packages/<owner>/<name>/<version>/`
+  matches the manifest's `"name"` and `"version"`.
 - Every export holds `CREATE FUNCTION` definitions and nothing else;
   every bin compiles — `sqlmpeg validate`, with the package's own
   namespace resolvable, so a bin may call its own exports.
 - Every dependency resolves to a published version.
-- The version is new and higher than the last published one. A
-  published version is never rewritten: content behind a pinned digest
-  changing under people is the failure mode content addressing exists
-  to prevent.
+- The version is new and higher than the last published one, and no
+  existing version directory was touched. A published version is never
+  rewritten: content behind a pinned digest changing under people is
+  the failure mode content addressing exists to prevent.
 
 ## What CI publishes
 
