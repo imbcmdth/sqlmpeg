@@ -8098,16 +8098,22 @@ def _is_input_value_column(node: exp.Expr, env: _Env) -> bool:
 
 def _row_metadata_column(node: exp.Expr, env: _Env) -> str | None:
     """The metadata column `node` reads off a row alias, else None (``track``
-    is a stream, not metadata; a chapters row has no stream to tag AT ALL, so
-    it is never a tag column either -- it falls through to `_row_value`'s
-    ordinary "not an output" rejection instead)."""
+    is a stream, not metadata).
+
+    A STREAMLESS row -- a chapter row, a written row -- counts here exactly as
+    a track row does: `_has_track_rows` sends a branch holding only those to
+    the CONTAINER tag and `_group_row` hands the value the one representative
+    tuple it reads, so ``c.title AS title`` writes the same tag ``'Ch: ' ||
+    c.title AS title`` already did. Without an alias the column is no tag
+    column at all and still falls through to `_row_value`'s ordinary "not an
+    output" rejection.
+    """
     if not isinstance(node, exp.Column):
         return None
     table_node = node.args.get("table")
     if table_node is None:
         return None
-    binding = env.bindings.get(_fold(table_node))
-    if not isinstance(binding, _RowBinding) or binding.streamless:
+    if not isinstance(env.bindings.get(_fold(table_node)), _RowBinding):
         return None
     name = _fold(node.this)
     return None if name == ROW_STREAM else name

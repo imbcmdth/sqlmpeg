@@ -315,8 +315,8 @@ _DIALECT_TAIL = """\
   rejection (unnest it).
 - Every row carries `index` (1-based, ffprobe's own chapter order), `title`,
   `start_t`, `end_t` (seconds). A chapter is not a stream, so a bare `c`
-  selects nothing and putting one of its columns into a media `COPY` is a
-  typed rejection; the columns feed `WHERE`/`ORDER BY`, trim windows
+  selects nothing and an UNALIASED column of it in a media `COPY` is a typed
+  rejection; the columns feed `WHERE`/`ORDER BY`, trim windows
   (`WHERE f.t BETWEEN c.start_t AND c.end_t`), fan-out destinations, and
   tag columns, exactly like a track row's.
 - To WRITE chapters, give the COPY's SELECT a column aliased `chapters`

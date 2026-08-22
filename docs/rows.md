@@ -53,7 +53,7 @@ The row IS the stream: a bare `t` where a stream is expected selects it, filters
 
 ## Chapter rows - `unnest(f.chapters) c`
 
-The same shape as track rows, over the container's chapter list. A chapter is not a stream, so a bare `c` selects nothing and nothing here reaches a media query; the columns feed trim windows (`WHERE f.t BETWEEN c.start_t AND c.end_t`), fan-out destinations, tag columns, and table/CSV output. Chapter rows cross join with track rows like any other pair of sources.
+The same shape as track rows, over the container's chapter list. A chapter is not a stream, so a bare `c` selects nothing and an unaliased column of it in a media query is a typed rejection; the columns feed trim windows (`WHERE f.t BETWEEN c.start_t AND c.end_t`), fan-out destinations, tag columns, and table/CSV output. Chapter rows cross join with track rows like any other pair of sources.
 
 | column | type | notes |
 | --- | --- | --- |

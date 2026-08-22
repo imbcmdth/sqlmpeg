@@ -7151,6 +7151,15 @@ def test_a_bare_cues_column_in_a_media_copy_is_a_typed_rejection() -> None:
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'v.cues' carries no streams" in err.message
     assert "unnest(v.cues) c" in (err.hint or "")
+def test_a_bare_chapter_column_tags_the_container_like_any_other_value() -> None:
+    """A chapter row's columns feed tag columns exactly as a track row's do, so
+    the BARE column is the tag value the concatenation around it already was."""
+    g = _lower(
+        "COPY (SELECT f.video[1], c.title AS title "
+        "FROM input('f.mkv') f, unnest(f.chapters) c WHERE c.index = 1) TO 'o.mkv'",
+        _chapter_probes(*_TWO_CHAPTERS),
+    )
+    assert g.sinks[0].tags == {"title": "Intro"}
 
 
 # ---------------------------------------------------------------------------
@@ -7211,6 +7220,17 @@ def test_a_tag_column_over_written_rows_tags_the_container() -> None:
         {"f": ProbeResult(streams=[_track("video", 0)])},
     )
     assert g.sinks[0].tags == {"title": "T: Doc"}
+
+
+def test_a_bare_written_column_tags_the_container_like_any_other_value() -> None:
+    """Same for a written row: the alias is the key, the column is the value."""
+    g = _lower(
+        "COPY (WITH marks(name) AS (VALUES ('Doc')) "
+        "SELECT f.video[1], m.name AS title "
+        "FROM input('f.mkv') f, marks m) TO 'o.mkv'",
+        {"f": ProbeResult(streams=[_track("video", 0)])},
+    )
+    assert g.sinks[0].tags == {"title": "Doc"}
 
 
 def test_a_values_row_is_not_an_output_stream() -> None:
