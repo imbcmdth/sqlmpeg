@@ -234,7 +234,15 @@ Rules:
   into a package you installed.
 
 The dependency value keeps the name and the version range together
-because the alias is the key; the lockfile pins the exact version.
+because the alias is the key; the lockfile pins the exact version and
+carries no aliases — they are the manifest's.
+
+`install broadcast/tracks` writes the dependency under the package
+segment, `tracks`, as Cargo keys a dependency by crate name; `--alias
+<name>` chooses another. A default that collides with an existing alias
+or an installed namespace is a rejection naming `--alias`. A global
+install has no manifest, so nothing is aliased and only the full path
+reaches it.
 
 ### 3.4 Three segments
 
