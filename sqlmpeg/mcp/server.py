@@ -12,9 +12,13 @@ stray write from any library or child process misses the protocol stream.
 ``run``'s ffmpeg children inherit that redirected descriptor, and their
 stderr is captured into the tool result rather than written anywhere.
 
-``run`` is registered only when the caller passes `allow_run`. The other
-tools return text about a query; ``run`` writes files on model say-so, which
-is a different trust posture and so a deliberate opt-in.
+One capability flag, not a matrix. ``allow_unsafe`` is the whole of it: the
+tools that only answer about a query are always there, and the ones that do
+something -- today ``run``, which writes files on model say-so -- are behind
+it. A permissions matrix for a local dev tool invites passing every flag, and
+the per-call prompting already lives in the MCP client. So the flag is a
+coarse capability switch, and the precision that matters goes in each tool's
+DESCRIPTION, since that is the text a client shows when it asks.
 """
 
 from __future__ import annotations
@@ -148,7 +152,11 @@ def run(
     overwrite: bool = False,
     project: str | None = None,
 ) -> dict[str, Any]:
-    """Compile a query and execute ffmpeg, WRITING the files its COPY ... TO names.
+    """Compile a query and execute ffmpeg. This WRITES FILES on disk.
+
+    Every path the query's COPY ... TO names is created or, with `overwrite`,
+    replaced -- this tool is the only one here that changes anything outside
+    the answer it returns.
 
     Returns the run's `exit_code` (0 on success), `timed_out`, and one entry
     per command with its `argv`, `exit_code` and captured `stderr` (tail only
@@ -166,8 +174,8 @@ def run(
     return tools.run_query(query, vars, timeout, overwrite, project)
 
 
-def build_server(*, allow_run: bool = False) -> MCPServer[Any]:
-    """The configured server; `allow_run` adds the file-writing ``run`` tool."""
+def build_server(*, allow_unsafe: bool = False) -> MCPServer[Any]:
+    """The configured server; `allow_unsafe` adds the file-writing ``run`` tool."""
     # log_level configures the root logger, and at INFO sqlglot narrates every
     # array subscript it rewrites -- a line per query in the client's log pane.
     server: MCPServer[Any] = MCPServer(
@@ -178,7 +186,7 @@ def build_server(*, allow_run: bool = False) -> MCPServer[Any]:
     server.add_tool(explain)
     server.add_tool(inspect)
     server.add_tool(filters)
-    if allow_run:
+    if allow_unsafe:
         server.add_tool(run)
 
     @server.resource(
@@ -196,6 +204,6 @@ def build_server(*, allow_run: bool = False) -> MCPServer[Any]:
     return server
 
 
-def serve(*, allow_run: bool = False) -> None:
+def serve(*, allow_unsafe: bool = False) -> None:
     """Serve over stdin/stdout until the client disconnects."""
-    build_server(allow_run=allow_run).run("stdio")
+    build_server(allow_unsafe=allow_unsafe).run("stdio")

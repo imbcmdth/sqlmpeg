@@ -26,7 +26,19 @@ from sqlmpeg.emit import build_ffmpeg_args, emit
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.functions import package_signatures
 from sqlmpeg.mcp import tools as mcp_tools
-from sqlmpeg.project import PackageSet, discover, find_manifest, read_manifest
+from sqlmpeg.project import (
+    LinkEntry,
+    PackageSet,
+    RegistryEntry,
+    discover,
+    find_manifest,
+    read_lockfile,
+    read_manifest,
+    with_entry,
+    without_namespace,
+    write_lockfile,
+    write_manifest,
+)
 from sqlmpeg.warnings import SqlmpegWarning, WarningCode
 
 QUIETER = (
@@ -1351,3 +1363,570 @@ def test_list_takes_no_query(
     with pytest.raises(SystemExit) as caught:
         cli.main(["list", "SELECT 1"])
     assert caught.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# writing the two files
+# ---------------------------------------------------------------------------
+
+
+def _registry_entry(namespace: str = "tracks") -> RegistryEntry:
+    sha256 = "a" * 64
+    return RegistryEntry(
+        namespace=namespace,
+        name=f"broadcast/{namespace}",
+        version="1.2.0",
+        sha256=sha256,
+        store=store.entry_path(sha256),
+    )
+
+
+def test_a_written_lockfile_reads_back_as_what_was_written(tmp_path: Path) -> None:
+    path = tmp_path / "sqlmpeg.lock"
+    entries = (_registry_entry(), LinkEntry(namespace="dev", path="../my-lib"))
+    write_lockfile(path, entries)
+    assert read_lockfile(path).entries == entries
+
+
+def test_writing_a_lockfile_twice_writes_the_same_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "sqlmpeg.lock"
+    entries = (_registry_entry(), LinkEntry(namespace="dev", path="../my-lib"))
+    write_lockfile(path, entries)
+    first = path.read_bytes()
+    write_lockfile(path, read_lockfile(path).entries)
+    assert path.read_bytes() == first
+    assert read_lockfile(path).entries == entries
+
+
+def test_a_written_lockfile_is_lf_only(tmp_path: Path) -> None:
+    path = tmp_path / "sqlmpeg.lock"
+    write_lockfile(path, (_registry_entry(),))
+    data = path.read_bytes()
+    assert b"\r" not in data
+    assert data.endswith(b"\n")
+
+
+def test_a_lockfile_of_registry_entries_claims_to_be_reproducible(tmp_path: Path) -> None:
+    path = tmp_path / "sqlmpeg.lock"
+    write_lockfile(path, (_registry_entry(),))
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["reproducible"] is True
+    assert "not_reproducible_because" not in written
+    assert read_lockfile(path).reproducible is True
+
+
+def test_a_lockfile_holding_a_link_says_it_is_not_reproducible_and_why(tmp_path: Path) -> None:
+    path = tmp_path / "sqlmpeg.lock"
+    write_lockfile(path, (_registry_entry(), LinkEntry(namespace="dev", path="../my-lib")))
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["reproducible"] is False
+    assert "linked to a working directory" in written["not_reproducible_because"]
+    assert read_lockfile(path).reproducible is False
+
+
+def test_an_empty_lockfile_reads_back(tmp_path: Path) -> None:
+    path = tmp_path / "sqlmpeg.lock"
+    write_lockfile(path, ())
+    lock = read_lockfile(path)
+    assert lock.entries == () and lock.reproducible is True
+
+
+def test_the_written_entry_order_is_the_order_given(tmp_path: Path) -> None:
+    path = tmp_path / "sqlmpeg.lock"
+    entries = (_registry_entry("zulu"), _registry_entry("alpha"))
+    write_lockfile(path, entries)
+    assert [entry.namespace for entry in read_lockfile(path).entries] == ["zulu", "alpha"]
+
+
+def test_an_entry_replaces_the_one_holding_its_namespace() -> None:
+    held = (_registry_entry("tracks"), _registry_entry("other"))
+    link = LinkEntry(namespace="tracks", path="../dev")
+    assert with_entry(held, link) == (link, held[1])
+    assert with_entry(held, _registry_entry("new"))[-1].namespace == "new"
+    assert without_namespace(held, "tracks") == (held[1],)
+    assert without_namespace(held, "absent") == held
+
+
+def test_a_written_manifest_reads_back_as_the_package_it_declares(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "lib.sql").write_text(QUIETER, encoding="utf-8")
+    (tmp_path / "queries").mkdir()
+    (tmp_path / "queries" / "split.sql").write_text(PROGRAM, encoding="utf-8")
+    path = tmp_path / "sqlmpeg.json"
+    write_manifest(
+        path,
+        name="my-edits",
+        version="0.1.0",
+        namespace="me",
+        description="what it is",
+        exports=["src/*.sql"],
+        programs={"split-chapters": "queries/split.sql"},
+        dependencies={"broadcast/tracks": "^1.2.0"},
+    )
+    package = read_manifest(path)
+    assert package.namespace == "me" and package.version == "0.1.0"
+    assert [program.name for program in package.programs] == ["split-chapters"]
+    assert b"\r" not in path.read_bytes()
+
+
+def test_a_manifest_leaves_out_what_it_was_not_given(tmp_path: Path) -> None:
+    path = tmp_path / "sqlmpeg.json"
+    write_manifest(path, name="my-edits", version="0.1.0", namespace="me")
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "name": "my-edits",
+        "version": "0.1.0",
+        "namespace": "me",
+    }
+    assert read_manifest(path).exports == ()
+
+
+def test_a_write_into_a_directory_that_is_a_file_is_a_rejection(tmp_path: Path) -> None:
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory\n", encoding="utf-8")
+    with pytest.raises(SqlmpegError) as caught:
+        write_lockfile(blocked / "sqlmpeg.lock", ())
+    assert "could not be written" in caught.value.message
+
+
+# ---------------------------------------------------------------------------
+# `sqlmpeg init`
+# ---------------------------------------------------------------------------
+
+
+def _run(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *argv: str,
+) -> tuple[int, str, str]:
+    """Run the CLI with `root` as the working directory."""
+    monkeypatch.chdir(root)
+    code = cli.main(list(argv))
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def test_init_writes_a_project_that_reads_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "my-edits"
+    root.mkdir()
+    code, out, _err = _run(root, monkeypatch, capsys, "init")
+    assert code == 0
+    assert "sqlmpeg.json" in out
+    package = read_manifest(root / "sqlmpeg.json")
+    assert package.name == "my-edits" and package.version == "0.1.0"
+    assert package.namespace == "my_edits"
+    assert [program.name for program in package.programs] == ["resize"]
+    assert read_lockfile(root / "sqlmpeg.lock").entries == ()
+    assert "-- variables:" in (root / "queries" / "resize.sql").read_text(encoding="utf-8")
+
+
+def test_init_then_list_then_run_the_starter_program(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "my-edits"
+    root.mkdir()
+    assert _run(root, monkeypatch, capsys, "init")[0] == 0
+
+    code, out, _err = _run(root, monkeypatch, capsys, "list")
+    assert code == 0
+    assert "my_edits  | resize" in out
+
+    code, out, _err = _run(
+        root, monkeypatch, capsys, "compile", "resize", "-v", "source=in.mp4", "-v", "dest=out.mp4"
+    )
+    assert code == 0
+    assert out.startswith("ffmpeg -i in.mp4 ")
+    assert "scale=width=-2:height=720" in out
+
+
+def test_init_writes_no_exports_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An export pattern matching no file is a rejection, so a fresh directory
+    # has nothing to name one with.
+    root = tmp_path / "my-edits"
+    root.mkdir()
+    assert _run(root, monkeypatch, capsys, "init")[0] == 0
+    assert "exports" not in json.loads((root / "sqlmpeg.json").read_text(encoding="utf-8"))
+
+
+def test_init_takes_the_name_and_the_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "whatever"
+    root.mkdir()
+    code, _out, _err = _run(
+        root, monkeypatch, capsys, "init", "--name", "broadcast/tracks", "--namespace", "tracks"
+    )
+    assert code == 0
+    package = read_manifest(root / "sqlmpeg.json")
+    assert package.name == "broadcast/tracks" and package.namespace == "tracks"
+
+
+def test_init_refuses_to_overwrite_a_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _project(tmp_path, files={"src/own.sql": NORMALIZE})
+    before = (tmp_path / "sqlmpeg.json").read_bytes()
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "init")
+    assert code == 1
+    assert "sqlmpeg.json already exists" in err
+    assert (tmp_path / "sqlmpeg.json").read_bytes() == before
+
+
+def test_init_refuses_to_overwrite_a_lockfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _lock(tmp_path, [])
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "init")
+    assert code == 1
+    assert "sqlmpeg.lock already exists" in err
+    assert not (tmp_path / "sqlmpeg.json").exists()
+
+
+@pytest.mark.parametrize("name", ["9lives", "...", "ffmpeg"])
+def test_init_refuses_a_name_no_namespace_comes_out_of(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], name: str
+) -> None:
+    root = tmp_path / "work"
+    root.mkdir()
+    code, _out, err = _run(root, monkeypatch, capsys, "init", "--name", name)
+    assert code == 1
+    assert "--namespace" in err
+    assert not (root / "sqlmpeg.json").exists()
+    assert not (root / "queries").exists()
+
+
+def test_init_refuses_a_namespace_that_is_not_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "work"
+    root.mkdir()
+    code, _out, err = _run(root, monkeypatch, capsys, "init", "--namespace", "Not One")
+    assert code == 1
+    assert "--namespace gives no namespace" in err
+
+
+# ---------------------------------------------------------------------------
+# `sqlmpeg link` and `sqlmpeg unlink`
+# ---------------------------------------------------------------------------
+
+
+def test_link_records_the_namespace_the_target_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _library(tmp_path / "dev", "tracks", "0.5")
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [])
+    code, out, _err = _run(project, monkeypatch, capsys, "link", "../dev")
+    assert code == 0
+    assert "linked 'tracks' -> ../dev" in out
+    assert "link it again" in out
+    lock = read_lockfile(project / "sqlmpeg.lock")
+    assert lock.entries == (LinkEntry(namespace="tracks", path="../dev"),)
+    assert lock.reproducible is False
+
+
+def test_a_linked_package_is_callable_right_after_linking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _library(tmp_path / "dev", "tracks", "0.5")
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [])
+    assert _run(project, monkeypatch, capsys, "link", "../dev")[0] == 0
+    code, out, err = _run(
+        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.quieter")
+    )
+    assert code == 0
+    assert "volume=volume=0.5" in out
+    assert "warning: package 'tracks' is linked to" in err
+
+
+def test_link_replaces_what_held_the_namespace(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [_installed(_library(tmp_path / "far", "tracks", "0.5"))])
+    _library(tmp_path / "dev", "tracks", "0.9")
+    code, out, _err = _run(project, monkeypatch, capsys, "link", "../dev")
+    assert code == 0
+    assert "replacing the installed tracks-lib 1.0.0" in out
+    assert read_lockfile(project / "sqlmpeg.lock").entries == (
+        LinkEntry(namespace="tracks", path="../dev"),
+    )
+
+
+def test_link_outside_a_project_names_both_ways_forward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _library(tmp_path / "dev", "tracks", "0.5")
+    bare = tmp_path / "elsewhere"
+    bare.mkdir()
+    code, _out, err = _run(bare, monkeypatch, capsys, "link", "../dev")
+    assert code == 2
+    assert "sqlmpeg init" in err and "link -g" in err
+    assert not (bare / "sqlmpeg.lock").exists()
+
+
+def test_link_writes_the_machine_wide_lockfile(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    linked = _library(tmp_path / "dev", "tracks", "0.5")
+    bare = tmp_path / "elsewhere"
+    bare.mkdir()
+    code, _out, _err = _run(bare, monkeypatch, capsys, "link", "-g", str(linked))
+    assert code == 0
+    lock = read_lockfile(store.global_lock_path())
+    # Absolute, since the machine-wide lockfile lives under the cache directory.
+    assert lock.entries == (LinkEntry(namespace="tracks", path=str(linked.resolve())),)
+
+
+def test_link_refuses_a_directory_holding_no_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "dev").mkdir()
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [])
+    code, _out, err = _run(project, monkeypatch, capsys, "link", "../dev")
+    assert code == 1
+    assert "holds no sqlmpeg.json" in err
+    assert read_lockfile(project / "sqlmpeg.lock").entries == ()
+
+
+def test_unlink_removes_the_entry_and_rewrites_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    linked = _library(tmp_path / "dev", "tracks", "0.5")
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [_link(linked, "tracks")])
+    code, out, _err = _run(project, monkeypatch, capsys, "unlink", "tracks")
+    assert code == 0
+    assert "unlinked 'tracks'" in out
+    lock = read_lockfile(project / "sqlmpeg.lock")
+    assert lock.entries == () and lock.reproducible is True
+
+
+def test_unlink_names_what_is_linked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    linked = _library(tmp_path / "dev", "tracks", "0.5")
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [_link(linked, "tracks")])
+    code, _out, err = _run(project, monkeypatch, capsys, "unlink", "nope")
+    assert code == 1
+    assert "nothing links 'nope'" in err
+    assert "hint: linked: tracks" in err
+
+
+def test_unlink_says_a_namespace_is_installed_rather_than_linked(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [_installed(_library(tmp_path / "far", "tracks", "0.5"))])
+    code, _out, err = _run(project, monkeypatch, capsys, "unlink", "tracks")
+    assert code == 1
+    assert "it is installed, not linked" in err
+    assert len(read_lockfile(project / "sqlmpeg.lock").entries) == 1
+
+
+def test_unlink_outside_a_project_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bare = tmp_path / "elsewhere"
+    bare.mkdir()
+    code, _out, err = _run(bare, monkeypatch, capsys, "unlink", "tracks")
+    assert code == 2
+    assert "unlink -g" in err
+    assert not (bare / "sqlmpeg.lock").exists()
+
+
+# ---------------------------------------------------------------------------
+# running a program by name
+# ---------------------------------------------------------------------------
+
+_MEDIA_QUERY = "COPY (SELECT scale(f.video[1], 640, 480) FROM input('x.mp4') f) TO 'out.mp4'"
+
+
+@pytest.mark.parametrize("command", ["compile", "explain", "validate", "run"])
+def test_every_subcommand_taking_a_query_takes_a_program_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    _project(
+        tmp_path,
+        files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
+        manifest=_BIN,
+    )
+    if command == "run":
+        # The default tier executes no ffmpeg: reaching the check for one is
+        # already proof the name resolved and the program compiled.
+        monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: None)
+    code, _out, err = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        command,
+        "split-chapters",
+        "-v",
+        "source=in.mkv",
+        "-v",
+        "dest=out.mkv",
+    )
+    if command == "run":
+        assert code == 1 and "ffmpeg not found" in err
+    else:
+        assert code == 0, err
+
+
+def test_a_program_name_is_not_looked_up_when_the_text_is_sql(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Text starting with one of the four words is SQL whatever else it might
+    # have matched.
+    _project(
+        tmp_path,
+        files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
+        manifest=_BIN,
+    )
+    code, out, _err = _run(tmp_path, monkeypatch, capsys, "compile", _MEDIA_QUERY)
+    assert code == 0
+    assert "scale=" in out
+
+
+def test_a_leading_comment_does_not_hide_that_the_text_is_sql(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _project(
+        tmp_path,
+        files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
+        manifest=_BIN,
+    )
+    code, out, _err = _run(
+        tmp_path, monkeypatch, capsys, "compile", f"-- a header\n/* and a block */\n{_MEDIA_QUERY}"
+    )
+    assert code == 0
+    assert "scale=" in out
+
+
+def test_a_bare_name_two_packages_ship_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    linked = tmp_path / "dev"
+    _library(linked, "tracks", "0.5")
+    (linked / "queries").mkdir()
+    (linked / "queries" / "split.sql").write_text(PROGRAM, encoding="utf-8")
+    written = json.loads((linked / "sqlmpeg.json").read_text(encoding="utf-8"))
+    written["bin"] = {"split-chapters": "queries/split.sql"}
+    (linked / "sqlmpeg.json").write_text(json.dumps(written) + "\n", encoding="utf-8")
+
+    project = tmp_path / "work"
+    _project(
+        project,
+        files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
+        manifest=_BIN,
+    )
+    _lock(project, [_link(linked, "tracks")])
+    code, _out, err = _run(project, monkeypatch, capsys, "validate", "split-chapters")
+    assert code == 1
+    assert "more than one package ships a program named 'split-chapters'" in err
+    assert "me.split-chapters, tracks.split-chapters" in err
+
+    code, _out, err = _run(
+        project,
+        monkeypatch,
+        capsys,
+        "validate",
+        "tracks.split-chapters",
+        "-v",
+        "source=in.mkv",
+        "-v",
+        "dest=out.mkv",
+    )
+    assert code == 0
+
+
+def test_an_undefined_variable_names_what_the_program_declares(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _project(
+        tmp_path,
+        files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
+        manifest=_BIN,
+    )
+    code, _out, err = _run(
+        tmp_path, monkeypatch, capsys, "validate", "split-chapters", "-v", "source=in.mkv"
+    )
+    assert code == 1
+    assert "undefined variable ':dest'" in err
+    assert "'split-chapters' declares source, dest" in err
+
+
+def test_a_name_matching_nothing_fails_as_sql_and_names_the_programs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _project(
+        tmp_path,
+        files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
+        manifest=_BIN,
+    )
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "compile", "split-chapter")
+    assert code == 1
+    assert "hint: installed programs: me.split-chapters" in err
+
+
+def test_a_failing_query_is_not_offered_a_program(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _project(
+        tmp_path,
+        files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
+        manifest=_BIN,
+    )
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "compile", "SELECT nope(1)")
+    assert code == 1
+    assert "installed programs" not in err
+
+
+def test_a_program_named_for_a_statement_word_is_refused(tmp_path: Path) -> None:
+    _project(
+        tmp_path,
+        files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
+        manifest={"bin": {"select": "queries/split.sql"}},
+    )
+    error = _refuses(tmp_path, "program name 'select' is a word a query begins with")
+    assert "rename it" in (error.hint or "")
+
+
+# ---------------------------------------------------------------------------
+# `sqlmpeg publish`
+# ---------------------------------------------------------------------------
+
+
+def test_publish_says_it_is_not_open_yet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, out, err = _run(tmp_path, monkeypatch, capsys, "publish")
+    assert code == 1
+    assert out == ""
+    assert "publishing is not open yet" in err
+    assert "pull request to the registry repository" in err

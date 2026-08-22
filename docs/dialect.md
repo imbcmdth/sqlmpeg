@@ -93,6 +93,43 @@ rejected as it always was. Library callers pass
 relying on a working directory, and the MCP tools take the same path as
 a `project` argument.
 
+### Starting one
+
+`sqlmpeg init` writes `sqlmpeg.json`, an empty `sqlmpeg.lock` and a
+starter program into the working directory. The name is the directory's
+and the version `0.1.0` unless `--name` says otherwise; the namespace is
+the name lowercased with everything that is not an identifier character
+folded to `_`, unless `--namespace` says otherwise. A name nothing
+usable comes out of is rejected rather than guessed at. It overwrites
+none of the three files, and what it writes reads back through the same
+validation every other command applies.
+
+The starter is a program, `queries/resize.sql` declared in `bin`, not an
+export: an export pattern matching no file is a rejection, so a fresh
+directory has nothing to name one with.
+
+### Running a program
+
+`sqlmpeg run split-chapters -v source=film.mkv -v dest=out.mkv` runs a
+program a package ships. `compile`, `explain` and `validate` take a
+program name in the same position, so a program can be inspected as well
+as run.
+
+Which the positional is, in order:
+
+1. Text beginning with `SELECT`, `COPY`, `CREATE` or `WITH` (past
+   leading whitespace and comments) is SQL, always.
+2. Otherwise, a name a discovered package ships a program under is that
+   program: its file's text is the query.
+3. Otherwise it is SQL, and fails as any other query text would.
+
+A manifest declaring a program named for one of those four words is
+rejected where it is written: rule 1 would never let it be reached.
+`ns.program` says which package when a bare name matches programs in
+more than one; a bare name that does is rejected naming each `ns.program`
+it could mean. Variables still come from `-v name=value`, and an
+undefined one names what the program's `-- variables:` header declares.
+
 ### Installed packages
 
 `sqlmpeg.lock`, beside the manifest, records what the project
@@ -130,6 +167,29 @@ link. Each is reported once per package - as a `warning:` line on
 stderr from the CLI, in the `warnings` array of an MCP tool result, and
 through `compile_sql`'s optional `on_warning` callback for a library
 caller.
+
+### Linking
+
+`sqlmpeg link ../my-lib` writes a link entry for the namespace that
+directory's manifest claims; `sqlmpeg unlink <namespace>` removes it and
+rewrites the file. Linking over a namespace something else already
+claims replaces that claim and says what it replaced. The entry records
+the namespace, so a package that later claims another one has to be
+linked again.
+
+`-g` writes the machine-wide lockfile instead of the project's. Without
+it, no lockfile at or above the working directory is a usage error
+(exit 2) naming both ways forward - `link -g`, or `init` first. Neither
+command ever creates a lockfile as a side effect.
+
+Every write to either file replaces it in one step and pins LF endings,
+and the lockfile is written in insertion order with no timestamp, so
+writing the same set of packages twice produces the same bytes.
+
+### Publishing
+
+`sqlmpeg publish` is not open yet: it exits nonzero saying so.
+Submissions are a pull request to the registry repository.
 
 ## FROM items
 

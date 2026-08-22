@@ -2378,3 +2378,27 @@ def test_the_mcp_run_tool_reports_a_failing_ffmpeg_rather_than_raising(
     assert result["exit_code"] != 0
     assert not out_path.exists()
     assert result["commands"][-1]["stderr"] != ""
+
+def test_init_writes_a_project_whose_starter_program_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`sqlmpeg init` then `sqlmpeg run <program>`, with real ffmpeg at the end.
+
+    The starter is what somebody meets first, so it has to compile AND run:
+    the default tier checks it compiles, this one checks ffmpeg accepts what
+    it compiled to.
+    """
+    _require_fixture(_AV2)
+    project = tmp_path / "my-edits"
+    project.mkdir()
+    monkeypatch.chdir(project)
+
+    assert cli.main(["init"]) == 0
+    assert cli.main(["list"]) == 0
+
+    out_path = project / "smaller.mp4"
+    code = cli.main(
+        ["run", "resize", "-v", f"source={_sql_path(_AV2)}", "-v", f"dest={_sql_path(out_path)}"]
+    )
+    assert code == 0
+    assert out_path.exists() and out_path.stat().st_size > 0

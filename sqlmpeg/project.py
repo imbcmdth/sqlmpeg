@@ -37,6 +37,12 @@ what those files DEFINE is :mod:`sqlmpeg.functions`' business, and keeping the
 split that way is what lets ``functions.py`` import this module without a
 cycle.
 
+It also WRITES the two, since the reader owns what a valid one looks like:
+:func:`write_manifest` for ``init``, :func:`write_lockfile` for everything
+that records a package. Both replace the file in one step and pin LF endings,
+and the lockfile writer decides the ``reproducible`` claim from the entries
+themselves rather than trusting a caller to keep the two in step.
+
 Every rejection is a `SqlmpegError`, anchored on the line where the offending
 key is written when there is one to point at.
 """
@@ -45,7 +51,10 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import re
+import tempfile
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -58,6 +67,7 @@ __all__ = [
     "LOCKFILE_NAME",
     "MANIFEST_NAME",
     "RESERVED_NAMESPACES",
+    "STATEMENT_KEYWORDS",
     "LinkEntry",
     "Lockfile",
     "Package",
@@ -67,8 +77,13 @@ __all__ = [
     "discover",
     "find_lockfile",
     "find_manifest",
+    "is_namespace",
     "read_lockfile",
     "read_manifest",
+    "with_entry",
+    "without_namespace",
+    "write_lockfile",
+    "write_manifest",
 ]
 
 MANIFEST_NAME = "sqlmpeg.json"
@@ -87,6 +102,11 @@ _NAMESPACE_RE = re.compile(r"[a-z_][a-z0-9_]*")
 # A program is typed as a command word, so its name is spelled like one: a
 # lowercase letter, then lowercase letters, digits, '-' or '_'.
 _PROGRAM_NAME_RE = re.compile(r"[a-z][a-z0-9_-]*")
+
+# The four words a statement can begin with. Text starting with one is read as
+# SQL, always; anything else typed where a query goes may name a program
+# instead. So a program named for one of them could never be run by name.
+STATEMENT_KEYWORDS = ("select", "copy", "create", "with")
 
 # Characters that make a written path a pattern rather than a file.
 _GLOB_CHARACTERS = "*?["
@@ -111,6 +131,16 @@ _PROGRAM_NAME_HINT = (
     "a program name is a command word: a lowercase letter, then lowercase "
     "letters, digits, '-' or '_'"
 )
+
+
+def is_namespace(text: str) -> bool:
+    """True when `text` is spelled like a namespace -- a lowercase plain identifier.
+
+    Shape only: whether the namespace is one sqlmpeg keeps for itself is
+    `RESERVED_NAMESPACES`' answer, and a caller deriving a namespace wants the
+    two apart to say which of them went wrong.
+    """
+    return _NAMESPACE_RE.fullmatch(text) is not None
 
 
 # Which of the three layers a package was found in. Factual, not a judgment:
@@ -417,6 +447,14 @@ def _programs(data: dict[str, object], root: Path, path: Path, text: str) -> tup
                 line=line,
                 hint=_PROGRAM_NAME_HINT,
             )
+        if name in STATEMENT_KEYWORDS:
+            raise _reject(
+                path,
+                f"program name {name!r} is a word a query begins with",
+                line=line,
+                hint=f"text beginning with {', '.join(STATEMENT_KEYWORDS)} is read as SQL, "
+                "so a program of that name could never be run by name; rename it",
+            )
         if not isinstance(written, str) or not written.strip():
             raise _reject(
                 path,
@@ -692,6 +730,136 @@ def read_lockfile(path: Path) -> Lockfile:
             "lockfile holding a link is not reproducible",
         )
     return lockfile
+
+
+# -- writing the two files -------------------------------------------------
+
+# The sentence a lockfile holding a link carries in its own text.
+_LINKED_BECAUSE = (
+    "a package is linked to a working directory, so its files are not pinned here"
+)
+
+_WRITE_HINT = "check that the directory exists and is writable"
+
+
+def _unwritable(path: Path, err: OSError) -> SqlmpegError:
+    return _reject(path, f"could not be written: {err.strerror or err}", hint=_WRITE_HINT)
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    """Replace `path` with `text` in one step, LF-terminated on every platform.
+
+    Written beside the destination and moved onto it, so a reader sees the old
+    file or the new one and never half of either. Unlike the registry's disk
+    cache, a failure here is a rejection: this file is the project's, and
+    losing it silently is not an option the caller has.
+    """
+    directory = path.parent
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        handle, temporary = tempfile.mkstemp(dir=directory, prefix=f"{path.name}-", suffix=".tmp")
+    except OSError as err:
+        raise _unwritable(path, err) from err
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as file:
+            file.write(text)
+        os.replace(temporary, path)
+    except OSError as err:
+        try:
+            os.unlink(temporary)
+        except OSError:  # already gone, or the directory refuses us twice
+            pass
+        raise _unwritable(path, err) from err
+
+
+def _rendered(payload: dict[str, object]) -> str:
+    """`payload` as the text of one project file: written order, 2-space indent, LF.
+
+    Insertion order, never sorted: the order keys and entries were handed over
+    in is the order the file holds them, so writing the same thing twice
+    produces the same bytes and a rewrite shows only what changed.
+    """
+    return json.dumps(payload, indent=2) + "\n"
+
+
+def write_manifest(
+    path: Path,
+    *,
+    name: str,
+    version: str,
+    namespace: str,
+    description: str | None = None,
+    exports: Sequence[str] = (),
+    programs: Mapping[str, str] | None = None,
+    dependencies: Mapping[str, str] | None = None,
+) -> None:
+    """Write the ``sqlmpeg.json`` declaring this package.
+
+    Only the three required keys are always written; an optional one is left
+    out entirely rather than written empty, since an empty ``exports`` is a
+    rejection and an empty ``bin`` says nothing.
+    """
+    payload: dict[str, object] = {"name": name, "version": version, "namespace": namespace}
+    if description:
+        payload["description"] = description
+    if exports:
+        payload["exports"] = list(exports)
+    if programs:
+        payload["bin"] = dict(programs)
+    if dependencies:
+        payload["dependencies"] = dict(dependencies)
+    _write_atomically(path, _rendered(payload))
+
+
+def _entry_payload(entry: LockEntry) -> dict[str, object]:
+    """One entry as the lockfile writes it, keys in the order the reader lists them."""
+    if isinstance(entry, LinkEntry):
+        return {"kind": "link", "namespace": entry.namespace, "path": entry.path}
+    return {
+        "kind": "registry",
+        "name": entry.name,
+        "version": entry.version,
+        "namespace": entry.namespace,
+        "sha256": entry.sha256,
+        "store": entry.store,
+    }
+
+
+def write_lockfile(path: Path, entries: Sequence[LockEntry]) -> None:
+    """Write the ``sqlmpeg.lock`` pinning `entries`, in the order given.
+
+    The reproducibility claim is this function's, not the caller's: a link is
+    read live and no digest survives that, so any link among `entries` makes
+    the file say it is not reproducible and say why. `read_lockfile` refuses a
+    file claiming otherwise, so a caller allowed to set the flag could write
+    one sqlmpeg would not read back.
+    """
+    linked = any(isinstance(entry, LinkEntry) for entry in entries)
+    payload: dict[str, object] = {
+        "format_version": LOCK_FORMAT_VERSION,
+        "reproducible": not linked,
+    }
+    if linked:
+        payload["not_reproducible_because"] = _LINKED_BECAUSE
+    payload["packages"] = [_entry_payload(entry) for entry in entries]
+    _write_atomically(path, _rendered(payload))
+
+
+def with_entry(entries: Sequence[LockEntry], entry: LockEntry) -> tuple[LockEntry, ...]:
+    """`entries` with `entry` in place of whatever held its namespace, else appended.
+
+    One namespace, one package: installing or linking over a namespace already
+    claimed replaces the claim rather than adding a second one the reader
+    would refuse.
+    """
+    if all(held.namespace != entry.namespace for held in entries):
+        return (*entries, entry)
+    return tuple(entry if held.namespace == entry.namespace else held for held in entries)
+
+
+def without_namespace(entries: Sequence[LockEntry], namespace: str) -> tuple[LockEntry, ...]:
+    """`entries` without the one claiming `namespace`, the rest in order."""
+    return tuple(held for held in entries if held.namespace != namespace)
 
 
 # -- discovery -------------------------------------------------------------

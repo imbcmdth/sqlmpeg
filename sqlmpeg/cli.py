@@ -39,14 +39,23 @@ Subcommands:
   dependencies provide: one table of packages, one of the functions they
   export, one of the programs they ship with the variables each declares.
   Takes no query and reads no SQL beyond those files.
+* ``init [--name NAME] [--namespace NS]`` -- write ``sqlmpeg.json``, an empty
+  ``sqlmpeg.lock`` and a starter program into the working directory. Refuses
+  to overwrite any of the three.
+* ``link PATH [-g]`` / ``unlink NAMESPACE [-g]`` -- record (or drop) a package
+  read live out of a directory, in this project's lockfile or, with ``-g``,
+  the machine-wide one. Outside a project and without ``-g`` there is no
+  lockfile to write and none is invented: usage error, exit 2.
+* ``publish`` -- not open yet; exits 1 naming where submissions go.
 * ``prompt`` -- print the LLM system prompt to stdout. Takes no arguments and
   touches no files, but calls ``registry.load()`` to render the filter
   reference from this machine's ``ffmpeg -filters``/``-help`` output.
-* ``mcp [--allow-run]`` -- serve the compiler to an editor or agent as a stdio
-  MCP server (``sqlmpeg.mcp``). Takes no arguments and needs the optional
-  ``mcp`` extra; without it, one stderr line naming the install command and
-  exit 1. stdout carries the protocol from the moment it starts, so nothing
-  else may write there -- ``--allow-run`` adds the one tool that runs ffmpeg.
+* ``mcp [--allow-unsafe]`` -- serve the compiler to an editor or agent as a
+  stdio MCP server (``sqlmpeg.mcp``). Takes no arguments and needs the
+  optional ``mcp`` extra; without it, one stderr line naming the install
+  command and exit 1. stdout carries the protocol from the moment it starts,
+  so nothing else may write there -- ``--allow-unsafe`` adds the tools that
+  do something other than answer about a query.
 * ``loudnorm2env`` -- read ffmpeg's stderr on stdin, print the
   ``export SQLMPEG_LN_*=`` lines its loudnorm JSON block holds. Takes no
   arguments and touches no files; exit 1 with one stderr line if there is no
@@ -59,6 +68,14 @@ reads stdin, e.g. for the LLM repair loop's pipe). Exactly one of the two is
 required; both or neither is a usage error, exit 2. If the positional string
 fails to compile and looks like a filename, a stderr hint suggests ``-f``
 (see ``_maybe_print_file_hint``).
+
+The positional may also name a PROGRAM a package ships (``sqlmpeg run
+split-chapters -v source=film.mkv``). One rule decides which it is, in
+``_resolve_query`` so every one of the four subcommands reads it the same
+way: text beginning with ``SELECT``, ``COPY``, ``CREATE`` or ``WITH`` is SQL,
+always; anything else that matches a program's name is that program's file;
+anything else is SQL and fails as it always did. ``ns.program`` says which
+package when two ship one name.
 
 A compile can also have something to say short of refusing: a call that
 resolved to a machine-wide package rather than to one this project installed,
@@ -87,15 +104,34 @@ from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 
-from . import binaries, loudnorm
+from . import binaries, loudnorm, store
 from . import registry as registry_module
 from .compiler import classify, compile_commands, compile_table_sql
 from .emit import Emitted, build_ffmpeg_commands, emit
-from .errors import SqlmpegError
+from .errors import ErrorCode, SqlmpegError
 from .execute import DEFAULT_TIMEOUT, execute
 from .functions import Signature, package_signatures
 from .ir import Graph, SinkUnit
-from .project import Package, PackageSet, Program, discover
+from .project import (
+    LOCKFILE_NAME,
+    MANIFEST_NAME,
+    RESERVED_NAMESPACES,
+    STATEMENT_KEYWORDS,
+    LinkEntry,
+    LockEntry,
+    Package,
+    PackageSet,
+    Program,
+    discover,
+    find_lockfile,
+    is_namespace,
+    read_lockfile,
+    read_manifest,
+    with_entry,
+    without_namespace,
+    write_lockfile,
+    write_manifest,
+)
 from .prompt import build_system_prompt
 from .table import CellValue, TableResult, TableSink, render_csv, render_table
 from .vars import Variable, declared_variables, substitute
@@ -114,7 +150,20 @@ _CHAIN = " && "
 # better diagnostic than a usage line. Consequence: `sqlmpeg -h` shows run's
 # help, not the top-level one.
 _SUBCOMMANDS = frozenset(
-    {"compile", "explain", "validate", "run", "list", "prompt", "mcp", loudnorm.ENV_SUBCOMMAND}
+    {
+        "compile",
+        "explain",
+        "validate",
+        "run",
+        "list",
+        "init",
+        "link",
+        "unlink",
+        "publish",
+        "prompt",
+        "mcp",
+        loudnorm.ENV_SUBCOMMAND,
+    }
 )
 
 
@@ -169,6 +218,16 @@ def _add_query_arguments(subparser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_global_argument(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument(
+        "-g",
+        "--global",
+        action="store_true",
+        dest="global_lock",
+        help="write the machine-wide lockfile instead of this project's",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sqlmpeg", description=f"sqlmpeg {_version()} - SQL frontend for FFmpeg filtergraphs"
@@ -209,12 +268,31 @@ def _build_parser() -> argparse.ArgumentParser:
     list_p.add_argument(
         "--json", action="store_true", dest="as_json", help="emit the listing as JSON"
     )
+    init_p = subparsers.add_parser(
+        "init", help="write sqlmpeg.json, sqlmpeg.lock and a starter program here"
+    )
+    init_p.add_argument("--name", default=None, help="the package name (default: this directory's)")
+    init_p.add_argument(
+        "--namespace",
+        default=None,
+        help="the namespace a query calls this package by (default: derived from the name)",
+    )
+
+    link_p = subparsers.add_parser("link", help="read a package live out of a directory")
+    link_p.add_argument("path", help="the directory holding the package's sqlmpeg.json")
+    _add_global_argument(link_p)
+    unlink_p = subparsers.add_parser("unlink", help="drop a linked package")
+    unlink_p.add_argument("namespace", help="the namespace to stop reading from a directory")
+    _add_global_argument(unlink_p)
+    subparsers.add_parser("publish", help="publish a package to the registry")
+
     subparsers.add_parser("prompt", help="print the LLM system prompt for this dialect")
     mcp_p = subparsers.add_parser("mcp", help="serve the compiler to an editor or agent over MCP")
     mcp_p.add_argument(
-        "--allow-run",
+        "--allow-unsafe",
         action="store_true",
-        help="also expose the run tool, which executes ffmpeg and writes files",
+        dest="allow_unsafe",
+        help="also expose the tools that do more than answer about a query",
     )
     subparsers.add_parser(
         loudnorm.ENV_SUBCOMMAND,
@@ -271,6 +349,112 @@ def _project_start(args: argparse.Namespace) -> Path:
     return Path.cwd()
 
 
+_LEADING_WORD_RE = re.compile(r"[A-Za-z]+")
+
+
+def _starts_a_statement(text: str) -> bool:
+    """True when `text` begins a SQL statement, past leading whitespace and comments.
+
+    The whole of rule one: four words, and a positional starting with any of
+    them is SQL whatever else it might have named. The scan skips what the
+    lexer would skip so a query written under a ``--`` header still reads as
+    one.
+    """
+    at = 0
+    end = len(text)
+    while at < end:
+        if text[at].isspace():
+            at += 1
+        elif text.startswith("--", at):
+            newline = text.find("\n", at)
+            at = end if newline == -1 else newline + 1
+        elif text.startswith("/*", at):
+            close = text.find("*/", at + 2)
+            at = end if close == -1 else close + 2
+        else:
+            break
+    word = _LEADING_WORD_RE.match(text, at)
+    return word is not None and word.group().lower() in STATEMENT_KEYWORDS
+
+
+def _program_names(packages: PackageSet | None) -> list[str]:
+    """Every program the discovered packages ship, written as ``ns.program``."""
+    if packages is None:
+        return []
+    return [
+        f"{namespace}.{program.name}"
+        for namespace in packages.namespaces()
+        for program in _package(packages, namespace).programs
+    ]
+
+
+def _package(packages: PackageSet, namespace: str) -> Package:
+    found = packages.get(namespace)
+    assert found is not None  # a namespace `namespaces()` just handed back
+    return found
+
+
+def _matching_programs(name: str, packages: PackageSet | None) -> list[tuple[Package, Program]]:
+    """The packages shipping a program `name` names, qualified or bare."""
+    if packages is None:
+        return []
+    namespace, dot, unqualified = name.partition(".")
+    if dot:
+        package = packages.get(namespace)
+        program = package.program(unqualified) if package is not None else None
+        return [(package, program)] if package is not None and program is not None else []
+    found: list[tuple[Package, Program]] = []
+    for claimed in packages.namespaces():
+        package = _package(packages, claimed)
+        program = package.program(name)
+        if program is not None:
+            found.append((package, program))
+    return found
+
+
+def _program_text(name: str, packages: PackageSet | None) -> str | None:
+    """The query text of the program `name` names, or None when it names none.
+
+    Two packages shipping one name is a rejection rather than a pick: the
+    qualified form says which, and guessing would run the wrong program.
+    """
+    found = _matching_programs(name, packages)
+    if not found:
+        return None
+    if len(found) > 1:
+        written = ", ".join(f"{package.namespace}.{program.name}" for package, program in found)
+        raise SqlmpegError(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"more than one package ships a program named '{name}'",
+            hint=f"name the one you mean: {written}",
+        )
+    package, program = found[0]
+    try:
+        return program.path.read_text(encoding="utf-8")
+    except OSError as err:
+        raise SqlmpegError(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"program '{package.namespace}.{program.name}' could not be read: "
+            f"{err.strerror or err}",
+            hint=f"its file is {program.path}",
+        ) from err
+
+
+def _program_variables_error(err: SqlmpegError, name: str, text: str) -> SqlmpegError:
+    """`err` again, its hint naming what the program's own header declares."""
+    declared = declared_variables(text)
+    if not declared:
+        return err
+    written = ", ".join(variable.name for variable in declared)
+    return SqlmpegError(
+        err.code,
+        err.message,
+        line=err.line,
+        col=err.col,
+        hint=f"'{name}' declares {written}; define each with -v name=value",
+    )
+
+
 def _resolve_query(args: argparse.Namespace) -> tuple[str | None, PackageSet | None, int]:
     """Resolve the query text and its project for compile/explain/validate/run.
 
@@ -283,6 +467,10 @@ def _resolve_query(args: argparse.Namespace) -> tuple[str | None, PackageSet | N
     ``packages`` is the project the query was written in, or None when the walk
     finds no manifest -- the ordinary case, and the one where a compile is
     exactly what it was before projects existed.
+
+    A positional that does not begin a statement and names a program one of
+    those packages ships is that program: its file's text replaces it, and
+    every subcommand taking a query takes a program name too.
 
     ``-v/--set`` substitution runs here, once, so every handler inherits it.
     A `SqlmpegError` from an undefined variable reference or a malformed
@@ -311,17 +499,35 @@ def _resolve_query(args: argparse.Namespace) -> tuple[str | None, PackageSet | N
         assert args.query is not None
         text = args.query
 
+    packages = discover(_project_start(args))
+    program: str | None = None
+    if not has_file and not _starts_a_statement(text):
+        shipped = _program_text(text, packages)
+        if shipped is not None:
+            program, text = text, shipped
+
     variables, code = _parse_set_vars(args.set_vars, args.command)
     if variables is None:
         return None, None, code
-    return substitute(text, variables), discover(_project_start(args)), 0
+    try:
+        substituted = substitute(text, variables)
+    except SqlmpegError as err:
+        if program is None:
+            raise
+        raise _program_variables_error(err, program, text) from err
+    return substituted, packages, 0
 
 
-def _maybe_print_file_hint(err: SqlmpegError, source: str | None) -> None:
+def _maybe_print_file_hint(
+    err: SqlmpegError, source: str | None, packages: PackageSet | None = None
+) -> None:
     """Suggest -f when an inline positional string names an existing file or
     ends in .sql/.SQL. Fires on ANY compile error, not just PARSE_ERROR: a
     bare filename like `query.sql` parses as a SQL column reference and fails
-    as UNSUPPORTED_SQL. CLI sugar only -- never touches `err`."""
+    as UNSUPPORTED_SQL. CLI sugar only -- never touches `err`.
+
+    A positional that does not begin a statement was a program name that
+    matched nothing, so the programs there ARE to run are named too."""
     if source is None:
         return
     if os.path.exists(source) or source.lower().endswith(".sql"):
@@ -329,6 +535,11 @@ def _maybe_print_file_hint(err: SqlmpegError, source: str | None) -> None:
             f"hint: '{source}' looks like a file; did you mean -f '{source}'?",
             file=sys.stderr,
         )
+    if _starts_a_statement(source):
+        return
+    shipped = _program_names(packages)
+    if shipped:
+        print(f"hint: installed programs: {', '.join(shipped)}", file=sys.stderr)
 
 
 def _print_warnings(warnings: WarningLog) -> None:
@@ -344,9 +555,11 @@ def _print_warnings(warnings: WarningLog) -> None:
             print(f"hint: {warning.hint}", file=sys.stderr)
 
 
-def _print_error(err: SqlmpegError, *, source: str | None = None) -> None:
+def _print_error(
+    err: SqlmpegError, *, source: str | None = None, packages: PackageSet | None = None
+) -> None:
     print(f"error: {err}", file=sys.stderr)
-    _maybe_print_file_hint(err, source)
+    _maybe_print_file_hint(err, source, packages)
 
 
 def _check_output_dir(out_path: str) -> str | None:
@@ -442,7 +655,7 @@ def _cmd_compile(args: argparse.Namespace, on_warning: OnWarning) -> int:
         if text is not None and _is_table_capable_query(text, packages, on_warning):
             print(_TABLE_USAGE_HINT, file=sys.stderr)
             return 2
-        _print_error(err, source=args.query)
+        _print_error(err, source=args.query, packages=packages)
         return 1
 
     if args.graph_only:
@@ -482,13 +695,14 @@ def _shell_commands(emitted: list[Emitted]) -> list[str]:
 
 
 def _cmd_explain(args: argparse.Namespace, on_warning: OnWarning) -> int:
+    packages: PackageSet | None = None
     try:
         text, packages, code = _resolve_query(args)
         if text is None:
             return code
         graphs = compile_commands(text, packages=packages, on_warning=on_warning)
     except SqlmpegError as err:
-        _print_error(err, source=args.query)
+        _print_error(err, source=args.query, packages=packages)
         return 1
 
     # One object for a single command, a JSON ARRAY for a sequence's.
@@ -516,22 +730,23 @@ def _cmd_validate(args: argparse.Namespace, on_warning: OnWarning) -> int:
             # Machine contract: stdout is pure JSON, the library error
             # verbatim. The file hint goes to stderr so it cannot perturb it.
             print(json.dumps(err.to_dict()))
-            _maybe_print_file_hint(err, args.query)
+            _maybe_print_file_hint(err, args.query, packages)
         else:
-            _print_error(err, source=args.query)
+            _print_error(err, source=args.query, packages=packages)
         return 1
 
     return 0
 
 
 def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
+    packages: PackageSet | None = None
     try:
         text, packages, code = _resolve_query(args)
         if text is None:
             return code
         is_table_capable, _has_copy = classify(text, packages=packages, on_warning=on_warning)
     except SqlmpegError as err:
-        _print_error(err, source=args.query)
+        _print_error(err, source=args.query, packages=packages)
         return 1
 
     # No media COPY -- a bare SELECT, or every COPY is FORMAT csv -- IS a
@@ -540,7 +755,7 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
         try:
             sinks = compile_table_sql(text, packages=packages, on_warning=on_warning)
         except SqlmpegError as err:
-            _print_error(err, source=args.query)
+            _print_error(err, source=args.query, packages=packages)
             return 1
         return _print_table_sinks(sinks)
 
@@ -548,7 +763,7 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
         graphs: list[Graph] = compile_commands(text, packages=packages, on_warning=on_warning)
         emitted: list[Emitted] = [emit(graph) for graph in graphs]
     except SqlmpegError as err:
-        _print_error(err, source=args.query)
+        _print_error(err, source=args.query, packages=packages)
         return 1
 
     # A media COPY names its own destination, so this fires only for the rare
@@ -757,6 +972,257 @@ def _cmd_list(args: argparse.Namespace, on_warning: OnWarning) -> int:
     return 0
 
 
+# The starter `init` writes: a program, not an export. An export pattern
+# matching no file is a rejection, so a fresh directory has nothing to name
+# one with -- and a runnable program is the first thing there is to try.
+_STARTER_PROGRAM = "resize"
+_STARTER_FILE = "queries/resize.sql"
+_STARTER_QUERY = """\
+-- Scale a file's video to 720p, its audio carried through untouched.
+-- variables: source (input media path), dest (output path)
+-- example: sqlmpeg run resize -v source=in.mp4 -v dest=out.mp4
+COPY (
+  SELECT scale(f.video[1], -2, 720), f.audio[1]
+  FROM input(:'source') f
+) TO :'dest'
+"""
+
+_NOT_A_NAMESPACE_HINT = (
+    "a namespace is a lowercase plain identifier: a letter or underscore, then "
+    "letters, digits or underscores -- pass --namespace to give one"
+)
+
+
+def _derived_namespace(name: str) -> str:
+    """`name` folded to a namespace: lowercase, everything else an underscore."""
+    return re.sub(r"[^a-z0-9_]", "_", name.lower())
+
+
+def _init_namespace(args: argparse.Namespace, name: str) -> str | None:
+    """The namespace `init` claims, or None with the rejection already printed.
+
+    A derivation that does not come out as an identifier is not guessed at:
+    they are told to say what they meant.
+    """
+    if args.namespace is not None:
+        written, given = str(args.namespace), "--namespace"
+        usable = is_namespace(written)
+    else:
+        written, given = _derived_namespace(name), f"the name {name!r}"
+        # A fold that kept none of the name's own characters is nothing to
+        # claim a namespace with.
+        usable = is_namespace(written) and any(char.isalnum() for char in written)
+    if not usable:
+        print(f"error: init: {given} gives no namespace: {written!r}", file=sys.stderr)
+        print(f"hint: {_NOT_A_NAMESPACE_HINT}", file=sys.stderr)
+        return None
+    if written in RESERVED_NAMESPACES:
+        reserved = ", ".join(sorted(RESERVED_NAMESPACES))
+        print(f"error: init: namespace {written!r} is reserved", file=sys.stderr)
+        print(
+            f"hint: {reserved} belong to sqlmpeg itself; pass --namespace with another",
+            file=sys.stderr,
+        )
+        return None
+    return written
+
+
+def _cmd_init(args: argparse.Namespace, on_warning: OnWarning) -> int:
+    """Write the three files a project starts as, into the working directory."""
+    directory = Path.cwd()
+    written = [directory / MANIFEST_NAME, directory / LOCKFILE_NAME, directory / _STARTER_FILE]
+    for path in written:
+        if path.exists():
+            print(f"error: init: {path} already exists", file=sys.stderr)
+            print(
+                "hint: init writes a project from scratch and overwrites nothing",
+                file=sys.stderr,
+            )
+            return 1
+
+    name = args.name if args.name is not None else directory.name
+    if not name:
+        print(f"error: init: {directory} has no name to take the package's from", file=sys.stderr)
+        print("hint: pass --name", file=sys.stderr)
+        return 1
+    namespace = _init_namespace(args, name)
+    if namespace is None:
+        return 1
+
+    manifest, lockfile, starter = written
+    try:
+        starter.parent.mkdir(parents=True, exist_ok=True)
+        starter.write_text(_STARTER_QUERY, encoding="utf-8", newline="\n")
+        write_manifest(
+            manifest,
+            name=name,
+            version="0.1.0",
+            namespace=namespace,
+            programs={_STARTER_PROGRAM: _STARTER_FILE},
+        )
+        write_lockfile(lockfile, ())
+        # What was just written has to read back, or the next command refuses
+        # a project this one made.
+        read_manifest(manifest)
+        read_lockfile(lockfile)
+    except SqlmpegError as err:
+        _print_error(err)
+        return 1
+    except OSError as err:
+        print(
+            f"error: init: {starter} could not be written: {err.strerror or err}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"wrote {MANIFEST_NAME}, {LOCKFILE_NAME} and {_STARTER_FILE} in {directory}")
+    print(f"namespace '{namespace}'; a query calls this package's functions as {namespace}.name()")
+    print(
+        f"run the starter program: sqlmpeg run {_STARTER_PROGRAM} "
+        f"-v source=in.mp4 -v dest=out.mp4"
+    )
+    return 0
+
+
+def _lock_to_write(args: argparse.Namespace) -> tuple[Path | None, int]:
+    """The lockfile `link`/`unlink` writes, or None with the usage error printed.
+
+    Never creates one as a side effect: outside a project there is nothing to
+    record a package in, and inventing a lockfile in whatever directory they
+    happen to stand in is not a project.
+    """
+    if args.global_lock:
+        return store.global_lock_path(), 0
+    found = find_lockfile(Path.cwd())
+    if found is None:
+        print(
+            f"error: {args.command}: no {LOCKFILE_NAME} in {Path.cwd()} or above it",
+            file=sys.stderr,
+        )
+        print(
+            f"hint: run `sqlmpeg init` to start a project here, or "
+            f"`sqlmpeg {args.command} -g ...` to put it on this machine",
+            file=sys.stderr,
+        )
+        return None, 2
+    return found, 0
+
+
+def _held_entries(path: Path) -> tuple[LockEntry, ...]:
+    """What `path` already pins, or nothing when there is no file there yet."""
+    return read_lockfile(path).entries if path.is_file() else ()
+
+
+def _held(entries: tuple[LockEntry, ...], namespace: str) -> LockEntry | None:
+    for entry in entries:
+        if entry.namespace == namespace:
+            return entry
+    return None
+
+
+def _described(entry: LockEntry) -> str:
+    """What an entry being replaced was, for the line that says it is going."""
+    if isinstance(entry, LinkEntry):
+        return f"the link to {entry.path}"
+    return f"the installed {entry.name} {entry.version}"
+
+
+def _written_link_path(target: Path, lock: Path, *, relative: bool) -> str:
+    """How the lockfile writes the linked directory.
+
+    Relative to the lockfile for a project's own, which keeps the file
+    readable beside the tree it points into; absolute for the machine-wide
+    one, which sits under the cache directory where relative would only be a
+    climb. A path on another drive has no relative form and stays absolute.
+    """
+    resolved = target.resolve()
+    if not relative:
+        return str(resolved)
+    try:
+        return Path(os.path.relpath(resolved, lock.parent)).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
+def _cmd_link(args: argparse.Namespace, on_warning: OnWarning) -> int:
+    """Record a package read live out of `path`, in this project's lockfile or -g's."""
+    target = Path(args.path)
+    manifest = target / MANIFEST_NAME
+    if not manifest.is_file():
+        print(f"error: link: {target} holds no {MANIFEST_NAME}", file=sys.stderr)
+        print("hint: link the directory a package's manifest sits in", file=sys.stderr)
+        return 1
+    lock, code = _lock_to_write(args)
+    if lock is None:
+        return code
+
+    try:
+        package = read_manifest(manifest)
+        entries = _held_entries(lock)
+        replaced = _held(entries, package.namespace)
+        entry = LinkEntry(
+            namespace=package.namespace,
+            path=_written_link_path(target, lock, relative=not args.global_lock),
+        )
+        write_lockfile(lock, with_entry(entries, entry))
+    except SqlmpegError as err:
+        _print_error(err)
+        return 1
+
+    print(f"linked '{package.namespace}' -> {entry.path} in {lock}")
+    if replaced is not None:
+        print(f"  replacing {_described(replaced)}")
+    print(
+        f"note: the entry records the namespace, not the name: if {package.name} claims "
+        f"another one, link it again"
+    )
+    return 0
+
+
+def _cmd_unlink(args: argparse.Namespace, on_warning: OnWarning) -> int:
+    """Drop the link on `namespace` and rewrite the lockfile."""
+    lock, code = _lock_to_write(args)
+    if lock is None:
+        return code
+    try:
+        entries = _held_entries(lock)
+    except SqlmpegError as err:
+        _print_error(err)
+        return 1
+
+    held = _held(entries, args.namespace)
+    if not isinstance(held, LinkEntry):
+        installed = "" if held is None else " -- it is installed, not linked"
+        print(
+            f"error: unlink: nothing links '{args.namespace}' in {lock}{installed}",
+            file=sys.stderr,
+        )
+        linked = [entry.namespace for entry in entries if isinstance(entry, LinkEntry)]
+        print(
+            f"hint: linked: {', '.join(linked)}" if linked else "hint: nothing here is linked",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        write_lockfile(lock, without_namespace(entries, args.namespace))
+    except SqlmpegError as err:
+        _print_error(err)
+        return 1
+    print(f"unlinked '{args.namespace}' from {lock}")
+    return 0
+
+
+def _cmd_publish(args: argparse.Namespace, on_warning: OnWarning) -> int:
+    """The command surface says what publishing will be; nothing publishes yet."""
+    print("error: publish: publishing is not open yet", file=sys.stderr)
+    print(
+        "hint: submit a package as a pull request to the registry repository",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def _cmd_prompt(args: argparse.Namespace, on_warning: OnWarning) -> int:
     print(build_system_prompt(registry_module.load()))
     return 0
@@ -774,7 +1240,7 @@ def _cmd_mcp(args: argparse.Namespace, on_warning: OnWarning) -> int:
     if not mcp_module.sdk_available():
         print(f"error: {mcp_module.INSTALL_HINT}", file=sys.stderr)
         return 1
-    mcp_module.serve(allow_run=args.allow_run)
+    mcp_module.serve(allow_unsafe=args.allow_unsafe)
     return 0
 
 
@@ -800,6 +1266,10 @@ _HANDLERS = {
     "validate": _cmd_validate,
     "run": _cmd_run,
     "list": _cmd_list,
+    "init": _cmd_init,
+    "link": _cmd_link,
+    "unlink": _cmd_unlink,
+    "publish": _cmd_publish,
     "prompt": _cmd_prompt,
     "mcp": _cmd_mcp,
     loudnorm.ENV_SUBCOMMAND: _cmd_loudnorm2env,

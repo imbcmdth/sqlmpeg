@@ -311,12 +311,12 @@ def test_run_is_absent_unless_it_was_allowed() -> None:
 
 
 @_sdk
-def test_run_is_registered_when_it_was_allowed() -> None:
+def test_run_is_registered_when_unsafe_tools_were_allowed() -> None:
     import anyio
 
     from sqlmpeg.mcp.server import build_server
 
-    server = build_server(allow_run=True)
+    server = build_server(allow_unsafe=True)
     names = {t.name for t in anyio.run(server.list_tools)}
     assert names == _BASE_TOOLS | {"run"}
 
@@ -327,7 +327,7 @@ def test_every_tool_takes_the_query_and_optional_variables() -> None:
 
     from sqlmpeg.mcp.server import build_server
 
-    server = build_server(allow_run=True)
+    server = build_server(allow_unsafe=True)
     for tool in anyio.run(server.list_tools):
         properties = tool.input_schema["properties"]
         assert tool.description
@@ -415,10 +415,12 @@ def test_the_mcp_subcommand_serves_and_prints_nothing_to_stdout(
 ) -> None:
     served: list[bool] = []
     monkeypatch.setattr(mcp_package, "sdk_available", lambda: True)
-    monkeypatch.setattr(mcp_package, "serve", lambda *, allow_run: served.append(allow_run))
+    monkeypatch.setattr(
+        mcp_package, "serve", lambda *, allow_unsafe: served.append(allow_unsafe)
+    )
 
     assert cli.main(["mcp"]) == 0
-    assert cli.main(["mcp", "--allow-run"]) == 0
+    assert cli.main(["mcp", "--allow-unsafe"]) == 0
     assert served == [False, True]
     captured = capsys.readouterr()
     assert captured.out == ""

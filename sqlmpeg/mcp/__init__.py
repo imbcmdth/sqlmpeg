@@ -55,13 +55,14 @@ def sdk_available() -> bool:
         return False
 
 
-def serve(*, allow_run: bool = False) -> None:
+def serve(*, allow_unsafe: bool = False) -> None:
     """Serve MCP over stdin/stdout until the client disconnects.
 
-    `allow_run` also registers the ``run`` tool, which executes ffmpeg and
+    `allow_unsafe` also registers the tools that do something other than
+    answer about a query -- today the ``run`` tool, which executes ffmpeg and
     writes files. Import the SDK here, not at module load: everything above
     works without it.
     """
     from .server import serve as _serve
 
-    _serve(allow_run=allow_run)
+    _serve(allow_unsafe=allow_unsafe)
