@@ -12,6 +12,8 @@ tests expand over. av2 and av3 differ only in their sine frequencies, so a
 ``UNION ALL`` of the two concatenates two distinguishable multi-language
 sources whose language tags agree track for track. ``stereo.mp4`` adds the
 one thing none of those have: a genuinely 2-CHANNEL audio track (plan 047).
+``font.ttf`` is a stub TrueType file and ``attached.mkv`` is a container
+carrying it, for reading attachments back.
 
 Idempotent: a fixture whose output file already exists is skipped, so this
 is safe to run repeatedly, including once per CI job right before the exec
@@ -56,6 +58,24 @@ _FRAME_PNG_NAME = "frame.png"
 _AV_CHAPTERS_NAME = "av-chapters.mkv"
 _TAGGED_NAME = "tagged.mp4"
 _AV_2ENG_NAME = "av-2eng.mp4"
+_FONT_TTF_NAME = "font.ttf"
+_ATTACHED_NAME = "attached.mkv"
+
+# The mimetype ffmpeg itself reports for a TrueType attachment.
+_FONT_MIMETYPE = "application/x-truetype-font"
+
+# An sfnt header with an empty table directory: the twelve bytes every
+# TrueType file starts with, and nothing after them. The fixture exists to be
+# attached and listed, never rendered, so a real face would only add weight.
+_FONT_TTF = bytes(
+    [
+        0x00, 0x01, 0x00, 0x00,  # sfnt version 1.0
+        0x00, 0x00,              # numTables
+        0x00, 0x00,              # searchRange
+        0x00, 0x00,              # entrySelector
+        0x00, 0x00,              # rangeShift
+    ]
+)
 
 # Intro 0-1, Chapter 1 1-2, Chapter 2 2-3, Credits 3-4 -- matches cookbook
 # recipe 39's pinned table exactly.
@@ -320,6 +340,40 @@ def _generate_frame_png() -> None:
     )
 
 
+def _generate_font_ttf() -> Path:
+    """A twelve-byte TrueType stub -- the file `attached.mkv` carries, and the
+    one cookbook recipe 66 attaches. No ffmpeg needed."""
+    out_path = FIXTURES_DIR / _FONT_TTF_NAME
+    if out_path.exists():
+        print(f"skip (already exists): {out_path}")
+        return out_path
+    FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"generating: {out_path}")
+    out_path.write_bytes(_FONT_TTF)
+    return out_path
+
+
+def _generate_attached(font_path: Path) -> None:
+    """av.mp4's video+audio remuxed into an mkv carrying font.ttf.
+
+    The attachment-reading fixture: one attachment, tagged filename and
+    mimetype, alongside one video and one audio stream -- so a read also
+    shows that an attachment takes no per-type stream index. Must run after
+    av.mp4 exists.
+    """
+    _run(
+        FIXTURES_DIR / _ATTACHED_NAME,
+        [
+            "-i", str(FIXTURES_DIR / _AV_NAME),
+            "-attach", str(font_path),
+            "-map", "0:v:0", "-map", "0:a:0",
+            "-c", "copy",
+            "-metadata:s:2", f"mimetype={_FONT_MIMETYPE}",
+            "-metadata:s:2", f"filename={_FONT_TTF_NAME}",
+        ],
+    )
+
+
 def main() -> int:
     if not _ffmpeg_available():
         print("error: ffmpeg not found on PATH", file=sys.stderr)
@@ -337,6 +391,7 @@ def main() -> int:
     _generate_av_2eng()
     _generate_tagged()
     _generate_frame_png()
+    _generate_attached(_generate_font_ttf())
     return 0
 
 

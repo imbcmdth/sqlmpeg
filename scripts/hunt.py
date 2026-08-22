@@ -40,7 +40,13 @@ from sqlmpeg import vars as vars_module  # noqa: E402
 from sqlmpeg.errors import ErrorCode, SqlmpegError  # noqa: E402
 from sqlmpeg.inputs import INPUT_OPTIONS  # noqa: E402
 from sqlmpeg.ir import Graph  # noqa: E402
-from sqlmpeg.probe import ChapterMeta, CueMeta, ProbeResult, StreamMeta  # noqa: E402
+from sqlmpeg.probe import (  # noqa: E402
+    AttachmentMeta,
+    ChapterMeta,
+    CueMeta,
+    ProbeResult,
+    StreamMeta,
+)
 from sqlmpeg.registry import load_reference  # noqa: E402
 from sqlmpeg.sink import SINK_OPTIONS  # noqa: E402
 from sqlmpeg.types import DISPOSITION_KEYS  # noqa: E402
@@ -82,6 +88,11 @@ _PROBE = ProbeResult(
     chapters=[
         ChapterMeta(index=1, start_t=0.0, end_t=30.0, title="Intro"),
         ChapterMeta(index=2, start_t=30.0, end_t=90.0, title="Credits"),
+    ],
+    attachments=[
+        AttachmentMeta(
+            index=1, filename="font.ttf", mimetype="application/x-truetype-font"
+        )
     ],
 )
 
@@ -271,6 +282,7 @@ VIDEO_ROW_COLS = TRACK_COLS + ["width", "height", "fps"]
 AUDIO_ROW_COLS = TRACK_COLS + ["channels", "channel_layout", "sample_rate"]
 CHAPTER_COLS = ["index", "title", "start_t", "end_t"]
 CUE_COLS = ["index", "text", "start_t", "end_t"]
+ATTACHMENT_COLS = ["index", "filename", "mimetype"]
 
 # Aliases that name a probed field rather than a tag key.
 TAG_ALIASES = ["codec", "index", "width", "channels", "duration", "sample_rate"]
@@ -347,7 +359,8 @@ BAD_LITERALS = [
 class Item:
     def __init__(self, alias: str, kind: str, base: str | None = None) -> None:
         self.alias = alias
-        self.kind = kind  # input | vrow | arow | srow | chapter | cue | source-* | rel
+        # input | vrow | arow | srow | chapter | cue | attachment | source-* | rel
+        self.kind = kind
         self.base = base
 
 
@@ -526,6 +539,8 @@ def gen_row_col(ctx: Ctx) -> str:
         col = ctx.pick(CHAPTER_COLS)
     elif it.kind == "cue":
         col = ctx.pick(CUE_COLS)
+    elif it.kind == "attachment":
+        col = ctx.pick(ATTACHMENT_COLS)
     else:
         col = ctx.pick(["index", "t", "duration"])
     if ctx.bad():
@@ -564,6 +579,7 @@ _ARRAY_KIND = {
     "subtitle": "srow",
     "chapters": "chapter",
     "cues": "cue",
+    "attachments": "attachment",
     "data": "srow",
 }
 
@@ -615,12 +631,14 @@ def gen_from(ctx: Ctx) -> str:
             ctx.items.append(Item(alias, kind))
         elif r < 0.9 and inputs:
             base = ctx.pick(inputs).alias
-            arr = ctx.pick(["video", "audio", "subtitle", "chapters", "cues", "data"])
+            arr = ctx.pick(
+                ["video", "audio", "subtitle", "chapters", "cues", "attachments", "data"]
+            )
             piece = f"unnest({base}.{arr}) {alias}"
             rows = [
                 it
                 for it in ctx.items
-                if it.kind in ("vrow", "arow", "srow", "chapter", "cue")
+                if it.kind in ("vrow", "arow", "srow", "chapter", "cue", "attachment")
             ]
             if rows and rng.random() < 0.3:
                 kind = ctx.pick(
@@ -831,6 +849,55 @@ def gen_cues_copy(ctx: Ctx) -> str:
     )
 
 
+_ATTACHMENT_NAMES = ["'font.ttf'", "NULL", "''", "1", "'a' || 'b'"]
+_ATTACHMENT_TYPES = ["'application/x-truetype-font'", "'text/plain'", "NULL", "''", "2"]
+_ATTACHMENT_PATHS = ["'font.ttf'", "'fonts/x.otf'", "NULL", "''", ":'source'", "3"]
+
+
+def gen_attachments_copy(ctx: Ctx) -> str:
+    """An `attachments` output column, written as a literal array or gathered.
+
+    Names, types and paths are mistyped and NULL as often as not, so the
+    field checks are exercised alongside the lists that compile.
+    """
+    rng = ctx.rng
+    records = []
+    for _ in range(rng.randint(1, 3)):
+        cells = [
+            ctx.pick(_ATTACHMENT_NAMES),
+            ctx.pick(_ATTACHMENT_TYPES),
+            ctx.pick(_ATTACHMENT_PATHS),
+        ]
+        if ctx.bad():
+            cells = cells[: rng.randint(0, 4)]
+        records.append(f"ROW({', '.join(cells)})::attachment")
+    if rng.random() < 0.5:
+        column = f"ARRAY[{', '.join(records)}] AS attachments"
+        if ctx.bad():
+            column = ctx.pick(
+                [
+                    "NULL AS attachments",
+                    "'x' AS attachments",
+                    "ARRAY[] AS attachments",
+                    "a0.attachments AS attachments",
+                ]
+            )
+        return (
+            f"COPY (\n  SELECT a0.video[1], {column} FROM input('in.mp4') a0\n"
+            ") TO 'out.mkv'"
+        )
+    source = ctx.pick(["a0.attachments", "a1.attachments"])
+    if ctx.bad():
+        source = ctx.pick(["a0.audio", "a0.chapters", "a0.nosuch"])
+    return (
+        "COPY (\n  SELECT a0.video[1], "
+        "array_agg(ROW(c.filename, c.mimetype, 'font.ttf')::attachment) AS attachments\n"
+        f"  FROM input('in.mp4') a0, input('other.mkv') a1, unnest({source}) c\n"
+        "  GROUP BY a0.video[1]\n"
+        ") TO 'out.mkv'"
+    )
+
+
 def gen_query(rng: random.Random, p_bad: float) -> str:
     ctx = Ctx(rng, p_bad)
     r = rng.random()
@@ -838,6 +905,8 @@ def gen_query(rng: random.Random, p_bad: float) -> str:
         return gen_chapters_copy(ctx)
     if r < 0.08:
         return gen_cues_copy(ctx)
+    if r < 0.12:
+        return gen_attachments_copy(ctx)
     if r < 0.25:
         return gen_select(ctx)
     if r < 0.75:
@@ -908,6 +977,15 @@ def rand_probe(rng):
                 title=rng.choice([None, "", f"Ch {i}", "x" * 100]),
             )
         )
+    attachments = []
+    for i in range(rng.choice([0, 0, 1, 2])):
+        attachments.append(
+            AttachmentMeta(
+                index=i + 1,
+                filename=rng.choice([None, "", f"font{i}.ttf", "x" * 100]),
+                mimetype=rng.choice([None, "", "application/x-truetype-font"]),
+            )
+        )
     tags = {}
     if rng.random() < 0.5:
         tags = {"title": rng.choice(["T", ""]), "artist": "A"}
@@ -931,6 +1009,7 @@ def rand_probe(rng):
         chapters=chapters,
         format_name="webvtt" if webvtt else rng.choice([None, "matroska,webm"]),
         cues=cues,
+        attachments=attachments,
         tags=tags,
     )
 

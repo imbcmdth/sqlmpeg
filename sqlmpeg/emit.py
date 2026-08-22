@@ -212,6 +212,7 @@ from . import loudnorm
 from .errors import ErrorCode, SqlmpegError
 from .inputs import InputOptionSpec, option_spec
 from .ir import (
+    Attachment,
     FrameRef,
     Graph,
     Node,
@@ -271,6 +272,9 @@ _ANALYSIS_FORMAT = "null"
 # The chapter list is an output COLUMN, not a sink option, so its flag is not
 # table data. It names the input the chapters come from and renders last.
 MAP_CHAPTERS_FLAG = "-map_chapters"
+# One attached file. An output option: it applies to the output file that
+# follows it, and adds one output stream after that file's mapped ones.
+ATTACH_FLAG = "-attach"
 
 
 @dataclass
@@ -300,7 +304,9 @@ class OutputGroup:
     ``-to`` ahead of the maps; it re-encodes, so a group carrying one never
     renders ``-c:<i> copy``. `chapters` is the input index the file's chapter
     list comes from (``ir.NO_CHAPTERS`` for none), rendered last as
-    ``-map_chapters``; None leaves ffmpeg's default alone.
+    ``-map_chapters``; None leaves ffmpeg's default alone. `attachments` are
+    the files this one carries, rendered as ``-attach`` ahead of the maps;
+    each takes an output stream index after every map of this group.
     """
 
     maps: list[OutputMap]
@@ -309,6 +315,7 @@ class OutputGroup:
     tags: dict[str, str | None] = field(default_factory=dict)
     window: tuple[float | None, float | None] | None = None
     chapters: int | None = None
+    attachments: list[Attachment] = field(default_factory=list)
 
 
 @dataclass
@@ -388,6 +395,7 @@ def _output_group(g: Graph, unit: SinkUnit, labels: dict[str, str]) -> OutputGro
         tags=dict(unit.tags),
         window=unit.window,
         chapters=unit.chapters,
+        attachments=list(unit.attachments),
     )
 
 
@@ -636,6 +644,8 @@ def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> li
                 args += ["-ss", _render_number(start)]
             if end is not None:
                 args += ["-to", _render_number(end)]
+        for attachment in group.attachments:
+            args += [ATTACH_FLAG, attachment.path]
         # Output stream indices restart at 0 in every output file.
         for index, mapping in enumerate(group.maps):
             args += ["-map", mapping.target]
@@ -648,6 +658,7 @@ def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> li
                     f"-disposition:{index}",
                     "+".join(mapping.disposition) or "0",
                 ]
+        args += _render_attachment_tags(group.attachments, len(group.maps))
         # Ahead of the sink options. ffmpeg applies `-metadata` after
         # `-map_metadata` whatever the argv order, so a tag column wins over
         # `metadata_from`/`strip_metadata` either way.
@@ -693,6 +704,25 @@ def _render_input_options(options: dict[str, object]) -> list[str]:
         if rendered is None:
             continue
         args += [spec.flag, rendered]
+    return args
+
+
+def _render_attachment_tags(attachments: list[Attachment], maps: int) -> list[str]:
+    """``-metadata:s:<i>`` for each attached file, after this group's maps.
+
+    ffmpeg appends an attachment to the output as a stream of its own, in
+    ``-attach`` order and after every mapped stream, so the index is the map
+    count plus the attachment's position. A None tag is left unset: ffmpeg
+    then names the attachment after the file's basename and guesses its type.
+    """
+    args: list[str] = []
+    for offset, attachment in enumerate(attachments):
+        index = maps + offset
+        # mimetype first, the order ffmpeg's own -attach example writes.
+        tags = (("mimetype", attachment.mimetype), ("filename", attachment.filename))
+        for key, value in tags:
+            if value is not None:
+                args += [f"-metadata:s:{index}", f"{key}={value}"]
     return args
 
 

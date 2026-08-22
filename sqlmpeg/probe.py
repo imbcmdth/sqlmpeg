@@ -91,6 +91,22 @@ class ChapterMeta:
 
 
 @dataclass(frozen=True)
+class AttachmentMeta:
+    """One attached file, from a stream ffprobe reports as ``attachment``.
+
+    An attachment is not a stream sqlmpeg maps -- ffmpeg attaches a file by
+    path -- so these are kept OUT of :attr:`ProbeResult.streams`, and the
+    per-type indices there keep counting only the streams that are mapped.
+    `index` is the attachment's place in the file, 1-based;
+    `filename`/`mimetype` come from its tags, and are None when absent.
+    """
+
+    index: int
+    filename: str | None
+    mimetype: str | None
+
+
+@dataclass(frozen=True)
 class CueMeta:
     """One WebVTT cue, read from the document itself.
 
@@ -117,6 +133,9 @@ class ProbeResult:
     format_name: str | None = None
     # The document's cues, for a WebVTT input and nothing else.
     cues: list[CueMeta] = field(default_factory=list)
+    # The files riding inside the container, in ffprobe's order. A file with
+    # none has an empty list.
+    attachments: list[AttachmentMeta] = field(default_factory=list)
     # Container-level tags from -show_format, keys lowercased, values verbatim.
     # The WHOLE tag dict, not a whitelist: which keys a query may read is
     # decided where they resolve, not here.
@@ -244,6 +263,7 @@ def _parse_streams(data: object) -> ProbeResult | None:
             return None
 
         streams: list[StreamMeta] = []
+        attachments: list[AttachmentMeta] = []
         video_idx = 0
         audio_idx = 0
         subtitle_idx = 0
@@ -342,7 +362,16 @@ def _parse_streams(data: object) -> ProbeResult | None:
                     )
                 )
                 data_idx += 1
-            # other codec_type values (attachment, ...) are ignored.
+            elif codec_type == "attachment":
+                tags = _tags(raw)
+                attachments.append(
+                    AttachmentMeta(
+                        index=len(attachments) + 1,
+                        filename=tags.get("filename"),
+                        mimetype=tags.get("mimetype"),
+                    )
+                )
+            # other codec_type values are ignored.
 
         container_duration = None
         container_tags: dict[str, str] = {}
@@ -361,6 +390,7 @@ def _parse_streams(data: object) -> ProbeResult | None:
             chapters=chapters,
             format_name=format_name,
             tags=container_tags,
+            attachments=attachments,
         )
     except (KeyError, TypeError, ValueError):
         return None

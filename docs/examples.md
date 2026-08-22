@@ -1531,7 +1531,9 @@ COPY (
 
 ```
 $ sqlmpeg compile -f query.sql
-ffmpeg -i tests/fixtures/av2.mp4 -attach tests/fixtures/font.ttf -map 0:v:0 -c:0 copy   -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -metadata:s:2   mimetype=application/x-truetype-font -metadata:s:2 filename=font.ttf fonted.mkv
+ffmpeg -i tests/fixtures/av2.mp4 -attach tests/fixtures/font.ttf -map 0:v:0 -c:0 copy \
+  -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -metadata:s:2 \
+  mimetype=application/x-truetype-font -metadata:s:2 filename=font.ttf fonted.mkv
 ```
 
 Reading is the mirror - attachments are rows like chapters and cues, so a table query lists what a file carries:
@@ -1544,7 +1546,7 @@ FROM input('tests/fixtures/attached.mkv') f, unnest(f.attachments) a
 ```
 $ sqlmpeg -f query.sql
  index | filename | mimetype
--------+----------+---------------------------------
+-------+----------+-----------------------------
  1     | font.ttf | application/x-truetype-font
 (1 row)
 ```

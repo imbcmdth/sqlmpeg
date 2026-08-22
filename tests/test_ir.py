@@ -3,7 +3,16 @@ from __future__ import annotations
 import pytest
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import Graph, Node, Output, SinkUnit, is_src, src_alias, src_parts
+from sqlmpeg.ir import (
+    Attachment,
+    Graph,
+    Node,
+    Output,
+    SinkUnit,
+    is_src,
+    src_alias,
+    src_parts,
+)
 
 
 def _serialized_sinks(d: dict[str, object]) -> list[dict[str, object]]:
@@ -256,6 +265,27 @@ def test_sink_unit_chapters_round_trip() -> None:
     assert d["chapters"] == 1
     assert SinkUnit.from_dict(d) == unit
     assert "chapters" not in SinkUnit(outputs=[], path="out.mkv").to_dict()
+
+
+def test_sink_unit_attachments_round_trip() -> None:
+    """Same convention as the chapter list: a unit carrying no attached file
+    keeps the smaller shape."""
+    unit = SinkUnit(
+        outputs=[Output(ref="n2", type="video", name=None, metadata={})],
+        path="out.mkv",
+        attachments=[Attachment(path="f.ttf", filename="font.ttf", mimetype="font/ttf")],
+    )
+    d = unit.to_dict()
+    assert d["attachments"] == [
+        {"path": "f.ttf", "filename": "font.ttf", "mimetype": "font/ttf"}
+    ]
+    assert SinkUnit.from_dict(d) == unit
+    assert "attachments" not in SinkUnit(outputs=[], path="out.mkv").to_dict()
+
+
+def test_an_attachment_round_trips_with_no_tags() -> None:
+    unit = SinkUnit(outputs=[], path="out.mkv", attachments=[Attachment(path="f.ttf")])
+    assert SinkUnit.from_dict(unit.to_dict()) == unit
 
 
 def test_output_disposition_round_trips() -> None:

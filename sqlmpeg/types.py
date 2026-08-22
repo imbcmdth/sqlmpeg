@@ -38,6 +38,10 @@ Field flags:
     exposed    the compiler surfaces this field TODAY. A field declared here
                but not yet wired up carries ``exposed=False`` and stays out
                of every view.
+    readable   the field is a COLUMN of the row a query reads. Its opposite is
+               write-only: ``attachment.path`` is the file to read when one is
+               written, and a container carries the bytes rather than where
+               they came from, so there is nothing to read it back from.
 
 Field ORDER is column order: a row prints its fields in declaration order,
 so every declaration below is written in the order that row already prints.
@@ -49,6 +53,8 @@ from dataclasses import dataclass
 from typing import Literal
 
 __all__ = [
+    "ATTACHMENTS_COLUMN",
+    "ATTACHMENT_TYPE",
     "CHAPTERS_COLUMN",
     "CHAPTER_TYPE",
     "COLUMN_TYPES",
@@ -106,6 +112,7 @@ class Field:
     type: str
     writable: bool
     exposed: bool = True
+    readable: bool = True
 
 
 @dataclass(frozen=True)
@@ -153,6 +160,8 @@ def resolve(ref: str) -> Type:
 
 def _is_column(f: Field) -> bool:
     """True if a field is a row column: a scalar one, or a map array."""
+    if not f.readable:
+        return False
     return f.type in COLUMN_TYPES or (is_array(f.type) and resolve(f.type).kind == "map")
 
 
@@ -161,9 +170,9 @@ def _ro(name: str, type_: str, *, exposed: bool = True) -> Field:
     return Field(name, type_, writable=False, exposed=exposed)
 
 
-def _w(name: str, type_: str, *, exposed: bool = True) -> Field:
+def _w(name: str, type_: str, *, exposed: bool = True, readable: bool = True) -> Field:
     """A writable field: an assertion the query may make. NULL clears it."""
-    return Field(name, type_, writable=True, exposed=exposed)
+    return Field(name, type_, writable=True, exposed=exposed, readable=readable)
 
 
 def _stream_type(name: str, *probed: Field) -> Type:
@@ -267,16 +276,19 @@ _DECLARED: tuple[Type, ...] = (
             _w("end_t", "number"),  # seconds
         ),
     ),
-    # Declared, not wired up.
+    # A file riding inside the container: a subtitle font, cover art, a
+    # script. Not a stream sqlmpeg maps -- ffmpeg attaches it by path.
+    # `index` is the attachment's order in the file, 1-based.
     Type(
         "attachment",
         "record",
         (
-            _w("filename", "text", exposed=False),
-            _w("mimetype", "text", exposed=False),
-            # The source file when constructing; NULL when read from a
-            # container.
-            _w("path", "text", exposed=False),
+            _ro("index", "number"),
+            _w("filename", "text"),
+            _w("mimetype", "text"),
+            # The file to read when one is written. A container carries the
+            # bytes, not where they came from, so it is write-only.
+            _w("path", "text", readable=False),
         ),
     ),
     # A cue is a chapter's twin: a caption over a time span. Same field order,
@@ -307,7 +319,7 @@ _DECLARED: tuple[Type, ...] = (
             # A cue array is WRITTEN in a stream position (it IS a subtitle
             # track), never as a column named `cues`.
             _ro("cues", "cue[]"),
-            _w("attachments", "attachment[]", exposed=False),
+            _w("attachments", "attachment[]"),
             # The seek handle: legal only in a WHERE trim window, never a
             # value and never part of SELECT *.
             _ro("t", "seek"),
@@ -394,6 +406,14 @@ CUES_COLUMN = _sole(
     "the cue array column",
 )
 CUE_TYPE = RECORD_ELEMENTS[CUES_COLUMN]
+
+# The container column an input's attachment list lives in, and the record it
+# holds.
+ATTACHMENTS_COLUMN = _sole(
+    tuple(name for name, record in RECORD_ELEMENTS.items() if record == "attachment"),
+    "the attachment array column",
+)
+ATTACHMENT_TYPE = RECORD_ELEMENTS[ATTACHMENTS_COLUMN]
 
 # The scalar pseudo-column every INPUT alias carries.
 INPUT_DURATION_COLUMN = _sole(

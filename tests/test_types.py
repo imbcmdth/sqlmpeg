@@ -74,6 +74,7 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
         "end_t": ("number", "W"),
     },
     "attachment": {
+        "index": ("number", "RO"),
         "filename": ("text", "W"),
         "mimetype": ("text", "W"),
         "path": ("text", "W"),
@@ -100,12 +101,12 @@ EXPECTED_FIELDS: dict[str, dict[str, tuple[str, str]]] = {
 
 # The fields declared but not surfaced by the compiler today, as
 # "<type>.<field>". Nothing else may carry `exposed=False`.
-EXPECTED_UNEXPOSED = {
-    "attachment.filename",
-    "attachment.mimetype",
-    "attachment.path",
-    "container.attachments",
-}
+EXPECTED_UNEXPOSED: set[str] = set()
+
+# The WRITE-ONLY fields, as "<type>.<field>": written in a record literal,
+# never a column of the row a query reads back. Nothing else may carry
+# `readable=False`.
+EXPECTED_UNREADABLE = {"attachment.path"}
 
 EXPECTED_KINDS = {
     "text": "scalar",
@@ -166,6 +167,11 @@ EXPECTED_ROW_SCHEMAS = {
         "start_t": "number",
         "end_t": "number",
     },
+    "attachments": {
+        "index": "number",
+        "filename": "text",
+        "mimetype": "text",
+    },
 }
 
 EXPECTED_INPUT_COLUMNS = frozenset(
@@ -178,15 +184,27 @@ EXPECTED_INPUT_COLUMNS = frozenset(
         "duration",
         "chapters",
         "cues",
+        "attachments",
         "tags",
     }
 )
 
 EXPECTED_STREAM_ARRAY_COLUMNS = frozenset({"video", "audio", "subtitle", "data"})
 
-EXPECTED_UNNEST_COLUMNS = EXPECTED_STREAM_ARRAY_COLUMNS | {"chapters", "cues"}
+EXPECTED_UNNEST_COLUMNS = EXPECTED_STREAM_ARRAY_COLUMNS | {
+    "chapters",
+    "cues",
+    "attachments",
+}
 
-EXPECTED_STAR_COLUMNS = ("video", "audio", "subtitle", "data", "chapters")
+EXPECTED_STAR_COLUMNS = (
+    "video",
+    "audio",
+    "subtitle",
+    "data",
+    "chapters",
+    "attachments",
+)
 
 EXPECTED_ROW_STAR_COLUMNS = {
     "audio": ("index", "codec", "channels", "channel_layout", "sample_rate",
@@ -197,6 +215,7 @@ EXPECTED_ROW_STAR_COLUMNS = {
     "data": ("index", "codec"),
     "chapters": ("index", "title", "start_t", "end_t"),
     "cues": ("index", "text", "start_t", "end_t"),
+    "attachments": ("index", "filename", "mimetype"),
 }
 
 EXPECTED_ROW_READONLY_FIELDS = {
@@ -208,6 +227,7 @@ EXPECTED_ROW_READONLY_FIELDS = {
     "data": frozenset({"index", "codec"}),
     "chapters": frozenset({"index"}),
     "cues": frozenset({"index"}),
+    "attachments": frozenset({"index"}),
 }
 
 
@@ -277,6 +297,14 @@ def test_field_names_are_unique_within_a_type() -> None:
 def test_exposed_marks_are_the_declared_ones() -> None:
     unexposed = {f"{owner}.{f.name}" for owner, f in _all_fields() if not f.exposed}
     assert unexposed == EXPECTED_UNEXPOSED
+
+
+def test_readable_marks_are_the_declared_ones() -> None:
+    unreadable = {f"{owner}.{f.name}" for owner, f in _all_fields() if not f.readable}
+    assert unreadable == EXPECTED_UNREADABLE
+    # A write-only field is still one a record literal supplies.
+    written = [f.name for f in types.RECORD_FIELDS["attachment"]]
+    assert "path" in written and "path" not in types.ROW_SCHEMAS["attachments"]
 
 
 def test_a_map_type_is_a_key_and_one_more_field() -> None:
@@ -380,6 +408,8 @@ def test_named_column_views() -> None:
     assert types.STREAM_TAG_COLUMNS == ("language", "title")
     assert types.TAGS_COLUMN == "tags"
     assert types.CHAPTERS_COLUMN == "chapters"
+    assert types.ATTACHMENTS_COLUMN == "attachments"
+    assert types.ATTACHMENT_TYPE == "attachment"
     assert types.INPUT_DURATION_COLUMN == "duration"
     assert types.TIME_COLUMN == "t"
 

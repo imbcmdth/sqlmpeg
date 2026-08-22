@@ -18,6 +18,7 @@ import pytest
 
 from sqlmpeg import probe as probe_mod
 from sqlmpeg.probe import (
+    AttachmentMeta,
     ProbeResult,
     StreamMeta,
     clear_cache,
@@ -300,17 +301,21 @@ def test_maps_data_streams(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert data[0].sample_rate is None
 
 
-def test_attachment_codec_type_is_still_ignored(
+def test_an_attachment_is_not_a_stream(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    f = tmp_path / "x.mp4"
+    """It lands in `attachments`, carrying the tags the container gave it."""
+    f = tmp_path / "x.mkv"
     f.write_bytes(b"data")
     _fake_ffprobe_present(monkeypatch)
     attachment_json = json.dumps(
         {
             "streams": [
                 {"codec_type": "video"},
-                {"codec_type": "attachment"},
+                {
+                    "codec_type": "attachment",
+                    "tags": {"filename": "font.ttf", "mimetype": "font/ttf"},
+                },
             ]
         }
     )
@@ -320,6 +325,35 @@ def test_attachment_codec_type_is_still_ignored(
     assert result is not None
     assert len(result.streams) == 1
     assert result.streams[0].type == "video"
+    assert result.attachments == [
+        AttachmentMeta(index=1, filename="font.ttf", mimetype="font/ttf")
+    ]
+
+
+def test_an_untagged_attachment_reads_null_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "x.mkv"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch, stdout=json.dumps({"streams": [{"codec_type": "attachment"}]}))
+
+    result = probe(str(f))
+    assert result is not None
+    assert result.attachments == [AttachmentMeta(index=1, filename=None, mimetype=None)]
+
+
+def test_a_file_with_no_attachments_has_an_empty_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    f = tmp_path / "x.mp4"
+    f.write_bytes(b"data")
+    _fake_ffprobe_present(monkeypatch)
+    _fake_run(monkeypatch, stdout=json.dumps({"streams": [{"codec_type": "video"}]}))
+
+    result = probe(str(f))
+    assert result is not None
+    assert result.attachments == []
 
 
 def test_an_attachment_never_becomes_a_data_stream(
@@ -349,6 +383,7 @@ def test_an_attachment_never_becomes_a_data_stream(
     assert result is not None
     assert [s.type for s in result.streams] == ["video", "data", "data"]
     assert [s.index for s in result.by_type("data")] == [0, 1]
+    assert [a.index for a in result.attachments] == [1]
 
 
 def test_per_type_index_counted_in_file_order(
@@ -943,6 +978,24 @@ def test_probe_av2_fixture_bitrate_and_codec(_fixtures: Path) -> None:
         assert stream.codec  # non-empty codec name
         assert stream.bitrate is not None
         assert stream.bitrate > 0
+
+
+@pytest.mark.exec
+def test_probe_attached_fixture_lists_the_font(_fixtures: Path) -> None:
+    """attached.mkv: one video, one audio, and one attachment beside them.
+
+    The attachment is not a stream, so it takes no per-type index: the audio
+    track is still `0:a:0`.
+    """
+    result = probe(str(_fixtures / "attached.mkv"))
+    assert result is not None
+    assert [s.type for s in result.streams] == ["video", "audio"]
+    assert [s.index for s in result.streams] == [0, 0]
+    assert result.attachments == [
+        AttachmentMeta(
+            index=1, filename="font.ttf", mimetype="application/x-truetype-font"
+        )
+    ]
 
 
 @pytest.mark.exec

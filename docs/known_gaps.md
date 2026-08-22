@@ -8,7 +8,6 @@ output is plain ffmpeg, so the two mix freely in a script.
 
 | gap | ffmpeg surface | notes |
 | --- | --- | --- |
-| Attachments and cover art | `-attach`, `attached_pic` disposition | No sink surface for attaching files (fonts, thumbnails). |
 | HLS / DASH packaging | `hls_*`, segment muxer options | Format-specific muxer option families are not modeled. Writing to an `.m3u8` path may work for defaults, but segment length, playlist type, and encryption options have no spelling. |
 | Protocol options | `-headers`, `-user_agent`, `-rtsp_transport`, `-timeout` | Network inputs and outputs are passed to ffmpeg verbatim; per-protocol tuning options have no input/sink spelling. Authenticated URLs work only if the credential fits in the URL itself. |
 | Lossless concat | concat demuxer (`-f concat -i list.txt -c copy`) | Joining files without re-encoding needs the demuxer's list-file protocol. `concat` in sqlmpeg is the filter, which re-encodes. |

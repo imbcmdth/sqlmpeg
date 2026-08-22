@@ -286,6 +286,7 @@ from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import validate_option as validate_input_option
 from sqlmpeg.ir import (
     NO_CHAPTERS,
+    Attachment,
     FrameRef,
     Graph,
     Node,
@@ -315,6 +316,7 @@ from sqlmpeg.parser import (
     _pos,
     _projection_expr,
     _time_bounds,
+    article,
     column_label,
     flag_error,
     from_entries,
@@ -355,6 +357,8 @@ from sqlmpeg.table import (
     TableSink,
 )
 from sqlmpeg.types import (
+    ATTACHMENT_TYPE,
+    ATTACHMENTS_COLUMN,
     CHAPTER_TYPE,
     CHAPTERS_COLUMN,
     CONTAINER_READONLY_FIELDS,
@@ -482,6 +486,15 @@ _CUE_ARRAY_HINT = (
     f"an array of cue records IS a WebVTT subtitle track, e.g. "
     f"ARRAY[{_CUE_EXAMPLE}], or "
     f"array_agg(ROW(c.title, c.start_t, c.end_t)::{CUE_TYPE}) over chapter rows"
+)
+_ATTACHMENT_LITERAL = f"ROW(filename, mimetype, path)::{ATTACHMENT_TYPE}"
+_ATTACHMENT_EXAMPLE = (
+    f"ROW('font.ttf', 'application/x-truetype-font', 'fonts/font.ttf')"
+    f"::{ATTACHMENT_TYPE}"
+)
+_ATTACHMENTS_COLUMN_HINT = (
+    f"an {ATTACHMENTS_COLUMN} column is an array of attachment records, e.g. "
+    f"ARRAY[{_ATTACHMENT_EXAMPLE}] AS {ATTACHMENTS_COLUMN}"
 )
 _WRITTEN_ROW_HINT = (
     "a written row carries values, never a stream: filter, group and aggregate "
@@ -626,8 +639,9 @@ _PLANES_HINT = (
 
 def _record_row_hint(record: str) -> str:
     """What a record row can be asked for, when a query asked it for a stream."""
+    named = f"{article(record)} {record}"
     return (
-        f"a {record} row has no stream column at all — a {record} is not a "
+        f"{named} row has no stream column at all — {named} is not a "
         "track — so it can only be read as a metadata query, e.g. no COPY, or "
         "COPY ... WITH (FORMAT csv)"
     )
@@ -1460,6 +1474,42 @@ def _cue_text(value: RowValue, node: exp.Expr) -> str:
     return value
 
 
+def _attachment_path(value: RowValue, node: exp.Expr) -> str:
+    """One evaluated ``path`` as the file ffmpeg attaches.
+
+    The one field that may not be NULL: ffmpeg reads the bytes from this
+    file, so an attachment without one names nothing to attach.
+    """
+    if not isinstance(value, str) or not value.strip():
+        got = "NULL" if value is None else repr(value)
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{ATTACHMENTS_COLUMN}.path' must name a file, got {got}",
+            node,
+            hint=f"path is the file to attach, e.g. {_ATTACHMENT_EXAMPLE}",
+        )
+    return value
+
+
+def _attachment_text(value: RowValue, field_name: str, node: exp.Expr) -> str | None:
+    """One evaluated ``filename``/``mimetype`` as text, or None for NULL.
+
+    NULL leaves ffmpeg's own default in place: it names the attachment after
+    the file's basename and guesses the type from it.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{ATTACHMENTS_COLUMN}.{field_name}' must be a string or NULL, "
+            f"got {value!r}",
+            node,
+            hint=f"{field_name} is text or NULL, e.g. {_ATTACHMENT_EXAMPLE}",
+        )
+    return value
+
+
 def _input_value(node: exp.Expr) -> object:
     """One `input('path', name => value)` value as a python scalar.
 
@@ -2024,9 +2074,11 @@ def _row_columns(meta: StreamMeta, column: str) -> dict[str, RowValue]:
 def _record_columns(result: ProbeResult, column: str) -> list[dict[str, RowValue]]:
     """One container record array's rows, each keyed by the record's fields.
 
-    The one row table that is not built from a `StreamMeta`: a chapter comes
-    from ffprobe's own chapter list, a cue from the WebVTT document sqlmpeg
-    parsed (:func:`sqlmpeg.probe.parse_webvtt`).
+    The row tables that are not built from a `StreamMeta`: a chapter comes
+    from ffprobe's own chapter list, an attachment from the streams ffprobe
+    types as attachments, and a cue from the WebVTT document sqlmpeg parsed
+    (:func:`sqlmpeg.probe.parse_webvtt`). A file carrying none of a kind
+    reads zero rows.
     """
     if column == CHAPTERS_COLUMN:
         return [
@@ -2037,6 +2089,15 @@ def _record_columns(result: ProbeResult, column: str) -> list[dict[str, RowValue
                 "end_t": chapter.end_t,
             }
             for chapter in result.chapters
+        ]
+    if column == ATTACHMENTS_COLUMN:
+        return [
+            {
+                "index": attachment.index,
+                "filename": attachment.filename,
+                "mimetype": attachment.mimetype,
+            }
+            for attachment in result.attachments
         ]
     return [
         {"index": cue.index, "text": cue.text, "start_t": cue.start_t, "end_t": cue.end_t}
@@ -2261,6 +2322,9 @@ class _Lowerer:
         # its chapters come from, `ir.NO_CHAPTERS` for a written NULL, and None
         # while no `chapters` column has been read. Reset per COPY.
         self.chapters: int | None = None
+        # The files the file being written carries, in written order. Empty
+        # while no `attachments` column has been read. Reset per COPY.
+        self.attachments: list[Attachment] = []
         # Output fan-out: which row of the sink's relation THIS run binds, the
         # sink's TO expression once it is known to reference a row column, and
         # the pinned row / its branch environment once `_pin_fanout_row` runs.
@@ -2336,6 +2400,7 @@ class _Lowerer:
                     ),
                     tags=dict(self.container_tags),
                     chapters=self.chapters,
+                    attachments=list(self.attachments),
                 )
             ]
         self._check_loudnorm2()
@@ -2447,6 +2512,7 @@ class _Lowerer:
         self.sink_path = raw.path
         self.fanout_windows = {}
         self.chapters = None
+        self.attachments = []
         columns = self._lower_query(list(raw.branches), raw.query, tags="sink")
         options: dict[str, object] = {}
         option_nodes: dict[str, exp.Expr] = {}
@@ -2479,6 +2545,7 @@ class _Lowerer:
             tags=dict(self.container_tags),
             window=self._fanout_window(),
             chapters=self.chapters,
+            attachments=list(self.attachments),
         )
 
     # -- the fan-out TO expression ------------------------------------
@@ -2733,7 +2800,8 @@ class _Lowerer:
         if written is None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"a {record} is written as {literal}, got {_describe(node)}",
+                f"{article(record)} {record} is written as {literal}, got "
+                f"{_describe(node)}",
                 node,
                 fallback=select,
                 hint=hint,
@@ -2742,8 +2810,8 @@ class _Lowerer:
             named = ", ".join(field.name for field in fields)
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"a {record} takes {len(fields)} values ({named}), got "
-                f"{len(written)}",
+                f"{article(record)} {record} takes {len(fields)} values "
+                f"({named}), got {len(written)}",
                 node,
                 fallback=select,
                 hint=hint,
@@ -2773,6 +2841,116 @@ class _Lowerer:
             title=_chapter_title(title, title_cell),
             start_node=start_cell,
             end_node=end_cell,
+        )
+
+    # -- the attachments output column ---------------------------------
+
+    def _collect_attachments(
+        self, projection: exp.Expr, env: _Env, select: exp.Select, *, scope: _TagScope
+    ) -> None:
+        """``... AS attachments``: the files this output carries.
+
+        Each record names a file to read, so the column emits one ``-attach``
+        per record rather than minting an input the way a chapter list does.
+        The list belongs to the FILE, so two branches of a UNION ALL have to
+        agree on it.
+        """
+        if scope != "sink":
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{ATTACHMENTS_COLUMN}' is the file's attachment list, and a "
+                "CTE body writes no file",
+                projection,
+                fallback=select,
+                hint="build the list in the outer SELECT, e.g. "
+                f"ARRAY[{_ATTACHMENT_EXAMPLE}] AS {ATTACHMENTS_COLUMN}",
+            )
+        written = self._attachment_records(_unwrap(projection), env, select)
+        if self.attachments and self.attachments != written:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{ATTACHMENTS_COLUMN}' takes two different attachment lists",
+                projection,
+                fallback=select,
+                hint="a file has one attachment list, so write the column once; "
+                "the branches of a UNION ALL write one file between them",
+            )
+        self.attachments = written
+
+    def _attachment_records(
+        self, value: exp.Expr, env: _Env, select: exp.Select
+    ) -> list[Attachment]:
+        """The attachments an ``attachments`` column lists, in written order.
+
+        The two spellings a record list takes everywhere: a literal array,
+        read element by element over the branch's first row, and an
+        ``array_agg`` read once per surviving row. ``NULL`` writes a file
+        carrying none, which is also what an omitted column writes -- ffmpeg
+        attaches nothing on its own.
+        """
+        if isinstance(value, exp.Null):
+            return []
+        if isinstance(value, exp.ArrayAgg):
+            inner = value.this
+            relation = env.relation
+            if not isinstance(inner, exp.Expr) or relation is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "array_agg() aggregates rows, and this query has none",
+                    value,
+                    fallback=select,
+                    hint=_ATTACHMENTS_COLUMN_HINT,
+                )
+            return [
+                self._attachment_record(inner, env, row, select)
+                for row in relation.tuples
+            ]
+        if isinstance(value, exp.Array):
+            row = _group_row(env)
+            written = [
+                self._attachment_record(element, env, row, select)
+                for element in value.expressions
+                if isinstance(element, exp.Expr)
+            ]
+            if not written:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{ATTACHMENTS_COLUMN}' is an empty list",
+                    value,
+                    fallback=select,
+                    hint="write at least one attachment, or NULL AS "
+                    f"{ATTACHMENTS_COLUMN} for a file carrying none",
+                )
+            return written
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{ATTACHMENTS_COLUMN}' takes an array of attachment records, got "
+            f"{_describe(value)}",
+            value,
+            fallback=select,
+            hint=_ATTACHMENTS_COLUMN_HINT,
+        )
+
+    def _attachment_record(
+        self, node: exp.Expr, env: _Env, row: _RowTuple, select: exp.Select
+    ) -> Attachment:
+        """One ``ROW(filename, mimetype, path)::attachment``, evaluated."""
+        cells = self._written_record(
+            node,
+            ATTACHMENT_TYPE,
+            _ATTACHMENT_LITERAL,
+            _ATTACHMENTS_COLUMN_HINT,
+            env,
+            row,
+            select,
+        )
+        filename_cell, filename = cells["filename"]
+        mimetype_cell, mimetype = cells["mimetype"]
+        path_cell, path = cells["path"]
+        return Attachment(
+            path=_attachment_path(path, path_cell),
+            filename=_attachment_text(filename, "filename", filename_cell),
+            mimetype=_attachment_text(mimetype, "mimetype", mimetype_cell),
         )
 
     def _cue_record(
@@ -3022,6 +3200,11 @@ class _Lowerer:
             # tag: one array of chapter records, whatever the branch's rows.
             if _projection_name(projection) == CHAPTERS_COLUMN:
                 self._collect_chapters(projection, env, select, scope=tags)
+                continue
+            # An attached file is not a stream either: ffmpeg reads it by
+            # path, so the column is a list of files the output carries.
+            if _projection_name(projection) == ATTACHMENTS_COLUMN:
+                self._collect_attachments(projection, env, select, scope=tags)
                 continue
             # A tag column produces no stream, so it never becomes an output.
             # With track rows the tag is per-stream, without them it is a
@@ -5615,7 +5798,8 @@ class _Lowerer:
         if binding.column in RECORD_ARRAY_COLUMNS:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{binding.alias}' is a {binding.record} row, not a stream",
+                f"'{binding.alias}' is {article(binding.record)} "
+                f"{binding.record} row, not a stream",
                 anchor,
                 fallback=select,
                 hint=_record_row_hint(binding.record),
@@ -6143,8 +6327,8 @@ class _Lowerer:
             if index is not None:
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"'{alias}.{name}' cannot be subscripted: a "
-                    f"{record} is not a stream",
+                    f"'{alias}.{name}' cannot be subscripted: "
+                    f"{article(record)} {record} is not a stream",
                     anchor,
                     fallback=select,
                     hint=record_unnest_hint(alias, name),

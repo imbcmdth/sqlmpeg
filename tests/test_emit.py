@@ -28,7 +28,15 @@ from sqlmpeg.emit import (
     emit,
 )
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import NO_CHAPTERS, Graph, Node, Output, SinkUnit, StreamType
+from sqlmpeg.ir import (
+    NO_CHAPTERS,
+    Attachment,
+    Graph,
+    Node,
+    Output,
+    SinkUnit,
+    StreamType,
+)
 
 
 def _node(
@@ -63,6 +71,7 @@ def _sink(
     tags: dict[str, str | None] | None = None,
     window: tuple[float | None, float | None] | None = None,
     chapters: int | None = None,
+    attachments: list[Attachment] | None = None,
 ) -> SinkUnit:
     """A destination with no outputs yet -- `_graph` fills them in."""
     return SinkUnit(
@@ -72,6 +81,7 @@ def _sink(
         tags=dict(tags or {}),
         window=window,
         chapters=chapters,
+        attachments=list(attachments or []),
     )
 
 
@@ -102,6 +112,7 @@ def _graph(
                 tags=dict(sink.tags),
                 window=sink.window,
                 chapters=sink.chapters,
+                attachments=list(sink.attachments),
             )
         ]
     else:
@@ -1332,6 +1343,77 @@ def test_no_chapter_list_renders_no_map_chapters_at_all() -> None:
     assert "-map_chapters" not in build_ffmpeg_args(emit(g))
 
 
+def test_an_attachment_renders_attach_ahead_of_the_maps_and_tags_after() -> None:
+    """ffmpeg numbers an attachment after every mapped stream of that file."""
+    sink = _sink(
+        path="out.mkv",
+        attachments=[Attachment("f.ttf", "font.ttf", "application/x-truetype-font")],
+    )
+    g = _graph([], [_out("src:a:v:0"), _out("src:a:a:0", "audio")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args == [
+        "ffmpeg", "-i", "a.mp4",
+        "-attach", "f.ttf",
+        "-map", "0:v:0", "-c:0", "copy",
+        "-map", "0:a:0", "-c:1", "copy",
+        "-metadata:s:2", "mimetype=application/x-truetype-font",
+        "-metadata:s:2", "filename=font.ttf",
+        "out.mkv",
+    ]
+
+
+def test_two_attachments_take_consecutive_output_stream_indices() -> None:
+    sink = _sink(
+        path="out.mkv",
+        attachments=[
+            Attachment("f.ttf", "font.ttf", "application/x-truetype-font"),
+            Attachment("n.txt", "notes.txt", "text/plain"),
+        ],
+    )
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args[args.index("-attach") : args.index("-map")] == [
+        "-attach", "f.ttf", "-attach", "n.txt",
+    ]
+    assert args[args.index("-metadata:s:1") :] == [
+        "-metadata:s:1", "mimetype=application/x-truetype-font",
+        "-metadata:s:1", "filename=font.ttf",
+        "-metadata:s:2", "mimetype=text/plain",
+        "-metadata:s:2", "filename=notes.txt",
+        "out.mkv",
+    ]
+
+
+def test_an_attachment_with_no_tags_renders_attach_alone() -> None:
+    """ffmpeg then names it after the file and guesses its type."""
+    sink = _sink(path="out.mkv", attachments=[Attachment("f.ttf")])
+    g = _graph([], [_out("src:a:v:0")], sink=sink)
+    args = build_ffmpeg_args(emit(g))
+    assert args == [
+        "ffmpeg", "-i", "a.mp4", "-attach", "f.ttf",
+        "-map", "0:v:0", "-c:0", "copy", "out.mkv",
+    ]
+
+
+def test_each_output_file_carries_its_own_attachments() -> None:
+    """`-attach` applies to the output file that follows it."""
+    g = _graph(
+        [],
+        [],
+        sinks=[
+            SinkUnit(
+                outputs=[_out("src:a:v:0")],
+                path="one.mkv",
+                attachments=[Attachment("f.ttf", "font.ttf", "font/ttf")],
+            ),
+            SinkUnit(outputs=[_out("src:a:a:0", "audio")], path="two.mkv"),
+        ],
+    )
+    args = build_ffmpeg_args(emit(g))
+    assert args.index("-attach") < args.index("one.mkv")
+    assert args.count("-attach") == 1
+
+
 def test_sink_codec_params_derives_its_flag_from_video_codec() -> None:
     sink = _sink(
         path="out.mp4", options={"video_codec": "libx264", "codec_params": "keyint=48"}
@@ -2476,6 +2558,27 @@ def _run_ffmpeg(args: list[str]) -> None:
     assert result.returncode == 0, f"{args}\n{result.stderr}"
 
 
+def _probe_stream_tags(path: Path) -> list[dict[str, str]]:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type:stream_tags=filename,mimetype",
+            "-of",
+            "json",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=_SUBPROCESS_TIMEOUT,
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    return [dict(stream.get("tags") or {}) for stream in data["streams"]]
+
+
 def _probe_codec_types(path: Path) -> list[str]:
     result = subprocess.run(
         [
@@ -2533,6 +2636,35 @@ def test_passthrough_map_runs_under_real_ffmpeg(tmp_path: Path) -> None:
     _run_ffmpeg(build_ffmpeg_args(e, str(out_path)))
 
     assert _probe_codec_types(out_path) == ["video", "audio"]
+
+
+@pytest.mark.exec
+def test_an_attached_file_runs_under_real_ffmpeg(tmp_path: Path) -> None:
+    """The attachment lands after the mapped streams, tagged as written."""
+    _require_ffmpeg_and_fixture()
+    font = _FIXTURES_DIR / "font.ttf"
+    if not font.exists():
+        pytest.skip(f"fixture missing: {font} (run scripts/gen_fixtures.py first)")
+    sink = _sink(
+        path="out.mkv",
+        attachments=[
+            Attachment(str(font), "renamed.ttf", "application/x-truetype-font")
+        ],
+    )
+    g = _graph(
+        [],
+        [_out("src:a:v:0"), _out("src:a:a:0", "audio")],
+        input_paths=[str(_AV)],
+        sink=sink,
+    )
+    out_path = tmp_path / "attached.mkv"
+    _run_ffmpeg(build_ffmpeg_args(emit(g), str(out_path)))
+
+    assert _probe_codec_types(out_path) == ["video", "audio", "attachment"]
+    assert _probe_stream_tags(out_path)[2] == {
+        "filename": "renamed.ttf",
+        "mimetype": "application/x-truetype-font",
+    }
 
 
 @pytest.mark.exec

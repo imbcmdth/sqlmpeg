@@ -47,10 +47,11 @@ from sqlmpeg import registry as registry_module
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.emit import build_ffmpeg_args, emit
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import NO_CHAPTERS, Graph, StreamType
+from sqlmpeg.ir import NO_CHAPTERS, Attachment, Graph, StreamType
 from sqlmpeg.lower import lower, lower_table
 from sqlmpeg.parser import parse, resolve
 from sqlmpeg.probe import (
+    AttachmentMeta,
     ChapterMeta,
     CueMeta,
     ProbeResult,
@@ -6305,8 +6306,15 @@ def test_star_over_a_container_is_every_array_column_in_a_table_query() -> None:
         resolve(parse("SELECT * FROM input('f.mkv') f")),
         _chapter_probes(*_TWO_CHAPTERS),
     )
-    assert sinks[0].result.columns == ["video", "audio", "subtitle", "data", "chapters"]
-    video, audio, subtitle, data, chapters = sinks[0].result.rows[0]
+    assert sinks[0].result.columns == [
+        "video",
+        "audio",
+        "subtitle",
+        "data",
+        "chapters",
+        "attachments",
+    ]
+    video, audio, subtitle, data, chapters, _ = sinks[0].result.rows[0]
     assert video == ArrayCell(elements=(StreamCell(type="video", spec="0:v:0"),))
     assert audio == ArrayCell(elements=(StreamCell(type="audio", spec="0:a:0"),))
     assert subtitle == ArrayCell(elements=())
@@ -6361,6 +6369,7 @@ def test_a_bare_star_covers_container_and_rows_in_a_table_query() -> None:
         "subtitle",
         "data",
         "chapters",
+        "attachments",
         "index",
         "codec",
         "channels",
@@ -6948,7 +6957,14 @@ def test_a_bare_cues_column_prints_as_one_array_cell() -> None:
 def test_cues_stay_out_of_a_container_star() -> None:
     """`cues` is read-only, and a star names what a copy carries through."""
     sinks = lower_table(resolve(parse("SELECT f.* FROM input('f.mkv') f")), _cue_probes())
-    assert sinks[0].result.columns == ["video", "audio", "subtitle", "data", "chapters"]
+    assert sinks[0].result.columns == [
+        "video",
+        "audio",
+        "subtitle",
+        "data",
+        "chapters",
+        "attachments",
+    ]
 
 
 def test_reading_cues_of_a_file_that_is_not_webvtt_is_a_typed_rejection() -> None:
@@ -7151,6 +7167,199 @@ def test_a_bare_cues_column_in_a_media_copy_is_a_typed_rejection() -> None:
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'v.cues' carries no streams" in err.message
     assert "unnest(v.cues) c" in (err.hint or "")
+
+
+# ---------------------------------------------------------------------------
+# attachments: a file riding inside the container
+# ---------------------------------------------------------------------------
+
+
+_FONT = AttachmentMeta(index=1, filename="font.ttf", mimetype="application/x-truetype-font")
+_SCRIPT = AttachmentMeta(index=2, filename="notes.txt", mimetype="text/plain")
+
+
+def _attachment_probes(*attachments: AttachmentMeta) -> dict[str, ProbeResult | None]:
+    return {
+        "f": ProbeResult(
+            streams=[_track("video", 0), _track("audio", 0)],
+            attachments=list(attachments),
+        )
+    }
+
+
+_ATTACH = (
+    "ARRAY[ROW('font.ttf', 'application/x-truetype-font', "
+    "'fonts/font.ttf')::attachment] AS attachments"
+)
+
+
+def test_attachment_rows_read_the_declared_schema() -> None:
+    sinks = lower_table(
+        resolve(parse(
+            "SELECT a.index, a.filename, a.mimetype "
+            "FROM input('f.mkv') f, unnest(f.attachments) a"
+        )),
+        _attachment_probes(_FONT, _SCRIPT),
+    )
+    assert sinks[0].result.columns == ["index", "filename", "mimetype"]
+    assert sinks[0].result.rows == [
+        [1, "font.ttf", "application/x-truetype-font"],
+        [2, "notes.txt", "text/plain"],
+    ]
+
+
+def test_a_file_with_no_attachments_reads_no_rows() -> None:
+    sinks = lower_table(
+        resolve(parse("SELECT a.filename FROM input('f.mkv') f, unnest(f.attachments) a")),
+        _attachment_probes(),
+    )
+    assert sinks[0].result.rows == []
+
+
+def test_an_attachment_row_has_no_path_to_read() -> None:
+    """`path` is the file a written attachment reads; a container has none."""
+    err = _reject_lower_table(
+        "SELECT a.path FROM input('f.mkv') f, unnest(f.attachments) a",
+        _attachment_probes(_FONT),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "an attachment row exposes filename, index, mimetype" in (err.hint or "")
+
+
+def test_an_attachment_row_carries_no_stream_to_select() -> None:
+    err = _reject_lower(
+        "COPY (SELECT a FROM input('f.mkv') f, unnest(f.attachments) a) TO 'o.mkv'",
+        _attachment_probes(_FONT),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'a' is an attachment row, not a stream" in err.message
+
+
+def test_an_attachments_literal_writes_one_attach_per_record() -> None:
+    g = _lower(
+        f"COPY (SELECT f.video[1], {_ATTACH} FROM input('f.mkv') f) TO 'out.mkv'",
+        _attachment_probes(),
+    )
+    assert g.sinks[0].attachments == [
+        Attachment(
+            path="fonts/font.ttf",
+            filename="font.ttf",
+            mimetype="application/x-truetype-font",
+        )
+    ]
+    # It is not a stream: nothing is mapped for it and no input is minted.
+    assert _refs(g) == ["src:f:v:0"]
+    assert len(g.input_paths) == 1
+
+
+def test_array_agg_over_attachment_rows_copies_a_list_across() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], "
+        "array_agg(ROW(a.filename, a.mimetype, 'fonts/' || a.filename)::attachment) "
+        "AS attachments FROM input('f.mkv') f, unnest(f.attachments) a "
+        "GROUP BY f.video[1]) TO 'out.mkv'",
+        _attachment_probes(_FONT, _SCRIPT),
+    )
+    assert [one.path for one in g.sinks[0].attachments] == [
+        "fonts/font.ttf",
+        "fonts/notes.txt",
+    ]
+
+
+def test_a_null_attachments_column_writes_a_file_carrying_none() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], NULL AS attachments FROM input('f.mkv') f) "
+        "TO 'out.mkv'",
+        _attachment_probes(_FONT),
+    )
+    assert g.sinks[0].attachments == []
+
+
+def test_an_attachments_filename_and_mimetype_may_be_null() -> None:
+    """ffmpeg then names the attachment after the file and guesses the type."""
+    g = _lower(
+        "COPY (SELECT f.video[1], "
+        "ARRAY[ROW(NULL, NULL, 'fonts/font.ttf')::attachment] AS attachments "
+        "FROM input('f.mkv') f) TO 'out.mkv'",
+        _attachment_probes(),
+    )
+    assert g.sinks[0].attachments == [Attachment(path="fonts/font.ttf")]
+
+
+def test_an_attachment_without_a_path_is_rejected() -> None:
+    for written in ("NULL", "''", "1"):
+        err = _reject_lower(
+            f"COPY (SELECT f.video[1], ARRAY[ROW('a', 'text/plain', {written})"
+            "::attachment] AS attachments FROM input('f.mkv') f) TO 'out.mkv'",
+            _attachment_probes(),
+        )
+        assert err.code is ErrorCode.UNSUPPORTED_SQL
+        assert "'attachments.path' must name a file" in err.message
+
+
+def test_an_attachments_filename_must_be_text_or_null() -> None:
+    err = _reject_lower(
+        "COPY (SELECT f.video[1], ARRAY[ROW(2, 'text/plain', 'x.txt')::attachment] "
+        "AS attachments FROM input('f.mkv') f) TO 'out.mkv'",
+        _attachment_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'attachments.filename' must be a string or NULL" in err.message
+
+
+def test_an_attachment_record_takes_the_declared_field_count() -> None:
+    err = _reject_lower(
+        "COPY (SELECT f.video[1], ARRAY[ROW('a', 'text/plain')::attachment] "
+        "AS attachments FROM input('f.mkv') f) TO 'out.mkv'",
+        _attachment_probes(),
+    )
+    assert (
+        "an attachment takes 3 values (filename, mimetype, path), got 2" in err.message
+    )
+
+
+def test_an_empty_attachments_list_is_rejected() -> None:
+    err = _reject_lower(
+        "COPY (SELECT f.video[1], ARRAY[] AS attachments FROM input('f.mkv') f) "
+        "TO 'out.mkv'",
+        _attachment_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'attachments' is an empty list" in err.message
+    assert "NULL AS attachments" in (err.hint or "")
+
+
+def test_a_copied_attachments_column_is_a_typed_rejection() -> None:
+    """The bytes ride inside the source file; sqlmpeg attaches files by path."""
+    err = _reject_lower(
+        "COPY (SELECT f.video[1], f.attachments AS attachments "
+        "FROM input('f.mkv') f) TO 'out.mkv'",
+        _attachment_probes(_FONT),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'attachments' takes an array of attachment records" in err.message
+
+
+def test_an_attachments_column_in_a_cte_body_is_a_typed_rejection() -> None:
+    err = _reject_lower(
+        f"COPY (WITH gathered AS (SELECT f.video[1] AS v, {_ATTACH} "
+        "FROM input('f.mkv') f) SELECT gathered.v FROM gathered) TO 'out.mkv'",
+        _attachment_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a CTE body writes no file" in err.message
+
+
+def test_two_branches_may_not_write_two_attachment_lists() -> None:
+    err = _reject_lower(
+        f"COPY (SELECT f.video[1], {_ATTACH} FROM input('f.mkv') f "
+        "UNION ALL SELECT g.video[1], "
+        "ARRAY[ROW('other.ttf', 'font/ttf', 'o.ttf')::attachment] AS attachments "
+        "FROM input('f.mkv') g) TO 'out.mkv'",
+        {"f": _attachment_probes()["f"], "g": _attachment_probes()["f"]},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'attachments' takes two different attachment lists" in err.message
 def test_a_bare_chapter_column_tags_the_container_like_any_other_value() -> None:
     """A chapter row's columns feed tag columns exactly as a track row's do, so
     the BARE column is the tag value the concatenation around it already was."""

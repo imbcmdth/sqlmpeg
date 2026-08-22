@@ -193,6 +193,35 @@ class Output:
         )
 
 
+@dataclass(frozen=True)
+class Attachment:
+    """One file to attach to an output: ``-attach <path>`` plus its tags.
+
+    `filename` and `mimetype` are what the container records about the file;
+    either may be None, which leaves ffmpeg's own default in place (it names
+    the attachment after the file's basename and guesses the type). An
+    attachment becomes an output STREAM, numbered after the mapped ones, so
+    its ``-metadata:s:<i>`` index is computed from the file's map count.
+    """
+
+    path: str
+    filename: str | None = None
+    mimetype: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {"path": self.path, "filename": self.filename, "mimetype": self.mimetype}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, object]) -> Attachment:
+        raw_path = d["path"]
+        raw_filename = d.get("filename")
+        raw_mimetype = d.get("mimetype")
+        assert isinstance(raw_path, str)
+        assert raw_filename is None or isinstance(raw_filename, str)
+        assert raw_mimetype is None or isinstance(raw_mimetype, str)
+        return cls(path=raw_path, filename=raw_filename, mimetype=raw_mimetype)
+
+
 @dataclass
 class SinkUnit:
     """One output FILE: its stream list, its destination and its options.
@@ -216,6 +245,9 @@ class SinkUnit:
       written ``NULL AS chapters`` and writes none. A list built from
       ``chapter`` records is one extra ``data:`` ffmetadata input, and this is
       its index.
+    * ``attachments`` are the files riding inside this output, in written
+      order, rendered as ``-attach``. Each becomes an output stream of its
+      own, numbered after ``outputs``.
     * ``tags`` are the file's CONTAINER tags, key -> value, rendered as
       ``-metadata key=value``. A None value CLEARS the key and still renders
       (``-metadata key=``): ffmpeg copies an input's globals by default.
@@ -238,6 +270,7 @@ class SinkUnit:
     tags: dict[str, str | None] = field(default_factory=dict)
     window: tuple[float | None, float | None] | None = None
     chapters: int | None = None
+    attachments: list[Attachment] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         d: dict[str, object] = {
@@ -253,6 +286,8 @@ class SinkUnit:
             d["window"] = [self.window[0], self.window[1]]
         if self.chapters is not None:
             d["chapters"] = self.chapters
+        if self.attachments:
+            d["attachments"] = [one.to_dict() for one in self.attachments]
         return d
 
     @classmethod
@@ -263,7 +298,9 @@ class SinkUnit:
         raw_tags = d.get("tags")
         raw_window = d.get("window")
         raw_chapters = d.get("chapters")
+        raw_attachments = d.get("attachments")
         assert raw_chapters is None or isinstance(raw_chapters, int)
+        assert raw_attachments is None or isinstance(raw_attachments, list)
         assert isinstance(raw_outputs, list)
         assert raw_path is None or isinstance(raw_path, str)
         assert isinstance(raw_options, dict)
@@ -292,6 +329,11 @@ class SinkUnit:
             tags=tags,
             window=window,
             chapters=raw_chapters,
+            attachments=[
+                Attachment.from_dict(one)
+                for one in (raw_attachments or [])
+                if isinstance(one, dict)
+            ],
         )
 
 

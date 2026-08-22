@@ -164,9 +164,9 @@ _DIALECT_TAIL = """\
   `input()` alias in a media query that is `video`, `audio`, `subtitle`,
   `data` -- in THAT order, whatever order the file stores them in -- each one
   a plain passthrough column, the same as writing every subscript out by
-  hand; `chapters` takes no output position (a chapter is not a stream) and
-  rides through as ffmpeg's own default unless a `chapters` column says
-  otherwise. A bare `*` does every `FROM` alias in `FROM` order.
+  hand; `chapters` and `attachments` take no output position (neither is a
+  stream) and ride through as ffmpeg's own defaults unless a column of that
+  name says otherwise. A bare `*` does every `FROM` alias in `FROM` order.
   `<alias>.*` does one, and mixes freely with other columns:
   `SELECT a.*, b.audio[1]`. Star over an `input()` alias needs a readable
   file to size it (same policy as a bare array: `INPUT_NOT_FOUND` if it
@@ -232,8 +232,8 @@ _DIALECT_TAIL = """\
   schema order -- the metadata table. `tags` and `disposition` are NOT in the
   star (one disposition cell is every flag ffmpeg knows); name them to print
   them. `<input alias>.*` there prints every writable array column as one
-  cell each, `chapters` included; `cues` is read-only and stays out, so name
-  it to print it.
+  cell each, `chapters` and `attachments` included; `cues` is read-only and
+  stays out, so name it to print it.
 - `WHERE` over row columns compares a column against a literal; `ON`
   compares a column against another row's column or a literal: `=`, `!=`,
   `<`, `<=`, `>`, `>=`, `BETWEEN`, `IS [NOT] NULL`, `[NOT] IN (literals)`,
@@ -363,6 +363,27 @@ _DIALECT_TAIL = """\
   c` writes a chapter list as a caption track, and
   `array_agg(ROW(c.text, c.start_t, c.end_t)::chapter) AS chapters` over
   `unnest(v.cues) c` imports a `.vtt` file as a chapter list.
+
+### Attachments
+- `attachments` is a third record array of the input alias, the files riding
+  inside the container -- a subtitle font, cover art, a script: `FROM
+  input('film.mkv') f, unnest(f.attachments) a`. A file carrying none reads
+  zero rows. Every row carries `index` (1-based, the file's own order),
+  `filename` and `mimetype`; an attachment is not a stream, so the rows read
+  exactly like chapter rows and take no per-type stream index.
+- To WRITE attachments, give the COPY's SELECT a column aliased
+  `attachments` holding an array of `attachment` records: `SELECT
+  f.video[1], f.audio[1], ARRAY[ROW('font.ttf',
+  'application/x-truetype-font', 'fonts/font.ttf')::attachment] AS
+  attachments FROM input('film.mkv') f`. The record is
+  `ROW(filename, mimetype, path)`: `path` is the file to read and may not be
+  `NULL`, while `filename` and `mimetype` are what the container records and
+  may each be `NULL` to leave ffmpeg's own default. `path` is write-only --
+  a container carries the bytes, not where they came from, so an attachment
+  row has no `path` column to read back.
+- `NULL AS attachments` writes a file carrying none, which is also what
+  omitting the column does; ffmpeg attaches nothing on its own. Matroska is
+  the container that carries attachments.
 
 ### Broadcasting
 - Passing a bare array where a function expects one stream applies the call

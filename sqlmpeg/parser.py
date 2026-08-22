@@ -428,8 +428,9 @@ _GROUP_VALUE_HINT = (
 def _record_not_stream_hint(alias: str, record: str) -> str:
     """Why a record row has nothing to select, and what to read instead."""
     first = RECORD_FIELDS[record][0].name
+    named = f"{article(record)} {record}"
     return (
-        f"a {record} is not a track, so a {record} row has no stream to "
+        f"{named} is not a track, so {named} row has no stream to "
         f"select; read its metadata columns instead, e.g. {alias}.{first}"
     )
 
@@ -1386,6 +1387,12 @@ class Resolved:
 
 def _listed_columns(names: Iterable[str]) -> str:
     return ", ".join(sorted(names))
+
+
+def article(word: str) -> str:
+    """The indefinite article `word` takes, so a message naming a type reads
+    as English: an attachment, a chapter."""
+    return "an" if word[:1].lower() in "aeiou" else "a"
 
 
 def record_unnest_hint(alias: str, column: str = CHAPTERS_COLUMN) -> str:
@@ -3859,7 +3866,7 @@ class _Resolver:
                 record = RECORD_ELEMENTS[array_column]
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"'{alias}' is a {record} row, not a stream",
+                    f"'{alias}' is {article(record)} {record} row, not a stream",
                     column,
                     fallback=select,
                     hint=_record_not_stream_hint(alias, record),
@@ -3879,22 +3886,22 @@ class _Resolver:
                 record = RECORD_ELEMENTS[array_column]
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"'{alias}' is a {record} row, and a {record} carries no "
-                    f"{ref[0]}",
+                    f"'{alias}' is {article(record)} {record} row, and "
+                    f"{article(record)} {record} carries no {ref[0]}",
                     column,
                     fallback=select,
-                    hint=f"a {record} row exposes {_listed_columns(schema)}",
+                    hint=f"{article(record)} {record} row exposes "
+                    f"{_listed_columns(schema)}",
                 )
             return _map_column_type(ref, alias, column, select)
         if name in _REMOVED_STREAM_TAGS and name not in schema and not record_row:
             raise _removed_tag_error(alias, name, column, select)
         column_type = schema.get(name)
         if column_type is None:
-            exposes = (
-                f"a {RECORD_ELEMENTS[array_column]} row exposes"
-                if record_row
-                else f"{array_column} track rows expose"
-            )
+            exposes = f"{array_column} track rows expose"
+            if record_row:
+                record = RECORD_ELEMENTS[array_column]
+                exposes = f"{article(record)} {record} row exposes"
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"unknown column '{alias}.{column.name}'",
@@ -3985,8 +3992,8 @@ class _Resolver:
             record = RECORD_ELEMENTS[array_column]
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"'{alias}.{array_column}' cannot be subscripted: a {record} "
-                "is not a stream",
+                f"'{alias}.{array_column}' cannot be subscripted: "
+                f"{article(record)} {record} is not a stream",
                 inner,
                 fallback=fallback,
                 hint=record_unnest_hint(alias, array_column),
@@ -4937,7 +4944,7 @@ class _Resolver:
                 )
                 raise _error(
                     ErrorCode.UNSUPPORTED_SQL,
-                    f"a {record} record is not a value on its own",
+                    f"{article(record)} {record} record is not a value on its own",
                     node,
                     fallback=fallback,
                     hint=f"gather records into an array, e.g. {gathered}",
