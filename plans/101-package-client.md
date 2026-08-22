@@ -40,6 +40,26 @@ it).
   publishing is not open and submissions are a PR to the registry repo.
   It ships so the command surface is honest about the intended shape.
 
+## Waves
+
+Three, in order; each lands green on its own.
+
+**A - the manifest grows a second half.** `sources` -> `exports`, plus
+`bin`: a map of program name to query file. Validated by ROLE - an
+export holds definitions and nothing else (wave 100A's rule, unchanged),
+a bin file is a query and that rule must not reach it. `sqlmpeg list`
+prints what a project and its dependencies provide: functions with
+signatures, programs with their variables (from the `-- variables:`
+header the cookbook harness parses). No new writes, no network.
+
+**B - the local write commands.** `init`, `link`, `unlink`, the
+`publish` stub, running a bin by name, and the `--allow-run` ->
+`--allow-unsafe` rename. Every write atomic. No network.
+
+**C - the registry client.** `search` and `install`: HTTP against static
+JSON, the index cached in the store, blobs verified before they land.
+The `search` MCP tool. `install` and `link` behind `--allow-unsafe`.
+
 ## Rules
 
 - Every write is atomic (`tempfile.mkstemp` + `os.replace`), like the
