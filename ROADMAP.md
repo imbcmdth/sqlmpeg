@@ -93,11 +93,37 @@ unchanged at rung 3.
    ABI) whose parameters name a `.wasm` module makes pluggable WASM
    video filters work on stock ffmpeg, no fork. The ABI's limits
    (video-only, packed RGBA, one input) are fine for the proof.
-2. **An out-of-process host.** `ffmpeg | sqlmpeg-wasm-host | ffmpeg`:
-   raw frames and PCM over pipes, compiled as a command sequence (the
-   machinery two-pass encoding and loudnorm2 already use). Unlocks
-   audio, high bit depths, and multi-stream filters - and a
-   process-per-stage is exactly the unit a distributed engine
+2. **An out-of-process host** - and as of 2026-08-22 the maintainer
+   expects this, not rung 1, to be the primary shape: a sidecar ffmpeg
+   pipes into and back out of. The copy costs less than
+   frame- or slice-level parallelism wins. `ffmpeg <filters> |
+   sqlmpeg-wasm-host | ffmpeg <rest>`, with possibly several stages per
+   query.
+
+   What it asks of the compiler, worth knowing before starting:
+   - **Partition the filter DAG at wasm nodes.** Each segment is one
+     ffmpeg process. The objective is not fewest processes: the pipe
+     carries uncompressed frames (~190 MB/s at 1080p60 yuv420p, ~500
+     for RGBA), so cut where the stream is NARROWEST - after a
+     scale-down, not before.
+   - **The pipe needs a container**, not rawvideo, as soon as a cut
+     carries more than one stream or any timestamps. `nut` is built for
+     this: low overhead, raw-friendly, carries PTS. Losing timestamps
+     across a cut is a silent desync.
+   - **Linear chains print as a shell pipeline; a DAG of stages does
+     not** (it needs fifos or process substitution). The precedent is
+     loudnorm2: `run` orchestrates in process with no shell, `compile`
+     prints a POSIX-only line. Same split - print a pipeline when the
+     cut set is linear, something honest when it is not.
+   - **The split pass grows a cut-set cost.** A stream consumed on both
+     sides of a cut must either cross the pipe twice or have its
+     upstream work duplicated; that is what makes cut placement a real
+     optimization.
+   - **`describe()` should declare the output format transform**, not
+     just the pad signature, so facts survive a cut instead of going
+     NULL at every wasm stage.
+
+   A process per stage is also exactly the unit a distributed engine
    schedules.
 3. **A native `vf_wasm`/`af_wasm`.** wasmtime linked into libavfilter
    in the engine's own ffmpeg builds, frame planes mapped into WASM
