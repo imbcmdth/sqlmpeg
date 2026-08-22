@@ -75,6 +75,51 @@ asked ffmpeg task on the internet), image-sequence input and output,
 audio visualization (`showwaves`/`showspectrum`), a streaming *input*
 example. And `frei0r` deserves a recipe of its own - see below.
 
+## One construct: functions in another language
+
+Maintainer direction (2026-08-22), and it unifies most of what follows.
+A wasm extension should be written as an ordinary sqlmpeg FUNCTION whose
+body is Rust or Go, compiled to wasm - and it should receive ROWS with
+their metadata, not a pixel buffer, and be free to return structured
+data rather than only video.
+
+The door is already in the language: `CREATE FUNCTION ... LANGUAGE sql`
+validates `LANGUAGE` and deliberately rejects every other value.
+
+    CREATE FUNCTION detect_scenes(v video_stream, threshold number)
+    RETURNS TABLE(index number, start_t number, end_t number, score number)
+    AS $$ /* rust */ $$ LANGUAGE rust;
+
+**The return type already says what kind of extension it is**, using a
+distinction the compiler makes today: a value-returning function inlines
+into the graph (`RETURNS video_stream` is a filter stage), a
+table-returning one is a row source (`RETURNS TABLE(...)` is an analysis
+pass). Filters, analysis functions and SQL functions stop being three
+features with three surfaces.
+
+Three consequences worth holding onto:
+
+- **Rows, not buffers.** A video stream is a relation of frames - pts,
+  dimensions, the stream's tags, the planes. Handing a module a
+  frame-row is what lets one signature describe both "returns frames"
+  and "returns facts", and it is the same operator-over-stream model the
+  engine wants later.
+- **Compilation belongs to the registry.** `LANGUAGE rust` implies a
+  toolchain. A package ships the compiled `.wasm` with its source
+  alongside for provenance, and the registry CI compiles it, so nobody
+  needs cargo to USE a filter. An inline body stays possible for small
+  kernels, compiled on demand and cached content-addressed in the store
+  the package client already needs.
+- **Structured output is the genuinely new part.** Once a module returns
+  rows, analysis results are tables you can JOIN: face boxes against
+  speech segments is "who is speaking when", in SQL, over data no ffmpeg
+  filter can hand you. That is the argument for the extension surface -
+  not another denoiser.
+
+The standing constraint: rows from a module mean the compiler must RUN
+it to know them - at compile time as it runs ffprobe, or as a pass
+feeding the next command. That is loudnorm2's shape, already built.
+
 ## User-defined filters: the WASM ladder
 
 The extension model for the engine is WASM filters, and the plan is a
