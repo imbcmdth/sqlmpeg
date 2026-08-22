@@ -18,8 +18,10 @@ and holds dependencies.
 Beside it, ``sqlmpeg.lock`` records what the project INSTALLED: one entry per
 package, either a registry entry pinning a version and the sha256 of the
 archive its content was installed from, or a link entry naming a directory to
-read live. It is
-machine-owned -- installing writes it, nobody hand-edits it.
+read live. It is machine-owned -- installing writes it, nobody hand-edits it.
+An entry's
+namespace is the one that package answers under HERE: two published packages
+may claim the same one, and a lockfile maps one name to one package.
 
 :func:`discover` builds the set a compile resolves in, from three layers, the
 first claim on a namespace winning:
@@ -75,6 +77,7 @@ __all__ = [
     "PackageSet",
     "Program",
     "RegistryEntry",
+    "add_dependency",
     "discover",
     "find_lockfile",
     "find_manifest",
@@ -533,7 +536,11 @@ _KINDS = ("link", "registry")
 
 @dataclass(frozen=True)
 class RegistryEntry:
-    """A package installed from the registry: a version, and the archive digest that pinned it."""
+    """A package installed from the registry: a version, and the archive digest that pinned it.
+
+    `namespace` is what this project calls the package, which is its own claim
+    unless it was installed under another one.
+    """
 
     namespace: str
     name: str
@@ -812,6 +819,40 @@ def write_manifest(
     _write_atomically(path, _rendered(payload))
 
 
+def add_dependency(path: Path, name: str, version: str) -> None:
+    """Record `name` at `version` in the ``dependencies`` of the manifest at `path`.
+
+    The file is rewritten from its own text rather than from a parsed
+    `Package`: a manifest holds the glob patterns it was written with, and
+    regenerating it from the files those patterns matched would replace what
+    the author wrote with what it happened to expand to today. Key order is
+    kept, so a rewrite shows only the dependency that was added.
+
+    The version is written exact. A range is a thing a manifest may hold and
+    a reader may show; nothing here solves one.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as err:
+        raise _reject(path, f"could not be read: {err.strerror or err}") from err
+    try:
+        data = json.loads(text, object_pairs_hook=_as_object)
+    except (ValueError, RecursionError) as err:
+        raise _reject(path, "is not valid JSON", line=1, col=1, hint=_MANIFEST_HINT) from err
+    if not isinstance(data, dict):
+        raise _reject(path, "is not a JSON object", line=1, col=1, hint=_MANIFEST_HINT)
+    held = data.get("dependencies", {})
+    if not isinstance(held, dict) or any(not isinstance(value, str) for value in held.values()):
+        raise _reject(
+            path,
+            '"dependencies" is not an object of package name to version',
+            line=_key_line(text, "dependencies"),
+            hint=_MANIFEST_HINT,
+        )
+    data["dependencies"] = {**held, name: version}
+    _write_atomically(path, _rendered(dict(data)))
+
+
 def _entry_payload(entry: LockEntry) -> dict[str, object]:
     """One entry as the lockfile writes it, keys in the order the reader lists them."""
     if isinstance(entry, LinkEntry):
@@ -976,7 +1017,14 @@ def _linked_package(entry: LinkEntry, lock: Lockfile, layer: Layer) -> Package:
 
 
 def _stored_package(entry: RegistryEntry, lock: Lockfile, layer: Layer) -> Package:
-    """A registry entry resolved: the store directory its digest names."""
+    """A registry entry resolved: the store directory its digest names.
+
+    The ENTRY's namespace is the one the package answers under, not the
+    manifest's. Two published packages may claim the same one, and this
+    lockfile is where one name maps to one package: installing under another
+    namespace is how a consumer keeps both. The manifest's own claim is the
+    author's proposal, and installing is where it is accepted or overridden.
+    """
     try:
         root = store.load(entry.name, entry.store, entry.sha256)
     except SqlmpegError as err:
@@ -987,10 +1035,9 @@ def _stored_package(entry: RegistryEntry, lock: Lockfile, layer: Layer) -> Packa
         root, entry.namespace, lock, "the stored content is not a package; install it again"
     )
     package = read_manifest(manifest)
-    _same(entry.namespace, package.namespace, "namespace", entry.namespace, lock)
     _same(entry.name, package.name, "name", entry.namespace, lock)
     _same(entry.version, package.version, "version", entry.namespace, lock)
-    return replace(package, layer=layer)
+    return replace(package, namespace=entry.namespace, layer=layer)
 
 
 def _add_layer(packages: dict[str, Package], lock: Lockfile | None, layer: Layer) -> None:

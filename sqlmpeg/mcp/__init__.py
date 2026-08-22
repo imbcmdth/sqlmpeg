@@ -19,8 +19,10 @@ from .tools import (
     dialect_prompt,
     explain_query,
     inspect_query,
+    install_package,
     list_filters,
     run_query,
+    search_packages,
     validate_query,
 )
 
@@ -30,8 +32,10 @@ __all__ = [
     "dialect_prompt",
     "explain_query",
     "inspect_query",
+    "install_package",
     "list_filters",
     "run_query",
+    "search_packages",
     "sdk_available",
     "serve",
     "validate_query",
@@ -59,9 +63,10 @@ def serve(*, allow_unsafe: bool = False) -> None:
     """Serve MCP over stdin/stdout until the client disconnects.
 
     `allow_unsafe` also registers the tools that do something other than
-    answer about a query -- today the ``run`` tool, which executes ffmpeg and
-    writes files. Import the SDK here, not at module load: everything above
-    works without it.
+    answer: ``run``, which executes ffmpeg and writes files, and ``install``,
+    which downloads a package and writes it to the store and to a project's
+    lockfile. Import the SDK here, not at module load: everything above works
+    without it.
     """
     from .server import serve as _serve
 

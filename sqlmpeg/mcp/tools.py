@@ -17,6 +17,12 @@ lockfile instead of the project's, or one linked to a directory no lockfile
 pins. Each warning is a code, a message, the namespace it is about, an anchor
 and a hint. ``validate`` adds the array only when there is one, so a valid
 query with nothing to say still answers with an empty object.
+
+Two tools here are about packages rather than queries.
+:func:`search_packages` reads the registry's catalogue;
+:func:`install_package` downloads a package and writes it to the store and to
+a project's lockfile, which is why the server registers it only when the
+capability flag allows it.
 """
 
 from __future__ import annotations
@@ -27,13 +33,14 @@ from pathlib import Path
 from typing import Any
 
 from .. import binaries
+from .. import packages as packages_module
 from .. import registry as registry_module
 from ..compiler import classify, compile_commands, compile_table_sql
 from ..emit import build_ffmpeg_commands, emit
 from ..errors import ErrorCode, SqlmpegError
 from ..execute import DEFAULT_TIMEOUT, execute
 from ..ir import Graph, SinkUnit
-from ..project import PackageSet, discover
+from ..project import LOCKFILE_NAME, MANIFEST_NAME, PackageSet, discover, find_lockfile
 from ..prompt import build_system_prompt
 from ..table import TableResult, render_csv, render_table
 from ..vars import substitute
@@ -45,8 +52,10 @@ __all__ = [
     "dialect_prompt",
     "explain_query",
     "inspect_query",
+    "install_package",
     "list_filters",
     "run_query",
+    "search_packages",
     "validate_query",
 ]
 
@@ -350,6 +359,59 @@ def run_query(
         ],
         "outputs": [unit.path for unit in _sinks(graphs) if unit.path is not None],
         "warnings": _reported(warnings),
+    }
+
+
+def _reported_index(index: packages_module.Index) -> dict[str, Any]:
+    """Where the catalogue came from, as fields rather than a printed note."""
+    return {"registry": index.base, "cached": index.cached, "unreachable": index.unreachable}
+
+
+def search_packages(term: str | None = None) -> dict[str, Any]:
+    """The registry's catalogue, narrowed to `term`. Reads the network, writes nothing."""
+    index = packages_module.load_index()
+    return {
+        **_reported_index(index),
+        "packages": [listing.to_dict() for listing in packages_module.search(index, term)],
+    }
+
+
+def install_package(
+    package: str, project: str, namespace: str | None = None
+) -> dict[str, Any]:
+    """Install `package` into the project at `project`: the store, then its lockfile.
+
+    `project` is required and is never created: a directory with no lockfile
+    at or above it is not a project, and inventing one is not this tool's
+    call.
+    """
+    lock = find_lockfile(Path(project))
+    if lock is None:
+        raise SqlmpegError(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"no {LOCKFILE_NAME} in {project} or above it",
+            hint="run `sqlmpeg init` in that directory first; installing never creates one",
+        )
+    manifest = lock.parent / MANIFEST_NAME
+    index = packages_module.load_index()
+    installed = packages_module.install(
+        index,
+        package,
+        lock=lock,
+        manifest=manifest if manifest.is_file() else None,
+        namespace=namespace,
+    )
+    return {
+        **_reported_index(index),
+        "name": installed.release.name,
+        "version": installed.release.version,
+        "namespace": installed.namespace,
+        "claimed_namespace": installed.claimed,
+        "sha256": installed.release.sha256,
+        "downloaded": installed.downloaded,
+        "lockfile": str(installed.lock),
+        "manifest": None if installed.manifest is None else str(installed.manifest),
+        "replaced": None if installed.replaced is None else installed.replaced.namespace,
     }
 
 

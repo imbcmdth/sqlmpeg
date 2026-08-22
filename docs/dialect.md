@@ -151,7 +151,9 @@ A **registry** entry pins a version and the sha256 of the ARCHIVE the
 package travels as - one gzipped tar, built so the same content always
 produces the same bytes. `install` hashes the bytes it downloaded
 before opening them: a download that does not match the pin is
-discarded unopened and nothing is written. What matches is extracted
+discarded unopened and nothing is written. Its `namespace` is what this
+project calls the package, which is the manifest's own claim unless it
+was installed under another one. What matches is extracted
 into the store under `~/.cache/sqlmpeg/packages/`, and the extractor
 takes regular files and directories under the package root and nothing
 else - no absolute paths, no `..`, no links, no devices, and a member
@@ -175,6 +177,62 @@ stderr from the CLI, in the `warnings` array of an MCP tool result, and
 through `compile_sql`'s optional `on_warning` callback for a library
 caller.
 
+### The registry
+
+Packages come from a static site: `index.json` is the catalogue,
+`p/<owner>/<name>.json` is one package's detail (every published
+version, and per version the archive's sha256 and size), and
+`archives/<sha256>` is the archive. There is no service and no API
+beyond those files.
+
+The base URL is one setting, `https://imbcmdth.github.io/sqlmpeg-registry`,
+overridden by the `SQLMPEG_REGISTRY` environment variable. It may also
+be a `file://` URL or a plain directory path holding those same files,
+which is what a private registry behind any static host is.
+
+`index.json` is cached under `~/.cache/sqlmpeg/`. The fetch is tried
+every time - a stale catalogue would install an older version than the
+one published - and the cache answers only when the registry cannot be
+reached at all, saying so on stderr (`search`, `install`) or in the
+result's `cached` and `unreachable` fields (the MCP tools). The cache is
+only an optimization: one that cannot be read or written costs a fetch
+and nothing else.
+
+### Searching
+
+`sqlmpeg search tracks` prints the catalogue, narrowed to what matches
+the term: a case-insensitive substring of a package's name, namespace,
+description or the names of the functions it exports. No term lists
+everything, a term matching nothing is an empty table and exit 0, and
+`--json` emits the same results for scripting.
+
+### Installing
+
+`sqlmpeg install broadcast/tracks` resolves the package in the
+catalogue, fetches the archive its detail file names, verifies the bytes
+against the sha256 recorded there before opening them, writes the
+content into the store, and then pins it - a registry entry in the
+lockfile and a dependency in `sqlmpeg.json`. Nothing is recorded before
+the content is in the store, so an install that fails leaves the project
+pinning only what it had.
+
+`install <pkg>@<version>` takes that version; without one, the highest
+published version is taken and written exact. Exact pins only: a
+manifest `dependencies` range is recorded and shown, never solved.
+
+A version already in the store is not downloaded again - the same
+content, installed into a second project or globally, is stored once.
+
+`--as <namespace>` installs the package under a namespace other than the
+one it claims. Two published packages may both claim `tracks`, and this
+lockfile is where one name maps to one package; the namespace in the
+manifest inside the archive is the author's proposal, and the lockfile's
+is what a query calls. It must still be a namespace, and not one sqlmpeg
+holds for itself. Installing over a namespace already claimed replaces
+that claim and says what it replaced.
+
+`-g` and the project rule are `link`'s, below.
+
 ### Linking
 
 `sqlmpeg link ../my-lib` writes a link entry for the namespace that
@@ -186,8 +244,8 @@ linked again.
 
 `-g` writes the machine-wide lockfile instead of the project's. Without
 it, no lockfile at or above the working directory is a usage error
-(exit 2) naming both ways forward - `link -g`, or `init` first. Neither
-command ever creates a lockfile as a side effect.
+(exit 2) naming both ways forward - `install -g` / `link -g`, or `init`
+first. No command ever creates a lockfile as a side effect.
 
 Every write to either file replaces it in one step and pins LF endings,
 and the lockfile is written in insertion order with no timestamp, so
@@ -351,6 +409,14 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   holds a member outside the package root, a link, a device, or more
   members or bytes than the caps allow; an entry the package it points
   at disagrees with.
+- **The registry**: a registry that cannot be read, with nothing cached
+  to answer from; a catalogue or detail file that is not JSON, is not an
+  object, is written in another format version, or holds a malformed
+  field or a name that is not `<owner>/<name>`; a package or a version
+  the catalogue does not publish; an archive that is not the size or the
+  digest its detail file records; an archive whose package says it is a
+  different name or version than what was published; `--as` naming
+  something that is not a namespace, or one that is reserved.
 - **Identifiers**: double-quoted identifiers (except tag-key aliases);
   the reserved names `ffmpeg` and `sqlmpeg` as aliases.
 - **Written records**: a chapter whose span ends at or before it starts,

@@ -90,6 +90,18 @@ def _isolated_store(_store_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _offline_registry(_store_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reaches the published registry.
+
+    A check that forgot to point `SQLMPEG_REGISTRY` somewhere of its own would
+    otherwise fetch over the network in CI. This aims it at a directory that
+    does not exist, so such a check fails as unreachable rather than quietly
+    depending on what is published.
+    """
+    monkeypatch.setenv("SQLMPEG_REGISTRY", str(_store_home / "no-registry-here"))
+
+
+@pytest.fixture(autouse=True)
 def _snapshot_function_surface(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:

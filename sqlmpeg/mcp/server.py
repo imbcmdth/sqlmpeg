@@ -13,12 +13,14 @@ stray write from any library or child process misses the protocol stream.
 stderr is captured into the tool result rather than written anywhere.
 
 One capability flag, not a matrix. ``allow_unsafe`` is the whole of it: the
-tools that only answer about a query are always there, and the ones that do
-something -- today ``run``, which writes files on model say-so -- are behind
-it. A permissions matrix for a local dev tool invites passing every flag, and
-the per-call prompting already lives in the MCP client. So the flag is a
-coarse capability switch, and the precision that matters goes in each tool's
-DESCRIPTION, since that is the text a client shows when it asks.
+tools that only answer -- about a query, or about what the registry publishes
+-- are always there, and the ones that do something are behind it: ``run``,
+which writes files on model say-so, and ``install``, which downloads code and
+writes it to disk and to a project's lockfile. A permissions matrix for a
+local dev tool invites passing every flag, and the per-call prompting already
+lives in the MCP client. So the flag is a coarse capability switch, and the
+precision that matters goes in each tool's DESCRIPTION, since that is the text
+a client shows when it asks.
 """
 
 from __future__ import annotations
@@ -145,6 +147,55 @@ def filters(pattern: str | None = None) -> dict[str, Any]:
     return tools.list_filters(pattern)
 
 
+def search(term: str | None = None) -> dict[str, Any]:
+    """Find installable sqlmpeg packages in the package registry.
+
+    `term` is matched case-insensitively against each package's name,
+    namespace, description and the names of the functions it exports; omit it
+    for the whole catalogue. A term matching nothing returns an empty list.
+
+    Each package has a `name` (`<owner>/<name>`, what the install tool takes),
+    its latest `version`, the `namespace` a query would call it by, a
+    `description`, and the `functions` and `programs` it provides.
+
+    Reads the registry over the network and writes nothing. `registry` is the
+    site it read; `cached` is true when that site could not be reached and the
+    catalogue cached on this machine answered instead, with `unreachable`
+    saying why.
+    """
+    return tools.search_packages(term)
+
+
+def install(package: str, project: str, namespace: str | None = None) -> dict[str, Any]:
+    """Install a package from the registry. This DOWNLOADS CODE and WRITES FILES.
+
+    It fetches an archive over the network, unpacks it into this machine's
+    package store under the home directory, and edits two files in `project`:
+    it pins the package in `sqlmpeg.lock` and records it as a dependency in
+    `sqlmpeg.json`. The code it installs becomes callable by every query
+    compiled in that project.
+
+    The archive is verified against the sha256 the registry publishes before
+    it is opened, so a download that does not match is discarded and nothing
+    is written -- but the registry's own contents are not reviewed by anything
+    here. Install only what the user asked for by name.
+
+    `package` is `<owner>/<name>`, or `<owner>/<name>@<version>` for an exact
+    version; without one, the highest published version is installed and
+    pinned exactly.
+
+    `project` is the directory the project lives in, and is required: a
+    directory with no `sqlmpeg.lock` at or above it is not a project, and this
+    tool never creates one.
+
+    `namespace` installs the package under a namespace other than the one it
+    claims, which is how two packages claiming the same one can both be
+    installed. Installing over a namespace already in the lockfile replaces
+    what held it, reported as `replaced`.
+    """
+    return tools.install_package(package, project, namespace)
+
+
 def run(
     query: str,
     vars: dict[str, str] | None = None,
@@ -175,7 +226,7 @@ def run(
 
 
 def build_server(*, allow_unsafe: bool = False) -> MCPServer[Any]:
-    """The configured server; `allow_unsafe` adds the file-writing ``run`` tool."""
+    """The configured server; `allow_unsafe` adds the tools that write: ``run`` and ``install``."""
     # log_level configures the root logger, and at INFO sqlglot narrates every
     # array subscript it rewrites -- a line per query in the client's log pane.
     server: MCPServer[Any] = MCPServer(
@@ -186,8 +237,10 @@ def build_server(*, allow_unsafe: bool = False) -> MCPServer[Any]:
     server.add_tool(explain)
     server.add_tool(inspect)
     server.add_tool(filters)
+    server.add_tool(search)
     if allow_unsafe:
         server.add_tool(run)
+        server.add_tool(install)
 
     @server.resource(
         DIALECT_URI,

@@ -42,6 +42,16 @@ Subcommands:
 * ``init [--name NAME] [--namespace NS]`` -- write ``sqlmpeg.json``, an empty
   ``sqlmpeg.lock`` and a starter program into the working directory. Refuses
   to overwrite any of the three.
+* ``search [TERM] [--json]`` -- fetch the registry's catalogue and print what
+  matches TERM, filtered locally over each package's name, namespace,
+  description and exported function names. A term matching nothing is an
+  empty table, exit 0.
+* ``install PKG[@VERSION] [--as NS] [-g]`` -- resolve a package in the
+  catalogue, verify the archive it publishes against the digest it records,
+  put it in the store, and pin it in the lockfile and the manifest. No
+  version means the highest published one, written exact. ``--as`` installs
+  it under a namespace other than the one it claims. Same project rule as
+  ``link``: outside a project and without ``-g``, exit 2.
 * ``link PATH [-g]`` / ``unlink NAMESPACE [-g]`` -- record (or drop) a package
   read live out of a directory, in this project's lockfile or, with ``-g``,
   the machine-wide one. Outside a project and without ``-g`` there is no
@@ -105,6 +115,7 @@ from importlib import metadata
 from pathlib import Path
 
 from . import binaries, loudnorm, store
+from . import packages as packages_module
 from . import registry as registry_module
 from .compiler import classify, compile_commands, compile_table_sql
 from .emit import Emitted, build_ffmpeg_commands, emit
@@ -157,6 +168,8 @@ _SUBCOMMANDS = frozenset(
         "run",
         "list",
         "init",
+        "search",
+        "install",
         "link",
         "unlink",
         "publish",
@@ -277,6 +290,31 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="the namespace a query calls this package by (default: derived from the name)",
     )
+
+    search_p = subparsers.add_parser("search", help="find packages in the registry")
+    search_p.add_argument(
+        "term",
+        nargs="?",
+        default=None,
+        help="matched against each package's name, namespace, description and "
+        "function names (default: everything published)",
+    )
+    search_p.add_argument(
+        "--json", action="store_true", dest="as_json", help="emit the results as JSON"
+    )
+
+    install_p = subparsers.add_parser("install", help="install a package from the registry")
+    install_p.add_argument(
+        "package", help="<owner>/<name>, or <owner>/<name>@<version> for an exact version"
+    )
+    install_p.add_argument(
+        "--as",
+        dest="as_namespace",
+        default=None,
+        metavar="NAMESPACE",
+        help="call the package by this namespace instead of the one it claims",
+    )
+    _add_global_argument(install_p)
 
     link_p = subparsers.add_parser("link", help="read a package live out of a directory")
     link_p.add_argument("path", help="the directory holding the package's sqlmpeg.json")
@@ -1127,6 +1165,86 @@ def _described(entry: LockEntry) -> str:
     return f"the installed {entry.name} {entry.version}"
 
 
+def _note_cached_catalogue(index: packages_module.Index) -> None:
+    """Say that the catalogue came off this machine rather than the registry.
+
+    stderr, like every other diagnostic: `search --json`'s stdout is the
+    result a script reads.
+    """
+    if not index.cached:
+        return
+    print(f"note: {index.unreachable}", file=sys.stderr)
+    print("note: answering from the catalogue cached on this machine", file=sys.stderr)
+
+
+def _search_rows(listings: tuple[packages_module.Listing, ...]) -> TableResult:
+    rows: list[list[CellValue]] = [
+        [listing.name, listing.version, listing.namespace, listing.description]
+        for listing in listings
+    ]
+    return TableResult(columns=["package", "version", "namespace", "description"], rows=rows)
+
+
+def _cmd_search(args: argparse.Namespace, on_warning: OnWarning) -> int:
+    """Print the registry's catalogue, narrowed to `term`. Reads nothing local."""
+    try:
+        index = packages_module.load_index()
+    except SqlmpegError as err:
+        _print_error(err)
+        return 1
+    _note_cached_catalogue(index)
+    found = packages_module.search(index, args.term)
+
+    if args.as_json:
+        payload = {
+            "registry": index.base,
+            "cached": index.cached,
+            "packages": [listing.to_dict() for listing in found],
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+    # An empty table, not a rejection: a term nothing matches is an answer.
+    print(render_table(_search_rows(found)))
+    return 0
+
+
+def _cmd_install(args: argparse.Namespace, on_warning: OnWarning) -> int:
+    """Install a package into this project's lockfile, or -g's, and record it."""
+    lock, code = _lock_to_write(args)
+    if lock is None:
+        return code
+    manifest = lock.parent / MANIFEST_NAME
+    try:
+        index = packages_module.load_index()
+        _note_cached_catalogue(index)
+        installed = packages_module.install(
+            index,
+            args.package,
+            lock=lock,
+            manifest=manifest if manifest.is_file() else None,
+            namespace=args.as_namespace,
+        )
+    except SqlmpegError as err:
+        _print_error(err)
+        return 1
+
+    release = installed.release
+    print(f"installed '{installed.namespace}' -> {release.name} {release.version} in {lock}")
+    if installed.replaced is not None:
+        print(f"  replacing {_described(installed.replaced)}")
+    if installed.namespace != installed.claimed:
+        print(f"  the package calls itself '{installed.claimed}'")
+    if not installed.downloaded:
+        print("  its content was already in the store; nothing was downloaded")
+    if installed.manifest is not None:
+        print(f"  recorded in {installed.manifest.name} as a dependency")
+    print(
+        f"a query calls it as {installed.namespace}.name() -- "
+        "`sqlmpeg list` shows what it provides"
+    )
+    return 0
+
+
 def _written_link_path(target: Path, lock: Path, *, relative: bool) -> str:
     """How the lockfile writes the linked directory.
 
@@ -1267,6 +1385,8 @@ _HANDLERS = {
     "run": _cmd_run,
     "list": _cmd_list,
     "init": _cmd_init,
+    "search": _cmd_search,
+    "install": _cmd_install,
     "link": _cmd_link,
     "unlink": _cmd_unlink,
     "publish": _cmd_publish,

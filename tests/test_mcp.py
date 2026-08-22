@@ -290,7 +290,11 @@ _sdk = pytest.mark.skipif(
     not mcp_package.sdk_available(), reason="the mcp extra is not installed"
 )
 
-_BASE_TOOLS = {"compile", "validate", "explain", "inspect", "filters"}
+_BASE_TOOLS = {"compile", "validate", "explain", "inspect", "filters", "search"}
+
+# The tools that answer about something other than one query, and so take no
+# query text: what the local ffmpeg has, and what the registry publishes.
+_QUERYLESS_TOOLS = {"filters", "search", "install"}
 
 
 def _call(server: Any, name: str, arguments: dict[str, Any]) -> Any:
@@ -300,7 +304,7 @@ def _call(server: Any, name: str, arguments: dict[str, Any]) -> Any:
 
 
 @_sdk
-def test_run_is_absent_unless_it_was_allowed() -> None:
+def test_the_writing_tools_are_absent_unless_they_were_allowed() -> None:
     import anyio
 
     from sqlmpeg.mcp.server import build_server
@@ -311,14 +315,30 @@ def test_run_is_absent_unless_it_was_allowed() -> None:
 
 
 @_sdk
-def test_run_is_registered_when_unsafe_tools_were_allowed() -> None:
+def test_run_and_install_are_registered_when_unsafe_tools_were_allowed() -> None:
     import anyio
 
     from sqlmpeg.mcp.server import build_server
 
     server = build_server(allow_unsafe=True)
     names = {t.name for t in anyio.run(server.list_tools)}
-    assert names == _BASE_TOOLS | {"run"}
+    assert names == _BASE_TOOLS | {"run", "install"}
+
+
+@_sdk
+def test_the_install_tool_says_it_downloads_code_and_writes_files() -> None:
+    import anyio
+
+    from sqlmpeg.mcp.server import build_server
+
+    server = build_server(allow_unsafe=True)
+    tool = next(t for t in anyio.run(server.list_tools) if t.name == "install")
+    # The description is the text an MCP client shows the user when it asks.
+    text = (tool.description or "").lower()
+    assert "downloads code" in text and "writes files" in text
+    assert "sqlmpeg.lock" in text and "network" in text
+    assert set(tool.input_schema["properties"]) == {"package", "project", "namespace"}
+    assert tool.input_schema["required"] == ["package", "project"]
 
 
 @_sdk
@@ -331,8 +351,8 @@ def test_every_tool_takes_the_query_and_optional_variables() -> None:
     for tool in anyio.run(server.list_tools):
         properties = tool.input_schema["properties"]
         assert tool.description
-        if tool.name == "filters":
-            assert set(properties) == {"pattern"}
+        if tool.name in _QUERYLESS_TOOLS:
+            assert "query" not in properties
             continue
         assert {"query", "vars"} <= set(properties)
         assert tool.input_schema["required"] == ["query"]
