@@ -29,6 +29,7 @@ from sqlmpeg.compiler import compile_sql
 from sqlmpeg.emit import build_ffmpeg_args, build_ffmpeg_commands, emit
 from sqlmpeg.errors import SqlmpegError
 from sqlmpeg.lower import lower_table
+from sqlmpeg.mcp import tools as mcp_tools
 from sqlmpeg.parser import parse, resolve
 from sqlmpeg.probe import probe
 from sqlmpeg.types import DISPOSITION_KEYS
@@ -2332,3 +2333,48 @@ def test_a_duration_trim_bound_shortens_the_output(tmp_path: Path) -> None:
     _compile_and_run(query, out_path)
 
     assert _ffprobe_duration(out_path) < source_duration
+
+
+# ---------------------------------------------------------------------------
+# the MCP run tool
+# ---------------------------------------------------------------------------
+
+
+def test_the_mcp_run_tool_writes_the_file_and_captures_stderr(tmp_path: Path) -> None:
+    """`run` is the one MCP tool that touches the disk, and the one whose
+    result carries ffmpeg's own words: a server owns no terminal to show
+    them on, so they come back in the result instead."""
+    _require_fixture(_AV2)
+    out_path = tmp_path / "scaled.mp4"
+    query = (
+        f"COPY (SELECT scale(f.video[1], 160, 120) FROM input('{_sql_path(_AV2)}') f) "
+        f"TO '{_sql_path(out_path)}'"
+    )
+
+    result = mcp_tools.run_query(query, timeout=_SUBPROCESS_TIMEOUT)
+
+    assert result["exit_code"] == 0
+    assert result["timed_out"] is False
+    assert result["outputs"] == [_sql_path(out_path)]
+    assert out_path.exists()
+    assert len(result["commands"]) == 1
+    assert "Input #0" in result["commands"][0]["stderr"]
+
+
+def test_the_mcp_run_tool_reports_a_failing_ffmpeg_rather_than_raising(
+    tmp_path: Path,
+) -> None:
+    """A destination directory that does not exist: ffmpeg refuses, and the
+    nonzero exit and its reason come back as data."""
+    _require_fixture(_AV2)
+    out_path = tmp_path / "nowhere" / "out.mp4"
+    query = (
+        f"COPY (SELECT f.video[1] FROM input('{_sql_path(_AV2)}') f) "
+        f"TO '{_sql_path(out_path)}'"
+    )
+
+    result = mcp_tools.run_query(query, timeout=_SUBPROCESS_TIMEOUT)
+
+    assert result["exit_code"] != 0
+    assert not out_path.exists()
+    assert result["commands"][-1]["stderr"] != ""

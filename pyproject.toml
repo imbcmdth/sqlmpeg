@@ -36,12 +36,21 @@ Homepage = "https://github.com/imbcmdth/sqlmpeg"
 include = ["sqlmpeg*"]
 
 [project.optional-dependencies]
+# `sqlmpeg mcp` only; the compiler and the CLI never import it. Kept optional
+# because it drags in a web stack (pydantic, starlette, uvicorn) that a user
+# who only compiles SQL has no use for.
+mcp = [
+    "mcp>=2.0",
+]
 dev = [
     "pytest",
     "ruff",
     "mypy",
     "hypothesis",
     "imagehash",
+    # So CI type-checks and exercises the MCP server; the suite skips those
+    # tests rather than failing when it is absent.
+    "sqlmpeg[mcp]",
 ]
 
 [project.scripts]

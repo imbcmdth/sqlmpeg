@@ -185,6 +185,7 @@ sqlmpeg <command> [-h] [-f FILE] [-v NAME=VALUE] [--timeout TIMEOUT] [-y] [query
 | `explain` | dump the compiled IR graph as JSON | |
 | `validate` | exit 0 if the query compiles, else a line-anchored error | `--json` (machine-readable error object on stdout) |
 | `prompt` | print the LLM system prompt | |
+| `mcp` | serve the compiler to an editor or agent over MCP (stdio) | `--allow-run` (also expose the tool that runs ffmpeg) |
 
 ## The ideas, briefly
 
@@ -215,6 +216,15 @@ $ sqlmpeg validate --json -f query.sql
 ```
 
 The prompt's filter reference is rendered from the same registry the compiler resolves against - your installed ffmpeg - so it cannot drift, and the model works with your actual machine rather than a platonic ideal of one.
+
+An editor or agent that speaks MCP can have the same loop without the pipes:
+
+```bash
+$ pip install "sqlmpeg[mcp]"
+$ sqlmpeg mcp                      # a stdio MCP server; add --allow-run to let it run ffmpeg
+```
+
+It serves the prompt as a resource and five tools: `compile`, `validate` (empty when the query is good, the typed error object when it isn't - the repair loop), `explain`, `inspect` for a file's tracks and chapters, and `filters` for what your ffmpeg actually has. `run` is the sixth, off unless you pass `--allow-run`: everything else returns text about a query, and that one writes files.
 
 ---
 

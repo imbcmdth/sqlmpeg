@@ -77,6 +77,7 @@ def _snapshot_function_surface(
     if request.node.get_closest_marker("exec") is not None:
         return
     from sqlmpeg import cli, compiler
+    from sqlmpeg.mcp import tools as mcp_tools
 
     monkeypatch.setattr(
         compiler, "registry_module", SimpleNamespace(load=_reference_registry)
@@ -85,4 +86,8 @@ def _snapshot_function_surface(
     # -- same shim, same reason: the default tier is deterministic on a bare machine.
     monkeypatch.setattr(
         cli, "registry_module", SimpleNamespace(load=_reference_registry)
+    )
+    # And the MCP tools, whose `filters` tool and dialect resource read it.
+    monkeypatch.setattr(
+        mcp_tools, "registry_module", SimpleNamespace(load=_reference_registry)
     )

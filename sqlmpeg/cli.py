@@ -38,6 +38,11 @@ Subcommands:
 * ``prompt`` -- print the LLM system prompt to stdout. Takes no arguments and
   touches no files, but calls ``registry.load()`` to render the filter
   reference from this machine's ``ffmpeg -filters``/``-help`` output.
+* ``mcp [--allow-run]`` -- serve the compiler to an editor or agent as a stdio
+  MCP server (``sqlmpeg.mcp``). Takes no arguments and needs the optional
+  ``mcp`` extra; without it, one stderr line naming the install command and
+  exit 1. stdout carries the protocol from the moment it starts, so nothing
+  else may write there -- ``--allow-run`` adds the one tool that runs ffmpeg.
 * ``loudnorm2env`` -- read ffmpeg's stderr on stdin, print the
   ``export SQLMPEG_LN_*=`` lines its loudnorm JSON block holds. Takes no
   arguments and touches no files; exit 1 with one stderr line if there is no
@@ -88,13 +93,13 @@ __all__ = ["main"]
 _CHAIN = " && "
 
 # `run` is the DEFAULT subcommand, unconditionally: any argv whose
-# first token is not one of these six names IS run's argv, flags included
+# first token is not one of these names IS run's argv, flags included
 # (`sqlmpeg -f q.sql`). No plausibility checking -- a mistyped subcommand falls
 # through to run's SQL parser and dies as a line-anchored PARSE_ERROR, a
 # better diagnostic than a usage line. Consequence: `sqlmpeg -h` shows run's
 # help, not the top-level one.
 _SUBCOMMANDS = frozenset(
-    {"compile", "explain", "validate", "run", "prompt", loudnorm.ENV_SUBCOMMAND}
+    {"compile", "explain", "validate", "run", "prompt", "mcp", loudnorm.ENV_SUBCOMMAND}
 )
 
 
@@ -178,6 +183,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("prompt", help="print the LLM system prompt for this dialect")
+    mcp_p = subparsers.add_parser("mcp", help="serve the compiler to an editor or agent over MCP")
+    mcp_p.add_argument(
+        "--allow-run",
+        action="store_true",
+        help="also expose the run tool, which executes ffmpeg and writes files",
+    )
     subparsers.add_parser(
         loudnorm.ENV_SUBCOMMAND,
         help="read ffmpeg's stderr on stdin, print loudnorm's measurements as exports",
@@ -529,6 +540,22 @@ def _cmd_prompt(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    """Serve MCP over stdin/stdout; takes no query.
+
+    stdout is the protocol stream from here on, so this handler prints
+    nothing to it -- the missing-SDK message goes to stderr like every other
+    CLI error, before the server would have started.
+    """
+    from . import mcp as mcp_module
+
+    if not mcp_module.sdk_available():
+        print(f"error: {mcp_module.INSTALL_HINT}", file=sys.stderr)
+        return 1
+    mcp_module.serve(allow_run=args.allow_run)
+    return 0
+
+
 def _cmd_loudnorm2env(args: argparse.Namespace) -> int:
     """stdin (ffmpeg's stderr) -> the ``export SQLMPEG_LN_*=`` block.
 
@@ -551,6 +578,7 @@ _HANDLERS = {
     "validate": _cmd_validate,
     "run": _cmd_run,
     "prompt": _cmd_prompt,
+    "mcp": _cmd_mcp,
     loudnorm.ENV_SUBCOMMAND: _cmd_loudnorm2env,
 }
 
