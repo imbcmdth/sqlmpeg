@@ -1,4 +1,4 @@
-"""psql-style variable substitution for query text.
+"""psql-style variable substitution for query text, and the header that declares them.
 
 ``substitute(text, variables)`` scans `text` for three reference forms --
 ``:'name'`` (quoted string literal), ``:"name"`` (quoted identifier), and
@@ -10,13 +10,24 @@ unchanged.
 
 An undefined reference raises `SqlmpegError` (`UNSUPPORTED_SQL`) anchored at
 the reference's own line:col.
+
+``declared_variables(text)`` reads the other direction: the ``-- variables:``
+header a runnable query carries, naming what the reader has to supply::
+
+    -- variables: source (input media path), prefix (output name prefix)
+
+It is a comment, so nothing enforces it and a query without one declares
+nothing.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from .errors import ErrorCode, SqlmpegError
+
+__all__ = ["Variable", "declared_variables", "substitute"]
 
 _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -122,3 +133,61 @@ def _line_col(text: str, offset: int) -> tuple[int, int]:
     last_newline = text.rfind("\n", 0, offset)
     col = offset - last_newline
     return line, col
+
+
+# -- the declaring header --------------------------------------------------
+
+_HEADER_RE = re.compile(r"^--\s*variables:\s*(?P<body>.+)$", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class Variable:
+    """One variable a query declares: its name, and what the header says it is."""
+
+    name: str
+    description: str = ""
+
+
+def declared_variables(text: str) -> tuple[Variable, ...]:
+    """The variables `text`'s ``-- variables:`` header declares, in written order.
+
+    Empty for a query with no such header: the header is documentation, and a
+    query is free not to carry one. A description is whatever the parentheses
+    after a name hold, commas and all; a name written without them declares
+    itself and nothing more.
+    """
+    header = _HEADER_RE.search(text)
+    if header is None:
+        return ()
+    body = header.group("body")
+    found: list[Variable] = []
+    at = 0
+    while at < len(body):
+        match = _NAME_RE.search(body, at)
+        if match is None:
+            break
+        description, at = _description(body, match.end())
+        found.append(Variable(name=match.group(), description=description))
+        # Past the separating comma, so a description's own words are not read
+        # as further names.
+        comma = body.find(",", at)
+        at = len(body) if comma == -1 else comma + 1
+    return tuple(found)
+
+
+def _description(body: str, start: int) -> tuple[str, int]:
+    """The ``(...)`` description at `start`, and where it ends. ("", start) if there is none."""
+    at = start
+    while at < len(body) and body[at].isspace():
+        at += 1
+    if at >= len(body) or body[at] != "(":
+        return "", start
+    depth = 0
+    for end in range(at, len(body)):
+        if body[end] == "(":
+            depth += 1
+        elif body[end] == ")":
+            depth -= 1
+            if depth == 0:
+                return body[at + 1 : end].strip(), end + 1
+    return body[at + 1 :].strip(), len(body)  # unclosed: the rest of the line

@@ -1,12 +1,19 @@
 """The project files -- ``sqlmpeg.json`` and ``sqlmpeg.lock`` -- and what a query may call.
 
 A directory holding a ``sqlmpeg.json`` is a PROJECT, and a project is itself a
-PACKAGE: the manifest claims a namespace and lists the SQL sources that
-namespace exports, so a query in ``queries/`` can call a function defined in
-``src/``::
+PACKAGE: the manifest claims a namespace and says what the package provides,
+so a query in ``queries/`` can call a function defined in ``src/``::
 
-    { "name": "my-edits", "version": "0.1.0",
-      "namespace": "me", "sources": ["src/*.sql"] }
+    { "name": "my-edits", "version": "0.1.0", "namespace": "me",
+      "exports": ["src/*.sql"],
+      "bin": { "split-chapters": "queries/split.sql" } }
+
+A package provides either half or both. ``exports`` is the library: files of
+``CREATE FUNCTION`` definitions, reached as ``ns.fn(...)``. ``bin`` is named
+runnable programs: one whole parameterized query per name. The two are read
+by ROLE -- an export holds definitions and nothing else, a program is a query
+-- and a manifest declaring neither is a project that only claims a namespace
+and holds dependencies.
 
 Beside it, ``sqlmpeg.lock`` records what the project INSTALLED: one entry per
 package, either a registry entry pinning a version and the sha256 of the
@@ -16,7 +23,7 @@ machine-owned -- installing writes it, nobody hand-edits it.
 :func:`discover` builds the set a compile resolves in, from three layers, the
 first claim on a namespace winning:
 
-1. the local manifest's own sources -- the project is a package,
+1. the local manifest's own exports -- the project is a package,
 2. the local lockfile -- what this project installed,
 3. the global lockfile -- what a global install put on this machine.
 
@@ -24,7 +31,7 @@ All of it is OPTIONAL: none of the three found means no packages, and a query
 compiles exactly as it did before this file existed.
 
 This module reads and validates those two files and resolves a package to the
-directory its sources live in -- the project's own, a linked one, or one in
+directory its files live in -- the project's own, a linked one, or one in
 the content-addressed store (:mod:`sqlmpeg.store`). It does not parse SQL:
 what those files DEFINE is :mod:`sqlmpeg.functions`' business, and keeping the
 split that way is what lets ``functions.py`` import this module without a
@@ -55,6 +62,7 @@ __all__ = [
     "Lockfile",
     "Package",
     "PackageSet",
+    "Program",
     "RegistryEntry",
     "discover",
     "find_lockfile",
@@ -76,18 +84,33 @@ RESERVED_NAMESPACES = frozenset({FILTER_NAMESPACE, MACRO_NAMESPACE, WASM_NAMESPA
 # without quoting is a lowercase plain identifier.
 _NAMESPACE_RE = re.compile(r"[a-z_][a-z0-9_]*")
 
-_REQUIRED = ("name", "version", "namespace", "sources")
-_KNOWN = frozenset({*_REQUIRED, "description", "dependencies"})
+# A program is typed as a command word, so its name is spelled like one: a
+# lowercase letter, then lowercase letters, digits, '-' or '_'.
+_PROGRAM_NAME_RE = re.compile(r"[a-z][a-z0-9_-]*")
+
+# Characters that make a written path a pattern rather than a file.
+_GLOB_CHARACTERS = "*?["
+
+_REQUIRED = ("name", "version", "namespace")
+_KNOWN = frozenset({*_REQUIRED, "bin", "description", "dependencies", "exports"})
 
 _NAMESPACE_HINT = (
     "a namespace is a lowercase plain identifier: a letter or underscore, then "
     "letters, digits or underscores"
 )
 _MANIFEST_HINT = (
-    'a manifest is one JSON object with "name", "version", "namespace" and '
-    '"sources"'
+    'a manifest is one JSON object with "name", "version" and "namespace"; '
+    '"exports" and "bin" are what the package provides, and both are optional'
 )
-_SOURCES_HINT = 'sources is a list of glob patterns relative to the manifest, e.g. ["src/*.sql"]'
+_EXPORTS_HINT = 'exports is a list of glob patterns relative to the manifest, e.g. ["src/*.sql"]'
+_BIN_HINT = (
+    "bin maps a program name to one query file relative to the manifest, e.g. "
+    '{"split-chapters": "queries/split.sql"}'
+)
+_PROGRAM_NAME_HINT = (
+    "a program name is a command word: a lowercase letter, then lowercase "
+    "letters, digits, '-' or '_'"
+)
 
 
 # Which of the three layers a package was found in. Factual, not a judgment:
@@ -97,8 +120,25 @@ Layer = Literal["project", "local", "global"]
 
 
 @dataclass(frozen=True)
+class Program:
+    """One named program: a query file the package ships to be run by name.
+
+    Not an export: its text is a whole query, and the definition reader never
+    opens it.
+    """
+
+    name: str
+    path: Path
+
+
+@dataclass(frozen=True)
 class Package:
-    """One package: the namespace it claims and the sources that namespace exports.
+    """One package: the namespace it claims, and what it provides under it.
+
+    `exports` are the files whose ``CREATE FUNCTION`` definitions the
+    namespace answers for; `programs` are the named queries it ships. Either
+    may be empty -- a manifest with neither claims a namespace and holds
+    dependencies, which is what a consumer project's does.
 
     `linked` marks a package read straight out of a working directory rather
     than out of the store. Its files are whatever they are right now, so no
@@ -109,10 +149,18 @@ class Package:
     name: str
     version: str
     root: Path
-    sources: tuple[Path, ...]
+    exports: tuple[Path, ...]
     manifest: Path
+    programs: tuple[Program, ...] = ()
     layer: Layer = "project"
     linked: bool = False
+
+    def program(self, name: str) -> Program | None:
+        """The program `name`, or None when this package ships no such program."""
+        for program in self.programs:
+            if program.name == name:
+                return program
+        return None
 
 
 @dataclass(frozen=True)
@@ -174,6 +222,29 @@ def _did_you_mean(name: str, candidates: list[str]) -> str | None:
 # -- reading one manifest --------------------------------------------------
 
 
+class _Object(dict[str, object]):
+    """A parsed JSON object that remembers the keys its text wrote twice.
+
+    ``json`` keeps the last of two same-named keys and says nothing, which
+    would silently drop one of two programs written under one name.
+    """
+
+    repeated: tuple[str, ...] = ()
+
+
+def _as_object(pairs: list[tuple[str, object]]) -> _Object:
+    """The object-parsing hook: build the dict, and note every repeated key."""
+    seen: set[str] = set()
+    repeated: list[str] = []
+    for key, _value in pairs:
+        if key in seen and key not in repeated:
+            repeated.append(key)
+        seen.add(key)
+    parsed = _Object(pairs)
+    parsed.repeated = tuple(repeated)
+    return parsed
+
+
 def _text_field(data: dict[str, object], key: str, path: Path, text: str) -> str:
     value = data[key]
     if not isinstance(value, str) or not value.strip():
@@ -214,52 +285,63 @@ def _namespace(data: dict[str, object], path: Path, text: str, *, line: int | No
 
 
 def _patterns(data: dict[str, object], path: Path, text: str) -> tuple[str, ...]:
-    line = _key_line(text, "sources")
-    value = data["sources"]
+    """The glob patterns ``exports`` names; empty when it names none."""
+    if "exports" not in data:
+        return ()
+    line = _key_line(text, "exports")
+    value = data["exports"]
     if not isinstance(value, list) or not value:
-        raise _reject(path, '"sources" must be a non-empty list', line=line, hint=_SOURCES_HINT)
+        raise _reject(path, '"exports" must be a non-empty list', line=line, hint=_EXPORTS_HINT)
     patterns: list[str] = []
     for entry in value:
         if not isinstance(entry, str) or not entry.strip():
             raise _reject(
-                path, "every source pattern is a non-empty string", line=line, hint=_SOURCES_HINT
+                path, "every export pattern is a non-empty string", line=line, hint=_EXPORTS_HINT
             )
         patterns.append(entry)
     return tuple(patterns)
 
 
-def _source_files(root: Path, patterns: tuple[str, ...], path: Path, text: str) -> tuple[Path, ...]:
+def _leaves_project(written: str) -> bool:
+    """True for a written path that names something outside the manifest's directory."""
+    relative = PurePosixPath(written.replace("\\", "/"))
+    if relative.is_absolute() or ".." in relative.parts:
+        return True
+    return re.match(r"[A-Za-z]:", written) is not None
+
+
+def _export_files(root: Path, patterns: tuple[str, ...], path: Path, text: str) -> tuple[Path, ...]:
     """Every file the patterns name, in pattern then name order, deduplicated.
 
     A pattern that matches nothing is a rejection: it is a typo or a file that
     was moved, and silently exporting nothing would surface later as a
     missing function.
     """
-    line = _key_line(text, "sources")
+    line = _key_line(text, "exports")
     found: list[Path] = []
     seen: set[Path] = set()
     for pattern in patterns:
-        written = PurePosixPath(pattern.replace("\\", "/"))
-        if written.is_absolute() or ".." in written.parts or re.match(r"[A-Za-z]:", pattern):
+        if _leaves_project(pattern):
             raise _reject(
                 path,
-                f"source pattern {pattern!r} leaves the project directory",
+                f"export pattern {pattern!r} leaves the project directory",
                 line=line,
                 hint="a pattern is relative to the manifest and stays under it",
             )
+        written = PurePosixPath(pattern.replace("\\", "/"))
         try:
             matches = sorted(match for match in root.glob(str(written)) if match.is_file())
         except (OSError, ValueError) as err:
             raise _reject(
                 path,
-                f"source pattern {pattern!r} could not be read: {err}",
+                f"export pattern {pattern!r} could not be read: {err}",
                 line=line,
-                hint=_SOURCES_HINT,
+                hint=_EXPORTS_HINT,
             ) from err
         if not matches:
             raise _reject(
                 path,
-                f"source pattern {pattern!r} matches no file",
+                f"export pattern {pattern!r} matches no file",
                 line=line,
                 hint=f"relative to {root}; check the path and the extension",
             )
@@ -271,19 +353,95 @@ def _source_files(root: Path, patterns: tuple[str, ...], path: Path, text: str) 
     return tuple(found)
 
 
+def _program_file(
+    written: str, name: str, root: Path, path: Path, line: int | None
+) -> Path:
+    """The one file program `name` names, validated: under the project, and there."""
+    if _leaves_project(written):
+        raise _reject(
+            path,
+            f"program '{name}' points at {written!r}, which leaves the project directory",
+            line=line,
+            hint="a program's file is relative to the manifest and stays under it",
+        )
+    if any(character in written for character in _GLOB_CHARACTERS):
+        raise _reject(
+            path,
+            f"program '{name}' names the pattern {written!r}, not a file",
+            line=line,
+            hint="one name, one file; a glob belongs in exports",
+        )
+    file = root / Path(*PurePosixPath(written.replace("\\", "/")).parts)
+    try:
+        present = file.is_file()
+    except (OSError, ValueError) as err:
+        raise _reject(
+            path,
+            f"program '{name}': {written!r} could not be read: {err}",
+            line=line,
+            hint=_BIN_HINT,
+        ) from err
+    if not present:
+        raise _reject(
+            path,
+            f"program '{name}' names no file: {written!r}",
+            line=line,
+            hint=f"relative to {root}; check the path and the extension",
+        )
+    return file
+
+
+def _programs(data: dict[str, object], root: Path, path: Path, text: str) -> tuple[Program, ...]:
+    """The programs ``bin`` declares, in written order; empty when it declares none."""
+    if "bin" not in data:
+        return ()
+    at = _key_line(text, "bin")
+    value = data["bin"]
+    if not isinstance(value, dict):
+        raise _reject(path, '"bin" must be a JSON object', line=at, hint=_BIN_HINT)
+    if isinstance(value, _Object) and value.repeated:
+        repeated = value.repeated[0]
+        raise _reject(
+            path,
+            f"bin declares program {repeated!r} twice",
+            line=_key_line(text, repeated) or at,
+            hint="one name, one program; keep the one you meant",
+        )
+    programs: list[Program] = []
+    for name, written in value.items():
+        line = _key_line(text, name) or at
+        if _PROGRAM_NAME_RE.fullmatch(name) is None:
+            raise _reject(
+                path,
+                f"program name {name!r} is not a command name",
+                line=line,
+                hint=_PROGRAM_NAME_HINT,
+            )
+        if not isinstance(written, str) or not written.strip():
+            raise _reject(
+                path,
+                f"program '{name}' must name one file",
+                line=line,
+                hint=_BIN_HINT,
+            )
+        programs.append(Program(name=name, path=_program_file(written, name, root, path, line)))
+    return tuple(programs)
+
+
 def read_manifest(path: Path) -> Package:
     """Parse and validate one ``sqlmpeg.json`` into the package it declares.
 
     Raises ``SqlmpegError`` -- and nothing else -- on every rejection: an
     unreadable file, text that is not JSON, a missing or malformed key, a
-    reserved namespace, a source pattern matching no file.
+    reserved namespace, an export pattern matching no file, a program that
+    names no file.
     """
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as err:
         raise _reject(path, f"could not be read: {err.strerror or err}") from err
     try:
-        data = json.loads(text)
+        data = json.loads(text, object_pairs_hook=_as_object)
     except json.JSONDecodeError as err:
         raise _reject(
             path,
@@ -311,8 +469,9 @@ def read_manifest(path: Path) -> Package:
         name=_text_field(data, "name", path, text),
         version=_text_field(data, "version", path, text),
         root=path.parent,
-        sources=_source_files(path.parent, _patterns(data, path, text), path, text),
+        exports=_export_files(path.parent, _patterns(data, path, text), path, text),
         manifest=path,
+        programs=_programs(data, path.parent, path, text),
     )
 
 
@@ -635,7 +794,7 @@ def _linked_package(entry: LinkEntry, lock: Lockfile, layer: Layer) -> Package:
     """A link resolved: the local layer again, rooted somewhere else.
 
     Same `read_manifest`, so a linked package is validated exactly as the
-    project's own is -- and its sources are read on every compile, which is
+    project's own is -- and its exports are read on every compile, which is
     what makes an edit show up without reinstalling.
     """
     root = _linked_root(entry, lock)

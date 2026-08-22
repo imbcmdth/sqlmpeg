@@ -57,12 +57,12 @@ each read would mint its own ``-i`` for one file.
 
 **A definition need not be written in the script.** A call qualified by a
 namespace a package claims (``me.pick(...)``, :mod:`sqlmpeg.project`) resolves
-to a definition read out of that package's sources and inlines through this
+to a definition read out of that package's exports and inlines through this
 same expander -- same hygiene, same source map, same arity and type checks.
 Nothing is spliced into the script and the flat script namespace is untouched,
 because a package's definitions never enter it.
 
-One rule differs by where a definition was written. A package source is a
+One rule differs by where a definition was written. A package export is a
 LIBRARY: it exports more than any one query calls, so an uncalled definition
 in one is the point of it. A definition in the user's own script is a script's,
 and one nothing calls stays an error. :meth:`_Expander._uncalled` is where that
@@ -98,7 +98,7 @@ from .project import RESERVED_NAMESPACES, Package, PackageSet
 from .types import TYPES, element_type, is_array
 from .warnings import OnWarning, SqlmpegWarning, WarningCode
 
-__all__ = ["NAMEABLE_TYPES", "expanded"]
+__all__ = ["NAMEABLE_TYPES", "Parameter", "Signature", "expanded", "package_signatures"]
 
 # The FROM item that mints an `-i`. Never an argument: it is a table, and a
 # table reference in a value position is not SQL.
@@ -196,7 +196,7 @@ _EXPANSION_BUDGET = 200
 
 
 @dataclass(frozen=True)
-class _Param:
+class Parameter:
     """One position of a signature: a name and a declared type."""
 
     name: str
@@ -215,13 +215,13 @@ class _Function:
     """
 
     name: str
-    params: tuple[_Param, ...]
+    params: tuple[Parameter, ...]
     returns: str
     body: exp.Select
     node: exp.Expr
     aliases: frozenset[str]
     position: int
-    columns: tuple[_Param, ...] | None = None
+    columns: tuple[Parameter, ...] | None = None
     used: bool = False
     namespace: str = ""
 
@@ -231,7 +231,7 @@ class _Function:
 
     @property
     def library(self) -> bool:
-        """True for a definition read out of a package SOURCE, not the script."""
+        """True for a definition read out of a package EXPORT, not the script."""
         return bool(self.namespace)
 
     @property
@@ -309,7 +309,7 @@ def _written(node: exp.Expr | None) -> str:
         return node.__class__.__name__.upper()
 
 
-def _listed(columns: tuple[_Param, ...] | None) -> str:
+def _listed(columns: tuple[Parameter, ...] | None) -> str:
     """The columns an alias would expose, written off an example alias."""
     names = ", ".join(f"t.{column.name}" for column in columns or ())
     return names or "its columns"
@@ -441,7 +441,7 @@ def _reanchor(err: SqlmpegError, name: str, anchor: exp.Expr) -> SqlmpegError:
 
 
 def _body_select(
-    text: str, name: str, anchor: exp.Expr, columns: tuple[_Param, ...] | None
+    text: str, name: str, anchor: exp.Expr, columns: tuple[Parameter, ...] | None
 ) -> exp.Select:
     """Parse and shape-check one body: a single SELECT of the declared width.
 
@@ -492,7 +492,7 @@ def _body_select(
 
 
 def _body_aliases(
-    body: exp.Select, name: str, params: Sequence[_Param], anchor: exp.Expr
+    body: exp.Select, name: str, params: Sequence[Parameter], anchor: exp.Expr
 ) -> frozenset[str]:
     """The names the body binds in its own FROM, checked against the signature."""
     aliases: set[str] = set()
@@ -513,7 +513,11 @@ def _body_aliases(
 
 
 def _check_body_scope(
-    body: exp.Select, name: str, params: Sequence[_Param], aliases: frozenset[str], anchor: exp.Expr
+    body: exp.Select,
+    name: str,
+    params: Sequence[Parameter],
+    aliases: frozenset[str],
+    anchor: exp.Expr,
 ) -> None:
     """Every name the body reads is one of its parameters or one of its own aliases."""
     known = aliases.union(param.name for param in params)
@@ -559,9 +563,9 @@ _TABLE_COLUMN = _Declared(
 
 def _column_defs(
     nodes: Sequence[exp.Expr], name: str, anchor: exp.Expr, create: exp.Create, kind: _Declared
-) -> tuple[_Param, ...]:
+) -> tuple[Parameter, ...]:
     """One ``<name> <type>`` list -- a signature's, or a ``RETURNS TABLE``'s."""
-    declared: list[_Param] = []
+    declared: list[Parameter] = []
     for node in nodes:
         if not isinstance(node, exp.ColumnDef) or not isinstance(node.this, exp.Identifier):
             raise _error(
@@ -591,13 +595,13 @@ def _column_defs(
                 fallback=create,
                 hint=kind.once,
             )
-        declared.append(_Param(written, _checked_type(node.args.get("kind"), name, anchor)))
+        declared.append(Parameter(written, _checked_type(node.args.get("kind"), name, anchor)))
     return tuple(declared)
 
 
 def _table_columns(
     prop: exp.ReturnsProperty, name: str, anchor: exp.Expr, create: exp.Create
-) -> tuple[_Param, ...]:
+) -> tuple[Parameter, ...]:
     """The ``RETURNS TABLE(...)`` column list: the shape the call site's alias exposes."""
     schema = prop.this
     nodes = list(schema.expressions) if isinstance(schema, exp.Schema) else []
@@ -663,7 +667,7 @@ def _define(create: exp.Create) -> _Function:
             fallback=create,
             hint="only a LANGUAGE sql body is a query the compiler can inline",
         )
-    columns: tuple[_Param, ...] | None = None
+    columns: tuple[Parameter, ...] | None = None
     if returns_prop.args.get("is_table"):
         columns = _table_columns(returns_prop, name, identifier, create)
         returns = "TABLE(" + ", ".join(f"{c.name} {c.type}" for c in columns) + ")"
@@ -686,68 +690,124 @@ def _define(create: exp.Create) -> _Function:
     )
 
 
-def _in_source(err: SqlmpegError, namespace: str, path: Path, anchor: exp.Expr) -> SqlmpegError:
-    """A rejection from a package source, said at the call site that reached for it.
+def _in_export(
+    err: SqlmpegError, namespace: str, path: Path, anchor: exp.Expr | None
+) -> SqlmpegError:
+    """A rejection from a package export, said at the call site that reached for it.
 
-    A source file's line numbers mean nothing in the query the reader is
+    An export file's line numbers mean nothing in the query the reader is
     looking at, so the anchor moves to the call and the message carries the
-    file and the line it really came from.
+    file and the line it really came from. With no call to point at -- a
+    listing rather than a compile -- the export's own line is all there is.
     """
-    line, col = _pos(anchor)
+    line, col = _pos(anchor) if anchor is not None else (err.line, err.col)
     at = f" line {err.line}" if err.line is not None else ""
     return SqlmpegError(
         err.code,
-        f"package '{namespace}' source {path}{at}: {err.message}",
+        f"package '{namespace}' export {path}{at}: {err.message}",
         line=line,
         col=col,
         hint=err.hint,
     )
 
 
-def _source_definitions(package: Package, path: Path, anchor: exp.Expr) -> list[_Function]:
-    """Every ``CREATE FUNCTION`` one package source holds, validated.
+def _source_definitions(
+    package: Package, path: Path, anchor: exp.Expr | None
+) -> list[_Function]:
+    """Every ``CREATE FUNCTION`` one package export holds, validated.
 
-    A source is a LIBRARY, so it holds definitions and nothing else: a SELECT
+    An export is a LIBRARY, so it holds definitions and nothing else: a SELECT
     or a COPY in one is a script, and is rejected as one. Every definition it
     yields carries the package's namespace, which is what makes it a library's
     rather than the script's.
+
+    `path` is always one of ``package.exports``. A program's file is a query
+    and is never read here.
     """
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as err:
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            f"package '{package.namespace}': could not read source {path}: "
+            f"package '{package.namespace}': could not read export {path}: "
             f"{err.strerror or err}",
             anchor,
-            hint=f"{package.manifest} lists it as a source",
+            hint=f"{package.manifest} lists it as an export",
         ) from err
     try:
         statements = _statements(parse(text))
     except SqlmpegError as err:
-        raise _in_source(err, package.namespace, path, anchor) from err
+        raise _in_export(err, package.namespace, path, anchor) from err
 
     definitions: list[_Function] = []
     for statement in statements:
         if not (isinstance(statement, exp.Create) and _create_kind(statement) == "FUNCTION"):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"package '{package.namespace}' source {path} holds a statement that "
+                f"package '{package.namespace}' export {path} holds a statement that "
                 "is not a CREATE FUNCTION",
                 anchor,
-                hint="a package source is a library: it defines functions, and a "
-                "query of its own belongs in a script",
+                hint="an export is a library: it defines functions, and a "
+                "query of its own is a program, declared in bin",
             )
         try:
             function = _define(statement)
         except SqlmpegError as err:
-            raise _in_source(err, package.namespace, path, anchor) from err
+            raise _in_export(err, package.namespace, path, anchor) from err
         function.namespace = package.namespace
         # Ahead of every statement of the calling script: a library is already
         # defined when the query that calls it is written.
         function.position = -1
         definitions.append(function)
     return definitions
+
+
+@dataclass(frozen=True)
+class Signature:
+    """One function a package exports: how a call site writes it, and from where.
+
+    `params` and `returns` are the declared types, not the body's; `export` is
+    the file the definition was read out of.
+    """
+
+    namespace: str
+    name: str
+    params: tuple[Parameter, ...]
+    returns: str
+    export: Path
+
+    @property
+    def qualified(self) -> str:
+        """The name a call site writes: ``ns.fn``."""
+        return f"{self.namespace}.{self.name}"
+
+    @property
+    def written(self) -> str:
+        """The call form with its parameters: ``ns.fn(track audio_stream)``."""
+        return f"{self.qualified}({', '.join(f'{p.name} {p.type}' for p in self.params)})"
+
+
+def package_signatures(package: Package) -> tuple[Signature, ...]:
+    """Every function `package` exports, in export then definition order.
+
+    The same reading and validation a compile does, without one: it is what
+    answers "what did I just install" for a caller holding no query. Raises
+    ``SqlmpegError`` for an export that cannot be read, does not parse, or
+    holds anything but ``CREATE FUNCTION``.
+    """
+    found: list[Signature] = []
+    for path in package.exports:
+        for function in _source_definitions(package, path, None):
+            found.append(
+                Signature(
+                    namespace=package.namespace,
+                    name=function.name,
+                    params=function.params,
+                    returns=function.returns,
+                    export=path,
+                )
+            )
+    return tuple(found)
 
 
 # -- reading and rewriting nodes ------------------------------------------
@@ -881,7 +941,7 @@ def _splice(host: exp.Select, body: exp.Select) -> None:
         _and_into(host, where.this)
 
 
-def _name_columns(body: exp.Select, columns: tuple[_Param, ...]) -> None:
+def _name_columns(body: exp.Select, columns: tuple[Parameter, ...]) -> None:
     """Alias each projection to the column ``RETURNS TABLE`` named for it, in order.
 
     Naming the projections is what makes the generated CTE expose the declared
@@ -1032,7 +1092,7 @@ class _Expander:
         """The first definition that had to be called and was not.
 
         The script-versus-library asymmetry, in one place: a definition in a
-        package SOURCE is a library's, and a library exports more than any one
+        package EXPORT is a library's, and a library exports more than any one
         query calls, so only the script's own definitions carry the rule.
         """
         for function in (*self.functions.values(), *self._exported()):
@@ -1042,7 +1102,7 @@ class _Expander:
         return None
 
     def _exported(self) -> Iterator[_Function]:
-        """Every definition read out of a package source so far."""
+        """Every definition read out of a package export so far."""
         for functions in self.exports.values():
             yield from functions.values()
 
@@ -1085,7 +1145,7 @@ class _Expander:
     def _scoped(self, namespace: str) -> Iterator[None]:
         """Whose definitions a bare call name sees while `namespace`'s body expands.
 
-        A package source is its own flat namespace: a library body calling
+        A package export is its own flat namespace: a library body calling
         ``helper()`` means the package's own helper, never the script's, and a
         script body never sees a package's.
         """
@@ -1142,7 +1202,7 @@ class _Expander:
     def _warn_about(self, package: Package, anchor: exp.Expr) -> None:
         """Say what resolving in `package` cost, at the first call that reaches it.
 
-        Once per package: this runs where a namespace's sources are read, and
+        Once per package: this runs where a namespace's exports are read, and
         they are read once per compile. Both warnings are about where the
         definition came FROM, so a query that never calls into the package
         hears nothing.
@@ -1179,11 +1239,14 @@ class _Expander:
             )
 
     def _exports_of(self, package: Package, anchor: exp.Expr) -> dict[str, _Function]:
-        """Every definition `package`'s sources hold, read and parsed once per compile.
+        """Every definition `package`'s exports hold, read and parsed once per compile.
 
         Read on FIRST use of the namespace rather than up front: a package
-        whose sources this query never calls into costs nothing, and a broken
-        source only blocks the queries that reach for it.
+        whose exports this query never calls into costs nothing, and a broken
+        export only blocks the queries that reach for it.
+
+        ``package.exports`` and nothing else: a program's file is a query, and
+        no path through this module opens one.
         """
         cached = self.exports.get(package.namespace)
         if cached is not None:
@@ -1191,10 +1254,10 @@ class _Expander:
         self._warn_about(package, anchor)
         exports: dict[str, _Function] = {}
         origin: dict[str, Path] = {}
-        # Registered before the sources are read so a body calling a sibling
+        # Registered before the exports are read so a body calling a sibling
         # resolves against the same dict this loop is filling.
         self.exports[package.namespace] = exports
-        for path in package.sources:
+        for path in package.exports:
             for function in _source_definitions(package, path, anchor):
                 if function.name in exports:
                     raise _error(
@@ -1202,7 +1265,7 @@ class _Expander:
                         f"package '{package.namespace}' defines '{function.name}' twice: "
                         f"{origin[function.name]} and {path}",
                         anchor,
-                        hint="one name, one definition, across all of a package's sources",
+                        hint="one name, one definition, across all of a package's exports",
                     )
                 exports[function.name] = function
                 origin[function.name] = path

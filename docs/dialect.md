@@ -44,19 +44,34 @@ dest    := 'path' | STDOUT | ( value-expression )
 ## Projects and packages
 
 A directory holding a `sqlmpeg.json` is a project, and the project is a
-package: it claims a namespace, and the SQL files it lists export their
-functions under it.
+package: it claims a namespace and says what it provides under it.
 
 ```json
 { "name": "my-edits", "version": "0.1.0", "namespace": "me",
-  "description": "...", "sources": ["src/*.sql"] }
+  "description": "...",
+  "exports": ["src/*.sql"],
+  "bin": { "split-chapters": "queries/split.sql" },
+  "dependencies": { "broadcast/tracks": "^1.2.0" } }
 ```
 
-`name`, `version`, `namespace` and `sources` are required;
-`description` is optional. `namespace` is a lowercase plain identifier
-and may not be `ffmpeg`, `sqlmpeg` or `wasm`. Each `sources` pattern is
-a glob relative to the manifest, stays under it, and must match at
-least one file.
+`name`, `version` and `namespace` are required; `description`,
+`exports`, `bin` and `dependencies` are optional. `namespace` is a
+lowercase plain identifier and may not be `ffmpeg`, `sqlmpeg` or
+`wasm`.
+
+`exports` is the library: each pattern is a glob relative to the
+manifest, stays under it, and must match at least one file. `bin` is
+the programs, one name to one file - a name is a command word
+(`[a-z][a-z0-9_-]*`), the file is relative to the manifest, stays under
+it, is not a pattern, and must exist. A package may declare either half
+or both; a manifest declaring neither claims a namespace and holds
+dependencies, which is what a consumer project's does.
+
+The two halves are read by role. An export holds `CREATE FUNCTION`
+definitions and nothing else, and one it exports but the query never
+calls is fine - it is a library; an uncalled definition in the query's
+own text is still rejected. A program's file is a whole query, like any
+script, and the definition reader never opens it.
 
 A query calls into the namespace: `me.quieter(f.audio[1], 0.5)` as a
 value, `FROM me.pick('a.mka') t` as a row source. The call is expanded
@@ -65,9 +80,10 @@ hygiene, same arity and type checks, same command out. Nothing is
 prepended to the script, and a package's names never enter the script's
 flat namespace.
 
-A package source holds `CREATE FUNCTION` definitions and nothing else,
-and one it exports but the query never calls is fine - it is a library.
-An uncalled definition in the query's own text is still rejected.
+`sqlmpeg list` prints what the project at the working directory and its
+dependencies provide: the packages with their layer, the functions with
+their signatures, and the programs with the variables each declares
+(read from its `-- variables:` header). `--json` for scripting.
 
 The project is found by walking up from the query file's directory, or
 from the working directory for a query typed on the command line; there
@@ -251,11 +267,13 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   definition in the query's own text that nothing calls, and a
   `TABLE`-returning call in the `SELECT` list.
 - **Packages**: a namespace no manifest claims; a member the namespace
-  does not define; a manifest that is not one JSON object with the four
+  does not define; a manifest that is not one JSON object with the three
   required keys; a namespace that is reserved or is not a plain
-  identifier; a source pattern matching no file or leaving the project
-  directory; one name defined twice across a package's sources; a
-  package source holding anything but `CREATE FUNCTION`.
+  identifier; an export pattern matching no file or leaving the project
+  directory; one name defined twice across a package's exports; an
+  export holding anything but `CREATE FUNCTION`; a program name that is
+  not a command word, declared twice, or naming a pattern, a missing
+  file, or a path outside the project.
 - **Lockfiles**: a lockfile that is not one JSON object with its three
   required keys, or is written in another format version; an entry of
   no known kind, missing a key, or holding an unknown one; two entries

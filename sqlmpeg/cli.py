@@ -35,6 +35,10 @@ Subcommands:
   result set as a table (or CSV, for ``COPY ... WITH (FORMAT csv)``);
   otherwise it runs the compiled ffmpeg command(s) against the ``COPY``'s
   own destination paths.
+* ``list [--json]`` -- print what the project at the working directory and its
+  dependencies provide: one table of packages, one of the functions they
+  export, one of the programs they ship with the variables each declares.
+  Takes no query and reads no SQL beyond those files.
 * ``prompt`` -- print the LLM system prompt to stdout. Takes no arguments and
   touches no files, but calls ``registry.load()`` to render the filter
   reference from this machine's ``ffmpeg -filters``/``-help`` output.
@@ -79,6 +83,7 @@ import os
 import re
 import shlex
 import sys
+from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 
@@ -88,11 +93,12 @@ from .compiler import classify, compile_commands, compile_table_sql
 from .emit import Emitted, build_ffmpeg_commands, emit
 from .errors import SqlmpegError
 from .execute import DEFAULT_TIMEOUT, execute
+from .functions import Signature, package_signatures
 from .ir import Graph, SinkUnit
-from .project import PackageSet, discover
+from .project import Package, PackageSet, Program, discover
 from .prompt import build_system_prompt
-from .table import TableSink, render_csv, render_table
-from .vars import substitute
+from .table import CellValue, TableResult, TableSink, render_csv, render_table
+from .vars import Variable, declared_variables, substitute
 from .warnings import OnWarning, WarningLog
 
 __all__ = ["main"]
@@ -108,7 +114,7 @@ _CHAIN = " && "
 # better diagnostic than a usage line. Consequence: `sqlmpeg -h` shows run's
 # help, not the top-level one.
 _SUBCOMMANDS = frozenset(
-    {"compile", "explain", "validate", "run", "prompt", "mcp", loudnorm.ENV_SUBCOMMAND}
+    {"compile", "explain", "validate", "run", "list", "prompt", "mcp", loudnorm.ENV_SUBCOMMAND}
 )
 
 
@@ -197,6 +203,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "-y", action="store_true", dest="overwrite", help="pass -y (overwrite) to ffmpeg"
     )
 
+    list_p = subparsers.add_parser(
+        "list", help="print what this project and its dependencies provide"
+    )
+    list_p.add_argument(
+        "--json", action="store_true", dest="as_json", help="emit the listing as JSON"
+    )
     subparsers.add_parser("prompt", help="print the LLM system prompt for this dialect")
     mcp_p = subparsers.add_parser("mcp", help="serve the compiler to an editor or agent over MCP")
     mcp_p.add_argument(
@@ -585,6 +597,166 @@ def _echo_command(argv: list[str]) -> None:
     print("$", shlex.join(argv))
 
 
+@dataclass(frozen=True)
+class _ListedProgram:
+    """One program and the variables its query declares."""
+
+    program: Program
+    variables: tuple[Variable, ...]
+
+
+@dataclass(frozen=True)
+class _Listed:
+    """What one package provides, read once and printed either way."""
+
+    package: Package
+    functions: tuple[Signature, ...]
+    programs: tuple[_ListedProgram, ...]
+
+
+def _relative(path: Path, root: Path) -> str:
+    """`path` as the manifest writes it, or its own text when it is elsewhere."""
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _listed(package: Package) -> _Listed:
+    """Read one package's exports and programs. Raises like any other read."""
+    programs = tuple(
+        _ListedProgram(
+            program=program,
+            variables=declared_variables(program.path.read_text(encoding="utf-8")),
+        )
+        for program in package.programs
+    )
+    return _Listed(
+        package=package, functions=package_signatures(package), programs=programs
+    )
+
+
+def _listing_json(listed: list[_Listed]) -> str:
+    """The listing as one JSON object, for scripting."""
+    packages = [
+        {
+            "namespace": entry.package.namespace,
+            "name": entry.package.name,
+            "version": entry.package.version,
+            "layer": entry.package.layer,
+            "linked": entry.package.linked,
+            "root": str(entry.package.root),
+            "functions": [
+                {
+                    "name": signature.name,
+                    "params": [
+                        {"name": param.name, "type": param.type} for param in signature.params
+                    ],
+                    "returns": signature.returns,
+                    "export": _relative(signature.export, entry.package.root),
+                }
+                for signature in entry.functions
+            ],
+            "programs": [
+                {
+                    "name": listed_program.program.name,
+                    "file": _relative(listed_program.program.path, entry.package.root),
+                    "variables": [
+                        {"name": variable.name, "description": variable.description}
+                        for variable in listed_program.variables
+                    ],
+                }
+                for listed_program in entry.programs
+            ],
+        }
+        for entry in listed
+    ]
+    return json.dumps({"packages": packages}, indent=2)
+
+
+def _package_rows(listed: list[_Listed]) -> TableResult:
+    rows: list[list[CellValue]] = [
+        [
+            entry.package.namespace,
+            entry.package.name,
+            entry.package.version,
+            entry.package.layer,
+            entry.package.linked,
+        ]
+        for entry in listed
+    ]
+    return TableResult(
+        columns=["namespace", "package", "version", "layer", "linked"], rows=rows
+    )
+
+
+def _function_rows(listed: list[_Listed]) -> TableResult:
+    rows: list[list[CellValue]] = [
+        [entry.package.namespace, signature.written, signature.returns]
+        for entry in listed
+        for signature in entry.functions
+    ]
+    return TableResult(columns=["namespace", "function", "returns"], rows=rows)
+
+
+def _program_rows(listed: list[_Listed]) -> TableResult:
+    rows: list[list[CellValue]] = [
+        [
+            entry.package.namespace,
+            listed_program.program.name,
+            _written_variables(listed_program.variables),
+            _relative(listed_program.program.path, entry.package.root),
+        ]
+        for entry in listed
+        for listed_program in entry.programs
+    ]
+    return TableResult(columns=["namespace", "program", "variables", "file"], rows=rows)
+
+
+def _written_variables(variables: tuple[Variable, ...]) -> str:
+    """The declared variables as the header writes them, descriptions and all."""
+    return ", ".join(
+        f"{variable.name} ({variable.description})" if variable.description else variable.name
+        for variable in variables
+    )
+
+
+def _cmd_list(args: argparse.Namespace, on_warning: OnWarning) -> int:
+    """Print what the project at the working directory provides. Takes no query.
+
+    The same upward walk every other subcommand does, so the answer is the one
+    a compile here would resolve against.
+    """
+    try:
+        found = discover(Path.cwd())
+        packages = [] if found is None else [found.packages[ns] for ns in found.namespaces()]
+        listed = [_listed(package) for package in packages]
+    except SqlmpegError as err:
+        _print_error(err)
+        return 1
+    except OSError as err:
+        named = err.filename or "a file this project names"
+        print(f"error: could not read {named}: {err.strerror or err}", file=sys.stderr)
+        return 1
+
+    if args.as_json:
+        print(_listing_json(listed))
+        return 0
+
+    # One section per kind, each headed by its own name: three tables in a row
+    # are unreadable without one.
+    sections = [
+        f"{heading}\n{render_table(table)}"
+        for heading, table in (
+            ("packages", _package_rows(listed)),
+            ("functions", _function_rows(listed)),
+            ("programs", _program_rows(listed)),
+        )
+    ]
+    print("\n\n".join(sections))
+    return 0
+
+
 def _cmd_prompt(args: argparse.Namespace, on_warning: OnWarning) -> int:
     print(build_system_prompt(registry_module.load()))
     return 0
@@ -627,6 +799,7 @@ _HANDLERS = {
     "explain": _cmd_explain,
     "validate": _cmd_validate,
     "run": _cmd_run,
+    "list": _cmd_list,
     "prompt": _cmd_prompt,
     "mcp": _cmd_mcp,
     loudnorm.ENV_SUBCOMMAND: _cmd_loudnorm2env,

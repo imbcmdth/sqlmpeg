@@ -1,7 +1,8 @@
 """Tests for queries/ -- ready-to-run programs distilled from the cookbook.
 
 Parametrized over every ``queries/*.sql`` file: the header comment's
-``-- variables:`` list supplies dummy ``-v NAME=VALUE`` pairs, and the file is
+``-- variables:`` list (read by ``sqlmpeg.vars.declared_variables``) supplies
+dummy ``-v NAME=VALUE`` pairs, and the file is
 compiled through ``sqlmpeg.cli.main``. ``validate`` is the harness verb rather
 than ``compile`` because ``tracks-to-csv.sql`` is a metadata/CSV query, which
 the ``compile`` subcommand refuses by design (``compile`` wants an
@@ -25,14 +26,13 @@ import pytest
 
 from sqlmpeg import cli, compiler
 from sqlmpeg.probe import ChapterMeta, ProbeResult, StreamMeta
+from sqlmpeg.vars import declared_variables
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 QUERIES_DIR = REPO_ROOT / "queries"
 QUERY_FILES = sorted(QUERIES_DIR.glob("*.sql"))
 
-_VARIABLES_RE = re.compile(r"^-- variables:\s*(?P<body>.+)$", re.MULTILINE)
 _EXAMPLE_RE = re.compile(r"^-- example:", re.MULTILINE)
-_NAME_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 
 # Dummy values for every variable name used across queries/*.sql -- chosen to
 # match the synthetic probe below (language=eng, codec=aac, 1920x1080) so the
@@ -78,9 +78,9 @@ _DUMMY_VALUES = {
 
 
 def _variables(text: str) -> list[str]:
-    match = _VARIABLES_RE.search(text)
-    assert match is not None, "missing '-- variables:' header"
-    return _NAME_RE.findall(match.group("body"))
+    declared = declared_variables(text)
+    assert declared, "missing '-- variables:' header"
+    return [variable.name for variable in declared]
 
 
 @pytest.fixture(autouse=True)
@@ -135,7 +135,7 @@ def test_queries_dir_has_programs() -> None:
 @pytest.mark.parametrize("path", QUERY_FILES, ids=lambda p: p.name)
 def test_query_file_has_variables_header_and_example(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
-    assert _VARIABLES_RE.search(text), f"{path.name}: missing '-- variables:' header"
+    assert declared_variables(text), f"{path.name}: missing '-- variables:' header"
     assert _EXAMPLE_RE.search(text), f"{path.name}: missing '-- example:' line"
 
 
