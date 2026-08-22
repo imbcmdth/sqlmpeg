@@ -6,17 +6,24 @@ Keep them apart, because almost every mistake in this plan so far came
 from running them together.
 
 **The source repo** — `sqlmpeg-registry` on GitHub, the files on disk.
-One directory per package, holding the current source. Versions are
-ordinary git: a release is a TAG, and history is where old versions
-live. Nothing in here is served to anybody.
+Two directories, and the difference between them is the whole design:
+
+- `packages/<owner>/<name>/` — the CURRENT source of each package, one
+  directory, no version in the path. Reviewed as an ordinary diff.
+- `dist/<owner>/<name>/<version>.tar.gz` — the built archive of every
+  version ever released, committed and accumulating. Never modified,
+  only added to.
 
 **The package repository** — the built site on GitHub Pages, and the
-only thing a client ever talks to. It holds archives, an index of
-versions and their digests, and the HTML. It holds no raw package files
-at all.
+only thing a client ever talks to. It holds the archives and the indexes
+and nothing else: no `packages/`, no raw `.sql` anywhere. A client
+installs an archive; the site reads JSON.
 
-The build is the arrow between them: it reads tags out of the source
-repo and writes archives and JSON into the package repository.
+So there are two builds, and they are different jobs. **Releasing**
+packs the current source at the version its manifest declares and writes
+that one file into `dist/`. **Publishing** reads `dist/`, hashes each
+archive, and lays out the package repository. Releasing happens when a
+version changes; publishing happens on every push to main.
 
 It is not a service. Static files ARE the API: the client fetches them,
 the website fetches the same ones, and there is nothing running between
@@ -26,21 +33,18 @@ to break, rate-limit or pay for.
 
 A PR against `packages/<owner>/<name>/`, holding a `sqlmpeg.json` and
 the files it names — the same manifest the compiler already reads, so a
-package is a project someone pushed. One directory, the current source,
-reviewed as an ordinary diff.
+package is a project someone pushed.
 
-A release is a tag, `<owner>/<name>@<version>`, on a commit whose
-manifest declares that version. The build enumerates a package's tags,
-reads each tagged TREE, and packs it — so every published version stays
-fetchable without a byte of it being duplicated on disk, and `pack`
-being deterministic means a tagged tree always packs to the digest it
-was published under.
+A release bumps the manifest's `version` and adds the archive `build.py
+--release` produces. `pack` is deterministic, so CI repacks the source
+and refuses a PR whose archive is not what that source packs to — the
+committed artifact cannot drift from the tree that made it, and nobody
+has to trust that the contributor ran the script honestly.
 
-That is also what keeps a published version honest: the build compares
-what it computes against the digests already in the live index and
-refuses when one moved. A retagged version is the failure content
-addressing exists to prevent, and it is caught by arithmetic rather than
-by a rule about which files a PR may touch.
+An existing `dist/` file may never be modified or deleted. That is the
+one rule about which files a PR may touch, and it is the rule that makes
+a pinned digest mean something: the archive people installed is the
+archive that stays there.
 
 `owners.json` at the root maps `<owner>` to the GitHub accounts allowed
 to touch it. First PR into an unclaimed owner directory claims it for
@@ -56,20 +60,23 @@ does not reimplement one rule of the dialect.
 - The manifest parses and validates (`read_manifest`), and its
   `namespace` is not reserved.
 - The directory agrees with the manifest: `packages/<owner>/<name>/`
-  matches its `"name"`; a tag's version matches the `"version"` the
-  manifest declares at that commit.
+  matches its `"name"`.
 - Every export holds `CREATE FUNCTION` definitions and nothing else;
   every bin compiles — `sqlmpeg validate`, with the package's own
   namespace resolvable, so a bin may call its own exports.
 - Every dependency resolves to a published version.
-- A tagged version's recomputed digest matches what the live index
-  already publishes for it. A published version is never rewritten.
+- The manifest's version has an archive in `dist/`, and repacking the
+  source reproduces it byte for byte.
+- No existing `dist/` file was modified or deleted.
 
 ## What CI publishes
 
-This is the whole of the package repository. There is no `packages/`
-directory in it, and no raw `.sql` anywhere — a client installs an
-archive, and the site reads JSON.
+Published from `dist/` alone. The source tree is not read here: what
+was released is what ships, and repacking at publish time would be a
+second chance for the two to disagree. What a version's page says about
+it — its signatures, its programs, its description — is read by
+unpacking that version's own archive, so an old version describes itself
+as it was rather than as the current source is.
 
 
 - `index.json` — the whole catalogue: name, latest version, namespace,
@@ -79,8 +86,10 @@ archive, and the site reads JSON.
 - `p/<owner>/<name>.json` — the detail: every published version, and per
   version the archive's `sha256` and size, the function signatures and the
   programs with their variables.
-- `archives/<sha256>` — one gzipped tar per package version, addressed
-  by the sha256 of the archive's own bytes.
+- `archives/<sha256>` — every file in `dist/`, copied under the sha256
+  of its own bytes. Content addressing is for the client; `dist/` keeps
+  the readable name so a human reviewing a PR can see what a new blob
+  is.
 
 **The digest is over the archive.** A package is not only SQL: a wasm
 filter ships a binary, so packages compress and the thing that travels
@@ -175,8 +184,8 @@ only, no exports.
 The files are COPIED into the source repo, not mirrored from the
 sqlmpeg repo. A package is a directory here — that is the whole model,
 and a build that reaches into another repository to assemble one is not
-it. A tagged version is frozen anyway, so a later divergence is a new
-version, not drift.
+it. A released version is frozen in `dist/` anyway, so a later
+divergence is a new version, not drift.
 
 ## Not in v0
 
