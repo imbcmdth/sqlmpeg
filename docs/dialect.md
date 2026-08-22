@@ -147,10 +147,17 @@ should. Each entry is one of two kinds.
   ] }
 ```
 
-A **registry** entry pins a version and the sha256 of the content in
-the store under `~/.cache/sqlmpeg/packages/`. That content is hashed
-again every time it is read, and content that does not match the digest
-is a rejection naming the package, never a fall back to what is there.
+A **registry** entry pins a version and the sha256 of the ARCHIVE the
+package travels as - one gzipped tar, built so the same content always
+produces the same bytes. `install` hashes the bytes it downloaded
+before opening them: a download that does not match the pin is
+discarded unopened and nothing is written. What matches is extracted
+into the store under `~/.cache/sqlmpeg/packages/`, and the extractor
+takes regular files and directories under the package root and nothing
+else - no absolute paths, no `..`, no links, no devices, and a member
+count and uncompressed size cap. Reading a stored package hashes
+nothing; content that is missing from the store is a rejection naming
+the package, never a fall back to what is there.
 
 A **link** entry names a directory and nothing else. Its
 `sqlmpeg.json` is read like any other manifest, so an edit lands in the
@@ -339,9 +346,11 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   no known kind, missing a key, or holding an unknown one; two entries
   claiming one namespace; a lockfile claiming to be reproducible while
   linking a directory; a linked directory with no manifest; stored
-  content that is missing, was written by another store layout, or does
-  not hash to what the entry pins; an entry the package it points at
-  disagrees with.
+  content that is missing or was written by another store layout; a
+  downloaded archive that does not hash to what the entry pins, or that
+  holds a member outside the package root, a link, a device, or more
+  members or bytes than the caps allow; an entry the package it points
+  at disagrees with.
 - **Identifiers**: double-quoted identifiers (except tag-key aliases);
   the reserved names `ffmpeg` and `sqlmpeg` as aliases.
 - **Written records**: a chapter whose span ends at or before it starts,

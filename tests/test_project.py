@@ -14,8 +14,12 @@ same body written into the query itself.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import shutil
+import tarfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -770,11 +774,16 @@ def _library(root: Path, namespace: str, factor: str, *, version: str = "1.0.0")
     return root
 
 
+def _digest(archive: bytes) -> str:
+    return hashlib.sha256(archive).hexdigest()
+
+
 def _installed(source: Path) -> dict[str, object]:
-    """Copy a package into the store; return the lockfile entry that pins it."""
+    """Put a package in the store the way installing does; return the entry that pins it."""
     package = read_manifest(source / "sqlmpeg.json")
-    sha256 = store.digest(source)
-    shutil.copytree(source, store.store_dir() / store.entry_path(sha256))
+    archive = store.pack(source)
+    sha256 = _digest(archive)
+    store.unpack(package.name, archive, sha256)
     return {
         "kind": "registry",
         "name": package.name,
@@ -851,20 +860,6 @@ def test_a_locked_package_resolves_out_of_the_store(store_home: Path, tmp_path: 
     assert said == []
 
 
-def test_store_content_that_does_not_match_its_digest_is_refused(
-    store_home: Path, tmp_path: Path
-) -> None:
-    entry = _installed(_library(tmp_path / "built", "tracks", "0.5"))
-    project = tmp_path / "work"
-    _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [entry])
-    stored = store.store_dir() / str(entry["store"])
-    (stored / "src" / "lib.sql").write_text(_quieter("0.25"), encoding="utf-8")
-    error = _refuses(project, "tracks-lib")
-    assert "hashes to" in error.message
-    assert str(entry["sha256"]) in error.message
-
-
 def test_content_missing_from_the_store_is_refused(store_home: Path, tmp_path: Path) -> None:
     entry = _installed(_library(tmp_path / "built", "tracks", "0.5"))
     project = tmp_path / "work"
@@ -885,6 +880,20 @@ def test_a_store_path_from_another_layout_is_refused(store_home: Path, tmp_path:
     assert "v99" in error.message
 
 
+def test_a_store_path_that_is_not_the_digest_s_own_is_refused(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """An entry pinning one digest while pointing at another's content."""
+    entry = _installed(_library(tmp_path / "built", "tracks", "0.5"))
+    other = _installed(_library(tmp_path / "other", "far", "0.1"))
+    entry["store"] = other["store"]
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [entry])
+    error = _refuses(project, "is not where content of")
+    assert str(entry["sha256"]) in error.message
+
+
 def test_a_lockfile_entry_the_stored_package_disagrees_with_is_refused(
     store_home: Path, tmp_path: Path
 ) -> None:
@@ -894,6 +903,172 @@ def test_a_lockfile_entry_the_stored_package_disagrees_with_is_refused(
     _project(project, files={"src/own.sql": NORMALIZE})
     _lock(project, [entry])
     _refuses(project, "records version '9.9.9'")
+
+
+# ---------------------------------------------------------------------------
+# the archive: packing, verifying, extracting
+# ---------------------------------------------------------------------------
+
+
+def _archive(add: Callable[[tarfile.TarFile], None]) -> tuple[bytes, str]:
+    """A gzipped tar built member by member, and the digest of its bytes."""
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w:gz") as archive:
+        add(archive)
+    data = raw.getvalue()
+    return data, _digest(data)
+
+
+def _one_member(
+    name: str, *, kind: bytes = tarfile.REGTYPE, linkname: str = ""
+) -> tuple[bytes, str]:
+    """An archive holding one member of the given name and kind."""
+
+    def add(archive: tarfile.TarFile) -> None:
+        info = tarfile.TarInfo(name)
+        info.type = kind
+        info.linkname = linkname
+        if kind != tarfile.REGTYPE:
+            archive.addfile(info)
+            return
+        info.size = len(b"payload")
+        archive.addfile(info, io.BytesIO(b"payload"))
+
+    return _archive(add)
+
+
+def _unpacking(archive: bytes, sha256: str) -> SqlmpegError:
+    with pytest.raises(SqlmpegError) as caught:
+        store.unpack("broadcast/tracks", archive, sha256)
+    return caught.value
+
+
+def _nothing_stored(sha256: str) -> None:
+    """Neither the entry nor a half-written one beside it survived the rejection."""
+    entry = store.store_dir() / store.entry_path(sha256)
+    assert not entry.exists()
+    assert not entry.parent.exists() or list(entry.parent.iterdir()) == []
+
+
+def test_packing_a_tree_twice_produces_the_same_bytes(tmp_path: Path) -> None:
+    source = _library(tmp_path / "built", "tracks", "0.5")
+    assert store.pack(source) == store.pack(source)
+
+
+def test_packing_the_same_content_from_two_directories_produces_the_same_bytes(
+    tmp_path: Path,
+) -> None:
+    first = _library(tmp_path / "one", "tracks", "0.5")
+    second = _library(tmp_path / "two", "tracks", "0.5")
+    assert store.pack(first) == store.pack(second)
+
+
+def test_packing_a_tree_holding_a_link_is_refused(tmp_path: Path) -> None:
+    source = _library(tmp_path / "built", "tracks", "0.5")
+    try:
+        (source / "src" / "elsewhere.sql").symlink_to(tmp_path / "outside.sql")
+    except (NotImplementedError, OSError) as err:  # a platform that will not make one
+        pytest.skip(f"symlinks unavailable: {err}")
+    with pytest.raises(SqlmpegError) as caught:
+        store.pack(source)
+    assert "regular files and directories only" in caught.value.message
+
+
+def test_a_verified_archive_unpacks_into_the_store(store_home: Path, tmp_path: Path) -> None:
+    source = _library(tmp_path / "built", "tracks", "0.5")
+    archive = store.pack(source)
+    sha256 = _digest(archive)
+    stored = store.unpack("tracks-lib", archive, sha256)
+    assert stored == store.store_dir() / store.entry_path(sha256)
+    assert (stored / "src" / "lib.sql").read_text(encoding="utf-8") == _quieter("0.5")
+    read_manifest(stored / "sqlmpeg.json")
+
+
+def test_an_archive_that_is_not_what_was_pinned_is_refused(
+    store_home: Path, tmp_path: Path
+) -> None:
+    pinned = _digest(store.pack(_library(tmp_path / "built", "tracks", "0.5")))
+    swapped = store.pack(_library(tmp_path / "other", "tracks", "0.25"))
+    error = _unpacking(swapped, pinned)
+    assert "hashes to" in error.message
+    assert pinned in error.message
+    _nothing_stored(pinned)
+
+
+def test_bytes_that_are_not_an_archive_are_refused_by_their_digest(store_home: Path) -> None:
+    # The rejection names the digest, not a malformed tar: the bytes were never
+    # handed to an unpacker.
+    pinned = "b" * 64
+    error = _unpacking(b"not an archive at all", pinned)
+    assert "hashes to" in error.message
+    _nothing_stored(pinned)
+
+
+def test_unpacking_a_digest_already_in_the_store_leaves_it_alone(
+    store_home: Path, tmp_path: Path
+) -> None:
+    archive = store.pack(_library(tmp_path / "built", "tracks", "0.5"))
+    sha256 = _digest(archive)
+    stored = store.unpack("tracks-lib", archive, sha256)
+    (stored / "marker").write_text("kept", encoding="utf-8")
+    assert store.unpack("tracks-lib", archive, sha256) == stored
+    assert (stored / "marker").read_text(encoding="utf-8") == "kept"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["../escape.sql", "/etc/escape.sql", "..", "src/../../escape.sql", "..\\escape.sql"],
+)
+def test_a_member_that_leaves_the_destination_is_refused(store_home: Path, name: str) -> None:
+    archive, sha256 = _one_member(name)
+    error = _unpacking(archive, sha256)
+    assert "leaves the directory" in error.message
+    _nothing_stored(sha256)
+
+
+@pytest.mark.parametrize(
+    "kind", [tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.CHRTYPE, tarfile.FIFOTYPE]
+)
+def test_a_member_that_is_not_a_file_or_a_directory_is_refused(
+    store_home: Path, kind: bytes
+) -> None:
+    archive, sha256 = _one_member("passwd", kind=kind, linkname="src/lib.sql")
+    error = _unpacking(archive, sha256)
+    assert "neither a regular file nor a directory" in error.message
+    _nothing_stored(sha256)
+
+
+def test_an_archive_unpacking_past_the_size_cap_is_refused(
+    store_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store, "_MAX_UNPACKED_BYTES", 64)
+
+    def add(archive: tarfile.TarFile) -> None:
+        info = tarfile.TarInfo("big.sql")
+        info.size = 4096
+        archive.addfile(info, io.BytesIO(b"\0" * 4096))
+
+    archive, sha256 = _archive(add)
+    error = _unpacking(archive, sha256)
+    assert "more than 64 bytes" in error.message
+    _nothing_stored(sha256)
+
+
+def test_an_archive_past_the_member_cap_is_refused(
+    store_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store, "_MAX_MEMBERS", 2)
+
+    def add(archive: tarfile.TarFile) -> None:
+        for index in range(3):
+            info = tarfile.TarInfo(f"{index}.sql")
+            info.size = 1
+            archive.addfile(info, io.BytesIO(b"x"))
+
+    archive, sha256 = _archive(add)
+    error = _unpacking(archive, sha256)
+    assert "more than 2 members" in error.message
+    _nothing_stored(sha256)
 
 
 def test_a_link_resolves_through_the_directorys_own_manifest(tmp_path: Path) -> None:

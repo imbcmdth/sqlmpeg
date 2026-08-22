@@ -17,7 +17,8 @@ and holds dependencies.
 
 Beside it, ``sqlmpeg.lock`` records what the project INSTALLED: one entry per
 package, either a registry entry pinning a version and the sha256 of the
-content in the store, or a link entry naming a directory to read live. It is
+archive its content was installed from, or a link entry naming a directory to
+read live. It is
 machine-owned -- installing writes it, nobody hand-edits it.
 
 :func:`discover` builds the set a compile resolves in, from three layers, the
@@ -532,7 +533,7 @@ _KINDS = ("link", "registry")
 
 @dataclass(frozen=True)
 class RegistryEntry:
-    """A package installed from the registry: a version, and content pinned by digest."""
+    """A package installed from the registry: a version, and the archive digest that pinned it."""
 
     namespace: str
     name: str
@@ -975,7 +976,7 @@ def _linked_package(entry: LinkEntry, lock: Lockfile, layer: Layer) -> Package:
 
 
 def _stored_package(entry: RegistryEntry, lock: Lockfile, layer: Layer) -> Package:
-    """A registry entry resolved: the store directory its digest names, verified."""
+    """A registry entry resolved: the store directory its digest names."""
     try:
         root = store.load(entry.name, entry.store, entry.sha256)
     except SqlmpegError as err:
