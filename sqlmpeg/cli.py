@@ -7,9 +7,9 @@ A compile is a SEQUENCE of ffmpeg commands — one for every query but a
 ``two_pass`` sink or a ``sqlmpeg.loudnorm2`` graph (two each), and a
 stream-copied fan-out with trim windows (one per output file, the only
 form ffmpeg cuts copied streams correctly in).
-``compile`` prints them joined by `` && `` on one line; ``run`` executes them
-in order, stopping at the first nonzero exit and returning it, with
-``--timeout`` applied per command.
+``compile`` prints them joined by `` && `` on one line; ``run`` hands them to
+``sqlmpeg.execute``, which runs them in order, stops at the first nonzero exit
+and reports it, with ``--timeout`` applied per command.
 
 ``loudnorm2`` is the one compile whose printed line is not pure ffmpeg: its
 measuring pass is wrapped in ``eval "$(... | sqlmpeg loudnorm2env)"``, which
@@ -66,7 +66,6 @@ import json
 import os
 import re
 import shlex
-import subprocess
 import sys
 from importlib import metadata
 from pathlib import Path
@@ -76,14 +75,13 @@ from . import registry as registry_module
 from .compiler import classify, compile_commands, compile_table_sql
 from .emit import Emitted, build_ffmpeg_commands, emit
 from .errors import SqlmpegError
+from .execute import DEFAULT_TIMEOUT, execute
 from .ir import Graph, SinkUnit
 from .prompt import build_system_prompt
 from .table import TableSink, render_csv, render_table
 from .vars import substitute
 
 __all__ = ["main"]
-
-_DEFAULT_TIMEOUT = 600
 
 # `compile` prints a command SEQUENCE as one line: shell chaining, so the
 # printed line runs the passes in order when pasted.
@@ -173,7 +171,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_query_arguments(run_p)
     run_p.add_argument(
-        "--timeout", type=float, default=_DEFAULT_TIMEOUT, help="ffmpeg timeout in seconds"
+        "--timeout", type=float, default=DEFAULT_TIMEOUT, help="ffmpeg timeout in seconds"
     )
     run_p.add_argument(
         "-y", action="store_true", dest="overwrite", help="pass -y (overwrite) to ffmpeg"
@@ -497,58 +495,33 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"error: ffmpeg not found: {binaries.INSTALL_HINT}", file=sys.stderr)
         return 1
 
-    # A two-pass sink compiles to two commands, a loudnorm2 graph to two, a
-    # fan-out COPY to one per row, every other query to one. They run in order
-    # and the first nonzero exit is the run's exit code, so a failed pass 1
-    # never writes the destination. The timeout is per command.
-    #
-    # No shell, on any platform: loudnorm2's handoff is a captured stderr, the
-    # shared parser, and a substitution into the next command's argv -- the
-    # `eval "$(...)"` the printed line shows is only for a pasted command.
-    measured: dict[str, str] = {}
-    for e in emitted:
-        commands = build_ffmpeg_commands(e)
-        measures = bool(e.measure_filter_complex)
-        for index, command in enumerate(commands):
-            capture = measures and index == 0
-            ffmpeg_args = [loudnorm.substitute(word, measured) for word in command]
-            ffmpeg_args.insert(1, "-y" if args.overwrite else "-n")
-            ffmpeg_args.insert(1, "-hide_banner")
+    # `sqlmpeg.execute` owns the loop; the CLI owns the printing. stderr stays
+    # uncaptured (`capture_stderr` left false) so ffmpeg writes its progress
+    # straight to the terminal, and `echo` puts each `$ <cmd>` line in front
+    # of the output it produced.
+    result = execute(
+        emitted,
+        timeout=args.timeout,
+        overwrite=args.overwrite,
+        echo=_echo_command,
+    )
 
-            print("$", shlex.join(ffmpeg_args))
-
-            try:
-                code, captured = _run_ffmpeg(ffmpeg_args, args.timeout, capture=capture)
-            except subprocess.TimeoutExpired:
-                print(f"error: ffmpeg timed out after {args.timeout}s", file=sys.stderr)
-                return 1
-
-            if code != 0:
-                print(captured, file=sys.stderr, end="")
-                print(f"error: ffmpeg exited with code {code}", file=sys.stderr)
-                return code
-
-            if capture:
-                try:
-                    measured = loudnorm.parse(captured)
-                except ValueError as err:
-                    print(f"error: {err}", file=sys.stderr)
-                    return 1
+    if result.timed_out:
+        print(f"error: ffmpeg timed out after {args.timeout}s", file=sys.stderr)
+        return 1
+    if result.measure_error is not None:
+        print(f"error: {result.measure_error}", file=sys.stderr)
+        return 1
+    if result.exit_code != 0:
+        print(result.commands[-1].stderr, file=sys.stderr, end="")
+        print(f"error: ffmpeg exited with code {result.exit_code}", file=sys.stderr)
+        return result.exit_code
 
     return 0
 
 
-def _run_ffmpeg(argv: list[str], timeout: float, *, capture: bool) -> tuple[int, str]:
-    """Run one ffmpeg command; ``(exit code, its stderr)``.
-
-    stderr is captured only for loudnorm2's measuring pass, whose JSON block
-    is the whole point of running it; every other command writes straight
-    through to the terminal, progress lines included.
-    """
-    if not capture:
-        return subprocess.run(argv, timeout=timeout).returncode, ""
-    done = subprocess.run(argv, timeout=timeout, stderr=subprocess.PIPE, text=True)
-    return done.returncode, done.stderr
+def _echo_command(argv: list[str]) -> None:
+    print("$", shlex.join(argv))
 
 
 def _cmd_prompt(args: argparse.Namespace) -> int:

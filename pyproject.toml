@@ -29,8 +29,11 @@ license-files = ["LICENSE"]
 [project.urls]
 Homepage = "https://github.com/imbcmdth/sqlmpeg"
 
-[tool.setuptools]
-packages = ["sqlmpeg"]
+# Found, not listed: a subpackage added under sqlmpeg/ ships in the wheel
+# without a pyproject edit. An explicit list omits it silently -- an editable
+# install keeps working while the wheel is missing the code.
+[tool.setuptools.packages.find]
+include = ["sqlmpeg*"]
 
 [project.optional-dependencies]
 dev = [

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from sqlmpeg import probe as probe_mod
+from sqlmpeg import binaries
 from sqlmpeg.probe import (
     AttachmentMeta,
     ProbeResult,
@@ -72,7 +72,7 @@ def _clear_cache() -> Iterator[None]:
 
 
 def _fake_ffprobe_present(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(probe_mod.binaries, "ffprobe_path", lambda: "/usr/bin/ffprobe")
+    monkeypatch.setattr(binaries, "ffprobe_path", lambda: "/usr/bin/ffprobe")
 
 
 def _fake_run(
@@ -84,7 +84,7 @@ def _fake_run(
         calls.append(argv)
         return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr="")
 
-    monkeypatch.setattr(probe_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", fake_run)
     return calls
 
 
@@ -133,7 +133,7 @@ def test_directory_returns_none(tmp_path: Path) -> None:
 def test_ffprobe_absent_returns_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     f = tmp_path / "x.mp4"
     f.write_bytes(b"not really a video")
-    monkeypatch.setattr(probe_mod.binaries, "ffprobe_path", lambda: None)
+    monkeypatch.setattr(binaries, "ffprobe_path", lambda: None)
     assert probe(str(f)) is None
 
 
@@ -156,7 +156,7 @@ def test_timeout_returns_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     def raise_timeout(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(cmd=argv, timeout=5)
 
-    monkeypatch.setattr(probe_mod.subprocess, "run", raise_timeout)
+    monkeypatch.setattr(subprocess, "run", raise_timeout)
     assert probe(str(f)) is None
 
 
@@ -1017,7 +1017,7 @@ def test_probe_caches_real_ffprobe_call(
         calls.append(argv)
         return orig_run(argv, **kwargs)  # type: ignore[return-value]
 
-    monkeypatch.setattr(probe_mod.subprocess, "run", counting_run)
+    monkeypatch.setattr(subprocess, "run", counting_run)
     path = str(_fixtures / "testsrc.mp4")
     r1 = probe(path)
     r2 = probe(path)

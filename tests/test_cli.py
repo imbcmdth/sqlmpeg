@@ -776,7 +776,7 @@ def _record_runs(monkeypatch: pytest.MonkeyPatch, codes: list[int]) -> list[list
         return subprocess.CompletedProcess(args=argv, returncode=remaining.pop(0))
 
     monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", fake_run)
     return calls
 
 
@@ -904,7 +904,7 @@ def _record_loudnorm_runs(
         return subprocess.CompletedProcess(args=argv, returncode=0, stderr=captured)
 
     monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: "/usr/bin/ffmpeg")
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", fake_run)
     return calls
 
 
