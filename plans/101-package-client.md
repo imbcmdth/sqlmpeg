@@ -57,8 +57,31 @@ header the cookbook harness parses). No new writes, no network.
 `--allow-unsafe` rename. Every write atomic. No network.
 
 **C - the registry client.** `search` and `install`: HTTP against static
-JSON, the index cached in the store, blobs verified before they land.
+JSON, the index cached in the store, archives verified before they land.
 The `search` MCP tool. `install` and `link` behind `--allow-unsafe`.
+
+C also changes what the store pins (maintainer, 2026-08-22). A package
+is not only SQL - a wasm filter ships a binary - so a package travels as
+one compressed archive, and the digest is over the ARCHIVE, not the
+unpacked tree. That is what lets a bad download be thrown away without
+opening it: bytes in, digest, compare to the pin, discard. Nothing
+unverified reaches an unpacker.
+
+Consequences for what wave B shipped:
+
+- `store.digest` over a directory goes. The lockfile's `sha256` is the
+  archive's, checked at install against the bytes off the wire; reads
+  out of the store trust the store, which is the user's own cache and
+  behind the boundary the pin exists to guard. Re-hashing a tree on
+  every compile was affordable for a few KB of SQL and is not for a
+  wasm binary.
+- `store.load` stops re-hashing and checks the entry is there.
+- Extraction is ours to write: regular files and directories under the
+  root, no absolute paths, no `..`, no links, no devices, with a member
+  count and an uncompressed size cap. `tarfile` grew a data filter in
+  3.12 and this project supports 3.10.
+- `docs/dialect.md` says the store's content is hashed again on every
+  read. Fix it there too.
 
 ## Rules
 

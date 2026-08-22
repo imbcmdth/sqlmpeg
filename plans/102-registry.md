@@ -47,25 +47,39 @@ does not reimplement one rule of the dialect.
   Small enough that the site searches it client-side and the client
   caches it whole.
 - `p/<owner>/<name>.json` — the detail: every published version, and per
-  version the file list (`path`, `sha256`, `size`), the **tree digest**,
-  the function signatures and the programs with their variables.
-- `blobs/<sha256>` — one blob per FILE, addressed by the sha256 of its
-  bytes.
+  version the archive's `sha256` and size, the function signatures and the
+  programs with their variables.
+- `archives/<sha256>` — one gzipped tar per package version, addressed
+  by the sha256 of the archive's own bytes.
 
-**Per-file blobs, not archives.** The store's digest
-(`store.digest`) is over an unpacked directory, so an archive's own hash
-would not be the thing the lockfile pins — the client would have to
-unpack before it could verify, which means trusting the archive first
-(path traversal, symlinks, expansion bombs) and verifying second. With a
-file list there is nothing to unpack: the client fetches each blob,
-checks each against its own digest, writes the tree, and recomputes
-`store.digest` over the result. It must equal the tree digest the detail
-JSON records. Packages are a handful of small text files, so the request
-count is not a cost worth an archive format. Files also dedupe across
-versions for free.
+**The digest is over the archive.** A package is not only SQL: a wasm
+filter ships a binary, so packages compress and the thing that travels
+is one compressed file. Hashing what travels is what lets the client
+throw a bad download away without opening it - bytes in, digest, compare
+to the pin, discard. Nothing unverified ever reaches an unpacker, which
+is the ordering that matters when the unpacker is the part with a
+history of path traversal, symlinks and expansion bombs.
 
-CI computes the tree digest with `sqlmpeg`'s own `store.digest`. One
-definition of what a package hashes to, used by both sides.
+So `store.digest` over a directory is the wrong pinned value and goes:
+the lockfile's `sha256` is the archive's, verified at install against
+the bytes off the wire. Reads out of the store trust the store - it is
+the user's own cache under their own home, and the pin already did its
+work at the boundary where the content was untrusted. Re-hashing an
+unpacked tree on every compile was affordable for a few KB of SQL and is
+not for a wasm binary.
+
+Verified is not the same as safe to extract: the digest proves the
+archive is the one the registry published, not that its members are
+well-behaved. The extractor takes regular files and directories under
+the root and nothing else - no absolute paths, no `..`, no links, no
+devices - with a member count and an uncompressed size cap. Python's
+`tarfile` only grew a data filter in 3.12 and this project supports
+3.10, so that check is ours to write.
+
+**Deterministic archives.** Sorted member order, zeroed mtimes, uid/gid
+0, normalized modes, gzip with no timestamp: CI rebuilding a version
+produces the same bytes and so the same digest, and a published version
+never changes underneath a pin.
 
 ## The site
 
