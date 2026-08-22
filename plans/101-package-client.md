@@ -28,6 +28,14 @@ it).
   `install`. `sqlmpeg unlink <namespace>` removes it. The path form is
   primary; npm's two-step register-then-link indirection is the thing
   people get lost in.
+- **Running a package's program**: `sqlmpeg run <bin> -v name=value`.
+  `main()` already decides whether `argv[0]` is a subcommand or query
+  text, and a query can only start with `SELECT`/`COPY`/`CREATE`/
+  `WITH` - so a positional that is not valid SQL and matches an
+  installed bin resolves as one, unambiguously, by the same check one
+  level down. `sqlmpeg list` shows what a project provides and what its
+  dependencies provide: functions, programs, and their variables (read
+  from the `-- variables:` header the cookbook harness already parses).
 - `sqlmpeg publish` — a STUB: exits with a typed message that
   publishing is not open and submissions are a PR to the registry repo.
   It ships so the command surface is honest about the intended shape.

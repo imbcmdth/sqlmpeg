@@ -19,8 +19,23 @@ untouched because package contents never enter it.
 `sqlmpeg.json` - the project manifest, hand-edited:
 
     { "name": "my-edits", "version": "0.1.0", "namespace": "me",
-      "description": "...", "sources": ["src/*.sql"],
+      "description": "...",
+      "exports": ["src/*.sql"],
+      "bin": { "split-chapters": "queries/split.sql" },
       "dependencies": { "broadcast/tracks": "^1.2.0" } }
+
+A package may provide EITHER half or both, npm's shape (maintainer,
+2026-08-22): `exports` is the library - files of `CREATE FUNCTION`
+definitions reached as `ns.fn(...)`; `bin` is named runnable programs -
+whole parameterized queries. They are validated by ROLE: an export
+source holds definitions and nothing else, a bin file is a query.
+(Wave A shipped `sources` meaning exports only, and rejects a `SELECT`
+in one; that rule stays for exports and must not be applied to bins.
+Renaming `sources` -> `exports` is part of this change.)
+
+sqlmpeg's own `queries/` directory is 34 such programs already, with
+`-- variables:` headers - the obvious first registry package, and it
+dogfoods the format rather than inventing one.
 
 `sqlmpeg.lock` - machine-owned, added by 101; this plan reads it if
 present: each entry pins name, version, namespace, sha256 and the store
