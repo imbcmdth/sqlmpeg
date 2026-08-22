@@ -1,29 +1,46 @@
-# 102 — The registry: a separate repo, a static site (Phase 4)
+# 102 — The registry: a source repo, and the site it publishes (Phase 4)
 
-Where installable packages live. A second repository,
-`sqlmpeg-registry`, whose CI validates submissions and publishes a
-static site to GitHub Pages. Plan 101 writes the client that reads it.
+## Two things, both called the repository
 
-The registry is not a service. Static JSON IS the API: the client
-fetches files, the website fetches the same files, and there is nothing
-running between them to break, rate-limit, or pay for. Homebrew's shape,
-which is why the repo can be the repository for a long time.
+Keep them apart, because almost every mistake in this plan so far came
+from running them together.
+
+**The source repo** — `sqlmpeg-registry` on GitHub, the files on disk.
+One directory per package, holding the current source. Versions are
+ordinary git: a release is a TAG, and history is where old versions
+live. Nothing in here is served to anybody.
+
+**The package repository** — the built site on GitHub Pages, and the
+only thing a client ever talks to. It holds archives, an index of
+versions and their digests, and the HTML. It holds no raw package files
+at all.
+
+The build is the arrow between them: it reads tags out of the source
+repo and writes archives and JSON into the package repository.
+
+It is not a service. Static files ARE the API: the client fetches them,
+the website fetches the same ones, and there is nothing running between
+to break, rate-limit or pay for.
 
 ## Submitting
 
-A PR against `packages/<owner>/<name>/<version>/`, holding a
-`sqlmpeg.json` and the files it names — the same manifest the compiler
-already reads, so a package is a project someone pushed.
+A PR against `packages/<owner>/<name>/`, holding a `sqlmpeg.json` and
+the files it names — the same manifest the compiler already reads, so a
+package is a project someone pushed. One directory, the current source,
+reviewed as an ordinary diff.
 
-**One directory per version** (corrected 2026-08-22; an earlier draft of
-this plan said otherwise and was wrong). A client pins an exact version
-and refetches by digest, so every published version's files have to stay
-here or its pins die the first time anyone reinstalls. Packages are
-small text plus at most a binary, so the duplication is cheap, a version
-is auditable as a PR diff, and `pack` being deterministic means any
-version rebuilds to the digest it was published under. CI refuses a PR
-that modifies or deletes an existing version directory: that is how a
-published version stays the one people pinned.
+A release is a tag, `<owner>/<name>@<version>`, on a commit whose
+manifest declares that version. The build enumerates a package's tags,
+reads each tagged TREE, and packs it — so every published version stays
+fetchable without a byte of it being duplicated on disk, and `pack`
+being deterministic means a tagged tree always packs to the digest it
+was published under.
+
+That is also what keeps a published version honest: the build compares
+what it computes against the digests already in the live index and
+refuses when one moved. A retagged version is the failure content
+addressing exists to prevent, and it is caught by arithmetic rather than
+by a rule about which files a PR may touch.
 
 `owners.json` at the root maps `<owner>` to the GitHub accounts allowed
 to touch it. First PR into an unclaimed owner directory claims it for
@@ -38,18 +55,22 @@ does not reimplement one rule of the dialect.
 
 - The manifest parses and validates (`read_manifest`), and its
   `namespace` is not reserved.
-- The directory agrees with the manifest: `packages/<owner>/<name>/<version>/`
-  matches the manifest's `"name"` and `"version"`.
+- The directory agrees with the manifest: `packages/<owner>/<name>/`
+  matches its `"name"`; a tag's version matches the `"version"` the
+  manifest declares at that commit.
 - Every export holds `CREATE FUNCTION` definitions and nothing else;
   every bin compiles — `sqlmpeg validate`, with the package's own
   namespace resolvable, so a bin may call its own exports.
 - Every dependency resolves to a published version.
-- The version is new and higher than the last published one, and no
-  existing version directory was touched. A published version is never
-  rewritten: content behind a pinned digest changing under people is
-  the failure mode content addressing exists to prevent.
+- A tagged version's recomputed digest matches what the live index
+  already publishes for it. A published version is never rewritten.
 
 ## What CI publishes
+
+This is the whole of the package repository. There is no `packages/`
+directory in it, and no raw `.sql` anywhere — a client installs an
+archive, and the site reads JSON.
+
 
 - `index.json` — the whole catalogue: name, latest version, namespace,
   description, the function names it exports and the programs it ships.
@@ -151,11 +172,11 @@ first person who runs `sqlmpeg search`, rather than empty until authors
 show up. Published as `sqlmpeg/queries`, namespace `queries`; programs
 only, no exports.
 
-The files are COPIED into the registry, not mirrored from the sqlmpeg
-repo. A registry package is a directory in this repo — that is the whole
-model, and a build that reaches into another repository to assemble one
-is not it. A published version is frozen anyway, so a later divergence
-is a new version, not drift.
+The files are COPIED into the source repo, not mirrored from the
+sqlmpeg repo. A package is a directory here — that is the whole model,
+and a build that reaches into another repository to assemble one is not
+it. A tagged version is frozen anyway, so a later divergence is a new
+version, not drift.
 
 ## Not in v0
 
