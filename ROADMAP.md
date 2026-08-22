@@ -104,6 +104,47 @@ unchanged at rung 3.
    memory, full pixel-format and timeline support. Same WIT world; the
    modules come along unchanged.
 
+## Analysis functions: user-defined probes
+
+A second kind of extension, orthogonal to the filter ladder above and
+mostly buildable on machinery that already exists.
+
+Scene detection into chapter breaks is not a filter - it produces DATA,
+not pixels. But the row model's facts already come from a program:
+ffprobe answers "what streams are in this file", and nothing says the
+answer to "where are the scene cuts" must come from somewhere else. An
+analysis function is a user-defined probe:
+
+    COPY (
+      SELECT f.video[1], f.audio[1],
+             array_agg(ROW('Scene ' || s.index::text,
+                           s.start_t, s.end_t)::chapter) AS chapters
+      FROM input(:'src') f, analyze.scenes(f.video[1], threshold => 0.4) s
+      GROUP BY f.video[1], f.audio[1]
+    ) TO :'dest'
+
+Every piece of that shape exists today: a table-returning function is a
+row source (096), its rows become a chapter list (094), and running an
+analysis pass before the real command is what `sqlmpeg.loudnorm2`
+already does - `run` executes it in process, `compile` prints the shell
+chain. What is missing is the plugin surface: a second WIT world beside
+the filter one, taking decoded frames (and samples) and returning rows.
+Silence detection, speech to captions, face or shot tracks, and
+loudness all become the same shape.
+
+Multi-modal TRANSFORMS - the moonshot, e.g. re-timing lips to a
+different language track - are harder but not blocked by ffmpeg
+itself: libavfilter allows a filter with both video and audio input
+pads. They are blocked by the plugin ABIs (frei0r is video-only,
+ladspa audio-only), which is why they live at rung 3, and by the
+single-pass model, since that work wants lookahead or the whole file.
+The escape is the same two-pass split: analyse first, transform with
+the analysis in hand.
+
+Both become ordinary once the engine owns the pipeline: a DAG node
+that consumes video and audio and emits media plus metadata is just a
+node with state.
+
 ## Not before 1.0
 
 The engine itself - distribution, persistence, live session management.
