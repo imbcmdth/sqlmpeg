@@ -22,9 +22,11 @@ are read by ROLE -- a lib file holds definitions and nothing else, a
 program's file is a query -- and a manifest declaring neither is a consumer
 project that only holds dependencies.
 
-``dependencies`` keys are ALIASES: the name this project's queries may use for
-a package it installed. The value keeps the installed package's name and the
-version range together; the range is recorded, never solved.
+``dependencies`` keys are package NAMES -- ``<namespace>/<package>`` -- and the
+values are the version range recorded for each; the range is recorded, never
+solved. A call across packages is always written in full,
+``<namespace>.<package>.<member>``, so a manifest's ``dependencies`` needs no
+alias to bind.
 
 Beside it, ``sqlmpeg.lock`` records what the project INSTALLED: one entry per
 package, either a registry entry pinning a version and the sha256 of the
@@ -82,7 +84,6 @@ __all__ = [
     "MANIFEST_NAME",
     "RESERVED_NAMESPACES",
     "STATEMENT_KEYWORDS",
-    "Dependency",
     "LinkEntry",
     "Lockfile",
     "Package",
@@ -165,8 +166,8 @@ _BIN_HINT = (
     'relative to the manifest, e.g. {"duck": "queries/duck.sql"}'
 )
 _DEPENDENCIES_HINT = (
-    'dependencies maps an alias to "<namespace>/<package>@<range>", e.g. '
-    '{"tracks": "broadcast/tracks@^1.2.0"}'
+    'dependencies maps "<namespace>/<package>" to a version range, e.g. '
+    '{"broadcast/tracks": "^1.2.0"}'
 )
 _PROGRAM_NAME_HINT = (
     "a program name is a command word: a lowercase letter, then lowercase "
@@ -200,18 +201,6 @@ Layer = Literal["project", "local", "global"]
 
 
 @dataclass(frozen=True)
-class Dependency:
-    """One manifest dependency: the installed package's name, and the range as written.
-
-    The range is text the manifest holds and a reader may show; nothing here
-    solves one.
-    """
-
-    name: str
-    range: str
-
-
-@dataclass(frozen=True)
 class Package:
     """One package: its name, and what it provides under it.
 
@@ -219,8 +208,10 @@ class Package:
     stored twice. `exports` maps each exported function name to the file
     defining it: a string ``lib``'s one entry, named for the package segment,
     or a map's several. `programs` does the same for the runnable queries,
-    from ``bin``. Several names may share one file. `aliases` is the
-    manifest's ``dependencies``, keyed by alias.
+    from ``bin``. Several names may share one file. `dependencies` is the
+    manifest's own ``dependencies``: each key the depended-on package's name,
+    each value the version range as written -- recorded and shown, never
+    solved.
 
     `linked` marks a package read straight out of a working directory rather
     than out of the store. Its files are whatever they are right now, so no
@@ -233,7 +224,7 @@ class Package:
     manifest: Path
     exports: Mapping[str, Path] = field(default_factory=dict)
     programs: Mapping[str, Path] = field(default_factory=dict)
-    aliases: Mapping[str, Dependency] = field(default_factory=dict)
+    dependencies: Mapping[str, str] = field(default_factory=dict)
     # Set only where the manifest wrote a plain string: the one member that
     # answers to the package's own name.
     root_export: str | None = None
@@ -268,18 +259,10 @@ class Package:
             member = self.root_program
         return None if member is None else self.programs.get(member)
 
-    def dependency(self, alias: str) -> Dependency | None:
-        """What `alias` names in this package's manifest, or None."""
-        return self.aliases.get(alias)
-
 
 @dataclass(frozen=True)
 class PackageSet:
     """The packages a compile may resolve a call in, keyed by name.
-
-    `aliases` maps each of the PROJECT manifest's dependency aliases to the
-    package name it binds; a package the alias names but nothing installed is
-    an alias with no entry in `packages`.
 
     `in_project` is True when the query sits inside a project -- a manifest or
     a lockfile was found above it. It is what makes landing on the global
@@ -289,7 +272,6 @@ class PackageSet:
 
     root: Path
     packages: dict[str, Package] = field(default_factory=dict)
-    aliases: dict[str, str] = field(default_factory=dict)
     in_project: bool = True
 
     def get(self, name: str) -> Package | None:
@@ -299,11 +281,6 @@ class PackageSet:
     def find(self, namespace: str, package: str) -> Package | None:
         """The package the two segments name, or None."""
         return self.packages.get(f"{namespace}/{package}")
-
-    def aliased(self, alias: str) -> Package | None:
-        """The installed package the project's `alias` binds, or None."""
-        name = self.aliases.get(alias)
-        return None if name is None else self.packages.get(name)
 
     def in_namespace(self, namespace: str) -> tuple[Package, ...]:
         """Every package under `namespace`, in name order."""
