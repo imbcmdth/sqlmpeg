@@ -77,51 +77,17 @@ example. And `frei0r` deserves a recipe of its own - see below.
 
 ## One construct: functions in another language
 
-Maintainer direction (2026-08-22), and it unifies most of what follows.
-A wasm extension should be written as an ordinary sqlmpeg FUNCTION whose
-body is Rust or Go, compiled to wasm - and it should receive ROWS with
-their metadata, not a pixel buffer, and be free to return structured
-data rather than only video.
+Superseded by `plans/106-wasm-extensions.md` (2026-08-23). The shape
+there is `LANGUAGE wasm` with Postgres's own two-part `AS` — a module
+and an export — because `LANGUAGE c` never meant "the body is C" either.
+`LANGUAGE rust` is dropped: sqlmpeg compiles SQL, not Rust, and an
+author ships the `.wasm` and the declaration.
 
-The door is already in the language: `CREATE FUNCTION ... LANGUAGE sql`
-validates `LANGUAGE` and deliberately rejects every other value.
+What survives from here: the return type says what kind of extension it
+is (value-returning inlines as a filter stage, table-returning is a row
+source), and frames are rows to the MODULE and never to SQL, because
+every relation the compiler sees has to be countable at compile time.
 
-    CREATE FUNCTION detect_scenes(v video_stream, threshold number)
-    RETURNS TABLE(index number, start_t number, end_t number, score number)
-    AS $$ /* rust */ $$ LANGUAGE rust;
-
-**The return type already says what kind of extension it is**, using a
-distinction the compiler makes today: a value-returning function inlines
-into the graph (`RETURNS video_stream` is a filter stage), a
-table-returning one is a row source (`RETURNS TABLE(...)` is an analysis
-pass). Filters, analysis functions and SQL functions stop being three
-features with three surfaces.
-
-Three consequences worth holding onto:
-
-- **Frames are rows to the MODULE, never to SQL.** A module iterates
-  frame-rows - pts, dimensions, the stream's tags, the planes - and
-  that belongs to the WIT world's `process-frame`, not to the dialect.
-  The SQL signature passes a `video_stream`, the handle it already
-  has, and receives a declared table back.
-  This is deliberate. Every relation the compiler sees today is
-  countable at compile time, which is what makes `WHERE` filter tracks
-  during compilation, the one-row rule decidable, and `GROUP BY` a
-  compile-time partition. A frame relation would be the first whose
-  cardinality is unknown until ffmpeg runs, and admitting one costs all
-  three. Nothing is gained at the SQL level: the module's contract
-  already says it sees frames.
-  If frame-level PREDICATES are ever wanted, the precedent is `f.t` - a
-  runtime timeline you may constrain in a `WHERE` but never enumerate,
-  compiled to `-ss`/`-to`. Its honest extension is ffmpeg's `select`
-  filter, a runtime `WHERE` over frames. Narrowing a runtime stream is
-  fine; counting one at compile time is not.
-- **Compilation belongs to the registry.** `LANGUAGE rust` implies a
-  toolchain. A package ships the compiled `.wasm` with its source
-  alongside for provenance, and the registry CI compiles it, so nobody
-  needs cargo to USE a filter. An inline body stays possible for small
-  kernels, compiled on demand and cached content-addressed in the store
-  the package client already needs.
 - **Structured output is the genuinely new part.** Once a module returns
   rows, analysis results are tables you can JOIN: face boxes against
   speech segments is "who is speaking when", in SQL, over data no ffmpeg
