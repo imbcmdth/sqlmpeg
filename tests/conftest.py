@@ -70,9 +70,17 @@ def pinned_ffmpeg() -> None:
         pytest.skip(message)
 
 
-@pytest.fixture(scope="session")
-def _store_home(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    return tmp_path_factory.mktemp("store-home")
+@pytest.fixture
+def _store_home(tmp_path: Path) -> Path:
+    """A cache directory of this test's own.
+
+    Per test, not per session: a test that writes the machine-wide lockfile
+    would otherwise leak it into every later one, and what a project can see
+    is exactly what several of them assert.
+    """
+    home = tmp_path / "store-home"
+    home.mkdir()
+    return home
 
 
 @pytest.fixture(autouse=True)

@@ -84,33 +84,38 @@ never calls is fine - it is a library; an uncalled definition in the
 query's own text is still rejected. A program's file is a whole query,
 like any script, and the definition reader never opens it.
 
-`dependencies` keys are aliases: each is a plain identifier this
-project's queries may use for the package the value names. The value
-keeps the installed package's name and the version range together,
-`"<namespace>/<package>@<range>"`; the range is recorded and shown,
-never solved. An alias may not be reserved, and may not equal the
-namespace of any installed package.
+`dependencies` keys are package names - `<namespace>/<package>` - and
+the values are the version range for each, recorded and shown, never
+solved.
 
-A query calls into an installed package one of three ways:
+A query calls into an installed package one of two ways, always
+written in full:
 
 - **Three segments**, `<namespace>.<package>.<member>(...)` -
-  `imbcmdth.audio.quieter(f.audio[1], 0.5)` - always valid, reaching any
-  export whatever a project's own `dependencies` say.
+  `imbcmdth.audio.quieter(f.audio[1], 0.5)` - reaching any export
+  whatever a project's own `dependencies` say.
 - **Two segments**, `<namespace>.<package>(...)` - `imbcmdth.deband(v)` -
   the export a string `lib` names. A package whose `lib` is a map has
   none: the call is rejected, naming the exports to call by their own
   three-segment path instead.
-- **Two segments through an alias**, `<alias>.<member>(...)` -
-  `tracks.pick(...)` when `dependencies` binds `tracks` to a package.
-  The default export is not reachable through an alias - write the
-  full three-segment path for that.
 
-Aliases and namespaces are disjoint by construction (`install` refuses
-an alias equal to an installed namespace), so a two-segment call is
-decidable: sqlmpeg tries it as an alias first, then as a
-namespace/package pair. `ffmpeg.<filter>` and `sqlmpeg.<macro>` stay
-two-part and reserved, and take precedence over all of this - they are
-never read as a package call.
+There is no alias, so a ONE-segment qualifier is never a package
+lookup at all: it is either a call into the query's own definitions
+(bare, no qualifier) or, qualified, unresolvable - `UNKNOWN_FUNCTION`,
+its hint naming the three-segment form calls across packages are
+written as. `ffmpeg.<filter>` and `sqlmpeg.<macro>` stay two-part and
+reserved, and take precedence over all of this - they are never read
+as a package call.
+
+The VERSION a call reaches is whichever the CALLING package's own
+manifest depends on, not a single project-wide binding: a call written
+in the query itself resolves against the project's own `dependencies`,
+a call written inside an installed package's lib file or program
+resolves against THAT package's own. Two packages may each depend on a
+different version of a third, and each keeps resolving against its
+own - `install` walking `dependencies` records, on every package's own
+lockfile entry, the exact version it resolved each of ITS dependencies
+to (see [Installed packages](#installed-packages)).
 
 Called as a value (`imbcmdth.audio.quieter(...)`) or as a row source
 (`FROM imbcmdth.audio.pick('a.mka') t`), the call is expanded exactly
@@ -124,7 +129,7 @@ project that defines it; unqualified names are never a package lookup.
 dependencies provide: the packages with their layer, the exports with
 their signatures and files (the list is the manifest's; only parameter
 types are read from the files), the programs with the variables each
-declares (read from its `-- variables:` header), and the aliases.
+declares (read from its `-- variables:` header), and the dependencies.
 `--json` for scripting.
 
 The project is found by walking up from the query file's directory, or
@@ -182,21 +187,25 @@ declares.
 
 `sqlmpeg.lock`, beside the manifest, records what the project
 installed. It is machine-owned: installing writes it, nothing else
-should. Each entry is one of two kinds.
+should. Each entry is one of two kinds, one per package VERSION - a
+name may have more than one entry, since installing never removes one
+version to make room for another.
 
 ```json
-{ "format_version": 2,
+{ "format_version": 3,
   "reproducible": false,
   "not_reproducible_because": "a package is linked to a working directory, so its files are not pinned here",
+  "dependencies": { "broadcast/tracks": "1.2.0" },
   "packages": [
     { "kind": "registry", "name": "broadcast/tracks", "version": "1.2.0",
-      "sha256": "<64 hex>", "store": "v1/ab/<64 hex>" },
+      "sha256": "<64 hex>", "store": "v1/ab/<64 hex>",
+      "dependencies": { "imbcmdth/audio": "2.1.0" } },
     { "kind": "link", "path": "../my-lib" }
   ] }
 ```
 
-A **registry** entry is keyed by the package's name and pins a version
-and the sha256 of the ARCHIVE the package travels as - one gzipped
+A **registry** entry is keyed by the package's name and version, and
+pins the sha256 of the ARCHIVE the package travels as - one gzipped
 tar, built so the same content always produces the same bytes.
 `install` hashes the bytes it downloaded before opening them: a
 download that does not match the pin is discarded unopened and nothing
@@ -206,16 +215,27 @@ directories under the package root and nothing else - no absolute
 paths, no `..`, no links, no devices, and a member count and
 uncompressed size cap. Reading a stored package hashes nothing; content
 that is missing from the store is a rejection naming the package, never
-a fall back to what is there.
+a fall back to what is there. Its own `dependencies` is what ITS
+manifest's `dependencies` resolved to when this entry was installed -
+package name to the exact version, never a range - which is what lets
+a call written inside that package resolve at the right version even
+when another installed package depends on a different one of the same
+name.
 
 A **link** entry names a directory and nothing else - the package's
 name comes from the manifest there, so renaming the package needs no
 re-link. Its `sqlmpeg.json` is read like any other manifest, so an
 edit lands in the next compile - which is the point, and which no
 digest could survive. A lockfile holding a link is therefore not
-reproducible, and says so in its own text. Two entries naming one
-package are rejected. The lockfile carries no aliases - they are the
-manifest's.
+reproducible, and says so in its own text. Two entries pinning one
+package at one version are rejected; two different versions are not -
+that is the whole point of carrying several.
+
+The lockfile's own top-level `dependencies` is the same shape, one
+level up: what THIS project directly installed, package name to the
+exact version - what a call written in the project's own query
+resolves against. It is separate from the manifest's `dependencies`,
+which records the range as written and is never solved.
 
 A package resolves through three layers, the first claim on its name
 winning: the project's own manifest, then its lockfile, then the
@@ -278,17 +298,30 @@ pinning only what it had.
 published version is taken and written exact. Exact pins only: a
 manifest `dependencies` range is recorded and shown, never solved.
 
+It then walks the installed package's own manifest `dependencies` and
+installs each of THOSE the same way, recursively - each at its highest
+published version, exactly as a direct install resolves one. A
+dependency already pinned in the lockfile at the exact version wanted
+is left alone: not refetched, not walked again. A different version of
+the same name already pinned is not a conflict - install never
+arbitrates between versions of one package, so it simply pins the new
+one beside the old, and each installed package keeps resolving its own
+calls against the version IT depends on. A cycle in that walk is
+rejected, naming the loop. Only the package named on the command line
+is recorded in the project's manifest; what came along transitively is
+the lockfile's business, reported as what was brought along.
+
 A version already in the store is not downloaded again - the same
 content, installed into a second project or globally, is stored once.
 
-The dependency is recorded in the manifest under the package segment
-as its alias - `install broadcast/tracks` writes
-`"tracks": "broadcast/tracks@1.2.0"` - and `--alias <name>` chooses
-another. A default that collides with an existing alias or with an
-installed package's namespace is a rejection naming `--alias`. A
-global install (`-g`) has no manifest, so nothing is aliased.
-Installing a package already pinned replaces its entry and says what
-it replaced.
+The dependency is recorded in the manifest keyed by the package's own
+name - `install broadcast/tracks` writes
+`"broadcast/tracks": "1.2.0"`. A global install (`-g`) has no
+manifest, so nothing is recorded there, but its lockfile's own
+top-level `dependencies` still records what was directly asked for.
+Installing a package already directly pinned at another version
+changes what the project points at; the old entry is not removed, in
+case something else installed still depends on it.
 
 `-g` and the project rule are `link`'s, below.
 
@@ -517,28 +550,28 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   project; an exported name not defined in the file named for it; one name defined twice
   across a package's lib files; a lib file holding anything but
   `CREATE FUNCTION`; a program name that is not a command word or is
-  declared twice; a dependency alias that is not a plain identifier, is
-  reserved, or equals an installed package's namespace; a dependency
-  value that is not `<namespace>/<package>@<range>`.
+  declared twice; a dependency key that is not a package name or whose
+  namespace is reserved; a dependency value that is not a non-empty
+  string; a dependency cycle, naming the loop.
 - **Lockfiles**: a lockfile that is not one JSON object with its three
   required keys, or is written in another format version; an entry of
   no known kind, missing a key, or holding an unknown one; two entries
-  naming one package; a lockfile claiming to be reproducible while
-  linking a directory; a linked directory with no manifest; stored
-  content that is missing or was written by another store layout; a
-  downloaded archive that does not hash to what the entry pins, or that
-  holds a member outside the package root, a link, a device, or more
-  members or bytes than the caps allow; an entry the package it points
-  at disagrees with.
+  pinning one package at one version; a lockfile claiming to be
+  reproducible while linking a directory; a linked directory with no
+  manifest; stored content that is missing or was written by another
+  store layout; a downloaded archive that does not hash to what the
+  entry pins, or that holds a member outside the package root, a link,
+  a device, or more members or bytes than the caps allow; an entry the
+  package it points at disagrees with; a `dependencies` map -
+  the lockfile's own, or one carried on a registry entry - that is not
+  an object of name to version.
 - **The registry**: a registry that cannot be read, with nothing cached
   to answer from; a catalogue or detail file that is not JSON, is not an
   object, is written in another format version, or holds a malformed
   field or a name that is not `<namespace>/<package>`; a package or a
   version the catalogue does not publish; an archive that is not the
   size or the digest its detail file records; an archive whose package
-  says it is a different name or version than what was published;
-  `--alias` naming something that is not an alias, one that is
-  reserved, or one already taken.
+  says it is a different name or version than what was published.
 - **Identifiers**: double-quoted identifiers (except tag-key aliases);
   the reserved names `ffmpeg` and `sqlmpeg` as aliases.
 - **Written records**: a chapter whose span ends at or before it starts,

@@ -8,7 +8,7 @@ manifest says what the package provides under that name::
     { "name": "imbcmdth/audio", "version": "1.0.0",
       "bin": { "volume": "queries/volume.sql", "duck": "queries/duck.sql" },
       "lib": "src/audio.sql",
-      "dependencies": { "tracks": "broadcast/tracks@^1.2.0" } }
+      "dependencies": { "broadcast/tracks": "^1.2.0" } }
 
 ``lib`` and ``bin`` each accept a string, or a map, never both at once. A
 string names one file, its member named for the package segment --
@@ -29,11 +29,16 @@ solved. A call across packages is always written in full,
 alias to bind.
 
 Beside it, ``sqlmpeg.lock`` records what the project INSTALLED: one entry per
-package, either a registry entry pinning a version and the sha256 of the
-archive its content was installed from, or a link entry naming a directory to
-read live. A registry entry is keyed by the package's name; a link entry names
-only the directory, and the package's name comes from the manifest there. It
-is machine-owned -- installing writes it, nobody hand-edits it.
+package VERSION -- several may share a name, since installing never removes
+one version to make room for another -- either a registry entry pinning a
+version and the sha256 of the archive its content was installed from, or a
+link entry naming a directory to read live. A registry entry also carries its
+own ``dependencies``, package name to the exact version ITS OWN install
+resolved, so a call written inside that package binds to what it depends on,
+not what the project directly does. The lockfile's own top-level
+``dependencies`` is the same shape, one level up: what the project itself
+directly installed. It is machine-owned -- installing writes it, nobody
+hand-edits it.
 
 :func:`discover` builds the set a compile resolves in, from three layers, the
 first claim on a name winning:
@@ -116,7 +121,7 @@ RESERVED_NAMESPACES = frozenset({FILTER_NAMESPACE, MACRO_NAMESPACE, WASM_NAMESPA
 
 # Unquoted identifiers fold to lowercase, so a name a query can write without
 # quoting is a lowercase plain identifier. Both halves of a package name are
-# one, and so are an exported function name and a dependency alias.
+# one, and so is an exported function name.
 _IDENTIFIER_RE = re.compile(r"[a-z_][a-z0-9_]*")
 
 # A package name: `<namespace>/<package>`, each half a plain identifier.
@@ -264,6 +269,20 @@ class Package:
 class PackageSet:
     """The packages a compile may resolve a call in, keyed by name.
 
+    `packages` is one CANONICAL `Package` per name -- the first layer that
+    claimed it -- for listing and for a fallback resolution. `versions` is
+    every installed version of every name, since install never makes two
+    versions of one package fight over the name: a project depending on two
+    packages that each depend on a different version of a third package pins
+    both, and each keeps calling into its own.
+
+    `wants` answers the question `versions` alone cannot: which of those
+    versions a given DEPENDENT package itself resolved to, when its own
+    dependencies were installed. Keyed by the dependent's own name --
+    `project` for the top-level script and the project's own `sqlmpeg.json`
+    -- to a map of dependency name to the exact version that dependent binds
+    it to. See :meth:`resolve`.
+
     `in_project` is True when the query sits inside a project -- a manifest or
     a lockfile was found above it. It is what makes landing on the global
     layer worth warning about: outside a project, a globally installed package
@@ -272,18 +291,38 @@ class PackageSet:
 
     root: Path
     packages: dict[str, Package] = field(default_factory=dict)
+    versions: dict[str, dict[str, Package]] = field(default_factory=dict)
+    wants: dict[str, dict[str, str]] = field(default_factory=dict)
+    project: str | None = None
     in_project: bool = True
 
     def get(self, name: str) -> Package | None:
-        """The package `name` names, by its full ``<namespace>/<package>``."""
+        """The canonical package `name` names, by its full ``<namespace>/<package>``."""
         return self.packages.get(name)
 
     def find(self, namespace: str, package: str) -> Package | None:
-        """The package the two segments name, or None."""
+        """The canonical package the two segments name, or None."""
         return self.packages.get(f"{namespace}/{package}")
 
+    def resolve(self, dependent: str | None, name: str) -> Package | None:
+        """The package `name` names, at the version `dependent` itself depends on it at.
+
+        `dependent` is a package's own name -- whose source a call is written
+        in -- or None/empty for the top-level script, which resolves as the
+        project itself. Falls back to the canonical entry when nothing
+        recorded a binding: a linked package (not walked by `install`), or a
+        lockfile with no project above it to hold one.
+        """
+        who = dependent or self.project
+        version = self.wants.get(who, {}).get(name) if who is not None else None
+        if version is not None:
+            found = self.versions.get(name, {}).get(version)
+            if found is not None:
+                return found
+        return self.get(name)
+
     def in_namespace(self, namespace: str) -> tuple[Package, ...]:
-        """Every package under `namespace`, in name order."""
+        """Every canonical package under `namespace`, in name order."""
         return tuple(
             self.packages[name]
             for name in sorted(self.packages)
@@ -529,53 +568,36 @@ def _programs(
     return programs
 
 
-def _dependencies(data: dict[str, object], path: Path, text: str) -> dict[str, Dependency]:
-    """The alias map ``dependencies`` declares; empty when it declares none."""
+def _dependencies(data: dict[str, object], path: Path, text: str) -> dict[str, str]:
+    """The dependency map: package name to version range, empty when there is none."""
     if "dependencies" not in data:
         return {}
     at = _key_line(text, "dependencies")
-    dependencies: dict[str, Dependency] = {}
-    for alias, written in _map_of(data, "dependencies", path, text, _DEPENDENCIES_HINT).items():
-        line = _key_line(text, alias) or at
-        if _IDENTIFIER_RE.fullmatch(alias) is None:
+    dependencies: dict[str, str] = {}
+    for name, written in _map_of(data, "dependencies", path, text, _DEPENDENCIES_HINT).items():
+        line = _key_line(text, name) or at
+        if not is_package_name(name):
             raise _reject(
                 path,
-                f"alias {alias!r} is not a plain identifier",
+                f"dependency key {name!r} is not a package name",
                 line=line,
-                hint="an alias is a lowercase plain identifier a query may qualify a call with",
-            )
-        if alias in RESERVED_NAMESPACES:
-            reserved = ", ".join(sorted(RESERVED_NAMESPACES))
-            raise _reject(
-                path,
-                f"alias {alias!r} is reserved",
-                line=line,
-                hint=f"{reserved} belong to sqlmpeg itself; pick another alias",
-            )
-        if not isinstance(written, str) or not written.strip():
-            raise _reject(
-                path,
-                f"dependency '{alias}' must be a string",
-                line=line,
-                hint=_DEPENDENCIES_HINT,
-            )
-        name, separator, version_range = written.partition("@")
-        if not is_package_name(name) or not separator or not version_range.strip():
-            raise _reject(
-                path,
-                f"dependency '{alias}': {written!r} is not "
-                '"<namespace>/<package>@<range>"',
-                line=line,
-                hint=_DEPENDENCIES_HINT,
+                hint=_NAME_HINT,
             )
         if name.partition("/")[0] in RESERVED_NAMESPACES:
             raise _reject(
                 path,
-                f"dependency '{alias}': namespace {name.partition('/')[0]!r} is reserved",
+                f"dependency {name!r}: namespace {name.partition('/')[0]!r} is reserved",
                 line=line,
                 hint="no package is published under a reserved namespace",
             )
-        dependencies[alias] = Dependency(name=name, range=version_range)
+        if not isinstance(written, str) or not written.strip():
+            raise _reject(
+                path,
+                f"dependency {name!r} must be a string",
+                line=line,
+                hint=_DEPENDENCIES_HINT,
+            )
+        dependencies[name] = written
     return dependencies
 
 
@@ -631,7 +653,7 @@ def read_manifest(path: Path) -> Package:
         programs=_programs(data, segment, path.parent, path, text),
         root_export=segment if isinstance(data.get("lib"), str) else None,
         root_program=segment if isinstance(data.get("bin"), str) else None,
-        aliases=_dependencies(data, path, text),
+        dependencies=_dependencies(data, path, text),
     )
 
 
@@ -640,26 +662,40 @@ def read_manifest(path: Path) -> Package:
 # Bump on any change to the lockfile's shape. Another version's file is
 # rejected rather than read optimistically: installing rewrites the lockfile,
 # and guessing at a shape would resolve a call against content nobody pinned.
-LOCK_FORMAT_VERSION = 2
+LOCK_FORMAT_VERSION = 3
 
 _LOCK_HINT = 'a lockfile is one JSON object with "format_version", "reproducible" and "packages"'
 
 _LOCK_REQUIRED = ("format_version", "reproducible", "packages")
-_LOCK_KNOWN = frozenset({*_LOCK_REQUIRED, "not_reproducible_because"})
+_LOCK_KNOWN = frozenset({*_LOCK_REQUIRED, "not_reproducible_because", "dependencies"})
 
-_REGISTRY_KEYS = ("kind", "name", "version", "sha256", "store")
+_REGISTRY_KEYS = ("kind", "name", "version", "sha256", "store", "dependencies")
 _LINK_KEYS = ("kind", "path")
 _KINDS = ("link", "registry")
+
+_ENTRY_DEPENDENCIES_HINT = (
+    'a registry entry\'s "dependencies" is an object of package name to the exact '
+    "version it was resolved to"
+)
 
 
 @dataclass(frozen=True)
 class RegistryEntry:
-    """A package installed from the registry: a version, and the archive digest that pinned it."""
+    """A package installed from the registry: a version, and the archive digest that pinned it.
+
+    `dependencies` is what THIS version's own manifest resolved its own
+    dependencies to when it was installed -- package name to the exact
+    version, never a range. Several entries may share one `name` at
+    different `version`s: install never removes one version to make room for
+    another, so a project depending on two packages that each depend on a
+    different version of a third package pins both.
+    """
 
     name: str
     version: str
     sha256: str
     store: str
+    dependencies: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -685,11 +721,17 @@ class Lockfile:
     `reproducible` is false when some entry is a link, and the file says so in
     its own text -- both the flag and a sentence naming why -- so a human
     reading it is not left to infer it from the entry kinds.
+
+    `dependencies` is what THIS lockfile's own project directly installed --
+    package name to the exact version -- the same shape a `RegistryEntry`
+    carries for its own dependencies, one level up. Empty for a lockfile with
+    no project above it, or one nothing has been directly installed into yet.
     """
 
     path: Path
     reproducible: bool
     entries: tuple[LockEntry, ...]
+    dependencies: Mapping[str, str] = field(default_factory=dict)
 
     def links(self) -> tuple[LinkEntry, ...]:
         return tuple(entry for entry in self.entries if isinstance(entry, LinkEntry))
@@ -729,6 +771,15 @@ def _entry_kind(data: dict[str, object], path: Path, line: int | None) -> str:
     raise _reject(path, f"a package entry has {written}", line=line, hint=hint)
 
 
+def _string_map(value: object, path: Path, line: int | None, hint: str) -> dict[str, str]:
+    """A JSON object of string to string, or a typed rejection."""
+    if not isinstance(value, dict) or any(
+        not isinstance(k, str) or not isinstance(v, str) for k, v in value.items()
+    ):
+        raise _reject(path, "must be an object of name to version", line=line, hint=hint)
+    return {str(k): str(v) for k, v in value.items()}
+
+
 def _entry(raw: object, path: Path, text: str, index: int) -> LockEntry:
     """One ``packages`` element, validated into the entry it declares."""
     data = _entry_dict(raw, path, text, index)
@@ -741,6 +792,8 @@ def _entry(raw: object, path: Path, text: str, index: int) -> LockEntry:
         hint = _did_you_mean(key, list(keys)) or f"a {kind} entry holds: {', '.join(keys)}"
         raise _reject(path, f"unknown key {key!r} in a {kind} entry", line=line, hint=hint)
     for key in keys:
+        if key == "dependencies":  # the one optional key: absent means none
+            continue
         if key not in data:
             raise _reject(
                 path,
@@ -767,6 +820,9 @@ def _entry(raw: object, path: Path, text: str, index: int) -> LockEntry:
         version=_text_field(data, "version", path, text, hint=_LOCK_HINT),
         sha256=_text_field(data, "sha256", path, text, hint=_LOCK_HINT),
         store=_text_field(data, "store", path, text, hint=_LOCK_HINT),
+        dependencies=_string_map(
+            data.get("dependencies", {}), path, line, _ENTRY_DEPENDENCIES_HINT
+        ),
     )
 
 
@@ -776,19 +832,20 @@ def _entries(data: dict[str, object], path: Path, text: str) -> tuple[LockEntry,
     if not isinstance(raw, list):
         raise _reject(path, '"packages" must be a list', line=line, hint=_LOCK_HINT)
     entries: list[LockEntry] = []
-    named: set[str] = set()
+    named: set[tuple[str, str]] = set()
     linked: set[str] = set()
     for index, element in enumerate(raw):
         entry = _entry(element, path, text, index)
         if isinstance(entry, RegistryEntry):
-            if entry.name in named:
+            identity = (entry.name, entry.version)
+            if identity in named:
                 raise _reject(
                     path,
-                    f"two entries name package '{entry.name}'",
+                    f"two entries pin package '{entry.name}' at version '{entry.version}'",
                     line=_value_line(text, entry.name),
-                    hint="one package, one entry; install the one you meant to keep",
+                    hint="one package at one version, one entry",
                 )
-            named.add(entry.name)
+            named.add(identity)
         else:
             if entry.path in linked:
                 raise _reject(
@@ -862,7 +919,19 @@ def read_lockfile(path: Path) -> Lockfile:
             "is nothing to say",
         )
 
-    lockfile = Lockfile(path=path, reproducible=reproducible, entries=_entries(data, path, text))
+    dependencies = _string_map(
+        data.get("dependencies", {}),
+        path,
+        _key_line(text, "dependencies"),
+        'a lockfile\'s own "dependencies" is an object of package name to the exact '
+        "version this project directly installed",
+    )
+    lockfile = Lockfile(
+        path=path,
+        reproducible=reproducible,
+        entries=_entries(data, path, text),
+        dependencies=dependencies,
+    )
     linked = lockfile.links()
     if reproducible and linked:
         raise _reject(
@@ -954,13 +1023,12 @@ def write_manifest(
     _write_atomically(path, _rendered(payload))
 
 
-def add_dependency(path: Path, alias: str, name: str, version: str) -> None:
-    """Record `name` at `version` under `alias` in the manifest at `path`.
+def add_dependency(path: Path, name: str, version: str) -> None:
+    """Record `name` at `version` in the manifest's own ``dependencies``, keyed by name.
 
     The file is rewritten from its own text rather than from a parsed
     `Package`, so what the author wrote stays as written and a rewrite shows
-    only the dependency that changed. Any other alias naming `name` is
-    dropped: one package, one alias.
+    only the dependency that changed.
 
     The version is written exact. A range is a thing a manifest may hold and
     a reader may show; nothing here solves one.
@@ -979,14 +1047,12 @@ def add_dependency(path: Path, alias: str, name: str, version: str) -> None:
     if not isinstance(held, dict) or any(not isinstance(value, str) for value in held.values()):
         raise _reject(
             path,
-            '"dependencies" is not an object of alias to "<name>@<range>"',
+            '"dependencies" is not an object of "<namespace>/<package>" to version',
             line=_key_line(text, "dependencies"),
             hint=_DEPENDENCIES_HINT,
         )
-    kept = {
-        key: value for key, value in held.items() if str(value).partition("@")[0] != name
-    }
-    kept[alias] = f"{name}@{version}"
+    kept = dict(held)
+    kept[name] = version
     data["dependencies"] = kept
     _write_atomically(path, _rendered(dict(data)))
 
@@ -995,17 +1061,26 @@ def _entry_payload(entry: LockEntry) -> dict[str, object]:
     """One entry as the lockfile writes it, keys in the order the reader lists them."""
     if isinstance(entry, LinkEntry):
         return {"kind": "link", "path": entry.path}
-    return {
+    payload: dict[str, object] = {
         "kind": "registry",
         "name": entry.name,
         "version": entry.version,
         "sha256": entry.sha256,
         "store": entry.store,
     }
+    if entry.dependencies:
+        payload["dependencies"] = dict(entry.dependencies)
+    return payload
 
 
-def write_lockfile(path: Path, entries: Sequence[LockEntry]) -> None:
+def write_lockfile(
+    path: Path, entries: Sequence[LockEntry], *, dependencies: Mapping[str, str] | None = None
+) -> None:
     """Write the ``sqlmpeg.lock`` pinning `entries`, in the order given.
+
+    `dependencies` is what this lockfile's own project directly installed --
+    package name to the exact version -- carried over unchanged by a caller
+    that is not itself recording a direct install (``link``, ``unlink``).
 
     The reproducibility claim is this function's, not the caller's: a link is
     read live and no digest survives that, so any link among `entries` makes
@@ -1020,6 +1095,8 @@ def write_lockfile(path: Path, entries: Sequence[LockEntry]) -> None:
     }
     if linked:
         payload["not_reproducible_because"] = _LINKED_BECAUSE
+    if dependencies:
+        payload["dependencies"] = dict(dependencies)
     payload["packages"] = [_entry_payload(entry) for entry in entries]
     _write_atomically(path, _rendered(payload))
 
@@ -1197,25 +1274,37 @@ def _stored_package(entry: RegistryEntry, lock: Lockfile, layer: Layer) -> Packa
     return replace(package, layer=layer)
 
 
-def _add_layer(packages: dict[str, Package], lock: Lockfile | None, layer: Layer) -> None:
-    """Add `lock`'s packages under the names no earlier layer claimed."""
+def _add_layer(
+    packages: dict[str, Package],
+    versions: dict[str, dict[str, Package]],
+    wants: dict[str, dict[str, str]],
+    lock: Lockfile | None,
+    layer: Layer,
+) -> None:
+    """Add `lock`'s packages under the names/versions no earlier layer claimed."""
     if lock is None:
         return
-    resolved: set[str] = set()
+    resolved: set[tuple[str, str]] = set()
     for entry in lock.entries:
         if isinstance(entry, LinkEntry):
             package = _linked_package(entry, lock, layer)
         else:
             package = _stored_package(entry, lock, layer)
-        if package.name in resolved:
+            wants.setdefault(package.name, dict(entry.dependencies))
+        identity = (package.name, package.version)
+        if identity in resolved:
             # The reader catches two same-kind claims; a registry entry and a
-            # link resolving to one package is only knowable here.
+            # link resolving to one package AT ONE VERSION is only knowable
+            # here. Two different versions of one name are not a collision --
+            # that is the whole point of carrying several.
             raise _reject(
                 lock.path,
-                f"two entries name package '{package.name}'",
-                hint="one package, one entry; install or link the one you meant to keep",
+                f"two entries name package '{package.name}' {package.version}",
+                hint="one package at one version, one entry; install or link the one "
+                "you meant to keep",
             )
-        resolved.add(package.name)
+        resolved.add(identity)
+        versions.setdefault(package.name, {}).setdefault(package.version, package)
         if package.name in packages:  # first claim wins, layer by layer
             continue
         packages[package.name] = package
@@ -1232,31 +1321,6 @@ def _global_lockfile(local: Path | None) -> Lockfile | None:
     return read_lockfile(path)
 
 
-def _check_aliases(project: Package, packages: dict[str, Package]) -> None:
-    """Reject a project alias that is also an installed package's namespace.
-
-    A two-part call resolves an alias or a namespace, never both; the two
-    sets stay disjoint, and this is the one place both are known.
-    """
-    for alias in project.aliases:
-        held = next(
-            (package for package in packages.values() if package.namespace == alias), None
-        )
-        if held is None:
-            continue
-        try:
-            line = _key_line(project.manifest.read_text(encoding="utf-8"), alias)
-        except OSError:
-            line = None
-        raise _reject(
-            project.manifest,
-            f"alias '{alias}' is also the namespace of the installed package "
-            f"'{held.name}'",
-            line=line,
-            hint="an alias may not shadow a namespace; rename the alias in dependencies",
-        )
-
-
 def discover(start: Path | str | None = None) -> PackageSet | None:
     """The package set for a query written in `start`, or None with nothing to resolve in.
 
@@ -1267,31 +1331,41 @@ def discover(start: Path | str | None = None) -> PackageSet | None:
     Three layers, the first claim on a name winning: the project's own
     manifest, then its lockfile, then the machine-wide one. The layering lives
     here and nowhere else -- what the compiler gets is one name to one
-    package, with no idea which layer answered.
+    canonical package per layer, plus every version install ever pinned, with
+    no idea which layer answered.
 
     Raises ``SqlmpegError`` for a manifest or lockfile that is found but
-    malformed, for a locked package the store or the linked directory cannot
-    produce, and for a project alias equal to an installed package's
-    namespace.
+    malformed, or for a locked package the store or the linked directory
+    cannot produce.
     """
     base = Path(start) if start is not None else Path.cwd()
     manifest = find_manifest(base)
     local = find_lockfile(base)
     packages: dict[str, Package] = {}
+    versions: dict[str, dict[str, Package]] = {}
+    wants: dict[str, dict[str, str]] = {}
     project: Package | None = None
     if manifest is not None:
         project = read_manifest(manifest)
         packages[project.name] = project
-    _add_layer(packages, read_lockfile(local) if local is not None else None, "local")
-    _add_layer(packages, _global_lockfile(local), "global")
+        versions.setdefault(project.name, {})[project.version] = project
 
-    aliases: dict[str, str] = {}
+    local_lock = read_lockfile(local) if local is not None else None
+    _add_layer(packages, versions, wants, local_lock, "local")
+    _add_layer(packages, versions, wants, _global_lockfile(local), "global")
+
     if project is not None:
-        _check_aliases(project, packages)
-        aliases = {alias: dependency.name for alias, dependency in project.aliases.items()}
+        wants[project.name] = dict(local_lock.dependencies) if local_lock is not None else {}
 
     in_project = manifest is not None or local is not None
     if not in_project and not packages:
         return None
     root = manifest.parent if manifest is not None else local.parent if local is not None else base
-    return PackageSet(root=root, packages=packages, aliases=aliases, in_project=in_project)
+    return PackageSet(
+        root=root,
+        packages=packages,
+        versions=versions,
+        wants=wants,
+        project=project.name if project is not None else None,
+        in_project=in_project,
+    )

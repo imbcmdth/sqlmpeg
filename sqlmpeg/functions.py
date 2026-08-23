@@ -215,7 +215,9 @@ class _Function:
     `aliases` is what the body binds and expansion has to rename.
     `columns` is the ``RETURNS TABLE`` list, and None for a value.
     `package` is the name of the package this came from, and "" for the
-    script's own.
+    script's own; `package_version` is that package's own version, alongside
+    it -- together they are the exact instance whose scope a bare name inside
+    the body sees, since two versions of one name are never the same scope.
     """
 
     name: str
@@ -228,6 +230,7 @@ class _Function:
     columns: tuple[Parameter, ...] | None = None
     used: bool = False
     package: str = ""
+    package_version: str = ""
 
     @property
     def returns_rows(self) -> bool:
@@ -237,6 +240,11 @@ class _Function:
     def library(self) -> bool:
         """True for a definition read out of a package's lib file, not the script."""
         return bool(self.package)
+
+    @property
+    def identity(self) -> tuple[str, str] | None:
+        """(name, version) of the owning package, or None for the script's own."""
+        return (self.package, self.package_version) if self.package else None
 
     @property
     def namespace(self) -> str:
@@ -769,6 +777,7 @@ def _source_definitions(
         except SqlmpegError as err:
             raise _in_lib(err, package.name, path, anchor) from err
         function.package = package.name
+        function.package_version = package.version
         # Ahead of every statement of the calling script: a library is already
         # defined when the query that calls it is written.
         function.position = -1
@@ -1122,17 +1131,18 @@ class _Expander:
     budget: int = _EXPANSION_BUDGET
     # Where the statement being walked keeps its generated CTEs.
     site: _Site | None = None
-    # The packages a qualified call may resolve in, and -- keyed by package
-    # name -- what each one's lib files define and which of those names its
+    # The packages a qualified call may resolve in, and -- keyed by (package
+    # name, version), since two versions of one name are never the same
+    # scope -- what each one's lib files define and which of those names its
     # manifest exports, once they have been read.
     packages: PackageSet | None = None
-    scopes: dict[str, dict[str, _Function]] = field(default_factory=dict)
-    exported: dict[str, frozenset[str]] = field(default_factory=dict)
+    scopes: dict[tuple[str, str], dict[str, _Function]] = field(default_factory=dict)
+    exported: dict[tuple[str, str], frozenset[str]] = field(default_factory=dict)
     # Where a diagnostic that is not a rejection goes; None is silence.
     on_warning: OnWarning | None = None
-    # Whose definitions a BARE call name sees: a package name, or "" for the
-    # script's own.
-    scope: str = ""
+    # Whose definitions a BARE call name sees: the (name, version) of the
+    # package whose body is expanding, or None for the script's own.
+    scope: tuple[str, str] | None = None
 
     # -- entry point ------------------------------------------------------
 
@@ -1218,15 +1228,18 @@ class _Expander:
         return self.packages is not None and bool(self.packages.packages)
 
     @contextmanager
-    def _scoped(self, package: str) -> Iterator[None]:
-        """Whose definitions a bare call name sees while `package`'s body expands.
+    def _scoped(self, scope: tuple[str, str] | None) -> Iterator[None]:
+        """Whose definitions a bare call name sees while a function's body expands.
 
         A package's lib files are its own flat namespace: a library body
         calling ``helper()`` means the package's own helper, never the
-        script's, and a script body never sees a package's.
+        script's, and a script body never sees a package's. `scope` is the
+        (name, version) of the owning package, or None for the script's own
+        -- two versions of one package name are two scopes, never one
+        conflated by name alone.
         """
         previous = self.scope
-        self.scope = package
+        self.scope = scope
         try:
             yield
         finally:
@@ -1234,7 +1247,7 @@ class _Expander:
 
     def _visible(self, name: str) -> _Function | None:
         """The definition a BARE call name resolves to where it is written."""
-        if self.scope:
+        if self.scope is not None:
             return self.scopes.get(self.scope, {}).get(name)
         return self.functions.get(name)
 
@@ -1244,18 +1257,16 @@ class _Expander:
         """The definition a qualified call names, or None if there is no project.
 
         `segments` is the identifiers written before the call name: one for a
-        two-part call (``x.fn(...)``), two for a three-part one
-        (``ns.pkg.fn(...)``). None keeps a qualified call exactly what it was
-        before packages existed: outside a project, ``me.pick(...)`` is not a
-        package call and the rejection it earns downstream is the one it has
+        two-part call (``ns.pkg(...)``), two for a three-part one
+        (``ns.pkg.member(...)``). None keeps a qualified call exactly what it
+        was before packages existed: outside a project, ``me.pick(...)`` is not
+        a package call and the rejection it earns downstream is the one it has
         always earned.
 
-        Two-part resolution tries `segments[0]` as an ALIAS first, then as a
-        namespace holding a package named for the call itself (its default
-        export). Aliases and namespaces are disjoint by construction --
-        ``install`` refuses an alias equal to any installed namespace -- so
-        exactly one of the two ever applies. Three-part resolution is
-        `namespace.package.member` outright.
+        Two-part resolution is `namespace.package(...)`, reaching the
+        package's default export -- there is no alias to try first, since a
+        call across packages is always written in full. Three-part resolution
+        is `namespace.package.member` outright.
         """
         packages = self.packages
         if packages is None or not packages.packages:
@@ -1263,28 +1274,42 @@ class _Expander:
         name = _call_name(call)
         if len(segments) == 1:
             (qualifier,) = segments
-            aliased = packages.aliased(qualifier)
-            if aliased is not None:
-                return self._reach(aliased, name, qualifier, anchor)
-            package = self._package_at(qualifier, name, anchor)
+            package = self._package_at(qualifier, name, anchor, explicit=False)
             return self._reach(package, None, package.name.replace("/", "."), anchor)
         namespace, package_name = segments
         package = self._package_at(namespace, package_name, anchor)
         return self._reach(package, name, f"{namespace}.{package_name}", anchor)
 
-    def _package_at(self, namespace: str, package_name: str, anchor: exp.Expr) -> Package:
-        """The package `namespace.package_name` names, or a typed rejection.
+    def _package_at(
+        self, namespace: str, package_name: str, anchor: exp.Expr, *, explicit: bool = True
+    ) -> Package:
+        """The package `namespace.package_name` names, at the version the calling
+        package (or the project, outside one) itself depends on -- or a typed
+        rejection.
 
         An unknown namespace says what is installed; a known namespace with
-        no such package says what it holds.
+        no such package says what it holds. `explicit` is False for a
+        two-part call: with no alias to try first, an unknown first segment
+        there is likely someone reaching for the old aliased form, so the
+        hint points at the explicit one instead of guessing at a namespace
+        typo.
         """
         packages = self.packages
         assert packages is not None
-        found = packages.find(namespace, package_name)
+        dependent = self.scope[0] if self.scope is not None else None
+        found = packages.resolve(dependent, f"{namespace}/{package_name}")
         if found is not None:
             return found
         known = packages.namespaces()
         if namespace not in known:
+            if not explicit:
+                raise _error(
+                    ErrorCode.UNKNOWN_FUNCTION,
+                    f"unknown namespace '{namespace}'",
+                    anchor,
+                    hint="calls across packages are written "
+                    "<namespace>.<package>.<member>",
+                )
             near = difflib.get_close_matches(namespace, list(known), n=1, cutoff=0.6)
             raise _error(
                 ErrorCode.UNKNOWN_FUNCTION,
@@ -1320,12 +1345,13 @@ class _Expander:
         did-you-mean.
         """
         exports = self._scope_of(package, anchor)
+        identity = (package.name, package.version)
         key = package.package if member is None else member
-        function = exports.get(key) if key in self.exported[package.name] else None
+        function = exports.get(key) if key in self.exported[identity] else None
         if function is not None:
             return function
         if member is None:
-            named = sorted(self.exported[package.name])
+            named = sorted(self.exported[identity])
             if named:
                 raise _error(
                     ErrorCode.UNKNOWN_FUNCTION,
@@ -1339,7 +1365,7 @@ class _Expander:
                 anchor,
                 hint=f"{package.name} exports nothing",
             )
-        exported = sorted(self.exported[package.name])
+        exported = sorted(self.exported[identity])
         near = difflib.get_close_matches(member, exported, n=1, cutoff=0.6)
         raise _error(
             ErrorCode.UNKNOWN_FUNCTION,
@@ -1402,14 +1428,15 @@ class _Expander:
         ``package.exports``' files and nothing else: a program's file is a
         query, and no path through this module opens one.
         """
-        cached = self.scopes.get(package.name)
+        identity = (package.name, package.version)
+        cached = self.scopes.get(identity)
         if cached is not None:
             return cached
         self._warn_about(package, anchor)
         scope, origin = _package_scope(package, anchor)
         _check_exported(package, scope, origin, anchor)
-        self.scopes[package.name] = scope
-        self.exported[package.name] = frozenset(package.exports)
+        self.scopes[identity] = scope
+        self.exported[identity] = frozenset(package.exports)
         return scope
 
     # -- finding calls ----------------------------------------------------
@@ -1628,7 +1655,7 @@ class _Expander:
         body, _ = self._instance(site, arguments)
         # The body is the package's or the script's text, so its own bare calls
         # resolve where it was written, not where it was called from.
-        with self._scoped(function.package):
+        with self._scoped(function.identity):
             self._expand_within(body, host, position, (*stack, function.qualified))
         _splice(host, body)
         projection: exp.Expr = body.expressions[0]
@@ -1658,7 +1685,7 @@ class _Expander:
         arguments = self._arguments(function, site.call, host, position)
         body, index = self._instance(site, arguments)
         # The body is its own query now, so its own calls expand into it.
-        with self._scoped(function.package):
+        with self._scoped(function.identity):
             self._expand_within(body, body, position, (*stack, function.qualified))
         _name_columns(body, function.columns or ())
         name = self._fresh_name(f"{function.name}_{index + 1}")

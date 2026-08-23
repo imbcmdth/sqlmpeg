@@ -35,6 +35,18 @@ Ordering matters at install: the archive's bytes are verified against the
 digest the registry recorded before anything opens them (:func:`sqlmpeg.store.unpack`
 does that), and the lockfile is written only after the content is in the
 store. An install that cannot verify a hash leaves both untouched.
+
+Installing one package installs what it depends on too, recursively: after a
+package is stored, its own manifest's ``dependencies`` are walked and each is
+installed at its highest published version, exactly as a direct install
+resolves one -- there is no resolver here, and this module never picks among
+versions of a name. A dependency already pinned at the exact version wanted
+is left alone, not refetched and not walked again; a different version of the
+same name already pinned is not a conflict, since a package is content
+addressed by its own (name, version) and two versions simply coexist -- what
+changes is which one a given DEPENDENT resolves against, which is recorded on
+its own lockfile entry (see :class:`~sqlmpeg.project.RegistryEntry`). A cycle
+in that walk is the one thing this module refuses outright, naming the loop.
 """
 
 from __future__ import annotations
@@ -47,6 +59,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -56,16 +69,11 @@ from .project import (
     MANIFEST_NAME,
     RESERVED_NAMESPACES,
     LockEntry,
-    Package,
     RegistryEntry,
     add_dependency,
-    held_entry,
-    is_namespace,
     is_package_name,
     read_lockfile,
     read_manifest,
-    stored_name,
-    with_entry,
     write_lockfile,
 )
 
@@ -189,13 +197,18 @@ class Release:
 class Installed:
     """What one install did, for the caller that reports it.
 
-    `alias` is the name the project manifest now records the dependency under,
-    and None for a global install, which records no dependency. `replaced` is
-    whatever entry pinned this package before, or None.
+    `brought` is every OTHER package this install pulled in transitively, in
+    the order they were resolved -- empty when `release` depends on nothing,
+    or everything it depends on was already pinned. `replaced` is the entry
+    the project directly pointed `release.name` at before this install, if
+    this changes it -- not removed from the lockfile, since another
+    package's own dependency may still need it; only what THIS project's
+    manifest and this lockfile's own top-level `dependencies` name for
+    `release.name` changes.
     """
 
     release: Release
-    alias: str | None
+    brought: tuple[Release, ...]
     replaced: LockEntry | None
     root: Path
     lock: Path
@@ -635,118 +648,117 @@ def _agrees(release: Release, root: Path) -> None:
             )
 
 
-def _taken_namespaces(
-    project: Package, release: Release, entries: tuple[LockEntry, ...], lock: Path
-) -> dict[str, str]:
-    """Every namespace an installed package holds, mapped to that package's name.
-
-    The project's own, the one being installed, and each lockfile entry's --
-    the set a dependency alias must stay disjoint from.
-    """
-    taken = {project.namespace: project.name}
+def _entry_for(name: str, version: str, entries: Sequence[LockEntry]) -> RegistryEntry | None:
+    """The registry entry pinning `name` at exactly `version`, or None."""
     for entry in entries:
-        name = stored_name(entry, lock)
-        if name is not None:
-            taken.setdefault(name.partition("/")[0], name)
-    # The installed package's own namespace counts too: `<alias>.<member>`
-    # and `<namespace>.<package>` mean different things in their second
-    # segment, so an alias equal to any namespace is ambiguous.
-    taken.setdefault(release.name.partition("/")[0], release.name)
-    return taken
+        if isinstance(entry, RegistryEntry) and entry.name == name and entry.version == version:
+            return entry
+    return None
 
 
-def _alias_for(
-    project: Package,
-    release: Release,
-    written: str | None,
-    entries: tuple[LockEntry, ...],
-    lock: Path,
-) -> str:
-    """The alias this install records the dependency under, validated.
-
-    ``--alias`` when given; else the alias the manifest already binds to this
-    package; else the package segment. The alias may not already name another
-    package, and may not equal any installed package's namespace -- that
-    disjointness is what keeps a two-part call decidable.
-    """
-    existing = next(
-        (alias for alias, held in project.aliases.items() if held.name == release.name), None
-    )
-    if written is not None:
-        if not is_namespace(written):
-            raise _reject(
-                f"--alias {written!r} is not an alias",
-                "an alias is a lowercase plain identifier: a letter or underscore, "
-                "then letters, digits or underscores",
-            )
-        if written in RESERVED_NAMESPACES:
-            reserved = ", ".join(sorted(RESERVED_NAMESPACES))
-            raise _reject(
-                f"--alias {written!r} is reserved",
-                f"{reserved} belong to sqlmpeg itself; pick another alias",
-            )
-    chosen = written if written is not None else existing or release.name.partition("/")[2]
-    another = "pass --alias with another name" if written is not None else (
-        "the default alias collides; pass --alias to choose another"
-    )
-    held = project.aliases.get(chosen)
-    if held is not None and held.name != release.name:
-        raise _reject(f"alias '{chosen}' already names {held.name}", another)
-    taken = _taken_namespaces(project, release, entries, lock)
-    if chosen in taken:
-        raise _reject(
-            f"alias '{chosen}' is the namespace of the installed package "
-            f"'{taken[chosen]}'",
-            another,
-        )
-    return chosen
-
-
-def install(
+def _ensure(
     index: Index,
-    request: str,
-    *,
-    lock: Path,
-    manifest: Path | None = None,
-    alias: str | None = None,
-) -> Installed:
-    """Install `request` into the lockfile `lock`, and record it in `manifest`.
+    release: Release,
+    entries: list[LockEntry],
+    chain: list[str],
+    brought: list[Release],
+) -> None:
+    """Make sure `release`, and everything its manifest depends on, sits in `entries`.
 
-    In order: resolve the version, put its content in the store, then write
-    the lockfile and the manifest. Nothing is recorded before the content is
-    there, so an install that fails anywhere leaves a project pinning only
-    what it had.
-
-    The dependency is recorded under the package segment as its alias, or
-    under `alias` when one is given. With no `manifest` -- a global install --
-    nothing is aliased and nothing records a dependency. An entry already
-    pinning this package is replaced.
+    Post-order: a package's own entry is appended only once every dependency
+    it names has been resolved, so the `dependencies` map recorded on it is
+    complete the moment it is written. `chain` is the names currently being
+    walked -- an ancestor reappearing is a cycle, checked before anything
+    else, since it is what stops an infinite walk. An exact (name, version)
+    already in `entries` is left alone: not refetched, not walked again. A
+    different version of the same name is not a conflict -- it is simply
+    added beside the one already there; nothing here picks between them.
     """
-    release = resolve(index, request)
+    if release.name in chain:
+        loop = " -> ".join([*chain[chain.index(release.name) :], release.name])
+        raise _reject(
+            f"dependency cycle: {loop}",
+            "there is no resolver here to break it; one of these packages has to stop "
+            "depending on another in the loop",
+        )
+    if _entry_for(release.name, release.version, entries) is not None:
+        return
     already = stored(release)
     root = already if already is not None else fetch(release)
     _agrees(release, root)
+    package = read_manifest(root / MANIFEST_NAME)
 
-    entries = read_lockfile(lock).entries if lock.is_file() else ()
-    written_alias: str | None = None
-    if manifest is not None:
-        written_alias = _alias_for(read_manifest(manifest), release, alias, entries, lock)
-    replaced = held_entry(entries, release.name, lock)
-    entry = RegistryEntry(
-        name=release.name,
-        version=release.version,
-        sha256=release.sha256,
-        store=store.entry_path(release.sha256),
+    chain.append(release.name)
+    resolved: dict[str, str] = {}
+    for name in package.dependencies:
+        dependency = resolve(index, name)
+        _ensure(index, dependency, entries, chain, brought)
+        resolved[name] = dependency.version
+    chain.pop()
+
+    entries.append(
+        RegistryEntry(
+            name=release.name,
+            version=release.version,
+            sha256=release.sha256,
+            store=store.entry_path(release.sha256),
+            dependencies=resolved,
+        )
     )
-    write_lockfile(lock, with_entry(entries, entry, replaced))
-    if manifest is not None and written_alias is not None:
-        add_dependency(manifest, written_alias, release.name, release.version)
+    brought.append(release)
+
+
+def install(index: Index, request: str, *, lock: Path, manifest: Path | None = None) -> Installed:
+    """Install `request` into the lockfile `lock`, recording it in `manifest`.
+
+    Fetches what it depends on too, recursively, each at its highest
+    published version. In order: resolve the version, put its content in the
+    store, walk its manifest's own dependencies the same way, then write the
+    lockfile and the manifest. Nothing is recorded before the content is
+    there, so an install that fails anywhere leaves a project pinning only
+    what it had.
+
+    Only `release.name` is recorded in `manifest`'s own dependencies -- what
+    it pulled in transitively is the lockfile's business, not the project's.
+    With no `manifest` -- a global install -- nothing is written there either,
+    but the lockfile's own top-level `dependencies` still records what was
+    directly asked for, since that is what lets a call written in THIS
+    lockfile's own script resolve at the right version.
+    """
+    release = resolve(index, request)
+    was_stored = stored(release) is not None
+
+    current = read_lockfile(lock) if lock.is_file() else None
+    entries: list[LockEntry] = list(current.entries) if current is not None else []
+    wanted: dict[str, str] = dict(current.dependencies) if current is not None else {}
+    previous_version = wanted.get(release.name)
+    previous_entry = (
+        _entry_for(release.name, previous_version, entries)
+        if previous_version is not None
+        else None
+    )
+
+    brought: list[Release] = []
+    _ensure(index, release, entries, [], brought)
+    # `release` itself was brought along too, by the same walk; it is not one
+    # of its OWN dependencies.
+    brought = [
+        one for one in brought if not (one.name == release.name and one.version == release.version)
+    ]
+
+    wanted[release.name] = release.version
+    write_lockfile(lock, entries, dependencies=wanted)
+    if manifest is not None:
+        add_dependency(manifest, release.name, release.version)
+
+    root = stored(release)
+    assert root is not None  # `_ensure` just verified or fetched it
     return Installed(
         release=release,
-        alias=written_alias,
-        replaced=replaced,
+        brought=tuple(brought),
+        replaced=previous_entry,
         root=root,
         lock=lock,
         manifest=manifest,
-        downloaded=already is None,
+        downloaded=not was_stored,
     )

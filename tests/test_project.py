@@ -34,7 +34,6 @@ from sqlmpeg.functions import package_signatures
 from sqlmpeg.mcp import tools as mcp_tools
 from sqlmpeg.project import (
     LOCK_FORMAT_VERSION,
-    Dependency,
     LinkEntry,
     PackageSet,
     RegistryEntry,
@@ -182,21 +181,38 @@ def test_the_default_lib_is_reached_as_the_package_segment(tmp_path: Path) -> No
     assert "volume=volume=0.5" in " ".join(argv)
 
 
-def test_an_alias_call_and_the_full_path_compile_to_identical_argv(tmp_path: Path) -> None:
-    """`tracks.quieter(...)` through an alias is `broadcast.tracks.quieter(...)`, one function."""
+def test_a_dependency_is_called_by_its_full_path_never_an_alias(tmp_path: Path) -> None:
+    """`broadcast.tracks.quieter(...)` -- the explicit path is the only path."""
     entry = _installed(_library(tmp_path / "built", "broadcast", "0.5", package="tracks"))
     project = tmp_path / "work"
     _project(
         project,
         files={"src/own.sql": NORMALIZE},
-        manifest={"dependencies": {"tracks": "broadcast/tracks@^1.0.0"}},
+        manifest={"dependencies": {"broadcast/tracks": "^1.0.0"}},
     )
     _lock(project, [entry])
     packages = _packages(project)
-    aliased = _argv(QUERY.format(call="tracks.quieter"), packages)
     full = _argv(QUERY.format(call="broadcast.tracks.quieter"), packages)
-    assert aliased == full
     assert "volume=volume=0.5" in " ".join(full)
+
+
+def test_a_one_segment_qualifier_is_not_a_package_lookup(tmp_path: Path) -> None:
+    """What used to be an alias call is `UNKNOWN_FUNCTION`, hinting at the explicit form."""
+    entry = _installed(_library(tmp_path / "built", "broadcast", "0.5", package="tracks"))
+    project = tmp_path / "work"
+    _project(
+        project,
+        files={"src/own.sql": NORMALIZE},
+        manifest={"dependencies": {"broadcast/tracks": "^1.0.0"}},
+    )
+    _lock(project, [entry])
+    error = _rejects(
+        QUERY.format(call="tracks.quieter"),
+        _packages(project),
+        ErrorCode.UNKNOWN_FUNCTION,
+        "unknown namespace 'tracks'",
+    )
+    assert error.hint == "calls across packages are written <namespace>.<package>.<member>"
 
 
 def test_a_two_segment_call_on_a_map_lib_package_names_its_exports(
@@ -374,9 +390,10 @@ def test_a_reserved_namespace_is_refused(tmp_path: Path, claimed: str) -> None:
 
 
 def test_an_unknown_namespace_says_what_this_project_has(tmp_path: Path) -> None:
+    """The three-segment form: a genuinely unknown namespace, not a former alias."""
     _project(tmp_path, files={"src/tracks.sql": QUIETER})
     error = _rejects(
-        "COPY (SELECT you.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT you.tracks.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.UNKNOWN_FUNCTION,
         "unknown namespace 'you'",
@@ -384,12 +401,27 @@ def test_an_unknown_namespace_says_what_this_project_has(tmp_path: Path) -> None
     assert error.hint == "namespaces this project can call: me"
 
 
+def test_a_one_segment_qualifiers_unknown_namespace_hints_the_explicit_form(
+    tmp_path: Path,
+) -> None:
+    """The two-segment form is never an alias lookup, so its hint is not a did-you-mean."""
+    _project(tmp_path, files={"src/tracks.sql": QUIETER})
+    error = _rejects(
+        "COPY (SELECT you.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        _packages(tmp_path),
+        ErrorCode.UNKNOWN_FUNCTION,
+        "unknown namespace 'you'",
+    )
+    assert error.hint == "calls across packages are written <namespace>.<package>.<member>"
+
+
 def test_a_near_miss_namespace_gets_a_did_you_mean(tmp_path: Path) -> None:
+    """Also the three-segment form: a did-you-mean is only offered there."""
     _project(
         tmp_path, files={"src/tracks.sql": QUIETER}, manifest={"name": "mine/edits"}
     )
     error = _rejects(
-        "COPY (SELECT mien.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT mien.tracks.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.UNKNOWN_FUNCTION,
         "unknown namespace 'mien'",
@@ -564,7 +596,7 @@ def test_two_packages_share_one_namespace_and_resolve_by_full_path(tmp_path: Pat
 def test_a_two_segment_call_naming_no_package_in_a_shared_namespace_says_what_it_holds(
     tmp_path: Path,
 ) -> None:
-    """`me.quieter` is decidable neither as an alias nor as `me/quieter`; `me` holds two others."""
+    """`me.quieter` names no `me/quieter` package; `me` holds two others."""
     first = _library(tmp_path / "one", "me", "0.5", package="alpha")
     second = _library(tmp_path / "two", "me", "0.25", package="beta")
     project = tmp_path / "work"
@@ -658,14 +690,17 @@ def test_a_description_and_dependencies_are_accepted(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER},
-        manifest={"description": "edits", "dependencies": {"tracks": "broadcast/tracks@^1.2.0"}},
+        manifest={
+            "description": "edits",
+            "dependencies": {"broadcast/tracks": "^1.2.0"},
+        },
     )
     package = read_manifest(manifest)
     assert package.name == "me/edits"
     assert package.namespace == "me" and package.package == "edits"
     assert package.version == "0.1.0"
     assert [path.name for path in package.exports.values()] == ["tracks.sql"]
-    assert package.aliases == {"tracks": Dependency(name="broadcast/tracks", range="^1.2.0")}
+    assert package.dependencies == {"broadcast/tracks": "^1.2.0"}
 
 
 def test_a_map_libs_members_are_named_and_ordered(tmp_path: Path) -> None:
@@ -710,35 +745,29 @@ def test_a_string_bin_answers_at_the_packages_own_name(tmp_path: Path) -> None:
     assert package.program() == package.program("edits")
 
 
-@pytest.mark.parametrize("alias", ["Tracks", "a-b", ""])
-def test_an_alias_must_be_a_plain_identifier(tmp_path: Path, alias: str) -> None:
-    manifest = _project(
-        tmp_path, manifest={"dependencies": {alias: "broadcast/tracks@^1.0.0"}}
-    )
+@pytest.mark.parametrize("key", ["Tracks", "a-b", "tracks", ""])
+def test_a_dependency_key_must_be_a_package_name(tmp_path: Path, key: str) -> None:
+    manifest = _project(tmp_path, manifest={"dependencies": {key: "^1.0.0"}})
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
-    assert f"alias {alias!r} is not a plain identifier" in caught.value.message
+    assert f"dependency key {key!r} is not a package name" in caught.value.message
 
 
-def test_a_reserved_alias_is_refused(tmp_path: Path) -> None:
-    manifest = _project(
-        tmp_path, manifest={"dependencies": {"ffmpeg": "broadcast/tracks@^1.0.0"}}
-    )
+def test_a_dependency_under_a_reserved_namespace_is_refused(tmp_path: Path) -> None:
+    manifest = _project(tmp_path, manifest={"dependencies": {"ffmpeg/tracks": "^1.0.0"}})
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
-    assert "alias 'ffmpeg' is reserved" in caught.value.message
+    assert "namespace 'ffmpeg' is reserved" in caught.value.message
 
 
-@pytest.mark.parametrize(
-    "written", ["broadcast/tracks", "tracks@^1.0.0", "broadcast/tracks@", "", 7]
-)
-def test_a_dependency_value_keeps_name_and_range_together(
+@pytest.mark.parametrize("written", ["", 7, None])
+def test_a_dependency_value_must_be_a_non_empty_string(
     tmp_path: Path, written: object
 ) -> None:
-    manifest = _project(tmp_path, manifest={"dependencies": {"tracks": written}})
+    manifest = _project(tmp_path, manifest={"dependencies": {"broadcast/tracks": written}})
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
-    assert "dependency 'tracks'" in caught.value.message
+    assert "dependency 'broadcast/tracks' must be a string" in caught.value.message
 
 
 # ---------------------------------------------------------------------------
@@ -761,7 +790,7 @@ def _manifest_text(**declared: object) -> str:
 def test_a_manifest_declaring_neither_half_is_a_package(tmp_path: Path) -> None:
     """The consumer project: a name and its dependencies, nothing provided."""
     manifest = _project(
-        tmp_path, text=_manifest_text(dependencies={"tracks": "broadcast/tracks@^1.2.0"})
+        tmp_path, text=_manifest_text(dependencies={"broadcast/tracks": "^1.2.0"})
     )
     package = read_manifest(manifest)
     assert dict(package.exports) == {}
@@ -1061,22 +1090,33 @@ def _quieter(factor: str) -> str:
 
 
 def _library(
-    root: Path, namespace: str, factor: str, *, version: str = "1.0.0", package: str = "lib"
+    root: Path,
+    namespace: str,
+    factor: str,
+    *,
+    version: str = "1.0.0",
+    package: str = "lib",
+    member: str = "quieter",
+    src: str | None = None,
+    dependencies: dict[str, str] | None = None,
 ) -> Path:
-    """A package directory of its own: a manifest named `namespace`/`package`, one source."""
+    """A package directory of its own: a manifest named `namespace`/`package`, one source.
+
+    `src` overrides the default `quieter(factor)` body and `member` its
+    exported name -- for a package whose own body calls into ANOTHER package.
+    `dependencies` is its manifest's own.
+    """
     (root / "src").mkdir(parents=True, exist_ok=True)
-    (root / "src" / "lib.sql").write_text(_quieter(factor), encoding="utf-8")
-    (root / "sqlmpeg.json").write_text(
-        json.dumps(
-            {
-                "name": f"{namespace}/{package}",
-                "version": version,
-                "lib": {"quieter": "src/lib.sql"},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    body = src if src is not None else _quieter(factor)
+    (root / "src" / "lib.sql").write_text(body, encoding="utf-8")
+    declared: dict[str, object] = {
+        "name": f"{namespace}/{package}",
+        "version": version,
+        "lib": {member: "src/lib.sql"},
+    }
+    if dependencies:
+        declared["dependencies"] = dependencies
+    (root / "sqlmpeg.json").write_text(json.dumps(declared) + "\n", encoding="utf-8")
     return root
 
 
@@ -1084,19 +1124,27 @@ def _digest(archive: bytes) -> str:
     return hashlib.sha256(archive).hexdigest()
 
 
-def _installed(source: Path) -> dict[str, object]:
-    """Put a package in the store the way installing does; return the entry that pins it."""
+def _installed(source: Path, *, dependencies: dict[str, str] | None = None) -> dict[str, object]:
+    """Put a package in the store the way installing does; return the entry that pins it.
+
+    `dependencies` overrides what the entry itself records as ITS OWN
+    resolved dependencies -- the same shape `install` would write walking the
+    package's manifest, for a test that does not go through `install` itself.
+    """
     package = read_manifest(source / "sqlmpeg.json")
     archive = store.pack(source)
     sha256 = _digest(archive)
     store.unpack(package.name, archive, sha256)
-    return {
+    entry: dict[str, object] = {
         "kind": "registry",
         "name": package.name,
         "version": package.version,
         "sha256": sha256,
         "store": store.entry_path(sha256),
     }
+    if dependencies:
+        entry["dependencies"] = dependencies
+    return entry
 
 
 def _link(directory: Path) -> dict[str, object]:
@@ -1109,8 +1157,13 @@ def _lock(
     *,
     reproducible: bool | None = None,
     text: str | None = None,
+    dependencies: dict[str, str] | None = None,
 ) -> Path:
-    """Write a lockfile the way installing would, and return its path."""
+    """Write a lockfile the way installing would, and return its path.
+
+    `dependencies` is what the lockfile's own top-level field would hold: the
+    project's own directly-installed package name to exact version.
+    """
     path = directory / "sqlmpeg.lock"
     directory.mkdir(parents=True, exist_ok=True)
     if text is not None:
@@ -1123,6 +1176,8 @@ def _lock(
         data["not_reproducible_because"] = (
             "a package is linked to a working directory, so its files are not pinned here"
         )
+    if dependencies:
+        data["dependencies"] = dependencies
     data["packages"] = entries
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     return path
@@ -1558,51 +1613,114 @@ def test_nothing_anywhere_is_still_no_project(store_home: Path, tmp_path: Path) 
 
 
 # ---------------------------------------------------------------------------
-# aliases resolve through the set, and stay disjoint from namespaces
+# the version binding is per-manifest: a call resolves at the version the
+# CALLING package (or the project itself) depends on, never a flat table
 # ---------------------------------------------------------------------------
 
 
-def test_the_set_carries_the_projects_aliases(store_home: Path, tmp_path: Path) -> None:
+def test_the_set_carries_the_projects_own_wants(store_home: Path, tmp_path: Path) -> None:
     entry = _installed(_library(tmp_path / "built", "broadcast", "0.5", package="tracks"))
     project = tmp_path / "work"
-    _project(
-        project,
-        files={"src/own.sql": NORMALIZE},
-        manifest={"dependencies": {"t": "broadcast/tracks@^1.0.0"}},
-    )
-    _lock(project, [entry])
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [entry], dependencies={"broadcast/tracks": "1.0.0"})
     packages = _packages(project)
-    assert packages.aliases == {"t": "broadcast/tracks"}
-    aliased = packages.aliased("t")
-    assert aliased is not None and aliased.name == "broadcast/tracks"
-    assert packages.aliased("nothing") is None
-    assert packages.find("broadcast", "tracks") is aliased
+    assert packages.wants[packages.project or ""] == {"broadcast/tracks": "1.0.0"}
+    found = packages.resolve(None, "broadcast/tracks")
+    assert found is not None and found.name == "broadcast/tracks"
+    assert packages.resolve(None, "nothing/here") is None
 
 
-def test_an_alias_declared_but_not_installed_resolves_to_nothing(tmp_path: Path) -> None:
-    _project(
-        tmp_path,
-        files={"src/own.sql": NORMALIZE},
-        manifest={"dependencies": {"t": "broadcast/tracks@^1.0.0"}},
-    )
-    packages = _packages(tmp_path)
-    assert packages.aliases == {"t": "broadcast/tracks"}
-    assert packages.aliased("t") is None
-
-
-def test_an_alias_equal_to_an_installed_namespace_is_refused(
+def test_a_want_naming_a_version_nothing_installed_falls_back_to_the_canonical_entry(
     store_home: Path, tmp_path: Path
 ) -> None:
+    """A lockfile's own `dependencies` naming a version no entry pins is stale, not a crash."""
     entry = _installed(_library(tmp_path / "built", "broadcast", "0.5", package="tracks"))
     project = tmp_path / "work"
-    _project(
-        project,
-        files={"src/own.sql": NORMALIZE},
-        manifest={"dependencies": {"broadcast": "broadcast/tracks@^1.0.0"}},
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [entry], dependencies={"broadcast/tracks": "9.9.9"})
+    packages = _packages(project)
+    found = packages.resolve(None, "broadcast/tracks")
+    assert found is not None and found.version == "1.0.0"
+
+
+def test_two_dependents_resolve_a_shared_name_at_their_own_version(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """B depends on D@1, C depends on D@2; each keeps calling into its own."""
+    reach = (
+        "CREATE FUNCTION use(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT shared.d.quieter(track)\n"
+        "$$ LANGUAGE sql;\n"
     )
-    _lock(project, [entry])
-    error = _refuses(project, "alias 'broadcast' is also the namespace")
-    assert "broadcast/tracks" in error.message
+    d_low = _installed(_library(tmp_path / "d1", "shared", "0.1", package="d", version="1.0.0"))
+    d_high = _installed(_library(tmp_path / "d2", "shared", "0.2", package="d", version="2.0.0"))
+    b = _installed(
+        _library(
+            tmp_path / "b", "me", "", package="b", member="use", src=reach,
+            dependencies={"shared/d": "1.0.0"},
+        ),
+        dependencies={"shared/d": "1.0.0"},
+    )
+    c = _installed(
+        _library(
+            tmp_path / "c", "me", "", package="c", member="use", src=reach,
+            dependencies={"shared/d": "2.0.0"},
+        ),
+        dependencies={"shared/d": "2.0.0"},
+    )
+    project = tmp_path / "work"
+    _project(project, files={}, manifest={"name": "other/edits"})
+    _lock(project, [d_low, d_high, b, c])
+    packages = _packages(project)
+    through_b = _argv(QUERY.format(call="me.b.use"), packages)
+    through_c = _argv(QUERY.format(call="me.c.use"), packages)
+    assert "volume=volume=0.1" in " ".join(through_b)
+    assert "volume=volume=0.2" in " ".join(through_c)
+
+
+def test_two_dependents_in_one_query_each_inline_their_own_version(
+    store_home: Path, tmp_path: Path
+) -> None:
+    """The headline case: ONE compile inlines B and C, each resolving `shared.d` on its own.
+
+    B and C share a package NAME for their shared dependency ('shared/d'), so
+    this is only decidable if the scope a bare call resolves in -- and the
+    cache of what a package's lib files define -- is kept per (name, version),
+    never conflated by name alone once two versions of it are both read in
+    the same compile.
+    """
+    reach = (
+        "CREATE FUNCTION use(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT shared.d.quieter(track)\n"
+        "$$ LANGUAGE sql;\n"
+    )
+    d_low = _installed(_library(tmp_path / "d1", "shared", "0.1", package="d", version="1.0.0"))
+    d_high = _installed(_library(tmp_path / "d2", "shared", "0.2", package="d", version="2.0.0"))
+    b = _installed(
+        _library(
+            tmp_path / "b", "me", "", package="b", member="use", src=reach,
+            dependencies={"shared/d": "1.0.0"},
+        ),
+        dependencies={"shared/d": "1.0.0"},
+    )
+    c = _installed(
+        _library(
+            tmp_path / "c", "me", "", package="c", member="use", src=reach,
+            dependencies={"shared/d": "2.0.0"},
+        ),
+        dependencies={"shared/d": "2.0.0"},
+    )
+    project = tmp_path / "work"
+    _project(project, files={}, manifest={"name": "other/edits"})
+    _lock(project, [d_low, d_high, b, c])
+    argv = _argv(
+        "COPY (SELECT me.b.use(f.audio[1]), me.c.use(f.audio[2]) "
+        "FROM input('film.mkv') f) TO 'out.mkv'",
+        _packages(project),
+    )
+    graph = " ".join(argv)
+    assert "volume=volume=0.1" in graph
+    assert "volume=volume=0.2" in graph
 
 
 # ---------------------------------------------------------------------------
@@ -1661,16 +1779,28 @@ def test_two_entries_naming_one_package_are_refused(tmp_path: Path) -> None:
         "store": store.entry_path("a" * 64),
     }
     _lock(project, [entry, dict(entry)])
-    _refuses(project, "two entries name package 'broadcast/tracks'")
+    _refuses(project, "two entries pin package 'broadcast/tracks' at version '1.0.0'")
 
 
-def test_a_registry_entry_and_a_link_naming_one_package_are_refused(tmp_path: Path) -> None:
+def test_a_registry_entry_and_a_link_at_one_version_are_refused(tmp_path: Path) -> None:
+    """Same name AND same version, one from each kind: still one identity, still refused."""
     linked = _library(tmp_path / "dev", "broadcast", "0.5", package="tracks")
     entry = _installed(_library(tmp_path / "built", "broadcast", "0.25", package="tracks"))
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     _lock(project, [entry, _link(linked)])
-    _refuses(project, "two entries name package 'broadcast/tracks'")
+    _refuses(project, "two entries name package 'broadcast/tracks' 1.0.0")
+
+
+def test_a_registry_entry_and_a_link_at_different_versions_coexist(tmp_path: Path) -> None:
+    """A different version of the same name is not a collision -- both simply resolve."""
+    linked = _library(tmp_path / "dev", "broadcast", "0.5", package="tracks", version="2.0.0")
+    entry = _installed(_library(tmp_path / "built", "broadcast", "0.25", package="tracks"))
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [entry, _link(linked)])
+    packages = _packages(project)
+    assert packages.versions["broadcast/tracks"].keys() == {"1.0.0", "2.0.0"}
 
 
 def test_an_entry_of_no_known_kind_is_refused(tmp_path: Path) -> None:
@@ -1821,13 +1951,13 @@ def _list(
     return code, captured.out, captured.err
 
 
-def test_list_prints_the_exports_programs_and_aliases_a_project_provides(
+def test_list_prints_the_exports_programs_and_dependencies_a_project_provides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER + PICK, "queries/split.sql": PROGRAM},
-        manifest={**_BIN, "dependencies": {"tracks": "broadcast/tracks@^1.2.0"}},
+        manifest={**_BIN, "dependencies": {"broadcast/tracks": "^1.2.0"}},
     )
     code, out, _err = _list(tmp_path, monkeypatch, capsys)
     assert code == 0
@@ -1837,7 +1967,7 @@ def test_list_prints_the_exports_programs_and_aliases_a_project_provides(
     assert "source (input media path), dest (output path)" in out  # required column
     assert "queries/split.sql" in out
     assert "me/edits | 0.1.0   | project | false" in out
-    assert "broadcast/tracks@^1.2.0" in out
+    assert "broadcast/tracks" in out and "^1.2.0" in out
 
 
 def test_list_outside_a_project_prints_empty_tables(
@@ -1856,7 +1986,7 @@ def test_list_as_json_carries_the_signatures_and_the_variables(
     _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER, "queries/split.sql": PROGRAM},
-        manifest={**_BIN, "dependencies": {"tracks": "broadcast/tracks@^1.2.0"}},
+        manifest={**_BIN, "dependencies": {"broadcast/tracks": "^1.2.0"}},
     )
     code, out, _err = _list(tmp_path, monkeypatch, capsys, "--json")
     assert code == 0
@@ -1887,9 +2017,7 @@ def test_list_as_json_carries_the_signatures_and_the_variables(
             "optional": [],
         }
     ]
-    assert package["aliases"] == [
-        {"alias": "tracks", "package": "broadcast/tracks", "range": "^1.2.0"}
-    ]
+    assert package["dependencies"] == [{"name": "broadcast/tracks", "range": "^1.2.0"}]
 
 
 def test_list_names_the_layer_and_marks_a_linked_package(
@@ -2031,13 +2159,13 @@ def test_a_written_manifest_reads_back_as_the_package_it_declares(tmp_path: Path
         description="what it is",
         lib={"quieter": "src/lib.sql"},
         bin={"split-chapters": "queries/split.sql"},
-        dependencies={"tracks": "broadcast/tracks@^1.2.0"},
+        dependencies={"broadcast/tracks": "^1.2.0"},
     )
     package = read_manifest(path)
     assert package.name == "me/edits" and package.version == "0.1.0"
     assert list(package.exports) == ["quieter"]
     assert list(package.programs) == ["split-chapters"]
-    assert package.aliases == {"tracks": Dependency(name="broadcast/tracks", range="^1.2.0")}
+    assert package.dependencies == {"broadcast/tracks": "^1.2.0"}
     assert b"\r" not in path.read_bytes()
 
 

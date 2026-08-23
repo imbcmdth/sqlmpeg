@@ -413,10 +413,11 @@ def search_packages(term: str | None = None) -> dict[str, Any]:
     }
 
 
-def install_package(
-    package: str, project: str, alias: str | None = None
-) -> dict[str, Any]:
+def install_package(package: str, project: str) -> dict[str, Any]:
     """Install `package` into the project at `project`: the store, then its lockfile.
+
+    Fetches what it depends on too, recursively, each at its highest
+    published version -- see `brought`.
 
     `project` is required and is never created: a directory with no lockfile
     at or above it is not a project, and inventing one is not this tool's
@@ -432,18 +433,16 @@ def install_package(
     manifest = lock.parent / MANIFEST_NAME
     index = packages_module.load_index()
     installed = packages_module.install(
-        index,
-        package,
-        lock=lock,
-        manifest=manifest if manifest.is_file() else None,
-        alias=alias,
+        index, package, lock=lock, manifest=manifest if manifest.is_file() else None
     )
     replaced = installed.replaced
     return {
         **_reported_index(index),
         "name": installed.release.name,
         "version": installed.release.version,
-        "alias": installed.alias,
+        "brought": [
+            {"name": one.name, "version": one.version} for one in installed.brought
+        ],
         "sha256": installed.release.sha256,
         "downloaded": installed.downloaded,
         "lockfile": str(installed.lock),

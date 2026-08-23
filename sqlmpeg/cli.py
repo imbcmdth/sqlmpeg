@@ -38,8 +38,8 @@ Subcommands:
 * ``list [--json]`` -- print what the project at the working directory and its
   dependencies provide: one table of packages, one of the functions they
   export, one of the programs they ship with the variables each declares, and
-  one of the aliases each manifest binds. Takes no query; the export list is
-  the manifest's ``lib``, with parameter types read from the files.
+  one of the dependencies each manifest declares. Takes no query; the export
+  list is the manifest's ``lib``, with parameter types read from the files.
 * ``init [--name NAME] [--namespace NS]`` -- write ``sqlmpeg.json``, an empty
   ``sqlmpeg.lock`` and a starter program into the working directory. The
   package segment is the directory's name unless ``--name`` says otherwise;
@@ -48,13 +48,14 @@ Subcommands:
 * ``search [TERM] [--json]`` -- fetch the registry's catalogue and print what
   matches TERM, filtered locally over each package's name, description and
   exported function names. A term matching nothing is an empty table, exit 0.
-* ``install PKG[@VERSION] [--alias NAME] [-g]`` -- resolve a package in the
-  catalogue, verify the archive it publishes against the digest it records,
-  put it in the store, and pin it in the lockfile and the manifest. No
-  version means the highest published one, written exact. The dependency is
-  recorded under the package segment as its alias; ``--alias`` chooses
-  another. Same project rule as ``link``: outside a project and without
-  ``-g``, exit 2.
+* ``install PKG[@VERSION] [-g]`` -- resolve a package in the catalogue,
+  verify the archive it publishes against the digest it records, put it in
+  the store, and pin it in the lockfile and the manifest. No version means
+  the highest published one, written exact. Then walks its own manifest's
+  dependencies and installs each the same way, recursively, at its highest
+  published version -- only the package named on the command line is
+  recorded in the manifest, what came along is the lockfile's own. Same
+  project rule as ``link``: outside a project and without ``-g``, exit 2.
 * ``link PATH [-g]`` / ``unlink NAME [-g]`` -- record (or drop) a package
   read live out of a directory, in this project's lockfile or, with ``-g``,
   the machine-wide one. The entry records only the directory; the package's
@@ -320,13 +321,6 @@ def _build_parser() -> argparse.ArgumentParser:
     install_p.add_argument(
         "package",
         help="<namespace>/<package>, or <namespace>/<package>@<version> for an exact version",
-    )
-    install_p.add_argument(
-        "--alias",
-        dest="alias",
-        default=None,
-        metavar="NAME",
-        help="record the dependency under this alias (default: the package segment)",
     )
     _add_global_argument(install_p)
 
@@ -1091,9 +1085,9 @@ def _listing_json(listed: list[_Listed]) -> str:
                 }
                 for listed_program in entry.programs
             ],
-            "aliases": [
-                {"alias": alias, "package": dependency.name, "range": dependency.range}
-                for alias, dependency in entry.package.aliases.items()
+            "dependencies": [
+                {"name": name, "range": range_}
+                for name, range_ in entry.package.dependencies.items()
             ],
         }
         for entry in listed
@@ -1145,13 +1139,13 @@ def _program_rows(listed: list[_Listed]) -> TableResult:
     )
 
 
-def _alias_rows(listed: list[_Listed]) -> TableResult:
+def _dependency_rows(listed: list[_Listed]) -> TableResult:
     rows: list[list[CellValue]] = [
-        [entry.package.name, alias, f"{dependency.name}@{dependency.range}"]
+        [entry.package.name, name, range_]
         for entry in listed
-        for alias, dependency in entry.package.aliases.items()
+        for name, range_ in entry.package.dependencies.items()
     ]
-    return TableResult(columns=["package", "alias", "dependency"], rows=rows)
+    return TableResult(columns=["package", "dependency", "range"], rows=rows)
 
 
 def _written_variables(variables: tuple[Variable, ...]) -> str:
@@ -1192,7 +1186,7 @@ def _cmd_list(args: argparse.Namespace, on_warning: OnWarning) -> int:
             ("packages", _package_rows(listed)),
             ("exports", _export_rows(listed)),
             ("programs", _program_rows(listed)),
-            ("aliases", _alias_rows(listed)),
+            ("dependencies", _dependency_rows(listed)),
         )
     ]
     print("\n\n".join(sections))
@@ -1429,6 +1423,11 @@ def _held_entries(path: Path) -> tuple[LockEntry, ...]:
     return read_lockfile(path).entries if path.is_file() else ()
 
 
+def _held_dependencies(path: Path) -> dict[str, str]:
+    """What `path`'s own project directly installed, carried over by a rewrite that isn't one."""
+    return dict(read_lockfile(path).dependencies) if path.is_file() else {}
+
+
 def _described(entry: LockEntry) -> str:
     """What an entry being replaced was, for the line that says it is going."""
     if isinstance(entry, LinkEntry):
@@ -1479,17 +1478,14 @@ def _cmd_search(args: argparse.Namespace, on_warning: OnWarning) -> int:
 
 
 def _cmd_install(args: argparse.Namespace, on_warning: OnWarning) -> int:
-    """Install a package into this project's lockfile, or -g's, and record it."""
+    """Install a package into this project's lockfile, or -g's, and record it.
+
+    Fetches what it depends on too, recursively -- each at its highest
+    published version, unless the lockfile already pins that exact version.
+    """
     lock, code = _lock_to_write(args)
     if lock is None:
         return code
-    if args.global_lock and args.alias is not None:
-        print("error: install: -g takes no --alias", file=sys.stderr)
-        print(
-            "hint: an alias lives in a project manifest, and a global install has none",
-            file=sys.stderr,
-        )
-        return 2
     manifest = lock.parent / MANIFEST_NAME
     try:
         index = packages_module.load_index()
@@ -1499,7 +1495,6 @@ def _cmd_install(args: argparse.Namespace, on_warning: OnWarning) -> int:
             args.package,
             lock=lock,
             manifest=manifest if manifest.is_file() else None,
-            alias=args.alias,
         )
     except SqlmpegError as err:
         _print_error(err)
@@ -1512,20 +1507,12 @@ def _cmd_install(args: argparse.Namespace, on_warning: OnWarning) -> int:
     if not installed.downloaded:
         print("  its content was already in the store; nothing was downloaded")
     if installed.manifest is not None:
-        print(
-            f"  recorded in {installed.manifest.name} as a dependency, "
-            f"alias '{installed.alias}'"
-        )
+        print(f"  recorded in {installed.manifest.name} as a dependency")
+    if installed.brought:
+        brought = ", ".join(f"{one.name} {one.version}" for one in installed.brought)
+        print(f"  brought along as dependencies: {brought}")
     full = release.name.replace("/", ".")
-    if installed.alias is not None:
-        print(
-            f"a query calls it as {installed.alias}.<name>(), or {full}.<name>() -- "
-            "`sqlmpeg list` shows what it provides"
-        )
-    else:
-        print(
-            f"a query calls it as {full}.<name>() -- `sqlmpeg list` shows what it provides"
-        )
+    print(f"a query calls it as {full}.<name>() -- `sqlmpeg list` shows what it provides")
     return 0
 
 
@@ -1565,7 +1552,9 @@ def _cmd_link(args: argparse.Namespace, on_warning: OnWarning) -> int:
         entry = LinkEntry(
             path=_written_link_path(target, lock, relative=not args.global_lock),
         )
-        write_lockfile(lock, with_entry(entries, entry, replaced))
+        write_lockfile(
+            lock, with_entry(entries, entry, replaced), dependencies=_held_dependencies(lock)
+        )
     except SqlmpegError as err:
         _print_error(err)
         return 1
@@ -1624,7 +1613,7 @@ def _cmd_unlink(args: argparse.Namespace, on_warning: OnWarning) -> int:
         return 1
 
     try:
-        write_lockfile(lock, without_entry(entries, held))
+        write_lockfile(lock, without_entry(entries, held), dependencies=_held_dependencies(lock))
     except SqlmpegError as err:
         _print_error(err)
         return 1

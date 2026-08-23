@@ -166,7 +166,7 @@ def search(term: str | None = None) -> dict[str, Any]:
     return tools.search_packages(term)
 
 
-def install(package: str, project: str, alias: str | None = None) -> dict[str, Any]:
+def install(package: str, project: str) -> dict[str, Any]:
     """Install a package from the registry. This DOWNLOADS CODE and WRITES FILES.
 
     It fetches an archive over the network, unpacks it into this machine's
@@ -174,6 +174,12 @@ def install(package: str, project: str, alias: str | None = None) -> dict[str, A
     it pins the package in `sqlmpeg.lock` and records it as a dependency in
     `sqlmpeg.json`. The code it installs becomes callable by every query
     compiled in that project.
+
+    It also walks the package's own manifest for what IT depends on, and
+    installs each of those the same way, recursively -- each at its highest
+    published version, pinned in the lockfile but not the manifest, which
+    only ever names what was asked for. `brought` in the result lists what
+    came along.
 
     The archive is verified against the sha256 the registry publishes before
     it is opened, so a download that does not match is discarded and nothing
@@ -187,12 +193,8 @@ def install(package: str, project: str, alias: str | None = None) -> dict[str, A
     `project` is the directory the project lives in, and is required: a
     directory with no `sqlmpeg.lock` at or above it is not a project, and this
     tool never creates one.
-
-    `alias` records the dependency in the manifest under this name instead of
-    the package segment. An entry already pinning this package is replaced,
-    reported as `replaced`.
     """
-    return tools.install_package(package, project, alias)
+    return tools.install_package(package, project)
 
 
 def run(

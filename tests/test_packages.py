@@ -48,23 +48,28 @@ def _package(
     version: str = "1.0.0",
     factor: str = "0.5",
     description: str = "audio track tools",
+    member: str = "quieter",
+    src: str | None = None,
+    dependencies: dict[str, str] | None = None,
 ) -> Path:
-    """A package directory: a manifest, and one lib file defining ``quieter``."""
+    """A package directory: a manifest, and one lib file defining ``quieter``.
+
+    `src` overrides the body and `member` its exported name, for a package
+    whose own body calls into another package; `dependencies` is its own
+    manifest's.
+    """
     (root / "src").mkdir(parents=True, exist_ok=True)
-    (root / "src" / "lib.sql").write_text(_quieter(factor), encoding="utf-8")
-    (root / "sqlmpeg.json").write_text(
-        json.dumps(
-            {
-                "name": name,
-                "version": version,
-                "description": description,
-                "lib": {"quieter": "src/lib.sql"},
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    body = src if src is not None else _quieter(factor)
+    (root / "src" / "lib.sql").write_text(body, encoding="utf-8")
+    declared: dict[str, object] = {
+        "name": name,
+        "version": version,
+        "description": description,
+        "lib": {member: "src/lib.sql"},
+    }
+    if dependencies:
+        declared["dependencies"] = dependencies
+    (root / "sqlmpeg.json").write_text(json.dumps(declared, indent=2) + "\n", encoding="utf-8")
     return root
 
 
@@ -219,13 +224,13 @@ def test_init_then_install_then_a_query_calling_it(
     assert entry.store == store.entry_path(entry.sha256)
 
     code, out, _err = _run(
-        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.quieter")
+        project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.tracks.quieter")
     )
     assert code == 0
     assert "volume=volume=0.5" in out
 
 
-def test_install_records_the_dependency_under_the_package_segment(
+def test_install_records_the_dependency_keyed_by_name(
     store_home: Path,
     registry: Path,
     tmp_path: Path,
@@ -238,10 +243,10 @@ def test_install_records_the_dependency_under_the_package_segment(
 
     code, out, _err = _run(project, monkeypatch, capsys, "install", "broadcast/tracks")
     assert code == 0
-    assert "recorded in sqlmpeg.json as a dependency, alias 'tracks'" in out
+    assert "recorded in sqlmpeg.json as a dependency" in out
 
     after = _read_json(project / "sqlmpeg.json")
-    assert after["dependencies"] == {"tracks": "broadcast/tracks@1.0.0"}
+    assert after["dependencies"] == {"broadcast/tracks": "1.0.0"}
     # Everything the manifest already said is still there, unchanged.
     assert {key: after[key] for key in before} == before
     # And it still reads back through the same validation every command applies.
@@ -262,8 +267,169 @@ def test_the_lockfile_regenerates_byte_identically(
     assert _run(project, monkeypatch, capsys, "install", "broadcast/tracks")[0] == 0
     assert (project / "sqlmpeg.lock").read_bytes() == first
     assert _read_json(project / "sqlmpeg.json")["dependencies"] == {
-        "tracks": "broadcast/tracks@1.0.0"
+        "broadcast/tracks": "1.0.0"
     }
+
+
+# ---------------------------------------------------------------------------
+# install walks dependencies, recursively
+# ---------------------------------------------------------------------------
+
+
+def _dependent(root: Path, *, name: str, dep_name: str, dep_range: str) -> Path:
+    """A package shipping one PROGRAM that calls into `dep_name`'s default export."""
+    (root / "queries").mkdir(parents=True, exist_ok=True)
+    (root / "queries" / "run.sql").write_text(
+        "-- variables: source (input media path), dest (output path)\n"
+        f"COPY (SELECT {dep_name.replace('/', '.')}.quieter(f.audio[1]) "
+        "FROM input(:'source') f) TO :'dest';\n",
+        encoding="utf-8",
+    )
+    declared = {
+        "name": name,
+        "version": "1.0.0",
+        "bin": {"thumb": "queries/run.sql"},
+        "dependencies": {dep_name: dep_range},
+    }
+    (root / "sqlmpeg.json").write_text(json.dumps(declared, indent=2) + "\n", encoding="utf-8")
+    return root
+
+
+def test_install_fetches_a_dependency_and_its_program_runs_unaided(
+    store_home: Path,
+    registry: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The motivating case: a package with a dependency is not broken on arrival."""
+    _publish(registry, _package(tmp_path / "video", name="broadcast/video", factor="0.5"))
+    _publish(
+        registry,
+        _dependent(
+            tmp_path / "images",
+            name="broadcast/images",
+            dep_name="broadcast/video",
+            dep_range="^1.0.0",
+        ),
+        functions=(),
+        programs=("thumb",),
+    )
+    project = _project(tmp_path / "work", monkeypatch, capsys)
+
+    code, out, _err = _run(project, monkeypatch, capsys, "install", "broadcast/images")
+    assert code == 0
+    assert "brought along as dependencies: broadcast/video 1.0.0" in out
+
+    entries = read_lockfile(project / "sqlmpeg.lock").entries
+    names = sorted(entry.name for entry in entries if isinstance(entry, RegistryEntry))
+    assert names == ["broadcast/images", "broadcast/video"]
+    # Only what was asked for is in the project's own manifest.
+    assert _read_json(project / "sqlmpeg.json")["dependencies"] == {
+        "broadcast/images": "1.0.0"
+    }
+
+    # Nothing installed by hand beyond `broadcast/images`, and its program runs.
+    code, out, _err = _run(
+        project,
+        monkeypatch,
+        capsys,
+        "compile",
+        "thumb",
+        "-v",
+        "source=in.mkv",
+        "-v",
+        "dest=out.mkv",
+    )
+    assert code == 0
+    assert "volume=volume=0.5" in out
+
+
+def test_a_dependency_already_pinned_at_the_wanted_version_is_not_brought_again(
+    store_home: Path,
+    registry: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _publish(registry, _package(tmp_path / "video", name="broadcast/video", factor="0.5"))
+    _publish(
+        registry,
+        _dependent(
+            tmp_path / "images",
+            name="broadcast/images",
+            dep_name="broadcast/video",
+            dep_range="^1.0.0",
+        ),
+        functions=(),
+        programs=("thumb",),
+    )
+    project = _project(tmp_path / "work", monkeypatch, capsys)
+    assert _run(project, monkeypatch, capsys, "install", "broadcast/video")[0] == 0
+
+    index = packages.load_index()
+    installed = packages.install(
+        index,
+        "broadcast/images",
+        lock=project / "sqlmpeg.lock",
+        manifest=project / "sqlmpeg.json",
+    )
+    assert installed.brought == ()
+
+
+def test_a_dependency_cycle_is_rejected_naming_the_loop(
+    store_home: Path,
+    registry: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _publish(
+        registry,
+        _package(tmp_path / "a", name="broadcast/a", dependencies={"broadcast/b": "^1.0.0"}),
+    )
+    _publish(
+        registry,
+        _package(tmp_path / "b", name="broadcast/b", dependencies={"broadcast/a": "^1.0.0"}),
+    )
+    project = _project(tmp_path / "work", monkeypatch, capsys)
+    code, _out, err = _run(project, monkeypatch, capsys, "install", "broadcast/a")
+    assert code == 1
+    assert "dependency cycle" in err
+    assert "broadcast/a" in err and "broadcast/b" in err
+    assert read_lockfile(project / "sqlmpeg.lock").entries == ()
+
+
+def test_two_installs_pin_different_versions_of_a_shared_dependency(
+    store_home: Path,
+    registry: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No resolver arbitrates: each dependent's own install keeps its own version."""
+    _publish(registry, _package(tmp_path / "d1", name="broadcast/d", version="1.0.0"))
+    _publish(
+        registry,
+        _package(tmp_path / "b", name="broadcast/b", dependencies={"broadcast/d": "^1.0.0"}),
+    )
+    project = _project(tmp_path / "work", monkeypatch, capsys)
+    assert _run(project, monkeypatch, capsys, "install", "broadcast/b")[0] == 0
+
+    _publish(registry, _package(tmp_path / "d2", name="broadcast/d", version="2.0.0"))
+    _publish(
+        registry,
+        _package(tmp_path / "c", name="broadcast/c", dependencies={"broadcast/d": "^1.0.0"}),
+    )
+    assert _run(project, monkeypatch, capsys, "install", "broadcast/c")[0] == 0
+
+    entries = read_lockfile(project / "sqlmpeg.lock").entries
+    by_identity = {
+        (entry.name, entry.version): entry for entry in entries if isinstance(entry, RegistryEntry)
+    }
+    assert sorted(v for (n, v) in by_identity if n == "broadcast/d") == ["1.0.0", "2.0.0"]
+    assert by_identity[("broadcast/b", "1.0.0")].dependencies == {"broadcast/d": "1.0.0"}
+    assert by_identity[("broadcast/c", "1.0.0")].dependencies == {"broadcast/d": "2.0.0"}
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +469,7 @@ def test_an_exact_version_is_taken_and_pinned(
     assert _run(project, monkeypatch, capsys, "install", "broadcast/tracks@1.9.0")[0] == 0
     assert read_lockfile(project / "sqlmpeg.lock").entries[0].version == "1.9.0"
     code, out, _err = _run(
-        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.quieter")
+        project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.tracks.quieter")
     )
     assert code == 0 and "volume=volume=0.9" in out
 
@@ -473,30 +639,14 @@ def test_install_writes_the_machine_wide_lockfile(
     assert isinstance(entry, RegistryEntry) and entry.name == "broadcast/tracks"
 
 
-def test_a_global_install_takes_no_alias(
+def test_installing_another_version_changes_the_want_but_keeps_the_old_entry(
     store_home: Path,
     registry: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _publish(registry, _package(tmp_path / "built"))
-    bare = tmp_path / "elsewhere"
-    bare.mkdir()
-    code, _out, err = _run(
-        bare, monkeypatch, capsys, "install", "-g", "--alias", "t", "broadcast/tracks"
-    )
-    assert code == 2
-    assert "-g takes no --alias" in err
-
-
-def test_installing_another_version_replaces_the_pin(
-    store_home: Path,
-    registry: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+    """install never arbitrates between versions: the old one just stops being wanted."""
     _publish(registry, _package(tmp_path / "v1", version="1.0.0", factor="0.5"))
     _publish(registry, _package(tmp_path / "v2", version="2.0.0", factor="0.25"))
     project = _project(tmp_path / "work", monkeypatch, capsys)
@@ -506,131 +656,48 @@ def test_installing_another_version_replaces_the_pin(
     assert code == 0
     assert "replacing the installed broadcast/tracks 1.0.0" in out
     entries = read_lockfile(project / "sqlmpeg.lock").entries
-    assert len(entries) == 1 and entries[0].version == "2.0.0"
+    versions = sorted(entry.version for entry in entries if isinstance(entry, RegistryEntry))
+    assert versions == ["1.0.0", "2.0.0"]  # both still pinned; nothing is deleted
     assert _read_json(project / "sqlmpeg.json")["dependencies"] == {
-        "tracks": "broadcast/tracks@2.0.0"
+        "broadcast/tracks": "2.0.0"
     }
     code, out, _err = _run(
-        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.quieter")
+        project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.tracks.quieter")
     )
-    assert code == 0 and "volume=volume=0.25" in out
+    assert code == 0 and "volume=volume=0.25" in out  # the project resolves at its new want
 
 
-# ---------------------------------------------------------------------------
-# --alias
-# ---------------------------------------------------------------------------
-
-
-def test_alias_records_the_dependency_under_the_chosen_name(
+def test_two_packages_under_one_namespace_install_and_both_stay_pinned(
     store_home: Path,
     registry: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    _publish(registry, _package(tmp_path / "built"))
-    project = _project(tmp_path / "work", monkeypatch, capsys)
-
-    code, out, _err = _run(
-        project, monkeypatch, capsys, "install", "broadcast/tracks", "--alias", "audio"
-    )
-    assert code == 0
-    assert "alias 'audio'" in out
-    assert _read_json(project / "sqlmpeg.json")["dependencies"] == {
-        "audio": "broadcast/tracks@1.0.0"
-    }
-
-
-def test_reinstalling_with_another_alias_re_keys_the_dependency(
-    store_home: Path,
-    registry: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _publish(registry, _package(tmp_path / "built"))
-    project = _project(tmp_path / "work", monkeypatch, capsys)
-    assert _run(project, monkeypatch, capsys, "install", "broadcast/tracks")[0] == 0
-    assert (
-        _run(
-            project, monkeypatch, capsys, "install", "broadcast/tracks", "--alias", "audio"
-        )[0]
-        == 0
-    )
-    assert _read_json(project / "sqlmpeg.json")["dependencies"] == {
-        "audio": "broadcast/tracks@1.0.0"
-    }
-
-
-def test_a_default_alias_colliding_with_an_existing_alias_names_the_flag(
-    store_home: Path,
-    registry: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+    """No alias to collide over: two dependencies just sit in the lockfile by name."""
     _publish(registry, _package(tmp_path / "first", factor="0.5"))
-    _publish(registry, _package(tmp_path / "second", name="other/tracks", factor="0.25"))
+    _publish(registry, _package(tmp_path / "second", name="broadcast/other", factor="0.25"))
     project = _project(tmp_path / "work", monkeypatch, capsys)
     assert _run(project, monkeypatch, capsys, "install", "broadcast/tracks")[0] == 0
+    assert _run(project, monkeypatch, capsys, "install", "broadcast/other")[0] == 0
 
-    code, _out, err = _run(project, monkeypatch, capsys, "install", "other/tracks")
-    assert code == 1
-    assert "alias 'tracks' already names broadcast/tracks" in err
-    assert "--alias" in err
-
-    assert (
-        _run(project, monkeypatch, capsys, "install", "other/tracks", "--alias", "quiet")[0]
-        == 0
-    )
     listed = read_lockfile(project / "sqlmpeg.lock").entries
-    assert [entry.name for entry in listed if isinstance(entry, RegistryEntry)] == [
+    assert sorted(entry.name for entry in listed if isinstance(entry, RegistryEntry)) == [
+        "broadcast/other",
         "broadcast/tracks",
-        "other/tracks",
     ]
     assert _read_json(project / "sqlmpeg.json")["dependencies"] == {
-        "tracks": "broadcast/tracks@1.0.0",
-        "quiet": "other/tracks@1.0.0",
+        "broadcast/tracks": "1.0.0",
+        "broadcast/other": "1.0.0",
     }
-    # Calling THROUGH an alias (`tracks.quieter(...)`, `quiet.quieter(...)`) is
-    # compile-time resolution, covered in test_project.py; recording the two
-    # aliases here is all this checks.
-
-
-def test_an_alias_colliding_with_an_installed_namespace_is_refused(
-    store_home: Path,
-    registry: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    _publish(registry, _package(tmp_path / "built"))
-    project = _project(tmp_path / "work", monkeypatch, capsys)
-    code, _out, err = _run(
-        project, monkeypatch, capsys, "install", "broadcast/tracks", "--alias", "broadcast"
+    code, out, _err = _run(
+        project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.tracks.quieter")
     )
-    assert code == 1
-    assert "alias 'broadcast' is the namespace of the installed package" in err
-    assert read_lockfile(project / "sqlmpeg.lock").entries == ()
-
-
-@pytest.mark.parametrize("written", ["Not One", "ffmpeg"])
-def test_alias_refuses_a_name_no_query_could_use(
-    store_home: Path,
-    registry: Path,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    written: str,
-) -> None:
-    _publish(registry, _package(tmp_path / "built"))
-    project = _project(tmp_path / "work", monkeypatch, capsys)
-    code, _out, err = _run(
-        project, monkeypatch, capsys, "install", "broadcast/tracks", "--alias", written
+    assert code == 0 and "volume=volume=0.5" in out
+    code, out, _err = _run(
+        project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.other.quieter")
     )
-    assert code == 1
-    assert written in err
-    assert read_lockfile(project / "sqlmpeg.lock").entries == ()
+    assert code == 0 and "volume=volume=0.25" in out
 
 
 # ---------------------------------------------------------------------------
@@ -921,7 +988,7 @@ def test_the_install_tool_installs_into_the_project_it_is_given(
     project = _project(tmp_path / "work", monkeypatch, capsys)
     result = mcp_tools.install_package("broadcast/tracks", str(project))
     assert result["name"] == "broadcast/tracks"
-    assert result["alias"] == "tracks"
+    assert result["brought"] == []
     assert result["version"] == "1.0.0"
     assert result["downloaded"] is True
     assert read_lockfile(project / "sqlmpeg.lock").entries[0].name == "broadcast/tracks"

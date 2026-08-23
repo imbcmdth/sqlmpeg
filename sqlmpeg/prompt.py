@@ -613,18 +613,23 @@ sqlmpeg's own).
 
    `sqlmpeg` is a reserved name too: never use it as an alias or a CTE name.
 4. **A package call** -- only inside a project with a `sqlmpeg.json`, and only
-   for a package it installed (`sqlmpeg list` shows what one provides).
-   `<namespace>.<package>.<member>(...)` always reaches that package's export
-   named `<member>`; `<namespace>.<package>(...)`, two segments, reaches its
-   DEFAULT export instead; `<alias>.<member>(...)`, also two segments, reaches
-   `<member>` through an alias the project's manifest bound in
-   `dependencies` (Cargo-style: an alias is never the package's own
-   namespace, so a two-segment call is never ambiguous between the two
-   readings). `ffmpeg.<filter>` and `sqlmpeg.<name>` above stay two-part and
-   reserved regardless of any package installed under those names -- there
-   are none, since a package's namespace may never be `ffmpeg`, `sqlmpeg` or
-   `wasm`. A project's own `CREATE FUNCTION` definitions are always called
-   bare, never qualified.
+   for a package it installed (`sqlmpeg list` shows what one provides). Every
+   call across packages is written in full, three segments:
+   `<namespace>.<package>.<member>(...)` reaches that package's export named
+   `<member>`; `<namespace>.<package>(...)`, two segments, reaches its DEFAULT
+   export instead. There is no alias -- a one-segment qualifier is never a
+   package lookup, and used to be one is now `UNKNOWN_FUNCTION` naming the
+   three-segment form. `ffmpeg.<filter>` and `sqlmpeg.<name>` above stay
+   two-part and reserved regardless of any package installed under those
+   names -- there are none, since a package's namespace may never be
+   `ffmpeg`, `sqlmpeg` or `wasm`. A project's own `CREATE FUNCTION`
+   definitions are always called bare, never qualified.
+
+   The version a call reaches is whichever the CALLING package's own manifest
+   depends on -- the project's own `dependencies` for a call in the query
+   itself, a dependency's own for a call inside that dependency's body. Two
+   packages may each depend on a different version of a third; each keeps
+   resolving against its own.
 
 For any filter (namespace 1 or 2): option names are case-sensitive and are
 exactly ffmpeg's own (`sigmaV`, `luma_msize_x`), checked against the
