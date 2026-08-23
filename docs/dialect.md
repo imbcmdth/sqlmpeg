@@ -44,46 +44,63 @@ dest    := 'path' | STDOUT | ( value-expression )
 ## Projects and packages
 
 A directory holding a `sqlmpeg.json` is a project, and the project is a
-package: it claims a namespace and says what it provides under it.
+package. A package is named `<namespace>/<package>`, and that name is
+the path a call writes: `imbcmdth/audio` is called as `imbcmdth.audio`.
 
 ```json
-{ "name": "my-edits", "version": "0.1.0", "namespace": "me",
-  "description": "...",
-  "exports": ["src/*.sql"],
-  "bin": { "split-chapters": "queries/split.sql" },
-  "dependencies": { "broadcast/tracks": "^1.2.0" } }
+{ "name": "imbcmdth/audio", "version": "1.0.0",
+  "description": "Volume, loudness, ducking",
+  "lib":  "src/audio.sql",
+  "libs": { "quieter": "src/audio.sql", "duck": "src/duck.sql" },
+  "bin":  "queries/volume.sql",
+  "bins": { "loudnorm": "queries/loudnorm-all.sql" },
+  "dependencies": { "tracks": "broadcast/tracks@^1.2.0" } }
 ```
 
-`name`, `version` and `namespace` are required; `description`,
-`exports`, `bin` and `dependencies` are optional. `namespace` is a
-lowercase plain identifier and may not be `ffmpeg`, `sqlmpeg` or
-`wasm`.
+`name` and `version` are required; the rest is optional. Each half of
+the name is a lowercase plain identifier, and the first half - the
+namespace - may not be `ffmpeg`, `sqlmpeg` or `wasm`. There is no
+separate `namespace` key: the name carries it.
 
-`exports` is the library: each pattern is a glob relative to the
-manifest, stays under it, and must match at least one file. `bin` is
-the programs, one name to one file - a name is a command word
-(`[a-z][a-z0-9_-]*`), the file is relative to the manifest, stays under
-it, is not a pattern, and must exist. A package may declare either half
-or both; a manifest declaring neither claims a namespace and holds
-dependencies, which is what a consumer project's does.
+Singular is the default, plural is the map, on both halves.
+`lib`/`libs` are the exports: each `libs` key is an exported function
+name, its value the file defining it, and `lib`'s export is named for
+the package segment (`audio` in `imbcmdth/audio`). Several keys may
+name one file; a file may define more than the manifest exports, and
+the rest are private to the package. Each exported name must be
+defined in the file named for it. `bin`/`bins` are the programs:
+`bins` maps a command word (`[a-z][a-z0-9_-]*`) to one query file, and
+`bin` is the default program, named for the package segment. Every
+file value is one path relative to the manifest, stays under it, is
+not a pattern, and must exist. A manifest declaring none of the four
+is a consumer project that holds dependencies.
 
-The two halves are read by role. An export holds `CREATE FUNCTION`
-definitions and nothing else, and one it exports but the query never
-calls is fine - it is a library; an uncalled definition in the query's
-own text is still rejected. A program's file is a whole query, like any
-script, and the definition reader never opens it.
+The two halves are read by role. A lib file holds `CREATE FUNCTION`
+definitions and nothing else, and a definition it exports but the query
+never calls is fine - it is a library; an uncalled definition in the
+query's own text is still rejected. A program's file is a whole query,
+like any script, and the definition reader never opens it.
 
-A query calls into the namespace: `me.quieter(f.audio[1], 0.5)` as a
-value, `FROM me.pick('a.mka') t` as a row source. The call is expanded
-exactly as a definition written into the query would be - same
-hygiene, same arity and type checks, same command out. Nothing is
-prepended to the script, and a package's names never enter the script's
-flat namespace.
+`dependencies` keys are aliases: each is a plain identifier this
+project's queries may use for the package the value names. The value
+keeps the installed package's name and the version range together,
+`"<namespace>/<package>@<range>"`; the range is recorded and shown,
+never solved. An alias may not be reserved, and may not equal the
+namespace of any installed package.
+
+A query calls into the package: `imbcmdth.quieter(f.audio[1], 0.5)` as
+a value, `FROM imbcmdth.pick('a.mka') t` as a row source. The call is
+expanded exactly as a definition written into the query would be -
+same hygiene, same arity and type checks, same command out. Nothing is
+prepended to the script, and a package's names never enter the
+script's flat namespace.
 
 `sqlmpeg list` prints what the project at the working directory and its
-dependencies provide: the packages with their layer, the functions with
-their signatures, and the programs with the variables each declares
-(read from its `-- variables:` header). `--json` for scripting.
+dependencies provide: the packages with their layer, the exports with
+their signatures and files (the list is the manifest's; only parameter
+types are read from the files), the programs with the variables each
+declares (read from its `-- variables:` header), and the aliases.
+`--json` for scripting.
 
 The project is found by walking up from the query file's directory, or
 from the working directory for a query typed on the command line; there
@@ -96,17 +113,18 @@ a `project` argument.
 ### Starting one
 
 `sqlmpeg init` writes `sqlmpeg.json`, an empty `sqlmpeg.lock` and a
-starter program into the working directory. The name is the directory's
-and the version `0.1.0` unless `--name` says otherwise; the namespace is
-the name lowercased with everything that is not an identifier character
-folded to `_`, unless `--namespace` says otherwise. A name nothing
-usable comes out of is rejected rather than guessed at. It overwrites
-none of the three files, and what it writes reads back through the same
-validation every other command applies.
+starter program into the working directory. The package segment is the
+directory's name, folded to an identifier, unless `--name` says
+otherwise; the namespace is `--namespace`'s, or derived from the git
+remote `origin`'s owner, or required - `init` says which it used.
+`--name <namespace>/<package>` gives the whole name at once. A name
+nothing usable comes out of is rejected rather than guessed at. It
+overwrites none of the three files, and what it writes reads back
+through the same validation every other command applies.
 
-The starter is a program, `queries/resize.sql` declared in `bin`, not an
-export: an export pattern matching no file is a rejection, so a fresh
-directory has nothing to name one with.
+The starter is a program, `queries/resize.sql` declared in `bins`, not
+an export: a lib must name a file defining its export, so a fresh
+directory has nothing to declare one with.
 
 ### Running a program
 
@@ -139,45 +157,47 @@ installed. It is machine-owned: installing writes it, nothing else
 should. Each entry is one of two kinds.
 
 ```json
-{ "format_version": 1,
+{ "format_version": 2,
   "reproducible": false,
   "not_reproducible_because": "a package is linked to a working directory, so its files are not pinned here",
   "packages": [
     { "kind": "registry", "name": "broadcast/tracks", "version": "1.2.0",
-      "namespace": "tracks", "sha256": "<64 hex>", "store": "v1/ab/<64 hex>" },
-    { "kind": "link", "namespace": "dev", "path": "../my-lib" }
+      "sha256": "<64 hex>", "store": "v1/ab/<64 hex>" },
+    { "kind": "link", "path": "../my-lib" }
   ] }
 ```
 
-A **registry** entry pins a version and the sha256 of the ARCHIVE the
-package travels as - one gzipped tar, built so the same content always
-produces the same bytes. `install` hashes the bytes it downloaded
-before opening them: a download that does not match the pin is
-discarded unopened and nothing is written. Its `namespace` is what this
-project calls the package, which is the manifest's own claim unless it
-was installed under another one. What matches is extracted
-into the store under `~/.cache/sqlmpeg/packages/`, and the extractor
-takes regular files and directories under the package root and nothing
-else - no absolute paths, no `..`, no links, no devices, and a member
-count and uncompressed size cap. Reading a stored package hashes
-nothing; content that is missing from the store is a rejection naming
-the package, never a fall back to what is there.
+A **registry** entry is keyed by the package's name and pins a version
+and the sha256 of the ARCHIVE the package travels as - one gzipped
+tar, built so the same content always produces the same bytes.
+`install` hashes the bytes it downloaded before opening them: a
+download that does not match the pin is discarded unopened and nothing
+is written. What matches is extracted into the store under
+`~/.cache/sqlmpeg/packages/`, and the extractor takes regular files and
+directories under the package root and nothing else - no absolute
+paths, no `..`, no links, no devices, and a member count and
+uncompressed size cap. Reading a stored package hashes nothing; content
+that is missing from the store is a rejection naming the package, never
+a fall back to what is there.
 
-A **link** entry names a directory and nothing else. Its
-`sqlmpeg.json` is read like any other manifest, so an edit lands in the
-next compile - which is the point, and which no digest could survive.
-A lockfile holding a link is therefore not reproducible, and says so in
-its own text.
+A **link** entry names a directory and nothing else - the package's
+name comes from the manifest there, so renaming the package needs no
+re-link. Its `sqlmpeg.json` is read like any other manifest, so an
+edit lands in the next compile - which is the point, and which no
+digest could survive. A lockfile holding a link is therefore not
+reproducible, and says so in its own text. Two entries naming one
+package are rejected. The lockfile carries no aliases - they are the
+manifest's.
 
-A namespace resolves through three layers, the first claim winning: the
-project's own manifest, then its lockfile, then the machine-wide
-lockfile a global install writes. Two of those are worth saying out
-loud, so a compile reports them without refusing: resolving inside a
-project but landing on the machine-wide layer, and compiling against a
-link. Each is reported once per package - as a `warning:` line on
-stderr from the CLI, in the `warnings` array of an MCP tool result, and
-through `compile_sql`'s optional `on_warning` callback for a library
-caller.
+A package resolves through three layers, the first claim on its name
+winning: the project's own manifest, then its lockfile, then the
+machine-wide lockfile a global install writes. Two of those are worth
+saying out loud, so a compile reports them without refusing: resolving
+inside a project but landing on the machine-wide layer, and compiling
+against a link. Each is reported once per package - as a `warning:`
+line on stderr from the CLI, in the `warnings` array of an MCP tool
+result, and through `compile_sql`'s optional `on_warning` callback for
+a library caller.
 
 ### The registry
 
@@ -203,7 +223,7 @@ and nothing else.
 ### Searching
 
 `sqlmpeg search tracks` prints the catalogue, narrowed to what matches
-the term: a case-insensitive substring of a package's name, namespace,
+the term: a case-insensitive substring of a package's name, its
 description or the names of the functions it exports. No term lists
 everything, a term matching nothing is an empty table and exit 0, and
 `--json` emits the same results for scripting.
@@ -225,24 +245,24 @@ manifest `dependencies` range is recorded and shown, never solved.
 A version already in the store is not downloaded again - the same
 content, installed into a second project or globally, is stored once.
 
-`--as <namespace>` installs the package under a namespace other than the
-one it claims. Two published packages may both claim `tracks`, and this
-lockfile is where one name maps to one package; the namespace in the
-manifest inside the archive is the author's proposal, and the lockfile's
-is what a query calls. It must still be a namespace, and not one sqlmpeg
-holds for itself. Installing over a namespace already claimed replaces
-that claim and says what it replaced.
+The dependency is recorded in the manifest under the package segment
+as its alias - `install broadcast/tracks` writes
+`"tracks": "broadcast/tracks@1.2.0"` - and `--alias <name>` chooses
+another. A default that collides with an existing alias or with an
+installed package's namespace is a rejection naming `--alias`. A
+global install (`-g`) has no manifest, so nothing is aliased.
+Installing a package already pinned replaces its entry and says what
+it replaced.
 
 `-g` and the project rule are `link`'s, below.
 
 ### Linking
 
-`sqlmpeg link ../my-lib` writes a link entry for the namespace that
-directory's manifest claims; `sqlmpeg unlink <namespace>` removes it and
-rewrites the file. Linking over a namespace something else already
-claims replaces that claim and says what it replaced. The entry records
-the namespace, so a package that later claims another one has to be
-linked again.
+`sqlmpeg link ../my-lib` writes a link entry naming that directory; the
+package's name comes from its manifest. `sqlmpeg unlink <name>` (the
+package's name, or the directory for a link whose manifest is gone)
+removes it and rewrites the file. Linking a package something else
+already pins replaces that entry and says what it replaced.
 
 `-g` writes the machine-wide lockfile instead of the project's. Without
 it, no lockfile at or above the working directory is a usage error
@@ -450,18 +470,22 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   referencing anything but its parameters and its own `FROM` aliases, a
   definition in the query's own text that nothing calls, and a
   `TABLE`-returning call in the `SELECT` list.
-- **Packages**: a namespace no manifest claims; a member the namespace
-  does not define; a manifest that is not one JSON object with the three
-  required keys; a namespace that is reserved or is not a plain
-  identifier; an export pattern matching no file or leaving the project
-  directory; one name defined twice across a package's exports; an
-  export holding anything but `CREATE FUNCTION`; a program name that is
-  not a command word, declared twice, or naming a pattern, a missing
-  file, or a path outside the project.
+- **Packages**: a namespace no package claims; a member the package
+  does not export; a manifest that is not one JSON object with `name`
+  and `version`; a name that is not `<namespace>/<package>` in plain
+  identifiers, or whose namespace is reserved; a `lib`, `libs`, `bin`
+  or `bins` value naming a pattern, a missing file, or a path outside
+  the project; an exported name not defined in the file named for it;
+  a `libs` or `bins` key equal to the package segment; one name defined
+  twice across a package's lib files; a lib file holding anything but
+  `CREATE FUNCTION`; a program name that is not a command word or is
+  declared twice; a dependency alias that is not a plain identifier, is
+  reserved, or equals an installed package's namespace; a dependency
+  value that is not `<namespace>/<package>@<range>`.
 - **Lockfiles**: a lockfile that is not one JSON object with its three
   required keys, or is written in another format version; an entry of
   no known kind, missing a key, or holding an unknown one; two entries
-  claiming one namespace; a lockfile claiming to be reproducible while
+  naming one package; a lockfile claiming to be reproducible while
   linking a directory; a linked directory with no manifest; stored
   content that is missing or was written by another store layout; a
   downloaded archive that does not hash to what the entry pins, or that
@@ -471,11 +495,12 @@ Every one of these is a typed rejection, never a silent reinterpretation:
 - **The registry**: a registry that cannot be read, with nothing cached
   to answer from; a catalogue or detail file that is not JSON, is not an
   object, is written in another format version, or holds a malformed
-  field or a name that is not `<owner>/<name>`; a package or a version
-  the catalogue does not publish; an archive that is not the size or the
-  digest its detail file records; an archive whose package says it is a
-  different name or version than what was published; `--as` naming
-  something that is not a namespace, or one that is reserved.
+  field or a name that is not `<namespace>/<package>`; a package or a
+  version the catalogue does not publish; an archive that is not the
+  size or the digest its detail file records; an archive whose package
+  says it is a different name or version than what was published;
+  `--alias` naming something that is not an alias, one that is
+  reserved, or one already taken.
 - **Identifiers**: double-quoted identifiers (except tag-key aliases);
   the reserved names `ffmpeg` and `sqlmpeg` as aliases.
 - **Written records**: a chapter whose span ends at or before it starts,

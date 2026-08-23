@@ -353,7 +353,7 @@ def test_the_install_tool_says_it_downloads_code_and_writes_files() -> None:
     text = (tool.description or "").lower()
     assert "downloads code" in text and "writes files" in text
     assert "sqlmpeg.lock" in text and "network" in text
-    assert set(tool.input_schema["properties"]) == {"package", "project", "namespace"}
+    assert set(tool.input_schema["properties"]) == {"package", "project", "alias"}
     assert tool.input_schema["required"] == ["package", "project"]
 
 

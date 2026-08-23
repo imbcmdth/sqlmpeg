@@ -40,7 +40,14 @@ from ..emit import build_ffmpeg_commands, emit
 from ..errors import ErrorCode, SqlmpegError
 from ..execute import DEFAULT_TIMEOUT, execute
 from ..ir import Graph, SinkUnit
-from ..project import LOCKFILE_NAME, MANIFEST_NAME, PackageSet, discover, find_lockfile
+from ..project import (
+    LOCKFILE_NAME,
+    MANIFEST_NAME,
+    PackageSet,
+    RegistryEntry,
+    discover,
+    find_lockfile,
+)
 from ..prompt import build_system_prompt
 from ..table import TableResult, render_csv, render_table
 from ..vars import Substitution, referenced, substitute
@@ -407,7 +414,7 @@ def search_packages(term: str | None = None) -> dict[str, Any]:
 
 
 def install_package(
-    package: str, project: str, namespace: str | None = None
+    package: str, project: str, alias: str | None = None
 ) -> dict[str, Any]:
     """Install `package` into the project at `project`: the store, then its lockfile.
 
@@ -429,19 +436,23 @@ def install_package(
         package,
         lock=lock,
         manifest=manifest if manifest.is_file() else None,
-        namespace=namespace,
+        alias=alias,
     )
+    replaced = installed.replaced
     return {
         **_reported_index(index),
         "name": installed.release.name,
         "version": installed.release.version,
-        "namespace": installed.namespace,
-        "claimed_namespace": installed.claimed,
+        "alias": installed.alias,
         "sha256": installed.release.sha256,
         "downloaded": installed.downloaded,
         "lockfile": str(installed.lock),
         "manifest": None if installed.manifest is None else str(installed.manifest),
-        "replaced": None if installed.replaced is None else installed.replaced.namespace,
+        "replaced": None
+        if replaced is None
+        else replaced.name
+        if isinstance(replaced, RegistryEntry)
+        else replaced.path,
     }
 
 

@@ -39,8 +39,8 @@ class SqlmpegWarning:
 
     Shaped like `SqlmpegError` on purpose -- a typed code, a human message, an
     optional anchor and hint -- so an editor renders both the same way.
-    `package` is the namespace the warning is about, and what a sink dedupes
-    on.
+    `package` is the name of the package the warning is about, and what a
+    sink dedupes on.
     """
 
     code: WarningCode

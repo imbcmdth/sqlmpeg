@@ -56,11 +56,15 @@ from .project import (
     MANIFEST_NAME,
     RESERVED_NAMESPACES,
     LockEntry,
+    Package,
     RegistryEntry,
     add_dependency,
+    held_entry,
     is_namespace,
+    is_package_name,
     read_lockfile,
     read_manifest,
+    stored_name,
     with_entry,
     write_lockfile,
 )
@@ -101,14 +105,16 @@ _MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 
 _INDEX_NAME = "index.json"
 
-# One package name: `<owner>/<name>`, both halves starting with a letter or
-# digit. Checked before the name is ever part of a URL or a path, so a name
-# off the network cannot name a directory above the one it belongs in.
-_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*")
+# A package name's SHAPE is the project reader's rule (`is_package_name`):
+# `<namespace>/<package>`, each half a lowercase plain identifier. Checked
+# before the name is ever part of a URL or a path, so a name off the network
+# cannot name a directory above the one it belongs in.
 _VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+-]*")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
-_NAME_HINT = "a package name is <owner>/<name>, lowercase"
+_NAME_HINT = (
+    "a package name is <namespace>/<package>, each half a lowercase plain identifier"
+)
 _REGISTRY_HINT = (
     f"set {REGISTRY_ENV} to another registry, or check the network connection"
 )
@@ -130,7 +136,6 @@ class Listing:
 
     name: str
     version: str
-    namespace: str
     description: str
     functions: tuple[str, ...]
     programs: tuple[str, ...]
@@ -139,7 +144,6 @@ class Listing:
         return {
             "name": self.name,
             "version": self.version,
-            "namespace": self.namespace,
             "description": self.description,
             "functions": list(self.functions),
             "programs": list(self.programs),
@@ -185,15 +189,13 @@ class Release:
 class Installed:
     """What one install did, for the caller that reports it.
 
-    `namespace` is what the lockfile now maps to this package and `claimed` is
-    what the package calls itself; they differ when it was installed under
-    another namespace. `replaced` is whatever held that namespace before, or
-    None.
+    `alias` is the name the project manifest now records the dependency under,
+    and None for a global install, which records no dependency. `replaced` is
+    whatever entry pinned this package before, or None.
     """
 
     release: Release
-    namespace: str
-    claimed: str
+    alias: str | None
     replaced: LockEntry | None
     root: Path
     lock: Path
@@ -342,8 +344,10 @@ def _objects(data: dict[str, object], key: str, relative: str) -> list[dict[str,
 
 
 def _checked_name(name: str, relative: str) -> str:
-    if _NAME_RE.fullmatch(name) is None:
+    if not is_package_name(name):
         raise _malformed(relative, f"{name!r} is not a package name")
+    if name.partition("/")[0] in RESERVED_NAMESPACES:
+        raise _malformed(relative, f"{name!r} claims a reserved namespace")
     return name
 
 
@@ -351,7 +355,6 @@ def _listing(raw: dict[str, object], relative: str) -> Listing:
     return Listing(
         name=_checked_name(_text(raw, "name", relative), relative),
         version=_text(raw, "version", relative),
-        namespace=_text(raw, "namespace", relative),
         description=_optional_text(raw, "description", relative),
         functions=_names(raw, "functions", relative),
         programs=_names(raw, "programs", relative),
@@ -468,7 +471,7 @@ def load_index() -> Index:
 def search(index: Index, term: str | None = None) -> tuple[Listing, ...]:
     """The catalogue entries matching `term`, in the order the catalogue holds them.
 
-    Matched case-insensitively against the name, the namespace, the
+    Matched case-insensitively against the name (both segments), the
     description and the names of the functions the package exports. No term
     matches everything; a term matching nothing is an empty result, which is
     an answer and not a rejection.
@@ -480,7 +483,7 @@ def search(index: Index, term: str | None = None) -> tuple[Listing, ...]:
 
 
 def _matches(listing: Listing, needle: str) -> bool:
-    fields = (listing.name, listing.namespace, listing.description, *listing.functions)
+    fields = (listing.name, listing.description, *listing.functions)
     return any(needle in field.lower() for field in fields)
 
 
@@ -508,8 +511,14 @@ def _version_key(version: str) -> tuple[tuple[int, int, str], ...]:
 def _requested(request: str) -> tuple[str, str | None]:
     """`<name>` or `<name>@<version>` split, both halves checked for shape."""
     name, separator, version = request.partition("@")
-    if _NAME_RE.fullmatch(name) is None:
+    if not is_package_name(name):
         raise _reject(f"{request!r} does not name a package", _NAME_HINT)
+    if name.partition("/")[0] in RESERVED_NAMESPACES:
+        reserved = ", ".join(sorted(RESERVED_NAMESPACES))
+        raise _reject(
+            f"namespace '{name.partition('/')[0]}' is reserved",
+            f"{reserved} belong to sqlmpeg itself; nothing is published under them",
+        )
     if not separator:
         return name, None
     if _VERSION_RE.fullmatch(version) is None:
@@ -606,25 +615,8 @@ def stored(release: Release) -> Path | None:
 # --------------------------------------------------------------------------
 
 
-def _claimed(namespace: str) -> str:
-    """The namespace an install writes, checked to be one this project may use."""
-    if not is_namespace(namespace):
-        raise _reject(
-            f"{namespace!r} is not a namespace",
-            "a namespace is a lowercase plain identifier: a letter or underscore, "
-            "then letters, digits or underscores",
-        )
-    if namespace in RESERVED_NAMESPACES:
-        reserved = ", ".join(sorted(RESERVED_NAMESPACES))
-        raise _reject(
-            f"namespace {namespace!r} is reserved",
-            f"{reserved} belong to sqlmpeg itself; install it under another one",
-        )
-    return namespace
-
-
-def _agrees(release: Release, root: Path) -> str:
-    """The namespace the installed package claims, its name and version checked.
+def _agrees(release: Release, root: Path) -> None:
+    """The installed package's name and version, checked against the registry's.
 
     The registry said what it was publishing and the package says what it is;
     a disagreement is caught here rather than at the next compile, where the
@@ -641,7 +633,70 @@ def _agrees(release: Release, root: Path) -> str:
                 f"the package says {found!r}",
                 "the registry is serving an archive for another package; report it",
             )
-    return package.namespace
+
+
+def _taken_namespaces(
+    project: Package, release: Release, entries: tuple[LockEntry, ...], lock: Path
+) -> dict[str, str]:
+    """Every namespace an installed package holds, mapped to that package's name.
+
+    The project's own, the one being installed, and each lockfile entry's --
+    the set a dependency alias must stay disjoint from.
+    """
+    taken = {project.namespace: project.name}
+    taken[release.name.partition("/")[0]] = release.name
+    for entry in entries:
+        name = stored_name(entry, lock)
+        if name is not None:
+            taken.setdefault(name.partition("/")[0], name)
+    return taken
+
+
+def _alias_for(
+    project: Package,
+    release: Release,
+    written: str | None,
+    entries: tuple[LockEntry, ...],
+    lock: Path,
+) -> str:
+    """The alias this install records the dependency under, validated.
+
+    ``--alias`` when given; else the alias the manifest already binds to this
+    package; else the package segment. The alias may not already name another
+    package, and may not equal any installed package's namespace -- that
+    disjointness is what keeps a two-part call decidable.
+    """
+    existing = next(
+        (alias for alias, held in project.aliases.items() if held.name == release.name), None
+    )
+    if written is not None:
+        if not is_namespace(written):
+            raise _reject(
+                f"--alias {written!r} is not an alias",
+                "an alias is a lowercase plain identifier: a letter or underscore, "
+                "then letters, digits or underscores",
+            )
+        if written in RESERVED_NAMESPACES:
+            reserved = ", ".join(sorted(RESERVED_NAMESPACES))
+            raise _reject(
+                f"--alias {written!r} is reserved",
+                f"{reserved} belong to sqlmpeg itself; pick another alias",
+            )
+    chosen = written if written is not None else existing or release.name.partition("/")[2]
+    another = "pass --alias with another name" if written is not None else (
+        "the default alias collides; pass --alias to choose another"
+    )
+    held = project.aliases.get(chosen)
+    if held is not None and held.name != release.name:
+        raise _reject(f"alias '{chosen}' already names {held.name}", another)
+    taken = _taken_namespaces(project, release, entries, lock)
+    if chosen in taken:
+        raise _reject(
+            f"alias '{chosen}' is the namespace of the installed package "
+            f"'{taken[chosen]}'",
+            another,
+        )
+    return chosen
 
 
 def install(
@@ -650,42 +705,42 @@ def install(
     *,
     lock: Path,
     manifest: Path | None = None,
-    namespace: str | None = None,
+    alias: str | None = None,
 ) -> Installed:
     """Install `request` into the lockfile `lock`, and record it in `manifest`.
 
     In order: resolve the version, put its content in the store, then write
-    the lockfile. Nothing is recorded before the content is there, so an
-    install that fails anywhere leaves a project pinning only what it had.
+    the lockfile and the manifest. Nothing is recorded before the content is
+    there, so an install that fails anywhere leaves a project pinning only
+    what it had.
 
-    `namespace` installs the package under a name other than the one it
-    claims. Two packages may both want ``tracks``, and the lockfile is where
-    one name maps to one package; the manifest inside the archive is only the
-    author's proposal. Whatever the namespace ends up being, an entry already
-    holding it is replaced.
+    The dependency is recorded under the package segment as its alias, or
+    under `alias` when one is given. With no `manifest` -- a global install --
+    nothing is aliased and nothing records a dependency. An entry already
+    pinning this package is replaced.
     """
     release = resolve(index, request)
     already = stored(release)
     root = already if already is not None else fetch(release)
-    claimed = _agrees(release, root)
-    written = _claimed(namespace) if namespace is not None else _claimed(claimed)
+    _agrees(release, root)
 
     entries = read_lockfile(lock).entries if lock.is_file() else ()
-    replaced = next((held for held in entries if held.namespace == written), None)
+    written_alias: str | None = None
+    if manifest is not None:
+        written_alias = _alias_for(read_manifest(manifest), release, alias, entries, lock)
+    replaced = held_entry(entries, release.name, lock)
     entry = RegistryEntry(
-        namespace=written,
         name=release.name,
         version=release.version,
         sha256=release.sha256,
         store=store.entry_path(release.sha256),
     )
-    write_lockfile(lock, with_entry(entries, entry))
-    if manifest is not None:
-        add_dependency(manifest, release.name, release.version)
+    write_lockfile(lock, with_entry(entries, entry, replaced))
+    if manifest is not None and written_alias is not None:
+        add_dependency(manifest, written_alias, release.name, release.version)
     return Installed(
         release=release,
-        namespace=written,
-        claimed=claimed,
+        alias=written_alias,
         replaced=replaced,
         root=root,
         lock=lock,

@@ -37,25 +37,29 @@ Subcommands:
   own destination paths.
 * ``list [--json]`` -- print what the project at the working directory and its
   dependencies provide: one table of packages, one of the functions they
-  export, one of the programs they ship with the variables each declares.
-  Takes no query and reads no SQL beyond those files.
+  export, one of the programs they ship with the variables each declares, and
+  one of the aliases each manifest binds. Takes no query; the export list is
+  the manifest's ``lib``/``libs``, with parameter types read from the files.
 * ``init [--name NAME] [--namespace NS]`` -- write ``sqlmpeg.json``, an empty
-  ``sqlmpeg.lock`` and a starter program into the working directory. Refuses
-  to overwrite any of the three.
+  ``sqlmpeg.lock`` and a starter program into the working directory. The
+  package segment is the directory's name unless ``--name`` says otherwise;
+  the namespace is ``--namespace``'s, or derived from the git remote's owner,
+  or required. Refuses to overwrite any of the three files.
 * ``search [TERM] [--json]`` -- fetch the registry's catalogue and print what
-  matches TERM, filtered locally over each package's name, namespace,
-  description and exported function names. A term matching nothing is an
-  empty table, exit 0.
-* ``install PKG[@VERSION] [--as NS] [-g]`` -- resolve a package in the
+  matches TERM, filtered locally over each package's name, description and
+  exported function names. A term matching nothing is an empty table, exit 0.
+* ``install PKG[@VERSION] [--alias NAME] [-g]`` -- resolve a package in the
   catalogue, verify the archive it publishes against the digest it records,
   put it in the store, and pin it in the lockfile and the manifest. No
-  version means the highest published one, written exact. ``--as`` installs
-  it under a namespace other than the one it claims. Same project rule as
-  ``link``: outside a project and without ``-g``, exit 2.
-* ``link PATH [-g]`` / ``unlink NAMESPACE [-g]`` -- record (or drop) a package
+  version means the highest published one, written exact. The dependency is
+  recorded under the package segment as its alias; ``--alias`` chooses
+  another. Same project rule as ``link``: outside a project and without
+  ``-g``, exit 2.
+* ``link PATH [-g]`` / ``unlink NAME [-g]`` -- record (or drop) a package
   read live out of a directory, in this project's lockfile or, with ``-g``,
-  the machine-wide one. Outside a project and without ``-g`` there is no
-  lockfile to write and none is invented: usage error, exit 2.
+  the machine-wide one. The entry records only the directory; the package's
+  name comes from the manifest there. Outside a project and without ``-g``
+  there is no lockfile to write and none is invented: usage error, exit 2.
 * ``publish`` -- not open yet; exits 1 naming where submissions go.
 * ``prompt`` -- print the LLM system prompt to stdout. Takes no arguments and
   touches no files, but calls ``registry.load()`` to render the filter
@@ -109,6 +113,8 @@ import json
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from importlib import metadata
@@ -132,14 +138,15 @@ from .project import (
     LockEntry,
     Package,
     PackageSet,
-    Program,
     discover,
     find_lockfile,
+    held_entry,
     is_namespace,
     read_lockfile,
     read_manifest,
+    stored_name,
     with_entry,
-    without_namespace,
+    without_entry,
     write_lockfile,
     write_manifest,
 )
@@ -284,11 +291,16 @@ def _build_parser() -> argparse.ArgumentParser:
     init_p = subparsers.add_parser(
         "init", help="write sqlmpeg.json, sqlmpeg.lock and a starter program here"
     )
-    init_p.add_argument("--name", default=None, help="the package name (default: this directory's)")
+    init_p.add_argument(
+        "--name",
+        default=None,
+        help="the package name, <namespace>/<package> or just the package "
+        "segment (default: this directory's name)",
+    )
     init_p.add_argument(
         "--namespace",
         default=None,
-        help="the namespace a query calls this package by (default: derived from the name)",
+        help="the namespace half of the name (default: derived from the git remote's owner)",
     )
 
     search_p = subparsers.add_parser("search", help="find packages in the registry")
@@ -296,7 +308,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "term",
         nargs="?",
         default=None,
-        help="matched against each package's name, namespace, description and "
+        help="matched against each package's name, description and "
         "function names (default: everything published)",
     )
     search_p.add_argument(
@@ -305,14 +317,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     install_p = subparsers.add_parser("install", help="install a package from the registry")
     install_p.add_argument(
-        "package", help="<owner>/<name>, or <owner>/<name>@<version> for an exact version"
+        "package",
+        help="<namespace>/<package>, or <namespace>/<package>@<version> for an exact version",
     )
     install_p.add_argument(
-        "--as",
-        dest="as_namespace",
+        "--alias",
+        dest="alias",
         default=None,
-        metavar="NAMESPACE",
-        help="call the package by this namespace instead of the one it claims",
+        metavar="NAME",
+        help="record the dependency under this alias (default: the package segment)",
     )
     _add_global_argument(install_p)
 
@@ -320,7 +333,9 @@ def _build_parser() -> argparse.ArgumentParser:
     link_p.add_argument("path", help="the directory holding the package's sqlmpeg.json")
     _add_global_argument(link_p)
     unlink_p = subparsers.add_parser("unlink", help="drop a linked package")
-    unlink_p.add_argument("namespace", help="the namespace to stop reading from a directory")
+    unlink_p.add_argument(
+        "name", help="the linked package's name (or its directory) to stop reading live"
+    )
     _add_global_argument(unlink_p)
     subparsers.add_parser("publish", help="publish a package to the registry")
 
@@ -420,33 +435,39 @@ def _program_names(packages: PackageSet | None) -> list[str]:
     if packages is None:
         return []
     return [
-        f"{namespace}.{program.name}"
-        for namespace in packages.namespaces()
-        for program in _package(packages, namespace).programs
+        f"{package.namespace}.{program}"
+        for name in packages.names()
+        for package in [_package(packages, name)]
+        for program in package.programs
     ]
 
 
-def _package(packages: PackageSet, namespace: str) -> Package:
-    found = packages.get(namespace)
-    assert found is not None  # a namespace `namespaces()` just handed back
+def _package(packages: PackageSet, name: str) -> Package:
+    found = packages.get(name)
+    assert found is not None  # a name `names()` just handed back
     return found
 
 
-def _matching_programs(name: str, packages: PackageSet | None) -> list[tuple[Package, Program]]:
-    """The packages shipping a program `name` names, qualified or bare."""
+def _matching_programs(name: str, packages: PackageSet | None) -> list[tuple[Package, str]]:
+    """The (package, program name) pairs `name` names, qualified or bare.
+
+    A qualified ``ns.program`` is matched against every package under `ns` --
+    the interim two-part rule, which three-segment names replace.
+    """
     if packages is None:
         return []
     namespace, dot, unqualified = name.partition(".")
     if dot:
-        package = packages.get(namespace)
-        program = package.program(unqualified) if package is not None else None
-        return [(package, program)] if package is not None and program is not None else []
-    found: list[tuple[Package, Program]] = []
-    for claimed in packages.namespaces():
+        return [
+            (package, unqualified)
+            for package in packages.in_namespace(namespace)
+            if package.program(unqualified) is not None
+        ]
+    found: list[tuple[Package, str]] = []
+    for claimed in packages.names():
         package = _package(packages, claimed)
-        program = package.program(name)
-        if program is not None:
-            found.append((package, program))
+        if package.program(name) is not None:
+            found.append((package, name))
     return found
 
 
@@ -460,21 +481,23 @@ def _program_text(name: str, packages: PackageSet | None) -> str | None:
     if not found:
         return None
     if len(found) > 1:
-        written = ", ".join(f"{package.namespace}.{program.name}" for package, program in found)
+        written = ", ".join(f"{package.namespace}.{program}" for package, program in found)
         raise SqlmpegError(
             ErrorCode.UNSUPPORTED_SQL,
             f"more than one package ships a program named '{name}'",
             hint=f"name the one you mean: {written}",
         )
     package, program = found[0]
+    file = package.program(program)
+    assert file is not None  # _matching_programs only keeps shipped programs
     try:
-        return program.path.read_text(encoding="utf-8")
+        return file.read_text(encoding="utf-8")
     except OSError as err:
         raise SqlmpegError(
             ErrorCode.UNSUPPORTED_SQL,
-            f"program '{package.namespace}.{program.name}' could not be read: "
+            f"program '{package.namespace}.{program}' could not be read: "
             f"{err.strerror or err}",
-            hint=f"its file is {program.path}",
+            hint=f"its file is {file}",
         ) from err
 
 
@@ -913,7 +936,8 @@ def _echo_command(argv: list[str]) -> None:
 class _ListedProgram:
     """One program and the variables its query declares."""
 
-    program: Program
+    name: str
+    path: Path
     variables: tuple[Variable, ...]
 
 
@@ -935,13 +959,19 @@ def _relative(path: Path, root: Path) -> str:
 
 
 def _listed(package: Package) -> _Listed:
-    """Read one package's exports and programs. Raises like any other read."""
+    """Read one package's exports and programs. Raises like any other read.
+
+    The export list is the manifest's; `package_signatures` parses the files
+    only for the parameter types, and checks each export is defined where the
+    manifest says.
+    """
     programs = tuple(
         _ListedProgram(
-            program=program,
-            variables=declared_variables(program.path.read_text(encoding="utf-8")),
+            name=name,
+            path=path,
+            variables=declared_variables(path.read_text(encoding="utf-8")),
         )
-        for program in package.programs
+        for name, path in package.programs.items()
     )
     return _Listed(
         package=package, functions=package_signatures(package), programs=programs
@@ -952,33 +982,36 @@ def _listing_json(listed: list[_Listed]) -> str:
     """The listing as one JSON object, for scripting."""
     packages = [
         {
-            "namespace": entry.package.namespace,
             "name": entry.package.name,
             "version": entry.package.version,
             "layer": entry.package.layer,
             "linked": entry.package.linked,
             "root": str(entry.package.root),
-            "functions": [
+            "exports": [
                 {
                     "name": signature.name,
                     "params": [
                         {"name": param.name, "type": param.type} for param in signature.params
                     ],
                     "returns": signature.returns,
-                    "export": _relative(signature.export, entry.package.root),
+                    "file": _relative(signature.export, entry.package.root),
                 }
                 for signature in entry.functions
             ],
             "programs": [
                 {
-                    "name": listed_program.program.name,
-                    "file": _relative(listed_program.program.path, entry.package.root),
+                    "name": listed_program.name,
+                    "file": _relative(listed_program.path, entry.package.root),
                     "variables": [
                         {"name": variable.name, "description": variable.description}
                         for variable in listed_program.variables
                     ],
                 }
                 for listed_program in entry.programs
+            ],
+            "aliases": [
+                {"alias": alias, "package": dependency.name, "range": dependency.range}
+                for alias, dependency in entry.package.aliases.items()
             ],
         }
         for entry in listed
@@ -989,7 +1022,6 @@ def _listing_json(listed: list[_Listed]) -> str:
 def _package_rows(listed: list[_Listed]) -> TableResult:
     rows: list[list[CellValue]] = [
         [
-            entry.package.namespace,
             entry.package.name,
             entry.package.version,
             entry.package.layer,
@@ -997,32 +1029,44 @@ def _package_rows(listed: list[_Listed]) -> TableResult:
         ]
         for entry in listed
     ]
-    return TableResult(
-        columns=["namespace", "package", "version", "layer", "linked"], rows=rows
-    )
+    return TableResult(columns=["package", "version", "layer", "linked"], rows=rows)
 
 
-def _function_rows(listed: list[_Listed]) -> TableResult:
+def _export_rows(listed: list[_Listed]) -> TableResult:
     rows: list[list[CellValue]] = [
-        [entry.package.namespace, signature.written, signature.returns]
+        [
+            entry.package.name,
+            signature.written,
+            signature.returns,
+            _relative(signature.export, entry.package.root),
+        ]
         for entry in listed
         for signature in entry.functions
     ]
-    return TableResult(columns=["namespace", "function", "returns"], rows=rows)
+    return TableResult(columns=["package", "export", "returns", "file"], rows=rows)
 
 
 def _program_rows(listed: list[_Listed]) -> TableResult:
     rows: list[list[CellValue]] = [
         [
-            entry.package.namespace,
-            listed_program.program.name,
+            entry.package.name,
+            listed_program.name,
             _written_variables(listed_program.variables),
-            _relative(listed_program.program.path, entry.package.root),
+            _relative(listed_program.path, entry.package.root),
         ]
         for entry in listed
         for listed_program in entry.programs
     ]
-    return TableResult(columns=["namespace", "program", "variables", "file"], rows=rows)
+    return TableResult(columns=["package", "program", "variables", "file"], rows=rows)
+
+
+def _alias_rows(listed: list[_Listed]) -> TableResult:
+    rows: list[list[CellValue]] = [
+        [entry.package.name, alias, f"{dependency.name}@{dependency.range}"]
+        for entry in listed
+        for alias, dependency in entry.package.aliases.items()
+    ]
+    return TableResult(columns=["package", "alias", "dependency"], rows=rows)
 
 
 def _written_variables(variables: tuple[Variable, ...]) -> str:
@@ -1041,7 +1085,7 @@ def _cmd_list(args: argparse.Namespace, on_warning: OnWarning) -> int:
     """
     try:
         found = discover(Path.cwd())
-        packages = [] if found is None else [found.packages[ns] for ns in found.namespaces()]
+        packages = [] if found is None else [found.packages[name] for name in found.names()]
         listed = [_listed(package) for package in packages]
     except SqlmpegError as err:
         _print_error(err)
@@ -1055,23 +1099,24 @@ def _cmd_list(args: argparse.Namespace, on_warning: OnWarning) -> int:
         print(_listing_json(listed))
         return 0
 
-    # One section per kind, each headed by its own name: three tables in a row
+    # One section per kind, each headed by its own name: four tables in a row
     # are unreadable without one.
     sections = [
         f"{heading}\n{render_table(table)}"
         for heading, table in (
             ("packages", _package_rows(listed)),
-            ("functions", _function_rows(listed)),
+            ("exports", _export_rows(listed)),
             ("programs", _program_rows(listed)),
+            ("aliases", _alias_rows(listed)),
         )
     ]
     print("\n\n".join(sections))
     return 0
 
 
-# The starter `init` writes: a program, not an export. An export pattern
-# matching no file is a rejection, so a fresh directory has nothing to name
-# one with -- and a runnable program is the first thing there is to try.
+# The starter `init` writes: a program, not an export. A lib must name a file
+# that defines its export, so a fresh directory has nothing to declare one
+# with -- and a runnable program is the first thing there is to try.
 _STARTER_PROGRAM = "resize"
 _STARTER_FILE = "queries/resize.sql"
 _STARTER_QUERY = """\
@@ -1090,25 +1135,45 @@ _NOT_A_NAMESPACE_HINT = (
 )
 
 
-def _derived_namespace(name: str) -> str:
-    """`name` folded to a namespace: lowercase, everything else an underscore."""
+def _folded_identifier(name: str) -> str:
+    """`name` folded to a plain identifier: lowercase, everything else an underscore."""
     return re.sub(r"[^a-z0-9_]", "_", name.lower())
 
 
-def _init_namespace(args: argparse.Namespace, name: str) -> str | None:
-    """The namespace `init` claims, or None with the rejection already printed.
+def _git_remote_owner(directory: Path) -> str | None:
+    """The owner segment of the git remote `origin`'s URL, or None.
 
-    A derivation that does not come out as an identifier is not guessed at:
-    they are told to say what they meant.
+    One cheap subprocess; anything that goes wrong -- no git, no repository,
+    no remote, an unparseable URL -- is None, never an error: it only feeds a
+    default the flag overrides.
     """
-    if args.namespace is not None:
-        written, given = str(args.namespace), "--namespace"
-        usable = is_namespace(written)
-    else:
-        written, given = _derived_namespace(name), f"the name {name!r}"
-        # A fold that kept none of the name's own characters is nothing to
-        # claim a namespace with.
-        usable = is_namespace(written) and any(char.isalnum() for char in written)
+    git = shutil.which("git")
+    if git is None:
+        return None
+    try:
+        result = subprocess.run(
+            [git, "-C", str(directory), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    url = result.stdout.strip()
+    if url.endswith(".git"):
+        url = url[: -len(".git")]
+    if "://" in url:
+        url = url.split("://", 1)[1]
+    # scp-like `git@host:owner/repo` becomes `git@host/owner/repo`.
+    parts = [part for part in url.replace(":", "/").split("/") if part]
+    return parts[-2] if len(parts) >= 2 else None
+
+
+def _checked_namespace(written: str, given: str) -> str | None:
+    """`written` as a usable namespace, or None with the rejection printed."""
+    usable = is_namespace(written) and any(char.isalnum() for char in written)
     if not usable:
         print(f"error: init: {given} gives no namespace: {written!r}", file=sys.stderr)
         print(f"hint: {_NOT_A_NAMESPACE_HINT}", file=sys.stderr)
@@ -1124,6 +1189,78 @@ def _init_namespace(args: argparse.Namespace, name: str) -> str | None:
     return written
 
 
+def _init_name(args: argparse.Namespace, directory: Path) -> tuple[str | None, str]:
+    """The ``<namespace>/<package>`` name `init` writes, and where its namespace came from.
+
+    ``--name`` with a slash is the whole name; otherwise the package segment
+    is ``--name``'s or the directory's, and the namespace is ``--namespace``'s
+    or the git remote's owner. None with the rejection already printed.
+    """
+    written_name = str(args.name) if args.name is not None else None
+    if written_name is not None and "/" in written_name:
+        if args.namespace is not None:
+            print(
+                "error: init: --name carries the namespace; give one or the other",
+                file=sys.stderr,
+            )
+            return None, ""
+        namespace, _, segment = written_name.partition("/")
+        checked = _checked_namespace(namespace, "--name")
+        if checked is None:
+            return None, ""
+        return _init_full_name(checked, segment, "--name"), "--name"
+
+    segment_source = written_name if written_name is not None else directory.name
+    if not segment_source:
+        print(f"error: init: {directory} has no name to take the package's from", file=sys.stderr)
+        print("hint: pass --name", file=sys.stderr)
+        return None, ""
+    segment = _folded_identifier(segment_source)
+    if not (is_namespace(segment) and any(char.isalnum() for char in segment)):
+        print(
+            f"error: init: {segment_source!r} gives no package segment: {segment!r}",
+            file=sys.stderr,
+        )
+        print("hint: pass --name with a package name", file=sys.stderr)
+        return None, ""
+
+    if args.namespace is not None:
+        chosen = _checked_namespace(str(args.namespace), "--namespace")
+        if chosen is None:
+            return None, ""
+        return _init_full_name(chosen, segment, "--namespace"), "--namespace"
+
+    owner = _git_remote_owner(directory)
+    derived = _checked_silently(_folded_identifier(owner)) if owner is not None else None
+    if derived is None:
+        print("error: init: no namespace to name the package under", file=sys.stderr)
+        print(
+            "hint: pass --namespace, or --name <namespace>/<package>; none could be "
+            "derived from a git remote here",
+            file=sys.stderr,
+        )
+        return None, ""
+    return _init_full_name(derived, segment, "the git remote"), "the git remote 'origin'"
+
+
+def _checked_silently(written: str) -> str | None:
+    """`written` as a usable namespace, or None -- for a derived default only."""
+    usable = is_namespace(written) and any(char.isalnum() for char in written)
+    return written if usable and written not in RESERVED_NAMESPACES else None
+
+
+def _init_full_name(namespace: str, segment: str, given: str) -> str | None:
+    """The two halves joined, the segment checked, or None with the rejection printed."""
+    if not (is_namespace(segment) and any(char.isalnum() for char in segment)):
+        print(f"error: init: {given} gives no package segment: {segment!r}", file=sys.stderr)
+        print(
+            "hint: each half of a package name is a lowercase plain identifier",
+            file=sys.stderr,
+        )
+        return None
+    return f"{namespace}/{segment}"
+
+
 def _cmd_init(args: argparse.Namespace, on_warning: OnWarning) -> int:
     """Write the three files a project starts as, into the working directory."""
     directory = Path.cwd()
@@ -1137,13 +1274,8 @@ def _cmd_init(args: argparse.Namespace, on_warning: OnWarning) -> int:
             )
             return 1
 
-    name = args.name if args.name is not None else directory.name
-    if not name:
-        print(f"error: init: {directory} has no name to take the package's from", file=sys.stderr)
-        print("hint: pass --name", file=sys.stderr)
-        return 1
-    namespace = _init_namespace(args, name)
-    if namespace is None:
+    name, namespace_source = _init_name(args, directory)
+    if name is None:
         return 1
 
     manifest, lockfile, starter = written
@@ -1154,8 +1286,7 @@ def _cmd_init(args: argparse.Namespace, on_warning: OnWarning) -> int:
             manifest,
             name=name,
             version="0.1.0",
-            namespace=namespace,
-            programs={_STARTER_PROGRAM: _STARTER_FILE},
+            bins={_STARTER_PROGRAM: _STARTER_FILE},
         )
         write_lockfile(lockfile, ())
         # What was just written has to read back, or the next command refuses
@@ -1172,8 +1303,12 @@ def _cmd_init(args: argparse.Namespace, on_warning: OnWarning) -> int:
         )
         return 1
 
+    namespace = name.partition("/")[0]
     print(f"wrote {MANIFEST_NAME}, {LOCKFILE_NAME} and {_STARTER_FILE} in {directory}")
-    print(f"namespace '{namespace}'; a query calls this package's functions as {namespace}.name()")
+    print(
+        f"package '{name}' (namespace from {namespace_source}); a query calls its "
+        f"functions as {namespace}.name()"
+    )
     print(
         f"run the starter program: sqlmpeg run {_STARTER_PROGRAM} "
         f"-v source=in.mp4 -v dest=out.mp4"
@@ -1210,13 +1345,6 @@ def _held_entries(path: Path) -> tuple[LockEntry, ...]:
     return read_lockfile(path).entries if path.is_file() else ()
 
 
-def _held(entries: tuple[LockEntry, ...], namespace: str) -> LockEntry | None:
-    for entry in entries:
-        if entry.namespace == namespace:
-            return entry
-    return None
-
-
 def _described(entry: LockEntry) -> str:
     """What an entry being replaced was, for the line that says it is going."""
     if isinstance(entry, LinkEntry):
@@ -1238,10 +1366,9 @@ def _note_cached_catalogue(index: packages_module.Index) -> None:
 
 def _search_rows(listings: tuple[packages_module.Listing, ...]) -> TableResult:
     rows: list[list[CellValue]] = [
-        [listing.name, listing.version, listing.namespace, listing.description]
-        for listing in listings
+        [listing.name, listing.version, listing.description] for listing in listings
     ]
-    return TableResult(columns=["package", "version", "namespace", "description"], rows=rows)
+    return TableResult(columns=["package", "version", "description"], rows=rows)
 
 
 def _cmd_search(args: argparse.Namespace, on_warning: OnWarning) -> int:
@@ -1272,6 +1399,13 @@ def _cmd_install(args: argparse.Namespace, on_warning: OnWarning) -> int:
     lock, code = _lock_to_write(args)
     if lock is None:
         return code
+    if args.global_lock and args.alias is not None:
+        print("error: install: -g takes no --alias", file=sys.stderr)
+        print(
+            "hint: an alias lives in a project manifest, and a global install has none",
+            file=sys.stderr,
+        )
+        return 2
     manifest = lock.parent / MANIFEST_NAME
     try:
         index = packages_module.load_index()
@@ -1281,24 +1415,26 @@ def _cmd_install(args: argparse.Namespace, on_warning: OnWarning) -> int:
             args.package,
             lock=lock,
             manifest=manifest if manifest.is_file() else None,
-            namespace=args.as_namespace,
+            alias=args.alias,
         )
     except SqlmpegError as err:
         _print_error(err)
         return 1
 
     release = installed.release
-    print(f"installed '{installed.namespace}' -> {release.name} {release.version} in {lock}")
+    print(f"installed {release.name} {release.version} in {lock}")
     if installed.replaced is not None:
         print(f"  replacing {_described(installed.replaced)}")
-    if installed.namespace != installed.claimed:
-        print(f"  the package calls itself '{installed.claimed}'")
     if not installed.downloaded:
         print("  its content was already in the store; nothing was downloaded")
     if installed.manifest is not None:
-        print(f"  recorded in {installed.manifest.name} as a dependency")
+        print(
+            f"  recorded in {installed.manifest.name} as a dependency, "
+            f"alias '{installed.alias}'"
+        )
+    namespace = release.name.partition("/")[0]
     print(
-        f"a query calls it as {installed.namespace}.name() -- "
+        f"a query calls it as {namespace}.name() -- "
         "`sqlmpeg list` shows what it provides"
     )
     return 0
@@ -1336,28 +1472,45 @@ def _cmd_link(args: argparse.Namespace, on_warning: OnWarning) -> int:
     try:
         package = read_manifest(manifest)
         entries = _held_entries(lock)
-        replaced = _held(entries, package.namespace)
+        replaced = held_entry(entries, package.name, lock)
         entry = LinkEntry(
-            namespace=package.namespace,
             path=_written_link_path(target, lock, relative=not args.global_lock),
         )
-        write_lockfile(lock, with_entry(entries, entry))
+        write_lockfile(lock, with_entry(entries, entry, replaced))
     except SqlmpegError as err:
         _print_error(err)
         return 1
 
-    print(f"linked '{package.namespace}' -> {entry.path} in {lock}")
+    print(f"linked {package.name} -> {entry.path} in {lock}")
     if replaced is not None:
         print(f"  replacing {_described(replaced)}")
-    print(
-        f"note: the entry records the namespace, not the name: if {package.name} claims "
-        f"another one, link it again"
-    )
     return 0
 
 
+def _linked_as(entry: LinkEntry, lock: Path) -> str:
+    """How one link is named to the user: the package's name, or its bare path."""
+    name = stored_name(entry, lock)
+    return name if name is not None else f"the unreadable link {entry.path!r}"
+
+
+def _matching_link(entries: tuple[LockEntry, ...], written: str, lock: Path) -> LinkEntry | None:
+    """The link entry `written` names -- by package name, or by directory."""
+    for entry in entries:
+        if not isinstance(entry, LinkEntry):
+            continue
+        if stored_name(entry, lock) == written or entry.path == written:
+            return entry
+        # A dead link is still removable by the directory it points at.
+        try:
+            if (lock.parent / Path(entry.path)).resolve() == Path(written).resolve():
+                return entry
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def _cmd_unlink(args: argparse.Namespace, on_warning: OnWarning) -> int:
-    """Drop the link on `namespace` and rewrite the lockfile."""
+    """Drop the link `name` names and rewrite the lockfile."""
     lock, code = _lock_to_write(args)
     if lock is None:
         return code
@@ -1367,14 +1520,14 @@ def _cmd_unlink(args: argparse.Namespace, on_warning: OnWarning) -> int:
         _print_error(err)
         return 1
 
-    held = _held(entries, args.namespace)
-    if not isinstance(held, LinkEntry):
-        installed = "" if held is None else " -- it is installed, not linked"
-        print(
-            f"error: unlink: nothing links '{args.namespace}' in {lock}{installed}",
-            file=sys.stderr,
-        )
-        linked = [entry.namespace for entry in entries if isinstance(entry, LinkEntry)]
+    held = _matching_link(entries, args.name, lock)
+    if held is None:
+        installed = held_entry(entries, args.name, lock)
+        why = "" if installed is None else " -- it is installed, not linked"
+        print(f"error: unlink: nothing links '{args.name}' in {lock}{why}", file=sys.stderr)
+        linked = [
+            _linked_as(entry, lock) for entry in entries if isinstance(entry, LinkEntry)
+        ]
         print(
             f"hint: linked: {', '.join(linked)}" if linked else "hint: nothing here is linked",
             file=sys.stderr,
@@ -1382,11 +1535,11 @@ def _cmd_unlink(args: argparse.Namespace, on_warning: OnWarning) -> int:
         return 1
 
     try:
-        write_lockfile(lock, without_namespace(entries, args.namespace))
+        write_lockfile(lock, without_entry(entries, held))
     except SqlmpegError as err:
         _print_error(err)
         return 1
-    print(f"unlinked '{args.namespace}' from {lock}")
+    print(f"unlinked '{args.name}' from {lock}")
     return 0
 
 

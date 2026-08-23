@@ -150,12 +150,12 @@ def filters(pattern: str | None = None) -> dict[str, Any]:
 def search(term: str | None = None) -> dict[str, Any]:
     """Find installable sqlmpeg packages in the package registry.
 
-    `term` is matched case-insensitively against each package's name,
-    namespace, description and the names of the functions it exports; omit it
-    for the whole catalogue. A term matching nothing returns an empty list.
+    `term` is matched case-insensitively against each package's name, its
+    description and the names of the functions it exports; omit it for the
+    whole catalogue. A term matching nothing returns an empty list.
 
-    Each package has a `name` (`<owner>/<name>`, what the install tool takes),
-    its latest `version`, the `namespace` a query would call it by, a
+    Each package has a `name` (`<namespace>/<package>`, what the install tool
+    takes and what a query's calls are qualified by), its latest `version`, a
     `description`, and the `functions` and `programs` it provides.
 
     Reads the registry over the network and writes nothing. `registry` is the
@@ -166,7 +166,7 @@ def search(term: str | None = None) -> dict[str, Any]:
     return tools.search_packages(term)
 
 
-def install(package: str, project: str, namespace: str | None = None) -> dict[str, Any]:
+def install(package: str, project: str, alias: str | None = None) -> dict[str, Any]:
     """Install a package from the registry. This DOWNLOADS CODE and WRITES FILES.
 
     It fetches an archive over the network, unpacks it into this machine's
@@ -180,20 +180,19 @@ def install(package: str, project: str, namespace: str | None = None) -> dict[st
     is written -- but the registry's own contents are not reviewed by anything
     here. Install only what the user asked for by name.
 
-    `package` is `<owner>/<name>`, or `<owner>/<name>@<version>` for an exact
-    version; without one, the highest published version is installed and
-    pinned exactly.
+    `package` is `<namespace>/<package>`, or `<namespace>/<package>@<version>`
+    for an exact version; without one, the highest published version is
+    installed and pinned exactly.
 
     `project` is the directory the project lives in, and is required: a
     directory with no `sqlmpeg.lock` at or above it is not a project, and this
     tool never creates one.
 
-    `namespace` installs the package under a namespace other than the one it
-    claims, which is how two packages claiming the same one can both be
-    installed. Installing over a namespace already in the lockfile replaces
-    what held it, reported as `replaced`.
+    `alias` records the dependency in the manifest under this name instead of
+    the package segment. An entry already pinning this package is replaced,
+    reported as `replaced`.
     """
-    return tools.install_package(package, project, namespace)
+    return tools.install_package(package, project, alias)
 
 
 def run(

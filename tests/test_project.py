@@ -17,7 +17,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import shutil
+import subprocess
 import tarfile
 from collections.abc import Callable
 from pathlib import Path
@@ -31,6 +33,8 @@ from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.functions import package_signatures
 from sqlmpeg.mcp import tools as mcp_tools
 from sqlmpeg.project import (
+    LOCK_FORMAT_VERSION,
+    Dependency,
     LinkEntry,
     PackageSet,
     RegistryEntry,
@@ -39,7 +43,7 @@ from sqlmpeg.project import (
     read_lockfile,
     read_manifest,
     with_entry,
-    without_namespace,
+    without_entry,
     write_lockfile,
     write_manifest,
 )
@@ -55,6 +59,22 @@ PICK = (
     "  SELECT f.audio[1] FROM input(path) f\n"
     "$$ LANGUAGE sql;\n"
 )
+NORMALIZE = (
+    "CREATE FUNCTION normalize_lang(raw text) RETURNS text AS $$\n"
+    "  SELECT CASE WHEN raw = 'english' THEN 'eng' ELSE raw END\n"
+    "$$ LANGUAGE sql;\n"
+)
+
+
+def _derived_libs(files: dict[str, str]) -> dict[str, str]:
+    """A libs map exporting every definition the src files hold, in file order."""
+    libs: dict[str, str] = {}
+    for name, body in files.items():
+        if not name.startswith("src/"):
+            continue
+        for defined in re.findall(r"CREATE FUNCTION (\w+)\(", body):
+            libs[defined] = name
+    return libs
 
 
 def _project(
@@ -66,24 +86,25 @@ def _project(
 ) -> Path:
     """Write a project under `root` and return its manifest path.
 
-    `manifest` overrides the default object; `text` writes the manifest
-    verbatim, for the malformed cases a dict cannot express.
+    The default manifest names the package ``me/edits`` and exports every
+    definition the ``src/`` files hold; `manifest` overrides keys, `text`
+    writes the file verbatim, for the malformed cases a dict cannot express.
     """
     for name, body in (files or {}).items():
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body, encoding="utf-8")
     written = root / "sqlmpeg.json"
+    written.parent.mkdir(parents=True, exist_ok=True)
     if text is not None:
         written.write_text(text, encoding="utf-8")
     else:
-        declared = {
-            "name": "my-edits",
-            "version": "0.1.0",
-            "namespace": "me",
-            "exports": ["src/*.sql"],
-            **(manifest or {}),
-        }
+        declared: dict[str, object] = {"name": "me/edits", "version": "0.1.0"}
+        libs = _derived_libs(files or {})
+        if libs:
+            declared["libs"] = libs
+        declared.update(manifest or {})
+        declared = {key: value for key, value in declared.items() if value is not None}
         written.write_text(json.dumps(declared, indent=2) + "\n", encoding="utf-8")
     return written
 
@@ -142,11 +163,23 @@ def test_a_package_function_reads_rows_as_a_table_query(tmp_path: Path) -> None:
     assert sinks[0].result.rows == [["eng"], ["de"]]
 
 
-NORMALIZE = (
-    "CREATE FUNCTION normalize_lang(raw text) RETURNS text AS $$\n"
-    "  SELECT CASE WHEN raw = 'english' THEN 'eng' ELSE raw END\n"
-    "$$ LANGUAGE sql;\n"
-)
+def test_the_default_lib_is_reached_as_the_package_segment(tmp_path: Path) -> None:
+    """`lib`'s export is named for the package segment: `me.edits(...)`."""
+    edits = (
+        "CREATE FUNCTION edits(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT volume(track, 0.5)\n"
+        "$$ LANGUAGE sql;\n"
+    )
+    _project(
+        tmp_path,
+        files={"src/default.sql": edits},
+        manifest={"lib": "src/default.sql", "libs": None},
+    )
+    argv = _argv(
+        "COPY (SELECT me.edits(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'",
+        _packages(tmp_path),
+    )
+    assert "volume=volume=0.5" in " ".join(argv)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +194,7 @@ def test_discovery_walks_up_from_a_subdirectory(tmp_path: Path) -> None:
     assert find_manifest(deep) == manifest
     found = discover(deep)
     assert found is not None
+    assert found.names() == ("me/edits",)
     assert found.namespaces() == ("me",)
 
 
@@ -200,7 +234,7 @@ def test_without_a_project_a_namespaced_call_is_rejected_as_it_always_was(tmp_pa
 
 
 # ---------------------------------------------------------------------------
-# a package export is a library; the script is not
+# a package's lib files are a library; the script is not
 # ---------------------------------------------------------------------------
 
 
@@ -249,6 +283,35 @@ def test_a_package_body_calls_its_own_sibling_not_the_script(tmp_path: Path) -> 
     assert "volume=volume=8" in graph
 
 
+def test_a_definition_libs_does_not_name_is_private(tmp_path: Path) -> None:
+    """A lib file may define more than the manifest exports; the rest are the package's own."""
+    library = (
+        "CREATE FUNCTION helper(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT volume(track, 0.25)\n"
+        "$$ LANGUAGE sql;\n"
+        "CREATE FUNCTION quieter(track audio_stream) RETURNS audio_stream AS $$\n"
+        "  SELECT helper(track)\n"
+        "$$ LANGUAGE sql;\n"
+    )
+    _project(
+        tmp_path,
+        files={"src/tracks.sql": library},
+        manifest={"libs": {"quieter": "src/tracks.sql"}},
+    )
+    packages = _packages(tmp_path)
+    argv = _argv(
+        "COPY (SELECT me.quieter(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'", packages
+    )
+    assert "volume=volume=0.25" in " ".join(argv)
+    error = _rejects(
+        "COPY (SELECT me.helper(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'",
+        packages,
+        ErrorCode.UNKNOWN_FUNCTION,
+        "package 'me/edits' has no export 'helper'",
+    )
+    assert error.hint == "me/edits exports: quieter"
+
+
 # ---------------------------------------------------------------------------
 # rejections
 # ---------------------------------------------------------------------------
@@ -257,12 +320,12 @@ def test_a_package_body_calls_its_own_sibling_not_the_script(tmp_path: Path) -> 
 @pytest.mark.parametrize("claimed", ["ffmpeg", "sqlmpeg", "wasm"])
 def test_a_reserved_namespace_is_refused(tmp_path: Path, claimed: str) -> None:
     manifest = _project(
-        tmp_path, files={"src/tracks.sql": QUIETER}, manifest={"namespace": claimed}
+        tmp_path, files={"src/tracks.sql": QUIETER}, manifest={"name": f"{claimed}/edits"}
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
     assert f"namespace '{claimed}' is reserved" in caught.value.message
-    assert caught.value.line == 4
+    assert caught.value.line == 2
 
 
 def test_an_unknown_namespace_says_what_this_project_has(tmp_path: Path) -> None:
@@ -278,7 +341,7 @@ def test_an_unknown_namespace_says_what_this_project_has(tmp_path: Path) -> None
 
 def test_a_near_miss_namespace_gets_a_did_you_mean(tmp_path: Path) -> None:
     _project(
-        tmp_path, files={"src/tracks.sql": QUIETER}, manifest={"namespace": "mine"}
+        tmp_path, files={"src/tracks.sql": QUIETER}, manifest={"name": "mine/edits"}
     )
     error = _rejects(
         "COPY (SELECT mien.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
@@ -295,54 +358,104 @@ def test_an_unknown_member_gets_a_did_you_mean(tmp_path: Path) -> None:
         "COPY (SELECT me.quiter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.UNKNOWN_FUNCTION,
-        "package 'me' has no function 'quiter'",
+        "package 'me/edits' has no export 'quiter'",
     )
     assert error.hint == "did you mean me.quieter()?"
 
 
-def test_a_glob_matching_nothing_is_refused(tmp_path: Path) -> None:
+def test_an_export_naming_no_file_is_refused(tmp_path: Path) -> None:
     manifest = _project(
-        tmp_path, files={"src/tracks.sql": QUIETER}, manifest={"exports": ["lib/*.sql"]}
+        tmp_path,
+        files={"src/tracks.sql": QUIETER},
+        manifest={"libs": {"quieter": "lib/tracks.sql"}},
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
-    assert "export pattern 'lib/*.sql' matches no file" in caught.value.message
+    assert "export 'quieter' names no file: 'lib/tracks.sql'" in caught.value.message
 
 
-def test_a_pattern_leaving_the_project_is_refused(tmp_path: Path) -> None:
+def test_an_export_leaving_the_project_is_refused(tmp_path: Path) -> None:
     manifest = _project(
-        tmp_path, files={"src/tracks.sql": QUIETER}, manifest={"exports": ["../*.sql"]}
+        tmp_path,
+        files={"src/tracks.sql": QUIETER},
+        manifest={"libs": {"quieter": "../tracks.sql"}},
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
     assert "leaves the project directory" in caught.value.message
 
 
-def test_one_name_defined_twice_across_exports_is_refused(tmp_path: Path) -> None:
-    _project(tmp_path, files={"src/a.sql": QUIETER, "src/b.sql": QUIETER})
+def test_an_export_that_is_a_pattern_is_refused(tmp_path: Path) -> None:
+    manifest = _project(
+        tmp_path,
+        files={"src/tracks.sql": QUIETER},
+        manifest={"libs": {"quieter": "src/*.sql"}},
+    )
+    with pytest.raises(SqlmpegError) as caught:
+        read_manifest(manifest)
+    assert "names the pattern 'src/*.sql', not a file" in caught.value.message
+
+
+def test_a_file_that_does_not_define_its_export_is_refused(tmp_path: Path) -> None:
+    _project(
+        tmp_path,
+        files={"src/tracks.sql": QUIETER},
+        manifest={"libs": {"louder": "src/tracks.sql"}},
+    )
+    error = _rejects(
+        "COPY (SELECT me.louder(f.audio[1], 2) FROM input('film.mkv') f) TO 'out.mkv'",
+        _packages(tmp_path),
+        ErrorCode.UNSUPPORTED_SQL,
+        "does not define 'louder'",
+    )
+    assert "tracks.sql" in error.message
+
+
+def test_a_lib_file_that_does_not_define_the_default_is_refused(tmp_path: Path) -> None:
+    manifest = _project(
+        tmp_path,
+        files={"src/tracks.sql": QUIETER},
+        manifest={"lib": "src/tracks.sql", "libs": None},
+    )
+    with pytest.raises(SqlmpegError) as caught:
+        package_signatures(read_manifest(manifest))
+    assert "does not define 'edits'" in caught.value.message
+    assert "package segment" in (caught.value.hint or "")
+
+
+def test_one_name_defined_twice_across_lib_files_is_refused(tmp_path: Path) -> None:
+    _project(
+        tmp_path,
+        files={"src/a.sql": QUIETER, "src/b.sql": QUIETER + NORMALIZE},
+        manifest={"libs": {"quieter": "src/a.sql", "normalize_lang": "src/b.sql"}},
+    )
     error = _rejects(
         "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.UNSUPPORTED_SQL,
-        "package 'me' defines 'quieter' twice",
+        "package 'me/edits' defines 'quieter' twice",
     )
     assert "a.sql" in error.message and "b.sql" in error.message
 
 
-def test_an_export_that_fails_to_parse_names_the_file(tmp_path: Path) -> None:
-    _project(tmp_path, files={"src/tracks.sql": "CREATE FUNCTION oops("})
+def test_a_lib_file_that_fails_to_parse_names_the_file(tmp_path: Path) -> None:
+    _project(
+        tmp_path,
+        files={"src/tracks.sql": "CREATE FUNCTION oops("},
+        manifest={"libs": {"quieter": "src/tracks.sql"}},
+    )
     error = _rejects(
         "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.PARSE_ERROR,
         "tracks.sql",
     )
-    # The export file's own line means nothing in the query, so the anchor is
+    # The lib file's own line means nothing in the query, so the anchor is
     # the call that reached for it.
     assert (error.line, error.col) == (1, 14)
 
 
-def test_an_export_holding_a_query_is_refused(tmp_path: Path) -> None:
+def test_a_lib_file_holding_a_query_is_refused(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/tracks.sql": QUIETER + "SELECT 1;"})
     _rejects(
         "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
@@ -383,6 +496,22 @@ def test_the_wrong_argument_count_names_the_qualified_signature(tmp_path: Path) 
     assert error.hint == "me.quieter(track audio_stream, factor number) RETURNS audio_stream"
 
 
+def test_two_packages_in_one_namespace_reject_a_two_part_call(tmp_path: Path) -> None:
+    """The interim rule: `ns.fn` reaches the ONE package under `ns`."""
+    first = _library(tmp_path / "one", "me", "0.5", package="alpha")
+    second = _library(tmp_path / "two", "me", "0.25", package="beta")
+    project = tmp_path / "work"
+    _project(project, files={}, manifest={"name": "other/edits"})
+    _lock(project, [_link(first), _link(second)])
+    error = _rejects(
+        "COPY (SELECT me.quieter(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'",
+        _packages(project),
+        ErrorCode.UNKNOWN_FUNCTION,
+        "namespace 'me' holds more than one package",
+    )
+    assert "me/alpha" in error.message and "me/beta" in error.message
+
+
 # ---------------------------------------------------------------------------
 # manifest validation
 # ---------------------------------------------------------------------------
@@ -403,68 +532,135 @@ def test_a_manifest_that_is_not_an_object_is_refused(tmp_path: Path) -> None:
     assert "is not a JSON object" in caught.value.message
 
 
-@pytest.mark.parametrize("missing", ["name", "version", "namespace"])
+@pytest.mark.parametrize("missing", ["name", "version"])
 def test_every_required_key_is_required(tmp_path: Path, missing: str) -> None:
-    declared = {
-        "name": "my-edits",
-        "version": "0.1.0",
-        "namespace": "me",
-        "exports": ["src/*.sql"],
-    }
+    declared: dict[str, object] = {"name": "me/edits", "version": "0.1.0"}
     del declared[missing]
-    manifest = _project(
-        tmp_path, files={"src/tracks.sql": QUIETER}, text=json.dumps(declared, indent=2)
-    )
+    manifest = _project(tmp_path, text=json.dumps(declared, indent=2))
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
     assert f'is missing "{missing}"' in caught.value.message
 
 
-@pytest.mark.parametrize("claimed", ["My", "1st", "a-b", "a.b", ""])
-def test_a_namespace_must_be_a_plain_identifier(tmp_path: Path, claimed: str) -> None:
-    manifest = _project(
-        tmp_path, files={"src/tracks.sql": QUIETER}, manifest={"namespace": claimed}
-    )
+@pytest.mark.parametrize(
+    "claimed", ["me", "My/edits", "me/1st", "a-b/c", "a/b/c", "a.b/c", "", "me/"]
+)
+def test_a_name_must_be_two_plain_identifiers(tmp_path: Path, claimed: str) -> None:
+    manifest = _project(tmp_path, manifest={"name": claimed})
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
-    assert "namespace" in caught.value.message
+    assert "name" in caught.value.message
+
+
+def test_namespace_is_no_longer_a_key(tmp_path: Path) -> None:
+    manifest = _project(tmp_path, manifest={"namespace": "me"})
+    with pytest.raises(SqlmpegError) as caught:
+        read_manifest(manifest)
+    assert "unknown key 'namespace'" in caught.value.message
+    assert "the name carries the namespace" in (caught.value.hint or "")
+
+
+def test_exports_is_no_longer_a_key(tmp_path: Path) -> None:
+    manifest = _project(tmp_path, manifest={"exports": ["src/*.sql"]})
+    with pytest.raises(SqlmpegError) as caught:
+        read_manifest(manifest)
+    assert "unknown key 'exports'" in caught.value.message
+    assert "libs" in (caught.value.hint or "")
 
 
 def test_an_unknown_key_gets_a_did_you_mean(tmp_path: Path) -> None:
-    manifest = _project(
-        tmp_path, files={"src/tracks.sql": QUIETER}, manifest={"namespaces": "me"}
-    )
+    manifest = _project(tmp_path, manifest={"binz": {}})
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
-    assert "unknown key 'namespaces'" in caught.value.message
-    assert caught.value.hint == "did you mean 'namespace'?"
+    assert "unknown key 'binz'" in caught.value.message
+    assert caught.value.hint == "did you mean 'bins'?"
 
 
 def test_a_description_and_dependencies_are_accepted(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER},
-        manifest={"description": "edits", "dependencies": {"broadcast/tracks": "^1.2.0"}},
+        manifest={"description": "edits", "dependencies": {"tracks": "broadcast/tracks@^1.2.0"}},
     )
     package = read_manifest(manifest)
-    assert package.namespace == "me"
-    assert package.name == "my-edits"
+    assert package.name == "me/edits"
+    assert package.namespace == "me" and package.package == "edits"
     assert package.version == "0.1.0"
-    assert [path.name for path in package.exports] == ["tracks.sql"]
+    assert [path.name for path in package.exports.values()] == ["tracks.sql"]
+    assert package.aliases == {"tracks": Dependency(name="broadcast/tracks", range="^1.2.0")}
 
 
-def test_several_patterns_are_read_in_order_without_repeats(tmp_path: Path) -> None:
+def test_the_default_export_comes_first_and_is_named_for_the_segment(tmp_path: Path) -> None:
+    edits = QUIETER.replace("quieter", "edits")
     manifest = _project(
         tmp_path,
-        files={"src/a.sql": QUIETER, "src/b.sql": NORMALIZE},
-        manifest={"exports": ["src/*.sql", "src/a.sql"]},
+        files={"src/default.sql": edits, "src/tracks.sql": QUIETER},
+        manifest={"lib": "src/default.sql", "libs": {"quieter": "src/tracks.sql"}},
     )
     package = read_manifest(manifest)
-    assert [path.name for path in package.exports] == ["a.sql", "b.sql"]
+    assert list(package.exports) == ["edits", "quieter"]
+    assert package.export() == tmp_path / "src" / "default.sql"
+    assert package.export("quieter") == tmp_path / "src" / "tracks.sql"
+    assert package.export("nothing") is None
+
+
+def test_libs_may_not_claim_the_packages_own_name(tmp_path: Path) -> None:
+    edits = QUIETER.replace("quieter", "edits")
+    manifest = _project(
+        tmp_path,
+        files={"src/default.sql": edits},
+        manifest={"libs": {"edits": "src/default.sql"}},
+    )
+    with pytest.raises(SqlmpegError) as caught:
+        read_manifest(manifest)
+    assert "libs declares 'edits', the package's own name" in caught.value.message
+    assert '"lib"' in (caught.value.hint or "")
+
+
+def test_bins_may_not_claim_the_packages_own_name(tmp_path: Path) -> None:
+    manifest = _project(
+        tmp_path,
+        files={"queries/split.sql": PROGRAM},
+        manifest={"bins": {"edits": "queries/split.sql"}},
+    )
+    with pytest.raises(SqlmpegError) as caught:
+        read_manifest(manifest)
+    assert "bins declares 'edits', the package's own name" in caught.value.message
+
+
+@pytest.mark.parametrize("alias", ["Tracks", "a-b", ""])
+def test_an_alias_must_be_a_plain_identifier(tmp_path: Path, alias: str) -> None:
+    manifest = _project(
+        tmp_path, manifest={"dependencies": {alias: "broadcast/tracks@^1.0.0"}}
+    )
+    with pytest.raises(SqlmpegError) as caught:
+        read_manifest(manifest)
+    assert f"alias {alias!r} is not a plain identifier" in caught.value.message
+
+
+def test_a_reserved_alias_is_refused(tmp_path: Path) -> None:
+    manifest = _project(
+        tmp_path, manifest={"dependencies": {"ffmpeg": "broadcast/tracks@^1.0.0"}}
+    )
+    with pytest.raises(SqlmpegError) as caught:
+        read_manifest(manifest)
+    assert "alias 'ffmpeg' is reserved" in caught.value.message
+
+
+@pytest.mark.parametrize(
+    "written", ["broadcast/tracks", "tracks@^1.0.0", "broadcast/tracks@", "", 7]
+)
+def test_a_dependency_value_keeps_name_and_range_together(
+    tmp_path: Path, written: object
+) -> None:
+    manifest = _project(tmp_path, manifest={"dependencies": {"tracks": written}})
+    with pytest.raises(SqlmpegError) as caught:
+        read_manifest(manifest)
+    assert "dependency 'tracks'" in caught.value.message
 
 
 # ---------------------------------------------------------------------------
-# what a package provides: exports, bin, or neither
+# what a package provides: exports, programs, or neither
 # ---------------------------------------------------------------------------
 
 PROGRAM = (
@@ -472,53 +668,61 @@ PROGRAM = (
     "COPY (SELECT f.video[1] FROM input(:'source') f) TO :'dest';\n"
 )
 
-_BIN = {"bin": {"split-chapters": "queries/split.sql"}}
+_BINS = {"bins": {"split-chapters": "queries/split.sql"}}
 
 
 def _manifest_text(**declared: object) -> str:
     """A manifest written key by key, so a rejection's line is predictable."""
-    return json.dumps(
-        {"name": "my-edits", "version": "0.1.0", "namespace": "me", **declared}, indent=2
-    )
+    return json.dumps({"name": "me/edits", "version": "0.1.0", **declared}, indent=2)
 
 
 def test_a_manifest_declaring_neither_half_is_a_package(tmp_path: Path) -> None:
-    """The consumer project: a namespace and its dependencies, nothing provided."""
+    """The consumer project: a name and its dependencies, nothing provided."""
     manifest = _project(
-        tmp_path, text=_manifest_text(dependencies={"broadcast/tracks": "^1.2.0"})
+        tmp_path, text=_manifest_text(dependencies={"tracks": "broadcast/tracks@^1.2.0"})
     )
     package = read_manifest(manifest)
-    assert package.exports == ()
-    assert package.programs == ()
+    assert dict(package.exports) == {}
+    assert dict(package.programs) == {}
 
 
-def test_bin_declares_a_program_beside_the_exports(tmp_path: Path) -> None:
+def test_bins_declares_a_program_beside_the_exports(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER, "queries/split.sql": PROGRAM},
-        manifest=_BIN,
+        manifest=_BINS,
     )
     package = read_manifest(manifest)
-    assert [program.name for program in package.programs] == ["split-chapters"]
-    program = package.program("split-chapters")
-    assert program is not None and program.path == tmp_path / "queries" / "split.sql"
+    assert list(package.programs) == ["split-chapters"]
+    assert package.program("split-chapters") == tmp_path / "queries" / "split.sql"
     assert package.program("nothing-like-it") is None
 
 
-def test_a_package_may_ship_programs_and_export_nothing(tmp_path: Path) -> None:
-    manifest = _project(tmp_path, files={"queries/split.sql": PROGRAM}, text=_manifest_text(**_BIN))
+def test_bin_declares_the_default_program(tmp_path: Path) -> None:
+    manifest = _project(
+        tmp_path,
+        files={"queries/split.sql": PROGRAM},
+        text=_manifest_text(bin="queries/split.sql"),
+    )
     package = read_manifest(manifest)
-    assert package.exports == ()
-    assert [program.name for program in package.programs] == ["split-chapters"]
+    assert list(package.programs) == ["edits"]
+    assert package.program() == tmp_path / "queries" / "split.sql"
 
 
-def test_a_program_is_a_query_and_the_export_rule_never_reaches_it(tmp_path: Path) -> None:
-    """A bin file holds a whole query -- the rule that rejects one in an export
-    is about exports, and a compile that resolves into the package proves it."""
+def test_a_package_may_ship_programs_and_export_nothing(tmp_path: Path) -> None:
+    manifest = _project(tmp_path, files={"queries/split.sql": PROGRAM}, text=_manifest_text(**_BINS))
+    package = read_manifest(manifest)
+    assert dict(package.exports) == {}
+    assert list(package.programs) == ["split-chapters"]
+
+
+def test_a_program_is_a_query_and_the_lib_rule_never_reaches_it(tmp_path: Path) -> None:
+    """A bin file holds a whole query -- the rule that rejects one in a lib
+    file is about lib files, and a compile that resolves into the package proves it."""
     _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER, "queries/split.sql": PROGRAM},
-        manifest=_BIN,
+        manifest=_BINS,
     )
     argv = _argv(
         "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
@@ -532,28 +736,40 @@ def test_a_program_name_is_a_command_name(tmp_path: Path, claimed: str) -> None:
     manifest = _project(
         tmp_path,
         files={"queries/split.sql": PROGRAM},
-        text=_manifest_text(bin={claimed: "queries/split.sql"}),
+        text=_manifest_text(bins={claimed: "queries/split.sql"}),
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
     assert f"program name {claimed!r} is not a command name" in caught.value.message
-    assert caught.value.line == 6
+    assert caught.value.line == 5
 
 
-def test_bin_that_is_not_an_object_is_refused(tmp_path: Path) -> None:
+def test_bins_that_is_not_an_object_is_refused(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"queries/split.sql": PROGRAM},
-        text=_manifest_text(bin=["queries/split.sql"]),
+        text=_manifest_text(bins=["queries/split.sql"]),
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
-    assert '"bin" must be a JSON object' in caught.value.message
+    assert '"bins" must be a JSON object' in caught.value.message
+
+
+def test_bin_that_is_an_object_is_refused(tmp_path: Path) -> None:
+    """The old shape: a map under `bin`. One file now; the map is `bins`."""
+    manifest = _project(
+        tmp_path,
+        files={"queries/split.sql": PROGRAM},
+        text=_manifest_text(bin={"split": "queries/split.sql"}),
+    )
+    with pytest.raises(SqlmpegError) as caught:
+        read_manifest(manifest)
+    assert '"bin" must name one file' in caught.value.message
 
 
 def test_a_program_that_names_no_string_is_refused(tmp_path: Path) -> None:
     manifest = _project(
-        tmp_path, files={"queries/split.sql": PROGRAM}, text=_manifest_text(bin={"split": 1})
+        tmp_path, files={"queries/split.sql": PROGRAM}, text=_manifest_text(bins={"split": 1})
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
@@ -564,7 +780,7 @@ def test_a_program_leaving_the_project_is_refused(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"queries/split.sql": PROGRAM},
-        text=_manifest_text(bin={"split": "../split.sql"}),
+        text=_manifest_text(bins={"split": "../split.sql"}),
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
@@ -575,7 +791,7 @@ def test_a_program_matching_no_file_is_refused(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"queries/split.sql": PROGRAM},
-        text=_manifest_text(bin={"split": "queries/gone.sql"}),
+        text=_manifest_text(bins={"split": "queries/gone.sql"}),
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
@@ -586,7 +802,7 @@ def test_a_program_that_is_a_pattern_is_refused(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"queries/split.sql": PROGRAM},
-        text=_manifest_text(bin={"split": "queries/*.sql"}),
+        text=_manifest_text(bins={"split": "queries/*.sql"}),
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
@@ -599,29 +815,30 @@ def test_two_programs_written_under_one_name_are_refused(tmp_path: Path) -> None
         tmp_path,
         files={"queries/split.sql": PROGRAM, "queries/other.sql": PROGRAM},
         text=(
-            '{\n  "name": "my-edits",\n  "version": "0.1.0",\n  "namespace": "me",\n'
-            '  "bin": {\n    "split": "queries/split.sql",\n'
+            '{\n  "name": "me/edits",\n  "version": "0.1.0",\n'
+            '  "bins": {\n    "split": "queries/split.sql",\n'
             '    "split": "queries/other.sql"\n  }\n}\n'
         ),
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
-    assert "bin declares program 'split' twice" in caught.value.message
-    assert caught.value.line == 6
+    assert "bins declares 'split' twice" in caught.value.message
+    assert caught.value.line == 5
 
 
 def test_the_signatures_a_package_exports_are_readable_without_a_query(tmp_path: Path) -> None:
     manifest = _project(tmp_path, files={"src/tracks.sql": QUIETER + NORMALIZE})
     signatures = package_signatures(read_manifest(manifest))
     assert [signature.written for signature in signatures] == [
-        "me.quieter(track audio_stream, factor number)",
-        "me.normalize_lang(raw text)",
+        "quieter(track audio_stream, factor number)",
+        "normalize_lang(raw text)",
     ]
+    assert [signature.package for signature in signatures] == ["me/edits", "me/edits"]
     assert [signature.returns for signature in signatures] == ["audio_stream", "text"]
     assert [signature.export.name for signature in signatures] == ["tracks.sql", "tracks.sql"]
 
 
-def test_reading_the_signatures_of_a_broken_export_is_refused(tmp_path: Path) -> None:
+def test_reading_the_signatures_of_a_broken_lib_file_is_refused(tmp_path: Path) -> None:
     manifest = _project(tmp_path, files={"src/tracks.sql": QUIETER + "SELECT 1;"})
     with pytest.raises(SqlmpegError) as caught:
         package_signatures(read_manifest(manifest))
@@ -755,17 +972,18 @@ def _quieter(factor: str) -> str:
     )
 
 
-def _library(root: Path, namespace: str, factor: str, *, version: str = "1.0.0") -> Path:
-    """A package directory of its own: a manifest claiming `namespace`, one source."""
+def _library(
+    root: Path, namespace: str, factor: str, *, version: str = "1.0.0", package: str = "lib"
+) -> Path:
+    """A package directory of its own: a manifest named `namespace`/`package`, one source."""
     (root / "src").mkdir(parents=True, exist_ok=True)
     (root / "src" / "lib.sql").write_text(_quieter(factor), encoding="utf-8")
     (root / "sqlmpeg.json").write_text(
         json.dumps(
             {
-                "name": f"{namespace}-lib",
+                "name": f"{namespace}/{package}",
                 "version": version,
-                "namespace": namespace,
-                "exports": ["src/*.sql"],
+                "libs": {"quieter": "src/lib.sql"},
             }
         )
         + "\n",
@@ -788,14 +1006,13 @@ def _installed(source: Path) -> dict[str, object]:
         "kind": "registry",
         "name": package.name,
         "version": package.version,
-        "namespace": package.namespace,
         "sha256": sha256,
         "store": store.entry_path(sha256),
     }
 
 
-def _link(directory: Path, namespace: str) -> dict[str, object]:
-    return {"kind": "link", "namespace": namespace, "path": str(directory)}
+def _link(directory: Path) -> dict[str, object]:
+    return {"kind": "link", "path": str(directory)}
 
 
 def _lock(
@@ -813,7 +1030,7 @@ def _lock(
         return path
     linked = [entry for entry in entries if entry.get("kind") == "link"]
     honest = not linked if reproducible is None else reproducible
-    data: dict[str, object] = {"format_version": 1, "reproducible": honest}
+    data: dict[str, object] = {"format_version": LOCK_FORMAT_VERSION, "reproducible": honest}
     if not honest:
         data["not_reproducible_because"] = (
             "a package is linked to a working directory, so its files are not pinned here"
@@ -867,7 +1084,7 @@ def test_content_missing_from_the_store_is_refused(store_home: Path, tmp_path: P
     _lock(project, [entry])
     shutil.rmtree(store.store_dir() / str(entry["store"]))
     error = _refuses(project, "is not in the store")
-    assert "tracks-lib" in error.message
+    assert "tracks/lib" in error.message
 
 
 def test_a_store_path_from_another_layout_is_refused(store_home: Path, tmp_path: Path) -> None:
@@ -978,7 +1195,7 @@ def test_a_verified_archive_unpacks_into_the_store(store_home: Path, tmp_path: P
     source = _library(tmp_path / "built", "tracks", "0.5")
     archive = store.pack(source)
     sha256 = _digest(archive)
-    stored = store.unpack("tracks-lib", archive, sha256)
+    stored = store.unpack("tracks/lib", archive, sha256)
     assert stored == store.store_dir() / store.entry_path(sha256)
     assert (stored / "src" / "lib.sql").read_text(encoding="utf-8") == _quieter("0.5")
     read_manifest(stored / "sqlmpeg.json")
@@ -1009,9 +1226,9 @@ def test_unpacking_a_digest_already_in_the_store_leaves_it_alone(
 ) -> None:
     archive = store.pack(_library(tmp_path / "built", "tracks", "0.5"))
     sha256 = _digest(archive)
-    stored = store.unpack("tracks-lib", archive, sha256)
+    stored = store.unpack("tracks/lib", archive, sha256)
     (stored / "marker").write_text("kept", encoding="utf-8")
-    assert store.unpack("tracks-lib", archive, sha256) == stored
+    assert store.unpack("tracks/lib", archive, sha256) == stored
     assert (stored / "marker").read_text(encoding="utf-8") == "kept"
 
 
@@ -1075,7 +1292,7 @@ def test_a_link_resolves_through_the_directorys_own_manifest(tmp_path: Path) -> 
     linked = _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_link(linked, "tracks")])
+    _lock(project, [_link(linked)])
     argv, said = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
     assert argv == _argv(_quieter("0.5") + QUERY.format(call="quieter"))
     assert _codes(said) == [WarningCode.LINKED_PACKAGE]
@@ -1085,7 +1302,7 @@ def test_a_link_picks_up_an_edit_made_after_the_lockfile_was_written(tmp_path: P
     linked = _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_link(linked, "tracks")])
+    _lock(project, [_link(linked)])
     before, _ = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
     (linked / "src" / "lib.sql").write_text(_quieter("0.25"), encoding="utf-8")
     after, _ = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
@@ -1097,7 +1314,7 @@ def test_a_link_by_relative_path_resolves_against_the_lockfile(tmp_path: Path) -
     _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [{"kind": "link", "namespace": "tracks", "path": "../dev"}])
+    _lock(project, [{"kind": "link", "path": "../dev"}])
     argv, _ = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
     assert "volume=volume=0.5" in " ".join(argv)
 
@@ -1106,14 +1323,14 @@ def test_a_link_warns_once_however_many_call_sites(tmp_path: Path) -> None:
     linked = _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_link(linked, "tracks")])
+    _lock(project, [_link(linked)])
     _compiled, said = _heard(
         "COPY (SELECT tracks.quieter(f.audio[1]), tracks.quieter(f.audio[2]) "
         "FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(project),
     )
     assert _codes(said) == [WarningCode.LINKED_PACKAGE]
-    assert said[0].package == "tracks"
+    assert said[0].package == "tracks/lib"
     assert str(linked) in said[0].message
 
 
@@ -1122,26 +1339,34 @@ def test_a_linked_directory_with_no_manifest_is_refused(tmp_path: Path) -> None:
     empty.mkdir()
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_link(empty, "tracks")])
+    _lock(project, [_link(empty)])
     _refuses(project, "holds no sqlmpeg.json")
 
 
-def test_a_link_whose_namespace_moved_on_is_refused(tmp_path: Path) -> None:
-    linked = _library(tmp_path / "dev", "renamed", "0.5")
+def test_a_linked_package_may_rename_itself_without_a_re_link(tmp_path: Path) -> None:
+    """The entry records only the directory; the name is the manifest's."""
+    linked = _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_link(linked, "tracks")])
-    _refuses(project, "records namespace 'tracks'")
+    _lock(project, [_link(linked)])
+    assert "tracks/lib" in _packages(project).names()
+    renamed = json.loads((linked / "sqlmpeg.json").read_text(encoding="utf-8"))
+    renamed["name"] = "broadcast/audio"
+    (linked / "sqlmpeg.json").write_text(json.dumps(renamed) + "\n", encoding="utf-8")
+    packages = _packages(project)
+    assert "broadcast/audio" in packages.names()
+    argv, _ = _heard(QUERY.format(call="broadcast.quieter"), packages)
+    assert "volume=volume=0.5" in " ".join(argv)
 
 
-def test_the_manifest_wins_over_a_lockfile_claiming_its_namespace(tmp_path: Path) -> None:
-    linked = _library(tmp_path / "dev", "me", "0.25")
+def test_the_manifest_wins_over_a_lockfile_naming_its_package(tmp_path: Path) -> None:
+    linked = _library(tmp_path / "dev", "me", "0.25", package="edits")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": _quieter("0.5")})
-    _lock(project, [_link(linked, "me")])
+    _lock(project, [_link(linked)])
     argv, said = _heard(QUERY.format(call="me.quieter"), _packages(project))
     assert "volume=volume=0.5" in " ".join(argv)
-    # The link was never read, so there was nothing to say about it.
+    # The link lost the claim, so nothing resolves in it and nothing warns.
     assert said == []
 
 
@@ -1159,7 +1384,7 @@ def test_all_three_layers_answer_in_order(store_home: Path, tmp_path: Path) -> N
     _lock(
         store_home,
         [
-            _installed(_library(tmp_path / "g-shadowed", "me", "0.1")),
+            _installed(_library(tmp_path / "g-shadowed", "me", "0.1", package="edits")),
             _installed(_library(tmp_path / "g-tracks", "tracks", "0.2")),
             _installed(_library(tmp_path / "g-only", "far", "0.3")),
         ],
@@ -1168,8 +1393,9 @@ def test_all_three_layers_answer_in_order(store_home: Path, tmp_path: Path) -> N
     _project(project, files={"src/own.sql": _quieter("0.9")})
     _lock(project, [_installed(_library(tmp_path / "l-tracks", "tracks", "0.8"))])
     packages = _packages(project)
+    assert packages.names() == ("far/lib", "me/edits", "tracks/lib")
     assert packages.namespaces() == ("far", "me", "tracks")
-    assert [packages.packages[name].layer for name in packages.namespaces()] == [
+    assert [packages.packages[name].layer for name in packages.names()] == [
         "global",
         "project",
         "local",
@@ -1194,8 +1420,8 @@ def test_landing_on_the_global_layer_inside_a_project_warns(
     _project(project, files={"src/own.sql": NORMALIZE})
     _compiled, said = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
     assert _codes(said) == [WarningCode.GLOBAL_PACKAGE]
-    assert said[0].package == "tracks"
-    assert "tracks-lib" in (said[0].hint or "")
+    assert said[0].package == "tracks/lib"
+    assert "tracks/lib" in (said[0].hint or "")
 
 
 def test_a_global_package_outside_a_project_has_nothing_to_warn_about(
@@ -1213,7 +1439,7 @@ def test_a_global_package_outside_a_project_has_nothing_to_warn_about(
 
 def test_a_global_link_warns_about_both(store_home: Path, tmp_path: Path) -> None:
     linked = _library(tmp_path / "dev", "tracks", "0.5")
-    _lock(store_home, [_link(linked, "tracks")])
+    _lock(store_home, [_link(linked)])
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     _compiled, said = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
@@ -1234,13 +1460,61 @@ def test_a_lockfile_alone_is_a_project(store_home: Path, tmp_path: Path) -> None
     _lock(work, [_installed(_library(tmp_path / "near", "own", "0.5"))])
     packages = discover(work)
     assert packages is not None and packages.in_project
-    assert packages.namespaces() == ("own", "tracks")
+    assert packages.names() == ("own/lib", "tracks/lib")
 
 
 def test_nothing_anywhere_is_still_no_project(store_home: Path, tmp_path: Path) -> None:
     bare = tmp_path / "bare"
     bare.mkdir()
     assert discover(bare) is None
+
+
+# ---------------------------------------------------------------------------
+# aliases resolve through the set, and stay disjoint from namespaces
+# ---------------------------------------------------------------------------
+
+
+def test_the_set_carries_the_projects_aliases(store_home: Path, tmp_path: Path) -> None:
+    entry = _installed(_library(tmp_path / "built", "broadcast", "0.5", package="tracks"))
+    project = tmp_path / "work"
+    _project(
+        project,
+        files={"src/own.sql": NORMALIZE},
+        manifest={"dependencies": {"t": "broadcast/tracks@^1.0.0"}},
+    )
+    _lock(project, [entry])
+    packages = _packages(project)
+    assert packages.aliases == {"t": "broadcast/tracks"}
+    aliased = packages.aliased("t")
+    assert aliased is not None and aliased.name == "broadcast/tracks"
+    assert packages.aliased("nothing") is None
+    assert packages.find("broadcast", "tracks") is aliased
+
+
+def test_an_alias_declared_but_not_installed_resolves_to_nothing(tmp_path: Path) -> None:
+    _project(
+        tmp_path,
+        files={"src/own.sql": NORMALIZE},
+        manifest={"dependencies": {"t": "broadcast/tracks@^1.0.0"}},
+    )
+    packages = _packages(tmp_path)
+    assert packages.aliases == {"t": "broadcast/tracks"}
+    assert packages.aliased("t") is None
+
+
+def test_an_alias_equal_to_an_installed_namespace_is_refused(
+    store_home: Path, tmp_path: Path
+) -> None:
+    entry = _installed(_library(tmp_path / "built", "broadcast", "0.5", package="tracks"))
+    project = tmp_path / "work"
+    _project(
+        project,
+        files={"src/own.sql": NORMALIZE},
+        manifest={"dependencies": {"broadcast": "broadcast/tracks@^1.0.0"}},
+    )
+    _lock(project, [entry])
+    error = _refuses(project, "alias 'broadcast' is also the namespace")
+    assert "broadcast/tracks" in error.message
 
 
 # ---------------------------------------------------------------------------
@@ -1258,14 +1532,14 @@ def test_a_lockfile_that_is_not_json_is_anchored(tmp_path: Path) -> None:
 
 def test_a_lockfile_from_another_format_version_is_refused(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/own.sql": NORMALIZE})
-    _lock(tmp_path, [], text='{"format_version": 7, "reproducible": true, "packages": []}\n')
-    _refuses(tmp_path, "lockfile format 7")
+    _lock(tmp_path, [], text='{"format_version": 1, "reproducible": true, "packages": []}\n')
+    _refuses(tmp_path, "lockfile format 1")
 
 
 @pytest.mark.parametrize("missing", ["format_version", "reproducible", "packages"])
 def test_every_lockfile_key_is_required(tmp_path: Path, missing: str) -> None:
     _project(tmp_path, files={"src/own.sql": NORMALIZE})
-    written = {"format_version": 1, "reproducible": True, "packages": []}
+    written = {"format_version": LOCK_FORMAT_VERSION, "reproducible": True, "packages": []}
     del written[missing]
     _lock(tmp_path, [], text=json.dumps(written))
     _refuses(tmp_path, f'is missing "{missing}"')
@@ -1275,7 +1549,7 @@ def test_a_lockfile_claiming_to_be_reproducible_while_linking_is_refused(tmp_pat
     linked = _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_link(linked, "tracks")], reproducible=True)
+    _lock(project, [_link(linked)], reproducible=True)
     _refuses(project, "claims to be reproducible")
 
 
@@ -1283,56 +1557,85 @@ def test_a_lockfile_says_in_its_own_text_why_it_is_not_reproducible(tmp_path: Pa
     linked = _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    written = _lock(project, [_link(linked, "tracks")]).read_text(encoding="utf-8")
+    written = _lock(project, [_link(linked)]).read_text(encoding="utf-8")
     assert '"reproducible": false' in written
     assert "not_reproducible_because" in written
 
 
-def test_two_entries_claiming_one_namespace_are_refused(tmp_path: Path) -> None:
-    first = _library(tmp_path / "one", "tracks", "0.5")
-    second = _library(tmp_path / "two", "tracks", "0.25")
+def test_two_entries_naming_one_package_are_refused(tmp_path: Path) -> None:
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_link(first, "tracks"), _link(second, "tracks")])
-    _refuses(project, "two packages claim namespace 'tracks'")
+    entry = {
+        "kind": "registry",
+        "name": "broadcast/tracks",
+        "version": "1.0.0",
+        "sha256": "a" * 64,
+        "store": store.entry_path("a" * 64),
+    }
+    _lock(project, [entry, dict(entry)])
+    _refuses(project, "two entries name package 'broadcast/tracks'")
+
+
+def test_a_registry_entry_and_a_link_naming_one_package_are_refused(tmp_path: Path) -> None:
+    linked = _library(tmp_path / "dev", "broadcast", "0.5", package="tracks")
+    entry = _installed(_library(tmp_path / "built", "broadcast", "0.25", package="tracks"))
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [entry, _link(linked)])
+    _refuses(project, "two entries name package 'broadcast/tracks'")
 
 
 def test_an_entry_of_no_known_kind_is_refused(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/own.sql": NORMALIZE})
-    _lock(tmp_path, [{"namespace": "tracks", "path": "../dev"}])
+    _lock(tmp_path, [{"path": "../dev"}])
     _refuses(tmp_path, 'a package entry has no "kind"')
 
 
 def test_an_entry_missing_a_key_names_it(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/own.sql": NORMALIZE})
-    _lock(tmp_path, [{"kind": "link", "namespace": "tracks"}])
+    _lock(tmp_path, [{"kind": "link"}])
     _refuses(tmp_path, 'a link entry is missing "path"')
 
 
 def test_an_unknown_entry_key_gets_a_did_you_mean(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/own.sql": NORMALIZE})
-    _lock(tmp_path, [{"kind": "link", "namespace": "tracks", "path": "../dev", "pth": "x"}])
+    _lock(tmp_path, [{"kind": "link", "path": "../dev", "pth": "x"}])
     error = _refuses(tmp_path, "unknown key 'pth'")
     assert "did you mean 'path'?" in (error.hint or "")
 
 
-def test_a_reserved_namespace_in_a_lockfile_is_refused(tmp_path: Path) -> None:
+def test_a_namespace_key_is_no_longer_part_of_an_entry(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/own.sql": NORMALIZE})
-    _lock(tmp_path, [{"kind": "link", "namespace": "ffmpeg", "path": "../dev"}])
-    _refuses(tmp_path, "is reserved")
+    _lock(tmp_path, [{"kind": "link", "namespace": "tracks", "path": "../dev"}])
+    _refuses(tmp_path, "unknown key 'namespace'")
+
+
+def test_a_reserved_name_in_a_lockfile_is_refused(tmp_path: Path) -> None:
+    _project(tmp_path, files={"src/own.sql": NORMALIZE})
+    _lock(
+        tmp_path,
+        [
+            {
+                "kind": "registry",
+                "name": "ffmpeg/tracks",
+                "version": "1.0.0",
+                "sha256": "a" * 64,
+                "store": store.entry_path("a" * 64),
+            }
+        ],
+    )
+    _refuses(tmp_path, "reserved namespace")
 
 
 def test_a_rejection_points_at_the_entry_it_is_about(tmp_path: Path) -> None:
     first = _library(tmp_path / "one", "good", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    path = _lock(
-        project, [_link(first, "good"), {"kind": "link", "namespace": "later", "pth": "x"}]
-    )
+    path = _lock(project, [_link(first), {"kind": "link", "path": "../later", "pth": "x"}])
     error = _refuses(project, "unknown key 'pth'")
     lines = path.read_text(encoding="utf-8").splitlines()
     assert error.line is not None
-    assert '"later"' in lines[error.line - 1]
+    assert '"../later"' in lines[error.line - 1]
 
 
 # ---------------------------------------------------------------------------
@@ -1354,7 +1657,7 @@ def test_the_cli_prints_the_warning_on_stderr_and_the_command_on_stdout(
     captured = capsys.readouterr()
     assert "volume=volume=0.5" in captured.out
     assert "warning:" not in captured.out
-    assert "warning: package 'tracks' was resolved from the machine-wide" in captured.err
+    assert "warning: package 'tracks/lib' was resolved from the machine-wide" in captured.err
     assert "hint:" in captured.err
 
 
@@ -1364,7 +1667,7 @@ def test_the_cli_says_it_once_though_it_compiles_twice(
     linked = _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_link(linked, "tracks")])
+    _lock(project, [_link(linked)])
     monkeypatch.chdir(project)
     # A bare SELECT: `compile` refuses it, then tries the table fallback, so
     # the same text compiles twice in one command.
@@ -1378,12 +1681,12 @@ def test_validate_keeps_the_warning_off_stdout(
     linked = _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_link(linked, "tracks")])
+    _lock(project, [_link(linked)])
     monkeypatch.chdir(project)
     assert cli.main(["validate", QUERY.format(call="tracks.quieter")]) == 0
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "warning: package 'tracks' is linked to" in captured.err
+    assert "warning: package 'tracks/lib' is linked to" in captured.err
 
 
 def test_the_mcp_compile_tool_returns_the_warnings(store_home: Path, tmp_path: Path) -> None:
@@ -1392,14 +1695,14 @@ def test_the_mcp_compile_tool_returns_the_warnings(store_home: Path, tmp_path: P
     _project(project, files={"src/own.sql": NORMALIZE})
     result = mcp_tools.compile_query(QUERY.format(call="tracks.quieter"), None, str(project))
     assert [w["code"] for w in result["warnings"]] == [WarningCode.GLOBAL_PACKAGE.value]
-    assert result["warnings"][0]["package"] == "tracks"
+    assert result["warnings"][0]["package"] == "tracks/lib"
 
 
 def test_the_mcp_validate_tool_answers_with_warnings_and_no_code(tmp_path: Path) -> None:
     linked = _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_link(linked, "tracks")])
+    _lock(project, [_link(linked)])
     result = mcp_tools.validate_query(QUERY.format(call="tracks.quieter"), None, str(project))
     assert "code" not in result
     assert [w["code"] for w in result["warnings"]] == [WarningCode.LINKED_PACKAGE.value]
@@ -1430,23 +1733,23 @@ def _list(
     return code, captured.out, captured.err
 
 
-def test_list_prints_the_functions_and_programs_a_project_provides(
+def test_list_prints_the_exports_programs_and_aliases_a_project_provides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER + PICK, "queries/split.sql": PROGRAM},
-        manifest=_BIN,
+        manifest={**_BINS, "dependencies": {"tracks": "broadcast/tracks@^1.2.0"}},
     )
     code, out, _err = _list(tmp_path, monkeypatch, capsys)
     assert code == 0
-    assert out.count("(2 rows)") == 1 and out.count("(1 row)") == 2
-    assert "me.quieter(track audio_stream, factor number) | audio_stream" in out
-    assert "me.pick(path text)" in out and "TABLE(track audio_stream)" in out
+    assert "quieter(track audio_stream, factor number) | audio_stream" in out
+    assert "pick(path text)" in out and "TABLE(track audio_stream)" in out
     assert "split-chapters" in out
     assert "source (input media path), dest (output path)" in out
     assert "queries/split.sql" in out
-    assert "my-edits | 0.1.0   | project | false" in out
+    assert "me/edits | 0.1.0   | project | false" in out
+    assert "broadcast/tracks@^1.2.0" in out
 
 
 def test_list_outside_a_project_prints_empty_tables(
@@ -1456,7 +1759,7 @@ def test_list_outside_a_project_prints_empty_tables(
     bare.mkdir()
     code, out, _err = _list(bare, monkeypatch, capsys)
     assert code == 0
-    assert out.count("(0 rows)") == 3
+    assert out.count("(0 rows)") == 4
 
 
 def test_list_as_json_carries_the_signatures_and_the_variables(
@@ -1465,16 +1768,16 @@ def test_list_as_json_carries_the_signatures_and_the_variables(
     _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER, "queries/split.sql": PROGRAM},
-        manifest=_BIN,
+        manifest={**_BINS, "dependencies": {"tracks": "broadcast/tracks@^1.2.0"}},
     )
     code, out, _err = _list(tmp_path, monkeypatch, capsys, "--json")
     assert code == 0
     listed = json.loads(out)["packages"]
-    assert [package["namespace"] for package in listed] == ["me"]
+    assert [package["name"] for package in listed] == ["me/edits"]
     package = listed[0]
-    assert package["name"] == "my-edits" and package["layer"] == "project"
+    assert package["layer"] == "project"
     assert package["linked"] is False
-    assert package["functions"] == [
+    assert package["exports"] == [
         {
             "name": "quieter",
             "params": [
@@ -1482,7 +1785,7 @@ def test_list_as_json_carries_the_signatures_and_the_variables(
                 {"name": "factor", "type": "number"},
             ],
             "returns": "audio_stream",
-            "export": "src/tracks.sql",
+            "file": "src/tracks.sql",
         }
     ]
     assert package["programs"] == [
@@ -1495,6 +1798,9 @@ def test_list_as_json_carries_the_signatures_and_the_variables(
             ],
         }
     ]
+    assert package["aliases"] == [
+        {"alias": "tracks", "package": "broadcast/tracks", "range": "^1.2.0"}
+    ]
 
 
 def test_list_names_the_layer_and_marks_a_linked_package(
@@ -1503,13 +1809,13 @@ def test_list_names_the_layer_and_marks_a_linked_package(
     linked = _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_link(linked, "tracks")])
+    _lock(project, [_link(linked)])
     code, out, _err = _list(project, monkeypatch, capsys, "--json")
     assert code == 0
-    listed = {package["namespace"]: package for package in json.loads(out)["packages"]}
-    assert listed["me"]["layer"] == "project" and listed["me"]["linked"] is False
-    assert listed["tracks"]["layer"] == "local" and listed["tracks"]["linked"] is True
-    assert [f["name"] for f in listed["tracks"]["functions"]] == ["quieter"]
+    listed = {package["name"]: package for package in json.loads(out)["packages"]}
+    assert listed["me/edits"]["layer"] == "project" and listed["me/edits"]["linked"] is False
+    assert listed["tracks/lib"]["layer"] == "local" and listed["tracks/lib"]["linked"] is True
+    assert [f["name"] for f in listed["tracks/lib"]["exports"]] == ["quieter"]
 
 
 def test_list_reports_a_malformed_manifest(
@@ -1522,7 +1828,7 @@ def test_list_reports_a_malformed_manifest(
     assert "sqlmpeg.json" in err
 
 
-def test_list_reports_an_export_that_is_not_a_library(
+def test_list_reports_a_lib_file_that_is_not_a_library(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _project(tmp_path, files={"src/tracks.sql": QUIETER + "SELECT 1;"})
@@ -1545,11 +1851,10 @@ def test_list_takes_no_query(
 # ---------------------------------------------------------------------------
 
 
-def _registry_entry(namespace: str = "tracks") -> RegistryEntry:
+def _registry_entry(name: str = "broadcast/tracks") -> RegistryEntry:
     sha256 = "a" * 64
     return RegistryEntry(
-        namespace=namespace,
-        name=f"broadcast/{namespace}",
+        name=name,
         version="1.2.0",
         sha256=sha256,
         store=store.entry_path(sha256),
@@ -1558,14 +1863,14 @@ def _registry_entry(namespace: str = "tracks") -> RegistryEntry:
 
 def test_a_written_lockfile_reads_back_as_what_was_written(tmp_path: Path) -> None:
     path = tmp_path / "sqlmpeg.lock"
-    entries = (_registry_entry(), LinkEntry(namespace="dev", path="../my-lib"))
+    entries = (_registry_entry(), LinkEntry(path="../my-lib"))
     write_lockfile(path, entries)
     assert read_lockfile(path).entries == entries
 
 
 def test_writing_a_lockfile_twice_writes_the_same_bytes(tmp_path: Path) -> None:
     path = tmp_path / "sqlmpeg.lock"
-    entries = (_registry_entry(), LinkEntry(namespace="dev", path="../my-lib"))
+    entries = (_registry_entry(), LinkEntry(path="../my-lib"))
     write_lockfile(path, entries)
     first = path.read_bytes()
     write_lockfile(path, read_lockfile(path).entries)
@@ -1585,6 +1890,7 @@ def test_a_lockfile_of_registry_entries_claims_to_be_reproducible(tmp_path: Path
     path = tmp_path / "sqlmpeg.lock"
     write_lockfile(path, (_registry_entry(),))
     written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["format_version"] == LOCK_FORMAT_VERSION
     assert written["reproducible"] is True
     assert "not_reproducible_because" not in written
     assert read_lockfile(path).reproducible is True
@@ -1592,7 +1898,7 @@ def test_a_lockfile_of_registry_entries_claims_to_be_reproducible(tmp_path: Path
 
 def test_a_lockfile_holding_a_link_says_it_is_not_reproducible_and_why(tmp_path: Path) -> None:
     path = tmp_path / "sqlmpeg.lock"
-    write_lockfile(path, (_registry_entry(), LinkEntry(namespace="dev", path="../my-lib")))
+    write_lockfile(path, (_registry_entry(), LinkEntry(path="../my-lib")))
     written = json.loads(path.read_text(encoding="utf-8"))
     assert written["reproducible"] is False
     assert "linked to a working directory" in written["not_reproducible_because"]
@@ -1608,18 +1914,19 @@ def test_an_empty_lockfile_reads_back(tmp_path: Path) -> None:
 
 def test_the_written_entry_order_is_the_order_given(tmp_path: Path) -> None:
     path = tmp_path / "sqlmpeg.lock"
-    entries = (_registry_entry("zulu"), _registry_entry("alpha"))
+    entries = (_registry_entry("zulu/lib"), _registry_entry("alpha/lib"))
     write_lockfile(path, entries)
-    assert [entry.namespace for entry in read_lockfile(path).entries] == ["zulu", "alpha"]
+    assert read_lockfile(path).entries == entries
 
 
-def test_an_entry_replaces_the_one_holding_its_namespace() -> None:
-    held = (_registry_entry("tracks"), _registry_entry("other"))
-    link = LinkEntry(namespace="tracks", path="../dev")
-    assert with_entry(held, link) == (link, held[1])
-    assert with_entry(held, _registry_entry("new"))[-1].namespace == "new"
-    assert without_namespace(held, "tracks") == (held[1],)
-    assert without_namespace(held, "absent") == held
+def test_with_entry_replaces_and_without_entry_removes() -> None:
+    held = (_registry_entry("broadcast/tracks"), _registry_entry("far/other"))
+    link = LinkEntry(path="../dev")
+    assert with_entry(held, link, held[0]) == (link, held[1])
+    appended = with_entry(held, _registry_entry("new/lib"))
+    assert appended[-1] == _registry_entry("new/lib")
+    assert without_entry(held, held[0]) == (held[1],)
+    assert without_entry(held, link) == held
 
 
 def test_a_written_manifest_reads_back_as_the_package_it_declares(tmp_path: Path) -> None:
@@ -1630,29 +1937,29 @@ def test_a_written_manifest_reads_back_as_the_package_it_declares(tmp_path: Path
     path = tmp_path / "sqlmpeg.json"
     write_manifest(
         path,
-        name="my-edits",
+        name="me/edits",
         version="0.1.0",
-        namespace="me",
         description="what it is",
-        exports=["src/*.sql"],
-        programs={"split-chapters": "queries/split.sql"},
-        dependencies={"broadcast/tracks": "^1.2.0"},
+        libs={"quieter": "src/lib.sql"},
+        bin="queries/split.sql",
+        bins={"split-chapters": "queries/split.sql"},
+        dependencies={"tracks": "broadcast/tracks@^1.2.0"},
     )
     package = read_manifest(path)
-    assert package.namespace == "me" and package.version == "0.1.0"
-    assert [program.name for program in package.programs] == ["split-chapters"]
+    assert package.name == "me/edits" and package.version == "0.1.0"
+    assert list(package.programs) == ["edits", "split-chapters"]
+    assert package.aliases == {"tracks": Dependency(name="broadcast/tracks", range="^1.2.0")}
     assert b"\r" not in path.read_bytes()
 
 
 def test_a_manifest_leaves_out_what_it_was_not_given(tmp_path: Path) -> None:
     path = tmp_path / "sqlmpeg.json"
-    write_manifest(path, name="my-edits", version="0.1.0", namespace="me")
+    write_manifest(path, name="me/edits", version="0.1.0")
     assert json.loads(path.read_text(encoding="utf-8")) == {
-        "name": "my-edits",
+        "name": "me/edits",
         "version": "0.1.0",
-        "namespace": "me",
     }
-    assert read_manifest(path).exports == ()
+    assert dict(read_manifest(path).exports) == {}
 
 
 def test_a_write_into_a_directory_that_is_a_file_is_a_rejection(tmp_path: Path) -> None:
@@ -1686,13 +1993,13 @@ def test_init_writes_a_project_that_reads_back(
 ) -> None:
     root = tmp_path / "my-edits"
     root.mkdir()
-    code, out, _err = _run(root, monkeypatch, capsys, "init")
+    code, out, _err = _run(root, monkeypatch, capsys, "init", "--namespace", "me")
     assert code == 0
     assert "sqlmpeg.json" in out
+    assert "--namespace" in out
     package = read_manifest(root / "sqlmpeg.json")
-    assert package.name == "my-edits" and package.version == "0.1.0"
-    assert package.namespace == "my_edits"
-    assert [program.name for program in package.programs] == ["resize"]
+    assert package.name == "me/my_edits" and package.version == "0.1.0"
+    assert list(package.programs) == ["resize"]
     assert read_lockfile(root / "sqlmpeg.lock").entries == ()
     assert "-- variables:" in (root / "queries" / "resize.sql").read_text(encoding="utf-8")
 
@@ -1702,11 +2009,11 @@ def test_init_then_list_then_run_the_starter_program(
 ) -> None:
     root = tmp_path / "my-edits"
     root.mkdir()
-    assert _run(root, monkeypatch, capsys, "init")[0] == 0
+    assert _run(root, monkeypatch, capsys, "init", "--namespace", "me")[0] == 0
 
     code, out, _err = _run(root, monkeypatch, capsys, "list")
     assert code == 0
-    assert "my_edits  | resize" in out
+    assert "resize" in out and "me/my_edits" in out
 
     code, out, _err = _run(
         root, monkeypatch, capsys, "compile", "resize", "-v", "source=in.mp4", "-v", "dest=out.mp4"
@@ -1716,28 +2023,47 @@ def test_init_then_list_then_run_the_starter_program(
     assert "scale=width=-2:height=720" in out
 
 
-def test_init_writes_no_exports_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # An export pattern matching no file is a rejection, so a fresh directory
-    # has nothing to name one with.
-    root = tmp_path / "my-edits"
-    root.mkdir()
-    assert _run(root, monkeypatch, capsys, "init")[0] == 0
-    assert "exports" not in json.loads((root / "sqlmpeg.json").read_text(encoding="utf-8"))
-
-
-def test_init_takes_the_name_and_the_namespace(
+def test_init_takes_the_whole_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = tmp_path / "whatever"
     root.mkdir()
-    code, _out, _err = _run(
-        root, monkeypatch, capsys, "init", "--name", "broadcast/tracks", "--namespace", "tracks"
-    )
+    code, out, _err = _run(root, monkeypatch, capsys, "init", "--name", "broadcast/tracks")
     assert code == 0
-    package = read_manifest(root / "sqlmpeg.json")
-    assert package.name == "broadcast/tracks" and package.namespace == "tracks"
+    assert "--name" in out
+    assert read_manifest(root / "sqlmpeg.json").name == "broadcast/tracks"
+
+
+def test_init_derives_the_namespace_from_the_git_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is not installed")
+    root = tmp_path / "tracks"
+    root.mkdir()
+    subprocess.run([git, "init", "-q"], cwd=root, check=True)
+    subprocess.run(
+        [git, "remote", "add", "origin", "https://github.com/broadcast/tracks.git"],
+        cwd=root,
+        check=True,
+    )
+    code, out, _err = _run(root, monkeypatch, capsys, "init")
+    assert code == 0
+    assert "git remote" in out
+    assert read_manifest(root / "sqlmpeg.json").name == "broadcast/tracks"
+
+
+def test_init_without_a_derivable_namespace_requires_the_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "work"
+    root.mkdir()
+    code, _out, err = _run(root, monkeypatch, capsys, "init")
+    assert code == 1
+    assert "--namespace" in err
+    assert not (root / "sqlmpeg.json").exists()
+    assert not (root / "queries").exists()
 
 
 def test_init_refuses_to_overwrite_a_manifest(
@@ -1745,7 +2071,7 @@ def test_init_refuses_to_overwrite_a_manifest(
 ) -> None:
     _project(tmp_path, files={"src/own.sql": NORMALIZE})
     before = (tmp_path / "sqlmpeg.json").read_bytes()
-    code, _out, err = _run(tmp_path, monkeypatch, capsys, "init")
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "init", "--namespace", "me")
     assert code == 1
     assert "sqlmpeg.json already exists" in err
     assert (tmp_path / "sqlmpeg.json").read_bytes() == before
@@ -1755,21 +2081,23 @@ def test_init_refuses_to_overwrite_a_lockfile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _lock(tmp_path, [])
-    code, _out, err = _run(tmp_path, monkeypatch, capsys, "init")
+    code, _out, err = _run(tmp_path, monkeypatch, capsys, "init", "--namespace", "me")
     assert code == 1
     assert "sqlmpeg.lock already exists" in err
     assert not (tmp_path / "sqlmpeg.json").exists()
 
 
-@pytest.mark.parametrize("name", ["9lives", "...", "ffmpeg"])
-def test_init_refuses_a_name_no_namespace_comes_out_of(
+@pytest.mark.parametrize("name", ["9lives", "..."])
+def test_init_refuses_a_name_no_package_segment_comes_out_of(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], name: str
 ) -> None:
     root = tmp_path / "work"
     root.mkdir()
-    code, _out, err = _run(root, monkeypatch, capsys, "init", "--name", name)
+    code, _out, err = _run(
+        root, monkeypatch, capsys, "init", "--name", name, "--namespace", "me"
+    )
     assert code == 1
-    assert "--namespace" in err
+    assert "gives no package segment" in err
     assert not (root / "sqlmpeg.json").exists()
     assert not (root / "queries").exists()
 
@@ -1784,12 +2112,22 @@ def test_init_refuses_a_namespace_that_is_not_one(
     assert "--namespace gives no namespace" in err
 
 
+def test_init_refuses_a_reserved_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "work"
+    root.mkdir()
+    code, _out, err = _run(root, monkeypatch, capsys, "init", "--namespace", "ffmpeg")
+    assert code == 1
+    assert "reserved" in err
+
+
 # ---------------------------------------------------------------------------
 # `sqlmpeg link` and `sqlmpeg unlink`
 # ---------------------------------------------------------------------------
 
 
-def test_link_records_the_namespace_the_target_claims(
+def test_link_records_the_directory_and_names_the_package(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _library(tmp_path / "dev", "tracks", "0.5")
@@ -1798,10 +2136,9 @@ def test_link_records_the_namespace_the_target_claims(
     _lock(project, [])
     code, out, _err = _run(project, monkeypatch, capsys, "link", "../dev")
     assert code == 0
-    assert "linked 'tracks' -> ../dev" in out
-    assert "link it again" in out
+    assert "linked tracks/lib -> ../dev" in out
     lock = read_lockfile(project / "sqlmpeg.lock")
-    assert lock.entries == (LinkEntry(namespace="tracks", path="../dev"),)
+    assert lock.entries == (LinkEntry(path="../dev"),)
     assert lock.reproducible is False
 
 
@@ -1818,10 +2155,10 @@ def test_a_linked_package_is_callable_right_after_linking(
     )
     assert code == 0
     assert "volume=volume=0.5" in out
-    assert "warning: package 'tracks' is linked to" in err
+    assert "warning: package 'tracks/lib' is linked to" in err
 
 
-def test_link_replaces_what_held_the_namespace(
+def test_link_replaces_what_pinned_the_package(
     store_home: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1833,10 +2170,8 @@ def test_link_replaces_what_held_the_namespace(
     _library(tmp_path / "dev", "tracks", "0.9")
     code, out, _err = _run(project, monkeypatch, capsys, "link", "../dev")
     assert code == 0
-    assert "replacing the installed tracks-lib 1.0.0" in out
-    assert read_lockfile(project / "sqlmpeg.lock").entries == (
-        LinkEntry(namespace="tracks", path="../dev"),
-    )
+    assert "replacing the installed tracks/lib 1.0.0" in out
+    assert read_lockfile(project / "sqlmpeg.lock").entries == (LinkEntry(path="../dev"),)
 
 
 def test_link_outside_a_project_names_both_ways_forward(
@@ -1864,7 +2199,7 @@ def test_link_writes_the_machine_wide_lockfile(
     assert code == 0
     lock = read_lockfile(store.global_lock_path())
     # Absolute, since the machine-wide lockfile lives under the cache directory.
-    assert lock.entries == (LinkEntry(namespace="tracks", path=str(linked.resolve())),)
+    assert lock.entries == (LinkEntry(path=str(linked.resolve())),)
 
 
 def test_link_refuses_a_directory_holding_no_manifest(
@@ -1880,18 +2215,32 @@ def test_link_refuses_a_directory_holding_no_manifest(
     assert read_lockfile(project / "sqlmpeg.lock").entries == ()
 
 
-def test_unlink_removes_the_entry_and_rewrites_the_file(
+def test_unlink_removes_the_entry_by_package_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     linked = _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_link(linked, "tracks")])
-    code, out, _err = _run(project, monkeypatch, capsys, "unlink", "tracks")
+    _lock(project, [_link(linked)])
+    code, out, _err = _run(project, monkeypatch, capsys, "unlink", "tracks/lib")
     assert code == 0
-    assert "unlinked 'tracks'" in out
+    assert "unlinked 'tracks/lib'" in out
     lock = read_lockfile(project / "sqlmpeg.lock")
     assert lock.entries == () and lock.reproducible is True
+
+
+def test_unlink_removes_a_dead_link_by_its_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A link whose directory lost its manifest has no name, and still goes away."""
+    linked = _library(tmp_path / "dev", "tracks", "0.5")
+    project = tmp_path / "work"
+    _project(project, files={"src/own.sql": NORMALIZE})
+    _lock(project, [_link(linked)])
+    (linked / "sqlmpeg.json").unlink()
+    code, _out, _err = _run(project, monkeypatch, capsys, "unlink", str(linked))
+    assert code == 0
+    assert read_lockfile(project / "sqlmpeg.lock").entries == ()
 
 
 def test_unlink_names_what_is_linked(
@@ -1900,14 +2249,14 @@ def test_unlink_names_what_is_linked(
     linked = _library(tmp_path / "dev", "tracks", "0.5")
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _lock(project, [_link(linked, "tracks")])
-    code, _out, err = _run(project, monkeypatch, capsys, "unlink", "nope")
+    _lock(project, [_link(linked)])
+    code, _out, err = _run(project, monkeypatch, capsys, "unlink", "nope/nope")
     assert code == 1
-    assert "nothing links 'nope'" in err
-    assert "hint: linked: tracks" in err
+    assert "nothing links 'nope/nope'" in err
+    assert "hint: linked: tracks/lib" in err
 
 
-def test_unlink_says_a_namespace_is_installed_rather_than_linked(
+def test_unlink_says_a_package_is_installed_rather_than_linked(
     store_home: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1916,7 +2265,7 @@ def test_unlink_says_a_namespace_is_installed_rather_than_linked(
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     _lock(project, [_installed(_library(tmp_path / "far", "tracks", "0.5"))])
-    code, _out, err = _run(project, monkeypatch, capsys, "unlink", "tracks")
+    code, _out, err = _run(project, monkeypatch, capsys, "unlink", "tracks/lib")
     assert code == 1
     assert "it is installed, not linked" in err
     assert len(read_lockfile(project / "sqlmpeg.lock").entries) == 1
@@ -1927,7 +2276,7 @@ def test_unlink_outside_a_project_is_a_usage_error(
 ) -> None:
     bare = tmp_path / "elsewhere"
     bare.mkdir()
-    code, _out, err = _run(bare, monkeypatch, capsys, "unlink", "tracks")
+    code, _out, err = _run(bare, monkeypatch, capsys, "unlink", "tracks/lib")
     assert code == 2
     assert "unlink -g" in err
     assert not (bare / "sqlmpeg.lock").exists()
@@ -1950,7 +2299,7 @@ def test_every_subcommand_taking_a_query_takes_a_program_name(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BIN,
+        manifest=_BINS,
     )
     if command == "run":
         # The default tier executes no ffmpeg: reaching the check for one is
@@ -1973,6 +2322,28 @@ def test_every_subcommand_taking_a_query_takes_a_program_name(
         assert code == 0, err
 
 
+def test_the_default_program_is_reached_as_the_package_segment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _project(
+        tmp_path,
+        files={"queries/split.sql": PROGRAM},
+        manifest={"bin": "queries/split.sql"},
+    )
+    code, _out, err = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        "validate",
+        "me.edits",
+        "-v",
+        "source=in.mkv",
+        "-v",
+        "dest=out.mkv",
+    )
+    assert code == 0, err
+
+
 def test_a_program_name_is_not_looked_up_when_the_text_is_sql(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1981,7 +2352,7 @@ def test_a_program_name_is_not_looked_up_when_the_text_is_sql(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BIN,
+        manifest=_BINS,
     )
     code, out, _err = _run(tmp_path, monkeypatch, capsys, "compile", _MEDIA_QUERY)
     assert code == 0
@@ -1994,7 +2365,7 @@ def test_a_leading_comment_does_not_hide_that_the_text_is_sql(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BIN,
+        manifest=_BINS,
     )
     code, out, _err = _run(
         tmp_path, monkeypatch, capsys, "compile", f"-- a header\n/* and a block */\n{_MEDIA_QUERY}"
@@ -2011,16 +2382,16 @@ def test_a_bare_name_two_packages_ship_is_refused(
     (linked / "queries").mkdir()
     (linked / "queries" / "split.sql").write_text(PROGRAM, encoding="utf-8")
     written = json.loads((linked / "sqlmpeg.json").read_text(encoding="utf-8"))
-    written["bin"] = {"split-chapters": "queries/split.sql"}
+    written["bins"] = {"split-chapters": "queries/split.sql"}
     (linked / "sqlmpeg.json").write_text(json.dumps(written) + "\n", encoding="utf-8")
 
     project = tmp_path / "work"
     _project(
         project,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BIN,
+        manifest=_BINS,
     )
-    _lock(project, [_link(linked, "tracks")])
+    _lock(project, [_link(linked)])
     code, _out, err = _run(project, monkeypatch, capsys, "validate", "split-chapters")
     assert code == 1
     assert "more than one package ships a program named 'split-chapters'" in err
@@ -2046,7 +2417,7 @@ def test_an_undefined_variable_names_what_the_program_declares(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BIN,
+        manifest=_BINS,
     )
     code, _out, err = _run(
         tmp_path, monkeypatch, capsys, "validate", "split-chapters", "-v", "source=in.mkv"
@@ -2062,7 +2433,7 @@ def test_a_name_matching_nothing_fails_as_sql_and_names_the_programs(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BIN,
+        manifest=_BINS,
     )
     code, _out, err = _run(tmp_path, monkeypatch, capsys, "compile", "split-chapter")
     assert code == 1
@@ -2075,7 +2446,7 @@ def test_a_failing_query_is_not_offered_a_program(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BIN,
+        manifest=_BINS,
     )
     code, _out, err = _run(tmp_path, monkeypatch, capsys, "compile", "SELECT nope(1)")
     assert code == 1
@@ -2092,7 +2463,7 @@ def test_a_program_that_resolved_is_not_offered_the_other_programs(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": BAD_PROGRAM},
-        manifest=_BIN,
+        manifest=_BINS,
     )
     code, _out, err = _run(tmp_path, monkeypatch, capsys, "compile", "split-chapters")
     assert code == 1
@@ -2103,7 +2474,7 @@ def test_a_program_named_for_a_statement_word_is_refused(tmp_path: Path) -> None
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest={"bin": {"select": "queries/split.sql"}},
+        manifest={"bins": {"select": "queries/split.sql"}},
     )
     error = _refuses(tmp_path, "program name 'select' is a word a query begins with")
     assert "rename it" in (error.hint or "")

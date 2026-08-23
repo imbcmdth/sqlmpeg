@@ -55,15 +55,18 @@ comma is a cross join with real multiplicity, ``WHERE`` narrows the product,
 reads ``(f(x)).a`` once per FIELD, and input identity here is the alias, so
 each read would mint its own ``-i`` for one file.
 
-**A definition need not be written in the script.** A call qualified by a
-namespace a package claims (``me.pick(...)``, :mod:`sqlmpeg.project`) resolves
-to a definition read out of that package's exports and inlines through this
+**A definition need not be written in the script.** A qualified call that
+resolves in a package (``me.pick(...)``, :mod:`sqlmpeg.project`) reaches a
+definition read out of that package's lib files and inlines through this
 same expander -- same hygiene, same source map, same arity and type checks.
 Nothing is spliced into the script and the flat script namespace is untouched,
-because a package's definitions never enter it.
+because a package's definitions never enter it. What a package EXPORTS is its
+manifest's ``lib``/``libs`` map: each exported name must be defined in the
+file the manifest names for it -- checked here, where the file is parsed --
+and every other definition in a lib file is private to the package.
 
-One rule differs by where a definition was written. A package export is a
-LIBRARY: it exports more than any one query calls, so an uncalled definition
+One rule differs by where a definition was written. A package's lib files are
+a LIBRARY: it exports more than any one query calls, so an uncalled definition
 in one is the point of it. A definition in the user's own script is a script's,
 and one nothing calls stays an error. :meth:`_Expander._uncalled` is where that
 asymmetry is spelled out.
@@ -211,7 +214,8 @@ class _Function:
     statement, so a definition-level rejection anchors on the name.
     `aliases` is what the body binds and expansion has to rename.
     `columns` is the ``RETURNS TABLE`` list, and None for a value.
-    `namespace` is the package this came from, and "" for the script's own.
+    `package` is the name of the package this came from, and "" for the
+    script's own.
     """
 
     name: str
@@ -223,7 +227,7 @@ class _Function:
     position: int
     columns: tuple[Parameter, ...] | None = None
     used: bool = False
-    namespace: str = ""
+    package: str = ""
 
     @property
     def returns_rows(self) -> bool:
@@ -231,13 +235,18 @@ class _Function:
 
     @property
     def library(self) -> bool:
-        """True for a definition read out of a package EXPORT, not the script."""
-        return bool(self.namespace)
+        """True for a definition read out of a package's lib file, not the script."""
+        return bool(self.package)
+
+    @property
+    def namespace(self) -> str:
+        """The first segment of the owning package's name, and "" for the script's."""
+        return self.package.partition("/")[0]
 
     @property
     def qualified(self) -> str:
         """The name as a call site writes it: ``ns.fn`` for a package's, ``fn`` for a script's."""
-        return f"{self.namespace}.{self.name}" if self.namespace else self.name
+        return f"{self.namespace}.{self.name}" if self.package else self.name
 
     @property
     def signature(self) -> str:
@@ -690,21 +699,21 @@ def _define(create: exp.Create) -> _Function:
     )
 
 
-def _in_export(
-    err: SqlmpegError, namespace: str, path: Path, anchor: exp.Expr | None
+def _in_lib(
+    err: SqlmpegError, name: str, path: Path, anchor: exp.Expr | None
 ) -> SqlmpegError:
-    """A rejection from a package export, said at the call site that reached for it.
+    """A rejection from a package's lib file, said at the call site that reached for it.
 
-    An export file's line numbers mean nothing in the query the reader is
+    A lib file's line numbers mean nothing in the query the reader is
     looking at, so the anchor moves to the call and the message carries the
     file and the line it really came from. With no call to point at -- a
-    listing rather than a compile -- the export's own line is all there is.
+    listing rather than a compile -- the file's own line is all there is.
     """
     line, col = _pos(anchor) if anchor is not None else (err.line, err.col)
     at = f" line {err.line}" if err.line is not None else ""
     return SqlmpegError(
         err.code,
-        f"package '{namespace}' export {path}{at}: {err.message}",
+        f"package '{name}' lib {path}{at}: {err.message}",
         line=line,
         col=col,
         hint=err.hint,
@@ -714,47 +723,47 @@ def _in_export(
 def _source_definitions(
     package: Package, path: Path, anchor: exp.Expr | None
 ) -> list[_Function]:
-    """Every ``CREATE FUNCTION`` one package export holds, validated.
+    """Every ``CREATE FUNCTION`` one lib file holds, validated.
 
-    An export is a LIBRARY, so it holds definitions and nothing else: a SELECT
-    or a COPY in one is a script, and is rejected as one. Every definition it
-    yields carries the package's namespace, which is what makes it a library's
-    rather than the script's.
+    A lib file is a LIBRARY, so it holds definitions and nothing else: a
+    SELECT or a COPY in one is a script, and is rejected as one. Every
+    definition it yields carries the package's name, which is what makes it a
+    library's rather than the script's.
 
-    `path` is always one of ``package.exports``. A program's file is a query
-    and is never read here.
+    `path` is always one of ``package.exports``' files. A program's file is a
+    query and is never read here.
     """
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as err:
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            f"package '{package.namespace}': could not read export {path}: "
+            f"package '{package.name}': could not read {path}: "
             f"{err.strerror or err}",
             anchor,
-            hint=f"{package.manifest} lists it as an export",
+            hint=f"{package.manifest} names it in lib or libs",
         ) from err
     try:
         statements = _statements(parse(text))
     except SqlmpegError as err:
-        raise _in_export(err, package.namespace, path, anchor) from err
+        raise _in_lib(err, package.name, path, anchor) from err
 
     definitions: list[_Function] = []
     for statement in statements:
         if not (isinstance(statement, exp.Create) and _create_kind(statement) == "FUNCTION"):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"package '{package.namespace}' export {path} holds a statement that "
+                f"package '{package.name}' lib {path} holds a statement that "
                 "is not a CREATE FUNCTION",
                 anchor,
-                hint="an export is a library: it defines functions, and a "
-                "query of its own is a program, declared in bin",
+                hint="a lib file is a library: it defines functions, and a "
+                "query of its own is a program, declared in bin or bins",
             )
         try:
             function = _define(statement)
         except SqlmpegError as err:
-            raise _in_export(err, package.namespace, path, anchor) from err
-        function.namespace = package.namespace
+            raise _in_lib(err, package.name, path, anchor) from err
+        function.package = package.name
         # Ahead of every statement of the calling script: a library is already
         # defined when the query that calls it is written.
         function.position = -1
@@ -762,52 +771,94 @@ def _source_definitions(
     return definitions
 
 
+def _package_scope(
+    package: Package, anchor: exp.Expr | None
+) -> tuple[dict[str, _Function], dict[str, Path]]:
+    """Every definition across `package`'s lib files, and the file each came from.
+
+    One flat scope per package -- a bare call in a library body resolves here
+    -- so one name defined in two of its files is a rejection.
+    """
+    scope: dict[str, _Function] = {}
+    origin: dict[str, Path] = {}
+    for path in dict.fromkeys(package.exports.values()):
+        for function in _source_definitions(package, path, anchor):
+            if function.name in scope:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"package '{package.name}' defines '{function.name}' twice: "
+                    f"{origin[function.name]} and {path}",
+                    anchor,
+                    hint="one name, one definition, across all of a package's lib files",
+                )
+            scope[function.name] = function
+            origin[function.name] = path
+    return scope, origin
+
+
+def _check_exported(
+    package: Package, scope: dict[str, _Function], origin: dict[str, Path], anchor: exp.Expr | None
+) -> None:
+    """The manifest's promise, checked: each exported name is defined in its named file."""
+    for exported, path in package.exports.items():
+        if exported in scope and origin[exported] == path:
+            continue
+        hint = (
+            "lib's file must define a function named for the package segment"
+            if exported == package.package
+            else "libs is keyed by exported function name; the file must define "
+            f"CREATE FUNCTION {exported}"
+        )
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"package '{package.name}': {path} does not define '{exported}'",
+            anchor,
+            hint=hint,
+        )
+
+
 @dataclass(frozen=True)
 class Signature:
-    """One function a package exports: how a call site writes it, and from where.
+    """One function a package exports: its declared shape, and from where.
 
-    `params` and `returns` are the declared types, not the body's; `export` is
-    the file the definition was read out of.
+    `package` is the owning package's name; `params` and `returns` are the
+    declared types, not the body's; `export` is the file the definition was
+    read out of.
     """
 
-    namespace: str
+    package: str
     name: str
     params: tuple[Parameter, ...]
     returns: str
     export: Path
 
     @property
-    def qualified(self) -> str:
-        """The name a call site writes: ``ns.fn``."""
-        return f"{self.namespace}.{self.name}"
-
-    @property
     def written(self) -> str:
-        """The call form with its parameters: ``ns.fn(track audio_stream)``."""
-        return f"{self.qualified}({', '.join(f'{p.name} {p.type}' for p in self.params)})"
+        """The call form with its parameters: ``fn(track audio_stream)``."""
+        return f"{self.name}({', '.join(f'{p.name} {p.type}' for p in self.params)})"
 
 
 def package_signatures(package: Package) -> tuple[Signature, ...]:
-    """Every function `package` exports, in export then definition order.
+    """Every function `package` exports, in the manifest's own order.
 
     The same reading and validation a compile does, without one: it is what
     answers "what did I just install" for a caller holding no query. Raises
-    ``SqlmpegError`` for an export that cannot be read, does not parse, or
-    holds anything but ``CREATE FUNCTION``.
+    ``SqlmpegError`` for a lib file that cannot be read, does not parse, holds
+    anything but ``CREATE FUNCTION``, or does not define the function the
+    manifest exports from it.
     """
-    found: list[Signature] = []
-    for path in package.exports:
-        for function in _source_definitions(package, path, None):
-            found.append(
-                Signature(
-                    namespace=package.namespace,
-                    name=function.name,
-                    params=function.params,
-                    returns=function.returns,
-                    export=path,
-                )
-            )
-    return tuple(found)
+    scope, origin = _package_scope(package, None)
+    _check_exported(package, scope, origin, None)
+    return tuple(
+        Signature(
+            package=package.name,
+            name=exported,
+            params=scope[exported].params,
+            returns=scope[exported].returns,
+            export=path,
+        )
+        for exported, path in package.exports.items()
+    )
 
 
 # -- reading and rewriting nodes ------------------------------------------
@@ -1049,13 +1100,16 @@ class _Expander:
     budget: int = _EXPANSION_BUDGET
     # Where the statement being walked keeps its generated CTEs.
     site: _Site | None = None
-    # The packages a namespaced call may resolve in, and what each one's
-    # sources define once they have been read.
+    # The packages a qualified call may resolve in, and -- keyed by package
+    # name -- what each one's lib files define and which of those names its
+    # manifest exports, once they have been read.
     packages: PackageSet | None = None
-    exports: dict[str, dict[str, _Function]] = field(default_factory=dict)
+    scopes: dict[str, dict[str, _Function]] = field(default_factory=dict)
+    exported: dict[str, frozenset[str]] = field(default_factory=dict)
     # Where a diagnostic that is not a rejection goes; None is silence.
     on_warning: OnWarning | None = None
-    # Whose definitions a BARE call name sees; "" is the script's own.
+    # Whose definitions a BARE call name sees: a package name, or "" for the
+    # script's own.
     scope: str = ""
 
     # -- entry point ------------------------------------------------------
@@ -1102,8 +1156,8 @@ class _Expander:
         return None
 
     def _exported(self) -> Iterator[_Function]:
-        """Every definition read out of a package export so far."""
-        for functions in self.exports.values():
+        """Every definition read out of a package's lib files so far."""
+        for functions in self.scopes.values():
             yield from functions.values()
 
     def _collect(self, statements: list[exp.Expr]) -> list[exp.Expr]:
@@ -1142,15 +1196,15 @@ class _Expander:
         return self.packages is not None and bool(self.packages.packages)
 
     @contextmanager
-    def _scoped(self, namespace: str) -> Iterator[None]:
-        """Whose definitions a bare call name sees while `namespace`'s body expands.
+    def _scoped(self, package: str) -> Iterator[None]:
+        """Whose definitions a bare call name sees while `package`'s body expands.
 
-        A package export is its own flat namespace: a library body calling
-        ``helper()`` means the package's own helper, never the script's, and a
-        script body never sees a package's.
+        A package's lib files are its own flat namespace: a library body
+        calling ``helper()`` means the package's own helper, never the
+        script's, and a script body never sees a package's.
         """
         previous = self.scope
-        self.scope = namespace
+        self.scope = package
         try:
             yield
         finally:
@@ -1159,7 +1213,7 @@ class _Expander:
     def _visible(self, name: str) -> _Function | None:
         """The definition a BARE call name resolves to where it is written."""
         if self.scope:
-            return self.exports.get(self.scope, {}).get(name)
+            return self.scopes.get(self.scope, {}).get(name)
         return self.functions.get(name)
 
     def _member(self, namespace: str, call: exp.Anonymous, anchor: exp.Expr) -> _Function | None:
@@ -1168,13 +1222,18 @@ class _Expander:
         None keeps a qualified call exactly what it was before packages
         existed: outside a project, ``me.pick(...)`` is not a package call and
         the rejection it earns downstream is the one it has always earned.
+
+        Interim resolution: a two-part ``ns.fn`` call reaches an export of the
+        ONE package under `ns`, rejecting when the namespace holds more.
+        Three-segment ``namespace.package.member`` calls, the two-part default
+        (``namespace.package``) and alias resolution replace this rule.
         """
         packages = self.packages
         if packages is None or not packages.packages:
             return None
         name = _call_name(call)
-        package = packages.get(namespace)
-        if package is None:
+        candidates = packages.in_namespace(namespace)
+        if not candidates:
             known = packages.namespaces()
             near = difflib.get_close_matches(namespace, list(known), n=1, cutoff=0.6)
             raise _error(
@@ -1185,24 +1244,36 @@ class _Expander:
                 if near
                 else f"namespaces this project can call: {', '.join(known)}",
             )
-        exports = self._exports_of(package, anchor)
-        function = exports.get(name)
-        if function is None:
-            near = difflib.get_close_matches(name, sorted(exports), n=1, cutoff=0.6)
+        if len(candidates) > 1:
+            names = ", ".join(package.name for package in candidates)
             raise _error(
                 ErrorCode.UNKNOWN_FUNCTION,
-                f"package '{namespace}' has no function '{name}'",
+                f"namespace '{namespace}' holds more than one package: {names}",
+                anchor,
+                hint="a two-part call reaches one package per namespace; keep one of them",
+            )
+        package = candidates[0]
+        exports = self._scope_of(package, anchor)
+        function = (
+            exports.get(name) if name in self.exported[package.name] else None
+        )
+        if function is None:
+            exported = sorted(self.exported[package.name])
+            near = difflib.get_close_matches(name, exported, n=1, cutoff=0.6)
+            raise _error(
+                ErrorCode.UNKNOWN_FUNCTION,
+                f"package '{package.name}' has no export '{name}'",
                 anchor,
                 hint=f"did you mean {namespace}.{near[0]}()?"
                 if near
-                else f"{namespace} defines: {', '.join(sorted(exports)) or 'nothing'}",
+                else f"{package.name} exports: {', '.join(exported) or 'nothing'}",
             )
         return function
 
     def _warn_about(self, package: Package, anchor: exp.Expr) -> None:
         """Say what resolving in `package` cost, at the first call that reaches it.
 
-        Once per package: this runs where a namespace's exports are read, and
+        Once per package: this runs where a package's lib files are read, and
         they are read once per compile. Both warnings are about where the
         definition came FROM, so a query that never calls into the package
         hears nothing.
@@ -1214,8 +1285,8 @@ class _Expander:
             self.on_warning(
                 SqlmpegWarning(
                     WarningCode.LINKED_PACKAGE,
-                    package.namespace,
-                    f"package '{package.namespace}' is linked to {package.root}, so this "
+                    package.name,
+                    f"package '{package.name}' is linked to {package.root}, so this "
                     "command depends on files no lockfile pins",
                     line=line,
                     col=col,
@@ -1228,8 +1299,8 @@ class _Expander:
             self.on_warning(
                 SqlmpegWarning(
                     WarningCode.GLOBAL_PACKAGE,
-                    package.namespace,
-                    f"package '{package.namespace}' was resolved from the machine-wide "
+                    package.name,
+                    f"package '{package.name}' was resolved from the machine-wide "
                     f"lockfile, not from the project at {packages.root}",
                     line=line,
                     col=col,
@@ -1238,38 +1309,28 @@ class _Expander:
                 )
             )
 
-    def _exports_of(self, package: Package, anchor: exp.Expr) -> dict[str, _Function]:
-        """Every definition `package`'s exports hold, read and parsed once per compile.
+    def _scope_of(self, package: Package, anchor: exp.Expr) -> dict[str, _Function]:
+        """Every definition `package`'s lib files hold, read and parsed once per compile.
 
-        Read on FIRST use of the namespace rather than up front: a package
+        Read on FIRST use of the package rather than up front: a package
         whose exports this query never calls into costs nothing, and a broken
-        export only blocks the queries that reach for it.
+        lib file only blocks the queries that reach for it. Reading also
+        checks the manifest's promise -- each exported name defined in the
+        file named for it -- and records which names are exported at all;
+        the rest are the package's own.
 
-        ``package.exports`` and nothing else: a program's file is a query, and
-        no path through this module opens one.
+        ``package.exports``' files and nothing else: a program's file is a
+        query, and no path through this module opens one.
         """
-        cached = self.exports.get(package.namespace)
+        cached = self.scopes.get(package.name)
         if cached is not None:
             return cached
         self._warn_about(package, anchor)
-        exports: dict[str, _Function] = {}
-        origin: dict[str, Path] = {}
-        # Registered before the exports are read so a body calling a sibling
-        # resolves against the same dict this loop is filling.
-        self.exports[package.namespace] = exports
-        for path in package.exports:
-            for function in _source_definitions(package, path, anchor):
-                if function.name in exports:
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        f"package '{package.namespace}' defines '{function.name}' twice: "
-                        f"{origin[function.name]} and {path}",
-                        anchor,
-                        hint="one name, one definition, across all of a package's exports",
-                    )
-                exports[function.name] = function
-                origin[function.name] = path
-        return exports
+        scope, origin = _package_scope(package, anchor)
+        _check_exported(package, scope, origin, anchor)
+        self.scopes[package.name] = scope
+        self.exported[package.name] = frozenset(package.exports)
+        return scope
 
     # -- finding calls ----------------------------------------------------
 
@@ -1479,7 +1540,7 @@ class _Expander:
         body, _ = self._instance(site, arguments)
         # The body is the package's or the script's text, so its own bare calls
         # resolve where it was written, not where it was called from.
-        with self._scoped(function.namespace):
+        with self._scoped(function.package):
             self._expand_within(body, host, position, (*stack, function.qualified))
         _splice(host, body)
         projection: exp.Expr = body.expressions[0]
@@ -1506,7 +1567,7 @@ class _Expander:
         arguments = self._arguments(function, site.call, host, position)
         body, index = self._instance(site, arguments)
         # The body is its own query now, so its own calls expand into it.
-        with self._scoped(function.namespace):
+        with self._scoped(function.package):
             self._expand_within(body, body, position, (*stack, function.qualified))
         _name_columns(body, function.columns or ())
         name = self._fresh_name(f"{function.name}_{index + 1}")
