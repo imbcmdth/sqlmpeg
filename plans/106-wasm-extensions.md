@@ -112,43 +112,83 @@ particular source. A package MAY name a source repository and build
 command for a human to check; nothing verifies it, and the field should
 say so.
 
-## Hosts
+## Hosts: the sidecar is the baseline
 
-Two, running the same module — the maintainer's requirement:
+Maintainer, 2026-08-23. **The sidecar ships out of the box.** An earlier
+draft had the frei0r host first, because it needs no IR change and would
+prove the loop end to end. That was optimising for an easier first
+milestone rather than the right one, and it is wrong for three reasons,
+two of which are about capability rather than speed:
 
-- **frei0r/ladspa**, in-process and single-threaded, for the command
-  line. No wasi, so a module importing anything beyond the world is
-  refused against it at compile time.
-- **The sidecar**, ffmpeg piping out to a process and back, for
-  throughput and for capabilities.
+- **frei0r cannot express half the feature.** It is a video-filter ABI:
+  frame in, frame out. A `RETURNS TABLE(...)` analysis function has
+  nowhere to put its rows, so that path ships only the filter half - the
+  half that is least new.
+- **"frei0r/ladspa" was never one host.** frei0r is video-only; audio
+  needs LADSPA, a different ABI with a different lifecycle and data
+  layout. Two shims that do not unify, against a sidecar where a stream
+  is a stream.
+- **A frei0r plugin runs synchronously in ffmpeg's filter thread**, so a
+  module doing real work serialises the graph. Anything near realtime
+  needs processes.
 
-Which one is a compile-time policy, decided from the module's imports
-and the graph's shape, and `explain` should show it.
+The frei0r/ladspa host becomes optional - a single-process convenience
+for the command line, worth building when someone wants it, gating
+nothing.
 
-## The long pole
+### The protocol is a core artifact
+
+Frames and rows cannot share a channel without framing, so they do not
+share one:
+
+- **Frames** move over named pipes between ffmpeg and the sidecar.
+- **A control channel** - the sidecar's own stdin and stdout, carrying
+  JSON - takes stream metadata in at startup and structured rows back
+  out.
+
+That split is what makes "metadata in, rows out" work at all, and it is
+what the WIT world has to be shaped around.
+
+### Table-returning functions are a two-pass compile
+
+Rows from an analysis pass exist only after ffmpeg has run, so a query
+joining against them cannot be one invocation. It is: run the analysis,
+read the rows, compile the second command with them substituted in.
+
+That is `sqlmpeg.loudnorm2` exactly - a measuring pass whose output is
+parsed in process and substituted into a correction pass, already
+shipped and already tested. Analysis functions generalise machinery that
+exists rather than needing a new execution model, and loudnorm2 is also
+already "read structured data back from a process", which is the
+sidecar's own shape.
+
+## The long pole, now on the critical path
 
 The sidecar makes a filter graph DISJOINT. `Emitted` today is a list of
 commands run in sequence and stopped at the first failure. The sidecar
 needs a graph of concurrent processes joined by pipes, where a death
 propagates rather than hanging the others, and where a timeout covers
-the set rather than each member. That is an IR change and an execution
-change, and it is larger than anything else here.
+the set rather than each member.
+
+This was step four when frei0r came first. With the sidecar as the
+baseline it is unavoidable, which is more honest: it was always the
+largest piece, and deferring it only deferred finding out.
 
 ## Order
 
-1. **The WIT world.** Everything is downstream of what a module sees.
-   Getting it wrong means rewriting both hosts and every published
-   module. It is now a published contract authors target rather than
-   something generated around them, which makes it easier to version and
-   harder to change quietly.
-2. **`LANGUAGE wasm` in the parser and the expander**: the two-part
+1. **The WIT world**, shaped around the two channels above. Everything
+   is downstream of what a module sees, and it is a published contract
+   authors target rather than something generated around them.
+2. **The disjoint-graph IR and execution**: concurrent commands, pipes,
+   propagating failure, a timeout over the set.
+3. **`LANGUAGE wasm` in the parser and the expander**: the two-part
    `AS`, the signature check against the module, the capability read.
-   Small, once the world exists.
-3. **The frei0r host**, which needs no IR change and proves the loop end
-   to end: authored, published, installed, called, run.
-4. **The disjoint-graph IR**, then the sidecar.
+4. **The sidecar host**, and one pure pixel filter through the whole
+   loop - authored, published, installed, called, run.
+5. **Table-returning analysis**, on loudnorm2's two-pass shape.
+6. The frei0r/ladspa host, if anyone wants it.
 
 `wasi:nn` is deliberately last. It is the most interesting capability
-and the least load-bearing: one pure pixel filter through the whole loop
-first. If that works, inference is an increment; if it does not, wasi-nn
-will not save it.
+and the least load-bearing: get one filter through the loop first. If
+that works, inference is an increment; if it does not, wasi-nn will not
+save it.
