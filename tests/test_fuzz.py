@@ -51,12 +51,18 @@ from sqlmpeg.probe import ChapterMeta, ProbeResult, StreamMeta
 from sqlmpeg.table import TableSink
 from sqlmpeg.vars import substitute
 
+from .test_examples import _parse as parse_examples
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _GOLDEN_DIR = _REPO_ROOT / "tests" / "golden"
-_QUERIES_DIR = _REPO_ROOT / "packages"
+_COOKBOOK = _REPO_ROOT / "docs" / "examples.md"
 _CORPUS: list[str] = sorted(
-    p.read_text(encoding="utf-8")
-    for p in [*_GOLDEN_DIR.glob("*.sql"), *_QUERIES_DIR.glob("*/*/queries/*.sql")]
+    {
+        *(p.read_text(encoding="utf-8") for p in _GOLDEN_DIR.glob("*.sql")),
+        # The cookbook is where the row and grouping surface lives, and it is
+        # already kept honest by its own byte-verification.
+        *(example.sql for example in parse_examples(_COOKBOOK.read_text(encoding="utf-8"))),
+    }
 )
 assert _CORPUS, f"no seed queries found under {_GOLDEN_DIR}"
 

@@ -1,9 +1,0 @@
-{
-  "name": "imbcmdth/encode",
-  "version": "1.0.0",
-  "description": "Transcode to a target codec and quality.",
-  "bin": "queries/transcode.sql",
-  "bins": {
-    "abr-ladder": "queries/abr-ladder.sql"
-  }
-}

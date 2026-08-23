@@ -228,4 +228,4 @@ It serves the prompt as a resource and five tools: `compile`, `validate` (empty 
 
 ---
 
-More docs: [dialect](docs/dialect.md) · [types](docs/types.md) · [cookbook](docs/examples.md) · [filters](docs/filters.md) · [row shapes](docs/rows.md) · [trimming](docs/trimming.md) · [error contract](docs/errors.md) · [known gaps](docs/known_gaps.md) · [roadmap](ROADMAP.md)
+More docs: [dialect](docs/dialect.md) · [types](docs/types.md) · [cookbook](docs/examples.md) · [filters](docs/filters.md) · [row shapes](docs/rows.md) · [trimming](docs/trimming.md) · [error contract](docs/errors.md) · [known gaps](docs/known_gaps.md)
