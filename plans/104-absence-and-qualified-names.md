@@ -306,11 +306,24 @@ looking for a merge that is not there.
 | `fade` | `duration` |
 | `gif` | `fps`, `width` |
 | `retitle` | `title`, `artist`, via `COALESCE(:'title', f.title)` — see 1.5 |
-| `volume`, `speed` | nothing: `factor` is required, there is no operation without it |
+| `volume`, `speed` | `factor` reads as optional, and that is accepted (below) |
 | the rest | source and destination required, nothing else to generalize |
 
 `thumbnail` and `extract-frames` stay separate: one image versus a
 sequence is a different query shape, not a default.
+
+**A knob that is the point of a program still reads as optional**
+(maintainer, 2026-08-22, accepted). Required-ness is derived from use,
+and an ordinary filter option that is simply absent is not a rejection —
+`volume` with no factor drops the option, ffmpeg's default of 1.0
+applies, and the file comes back unchanged. The same holds for `crop`'s
+rectangle, `speed`'s factor, `rotate`'s `dir`, `thumbnail`'s `at`.
+
+Accepted rather than fixed. The alternatives were a marker in the
+`-- variables:` header, which reintroduces declaration, or widening the
+curated list from "what ffmpeg refuses" to "what we think matters",
+which is a fuzzier thing every filter would want to argue with. A no-op
+output is visible immediately, and `list` says optional and means it.
 
 ### 4.3 Grouping
 
