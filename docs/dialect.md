@@ -50,10 +50,8 @@ the path a call writes: `imbcmdth/audio` is called as `imbcmdth.audio`.
 ```json
 { "name": "imbcmdth/audio", "version": "1.0.0",
   "description": "Volume, loudness, ducking",
-  "lib":  "src/audio.sql",
-  "libs": { "quieter": "src/audio.sql", "duck": "src/duck.sql" },
-  "bin":  "queries/volume.sql",
-  "bins": { "loudnorm": "queries/loudnorm-all.sql" },
+  "bin": { "volume": "queries/volume.sql", "loudnorm": "queries/loudnorm-all.sql" },
+  "lib": "src/audio.sql",
   "dependencies": { "tracks": "broadcast/tracks@^1.2.0" } }
 ```
 
@@ -62,18 +60,23 @@ the name is a lowercase plain identifier, and the first half - the
 namespace - may not be `ffmpeg`, `sqlmpeg` or `wasm`. There is no
 separate `namespace` key: the name carries it.
 
-Singular is the default, plural is the map, on both halves.
-`lib`/`libs` are the exports: each `libs` key is an exported function
-name, its value the file defining it, and `lib`'s export is named for
-the package segment (`audio` in `imbcmdth/audio`). Several keys may
-name one file; a file may define more than the manifest exports, and
-the rest are private to the package. Each exported name must be
-defined in the file named for it. `bin`/`bins` are the programs:
-`bins` maps a command word (`[a-z][a-z0-9_-]*`) to one query file, and
-`bin` is the default program, named for the package segment. Every
-file value is one path relative to the manifest, stays under it, is
-not a pattern, and must exist. A manifest declaring none of the four
-is a consumer project that holds dependencies.
+`lib` and `bin` each take a string or a map, never both at once. A
+string names one file, its member named for the package segment
+(`audio` in `imbcmdth/audio`) - `imbcmdth/deband`'s `"lib": "src/deband.sql"`
+calls as `imbcmdth.deband(v)`. A map names several members, one file
+per key, and there is no root-callable one - `imbcmdth/audio`'s `bin`
+above reaches `imbcmdth.audio.volume`, never `imbcmdth.audio(...)`.
+`lib` is the exports: each map key an exported function name, its
+value the file defining it. `bin` is the programs: a map key is a
+command word (`[a-z][a-z0-9_-]*`), its value one query file. Several
+keys may name one file; a file may define more than the manifest
+exports, and the rest are private to the package. Each named member
+must be defined in the file named for it. Every file value is one path
+relative to the manifest, stays under it, is not a pattern, and must
+exist. A manifest declaring neither `lib` nor `bin` is a consumer
+project that holds dependencies. `bins` and `libs` are gone; a
+manifest that still writes either is rejected, its hint naming the
+singular that replaced it.
 
 The two halves are read by role. A lib file holds `CREATE FUNCTION`
 definitions and nothing else, and a definition it exports but the query
@@ -93,8 +96,10 @@ A query calls into an installed package one of three ways:
 - **Three segments**, `<namespace>.<package>.<member>(...)` -
   `imbcmdth.audio.quieter(f.audio[1], 0.5)` - always valid, reaching any
   export whatever a project's own `dependencies` say.
-- **Two segments**, `<namespace>.<package>(...)` - `imbcmdth.audio(...)`
-  - the package's DEFAULT export, the one `lib` names.
+- **Two segments**, `<namespace>.<package>(...)` - `imbcmdth.deband(v)` -
+  the export a string `lib` names. A package whose `lib` is a map has
+  none: the call is rejected, naming the exports to call by their own
+  three-segment path instead.
 - **Two segments through an alias**, `<alias>.<member>(...)` -
   `tracks.pick(...)` when `dependencies` binds `tracks` to a package.
   The default export is not reachable through an alias - write the
@@ -142,9 +147,9 @@ nothing usable comes out of is rejected rather than guessed at. It
 overwrites none of the three files, and what it writes reads back
 through the same validation every other command applies.
 
-The starter is a program, `queries/resize.sql` declared in `bins`, not
-an export: a lib must name a file defining its export, so a fresh
-directory has nothing to declare one with.
+The starter is a program, `queries/resize.sql` declared as a map `bin`
+entry, not an export: a lib must name a file defining its export, so a
+fresh directory has nothing to declare one with.
 
 ### Running a program
 
@@ -164,9 +169,9 @@ Which the positional is, in order:
 A manifest declaring a program named for one of those four words is
 rejected where it is written: rule 1 would never let it be reached.
 A program name may also be qualified: `<namespace>.<package>.<name>`
-names one package's `bins` entry, `<namespace>.<package>` its default
-`bin`. Either says which package when a bare name matches programs in
-more than one; a bare name that does is rejected naming each
+names one entry of a map `bin`, `<namespace>.<package>` a string
+`bin`'s program. Either says which package when a bare name matches
+programs in more than one; a bare name that does is rejected naming each
 `<namespace>.<package>.<name>` it could mean. Variables still come
 from `-v name=value`; an unset one substitutes to `NULL` (see
 [Variables](#variables)), and a rejection at
@@ -494,15 +499,15 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   definition in the query's own text that nothing calls, and a
   `TABLE`-returning call in the `SELECT` list.
 - **Packages**: a namespace no package claims; a namespace with no
-  package by that name; a call with no default export naming the
-  package's `libs` instead; a member the package does not export; a
-  manifest that is not one JSON object with `name` and `version`; a
-  name that is not `<namespace>/<package>` in plain
-  identifiers, or whose namespace is reserved; a `lib`, `libs`, `bin`
-  or `bins` value naming a pattern, a missing file, or a path outside
-  the project; an exported name not defined in the file named for it;
-  a `libs` or `bins` key equal to the package segment; one name defined
-  twice across a package's lib files; a lib file holding anything but
+  package by that name; a two-segment call on a package whose `lib` is
+  a map, naming its exports instead; a member the package does not
+  export; a manifest that is not one JSON object with `name` and
+  `version`; a name that is not `<namespace>/<package>` in plain
+  identifiers, or whose namespace is reserved; a `bins` or `libs` key
+  (`lib`/`bin` replaced them, its hint naming the singular); a `lib` or
+  `bin` value naming a pattern, a missing file, or a path outside the
+  project; an exported name not defined in the file named for it; one name defined twice
+  across a package's lib files; a lib file holding anything but
   `CREATE FUNCTION`; a program name that is not a command word or is
   declared twice; a dependency alias that is not a plain identifier, is
   reserved, or equals an installed package's namespace; a dependency

@@ -6,19 +6,21 @@ path a call writes: ``imbcmdth/audio`` is called as ``imbcmdth.audio``. The
 manifest says what the package provides under that name::
 
     { "name": "imbcmdth/audio", "version": "1.0.0",
-      "lib":  "src/audio.sql",
-      "libs": { "quieter": "src/audio.sql" },
-      "bin":  "queries/volume.sql",
-      "bins": { "duck": "queries/duck.sql" },
+      "bin": { "volume": "queries/volume.sql", "duck": "queries/duck.sql" },
+      "lib": "src/audio.sql",
       "dependencies": { "tracks": "broadcast/tracks@^1.2.0" } }
 
-Singular is the default, plural is the map, on both halves. ``lib``/``libs``
-are the exports: each key is an exported function name, its value the file
-defining it, and ``lib``'s export is named for the package segment. ``bin``/
-``bins`` are the programs: whole runnable queries, one file per name. The two
-halves are read by ROLE -- a lib file holds definitions and nothing else, a
-program's file is a query -- and a manifest declaring none of the four is a
-consumer project that only holds dependencies.
+``lib`` and ``bin`` each accept a string, or a map, never both at once. A
+string names one file, its member named for the package segment --
+``imbcmdth/deband``'s ``lib`` calls as ``imbcmdth.deband(...)``,
+``imbcmdth/clip``'s ``bin`` runs as ``imbcmdth.clip``. A map names several
+members, one file per name, and there is no root-callable one:
+``imbcmdth.audio.volume``, never ``imbcmdth.audio(...)``. ``lib`` is the
+exports: each key an exported function name, its value the file defining it.
+``bin`` is the programs: whole runnable queries, one file per name. The two
+are read by ROLE -- a lib file holds definitions and nothing else, a
+program's file is a query -- and a manifest declaring neither is a consumer
+project that only holds dependencies.
 
 ``dependencies`` keys are ALIASES: the name this project's queries may use for
 a package it installed. The value keeps the installed package's name and the
@@ -132,12 +134,15 @@ STATEMENT_KEYWORDS = ("select", "copy", "create", "with")
 _GLOB_CHARACTERS = "*?["
 
 _REQUIRED = ("name", "version")
-_KNOWN = frozenset({*_REQUIRED, "description", "lib", "libs", "bin", "bins", "dependencies"})
+_KNOWN = frozenset({*_REQUIRED, "description", "lib", "bin", "dependencies"})
 
 # Keys older manifests wrote, each with the hint that says what replaced it.
 _RETIRED = {
     "namespace": 'the name carries the namespace: "name" is "<namespace>/<package>"',
-    "exports": '"libs" replaced it: a map of exported function name to the file defining it',
+    "exports": '"lib" replaced it: a string or a map of exported function name to file',
+    "libs": '"lib" replaced it: a string names one file, a map names exported function '
+    "name to file",
+    "bins": '"bin" replaced it: a string names one file, a map names program name to file',
 }
 
 _NAMESPACE_HINT = (
@@ -148,16 +153,16 @@ _NAME_HINT = (
     'a package name is "<namespace>/<package>", each half a lowercase plain identifier'
 )
 _MANIFEST_HINT = (
-    'a manifest is one JSON object with "name" and "version"; "lib", "libs", '
-    '"bin" and "bins" are what the package provides, all optional'
+    'a manifest is one JSON object with "name" and "version"; "lib" and "bin" -- each a '
+    "string or a map -- are what the package provides, both optional"
 )
-_LIBS_HINT = (
-    "libs maps an exported function name to the file defining it, relative to "
-    'the manifest, e.g. {"quieter": "src/audio.sql"}'
+_LIB_HINT = (
+    '"lib" is a string naming one file, or a map of exported function name to file, '
+    'relative to the manifest, e.g. {"quieter": "src/audio.sql"}'
 )
-_BINS_HINT = (
-    "bins maps a program name to one query file relative to the manifest, e.g. "
-    '{"duck": "queries/duck.sql"}'
+_BIN_HINT = (
+    '"bin" is a string naming one file, or a map of program name to one query file, '
+    'relative to the manifest, e.g. {"duck": "queries/duck.sql"}'
 )
 _DEPENDENCIES_HINT = (
     'dependencies maps an alias to "<namespace>/<package>@<range>", e.g. '
@@ -212,9 +217,9 @@ class Package:
 
     `name` is ``<namespace>/<package>``; the two halves are derived, never
     stored twice. `exports` maps each exported function name to the file
-    defining it, the default (``lib``'s, named for the package segment) first;
-    `programs` does the same for the runnable queries, ``bin``'s under the
-    package segment. Several names may share one file. `aliases` is the
+    defining it: a string ``lib``'s one entry, named for the package segment,
+    or a map's several. `programs` does the same for the runnable queries,
+    from ``bin``. Several names may share one file. `aliases` is the
     manifest's ``dependencies``, keyed by alias.
 
     `linked` marks a package read straight out of a working directory rather
@@ -229,6 +234,10 @@ class Package:
     exports: Mapping[str, Path] = field(default_factory=dict)
     programs: Mapping[str, Path] = field(default_factory=dict)
     aliases: Mapping[str, Dependency] = field(default_factory=dict)
+    # Set only where the manifest wrote a plain string: the one member that
+    # answers to the package's own name.
+    root_export: str | None = None
+    root_program: str | None = None
     layer: Layer = "project"
     linked: bool = False
 
@@ -243,12 +252,21 @@ class Package:
         return self.name.partition("/")[2]
 
     def export(self, member: str | None = None) -> Path | None:
-        """The file exporting `member`, or the default export's file for None."""
-        return self.exports.get(self.package if member is None else member)
+        """The file exporting `member`, or the root-callable export's for None.
+
+        Only the string form of ``lib`` has a root-callable export, and
+        `root_export` is set when it does. A map entry that happens to be
+        named for the package is reached at its own name like any other.
+        """
+        if member is None:
+            member = self.root_export
+        return None if member is None else self.exports.get(member)
 
     def program(self, member: str | None = None) -> Path | None:
-        """The file of program `member`, or the default program's file for None."""
-        return self.programs.get(self.package if member is None else member)
+        """The file of program `member`, or the root-callable program's for None."""
+        if member is None:
+            member = self.root_program
+        return None if member is None else self.programs.get(member)
 
     def dependency(self, alias: str) -> Dependency | None:
         """What `alias` names in this package's manifest, or None."""
@@ -463,19 +481,34 @@ def _map_of(data: dict[str, object], key: str, path: Path, text: str, hint: str)
     return result
 
 
+def _string_or_map(data: dict[str, object], key: str, path: Path, text: str, hint: str) -> _Object:
+    """The JSON object `key` holds, once its string form is ruled out; repeated keys rejected."""
+    at = _key_line(text, key)
+    value = data[key]
+    if not isinstance(value, dict):
+        raise _reject(path, f'"{key}" must be a string or a JSON object', line=at, hint=hint)
+    if isinstance(value, _Object) and value.repeated:
+        repeated = value.repeated[0]
+        raise _reject(
+            path,
+            f"{key} declares {repeated!r} twice",
+            line=_key_line(text, repeated) or at,
+            hint="one name, one entry; keep the one you meant",
+        )
+    return _Object(value)
+
+
 def _exports(
     data: dict[str, object], segment: str, root: Path, path: Path, text: str
 ) -> dict[str, Path]:
-    """The export map ``lib``/``libs`` declare: name to file, the default first."""
+    """The export map ``lib`` declares: name to file. A string is one export named for `segment`."""
+    if "lib" not in data:
+        return {}
+    at = _key_line(text, "lib")
+    if isinstance(data["lib"], str):
+        return {segment: _file_value(data["lib"], '"lib"', root, path, at, _MANIFEST_HINT)}
     exports: dict[str, Path] = {}
-    if "lib" in data:
-        exports[segment] = _file_value(
-            data["lib"], '"lib"', root, path, _key_line(text, "lib"), _MANIFEST_HINT
-        )
-    if "libs" not in data:
-        return exports
-    at = _key_line(text, "libs")
-    for name, written in _map_of(data, "libs", path, text, _LIBS_HINT).items():
+    for name, written in _string_or_map(data, "lib", path, text, _LIB_HINT).items():
         line = _key_line(text, name) or at
         if _IDENTIFIER_RE.fullmatch(name) is None:
             raise _reject(
@@ -484,30 +517,21 @@ def _exports(
                 line=line,
                 hint="an exported function name is a lowercase plain identifier",
             )
-        if name == segment:
-            raise _reject(
-                path,
-                f"libs declares {name!r}, the package's own name",
-                line=line,
-                hint='the package segment names the default export; declare its file as "lib"',
-            )
-        exports[name] = _file_value(written, f"export '{name}'", root, path, line, _LIBS_HINT)
+        exports[name] = _file_value(written, f"export '{name}'", root, path, line, _LIB_HINT)
     return exports
 
 
 def _programs(
     data: dict[str, object], segment: str, root: Path, path: Path, text: str
 ) -> dict[str, Path]:
-    """The program map ``bin``/``bins`` declare: name to file, the default first."""
+    """The program map ``bin`` declares: name to file. A string is one, named for `segment`."""
+    if "bin" not in data:
+        return {}
+    at = _key_line(text, "bin")
+    if isinstance(data["bin"], str):
+        return {segment: _file_value(data["bin"], '"bin"', root, path, at, _MANIFEST_HINT)}
     programs: dict[str, Path] = {}
-    if "bin" in data:
-        programs[segment] = _file_value(
-            data["bin"], '"bin"', root, path, _key_line(text, "bin"), _MANIFEST_HINT
-        )
-    if "bins" not in data:
-        return programs
-    at = _key_line(text, "bins")
-    for name, written in _map_of(data, "bins", path, text, _BINS_HINT).items():
+    for name, written in _string_or_map(data, "bin", path, text, _BIN_HINT).items():
         line = _key_line(text, name) or at
         if _PROGRAM_NAME_RE.fullmatch(name) is None:
             raise _reject(
@@ -524,14 +548,7 @@ def _programs(
                 hint=f"text beginning with {', '.join(STATEMENT_KEYWORDS)} is read as SQL, "
                 "so a program of that name could never be run by name; rename it",
             )
-        if name == segment:
-            raise _reject(
-                path,
-                f"bins declares {name!r}, the package's own name",
-                line=line,
-                hint='the package segment names the default program; declare its file as "bin"',
-            )
-        programs[name] = _file_value(written, f"program '{name}'", root, path, line, _BINS_HINT)
+        programs[name] = _file_value(written, f"program '{name}'", root, path, line, _BIN_HINT)
     return programs
 
 
@@ -635,6 +652,8 @@ def read_manifest(path: Path) -> Package:
         manifest=path,
         exports=_exports(data, segment, path.parent, path, text),
         programs=_programs(data, segment, path.parent, path, text),
+        root_export=segment if isinstance(data.get("lib"), str) else None,
+        root_program=segment if isinstance(data.get("bin"), str) else None,
         aliases=_dependencies(data, path, text),
     )
 
@@ -935,28 +954,24 @@ def write_manifest(
     name: str,
     version: str,
     description: str | None = None,
-    lib: str | None = None,
-    libs: Mapping[str, str] | None = None,
-    bin: str | None = None,
-    bins: Mapping[str, str] | None = None,
+    lib: str | Mapping[str, str] | None = None,
+    bin: str | Mapping[str, str] | None = None,
     dependencies: Mapping[str, str] | None = None,
 ) -> None:
     """Write the ``sqlmpeg.json`` declaring this package.
 
-    Only the two required keys are always written; an optional one is left
-    out entirely rather than written empty.
+    `lib` and `bin` each take a string (one file, named for the package
+    segment) or a map (several, named for their keys). Only the two required
+    keys are always written; an optional one is left out entirely rather than
+    written empty.
     """
     payload: dict[str, object] = {"name": name, "version": version}
     if description:
         payload["description"] = description
     if lib:
-        payload["lib"] = lib
-    if libs:
-        payload["libs"] = dict(libs)
+        payload["lib"] = lib if isinstance(lib, str) else dict(lib)
     if bin:
-        payload["bin"] = bin
-    if bins:
-        payload["bins"] = dict(bins)
+        payload["bin"] = bin if isinstance(bin, str) else dict(bin)
     if dependencies:
         payload["dependencies"] = dict(dependencies)
     _write_atomically(path, _rendered(payload))

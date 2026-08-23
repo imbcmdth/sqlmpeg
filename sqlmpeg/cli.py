@@ -39,7 +39,7 @@ Subcommands:
   dependencies provide: one table of packages, one of the functions they
   export, one of the programs they ship with the variables each declares, and
   one of the aliases each manifest binds. Takes no query; the export list is
-  the manifest's ``lib``/``libs``, with parameter types read from the files.
+  the manifest's ``lib``, with parameter types read from the files.
 * ``init [--name NAME] [--namespace NS]`` -- write ``sqlmpeg.json``, an empty
   ``sqlmpeg.lock`` and a starter program into the working directory. The
   package segment is the directory's name unless ``--name`` says otherwise;
@@ -89,8 +89,8 @@ split-chapters -v source=film.mkv``). One rule decides which it is, in
 way: text beginning with ``SELECT``, ``COPY``, ``CREATE`` or ``WITH`` is SQL,
 always; anything else that matches a program's name is that program's file;
 anything else is SQL and fails as it always did. ``ns.pkg.program`` names one
-package's ``bins`` entry, ``ns.pkg`` its default ``bin``; either says which
-package when a bare name matches more than one.
+of a map ``bin``'s entries, ``ns.pkg`` a string ``bin``'s program; either says
+which package when a bare name matches more than one.
 
 A compile can also have something to say short of refusing: a call that
 resolved to a machine-wide package rather than to one this project installed,
@@ -459,9 +459,9 @@ def _package(packages: PackageSet, name: str) -> Package:
 def _matching_programs(name: str, packages: PackageSet | None) -> list[tuple[Package, str]]:
     """The (package, program name) pairs `name` names, qualified or bare.
 
-    Three segments (``ns.pkg.program``) name one package's `bins` entry; two
-    (``ns.pkg``) name its default `bin`. A bare name is looked up across every
-    installed package, which may match more than one.
+    Three segments (``ns.pkg.program``) name one entry of a map `bin`; two
+    (``ns.pkg``) name a string `bin`'s program. A bare name is looked up
+    across every installed package, which may match more than one.
     """
     if packages is None:
         return []
@@ -1371,7 +1371,7 @@ def _cmd_init(args: argparse.Namespace, on_warning: OnWarning) -> int:
             manifest,
             name=name,
             version="0.1.0",
-            bins={_STARTER_PROGRAM: _STARTER_FILE},
+            bin={_STARTER_PROGRAM: _STARTER_FILE},
         )
         write_lockfile(lockfile, ())
         # What was just written has to read back, or the next command refuses

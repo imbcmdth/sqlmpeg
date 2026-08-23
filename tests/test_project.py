@@ -66,15 +66,15 @@ NORMALIZE = (
 )
 
 
-def _derived_libs(files: dict[str, str]) -> dict[str, str]:
-    """A libs map exporting every definition the src files hold, in file order."""
-    libs: dict[str, str] = {}
+def _derived_lib(files: dict[str, str]) -> dict[str, str]:
+    """A map `lib` exporting every definition the src files hold, in file order."""
+    lib: dict[str, str] = {}
     for name, body in files.items():
         if not name.startswith("src/"):
             continue
         for defined in re.findall(r"CREATE FUNCTION (\w+)\(", body):
-            libs[defined] = name
-    return libs
+            lib[defined] = name
+    return lib
 
 
 def _project(
@@ -100,9 +100,9 @@ def _project(
         written.write_text(text, encoding="utf-8")
     else:
         declared: dict[str, object] = {"name": "me/edits", "version": "0.1.0"}
-        libs = _derived_libs(files or {})
-        if libs:
-            declared["libs"] = libs
+        lib = _derived_lib(files or {})
+        if lib:
+            declared["lib"] = lib
         declared.update(manifest or {})
         declared = {key: value for key, value in declared.items() if value is not None}
         written.write_text(json.dumps(declared, indent=2) + "\n", encoding="utf-8")
@@ -173,7 +173,7 @@ def test_the_default_lib_is_reached_as_the_package_segment(tmp_path: Path) -> No
     _project(
         tmp_path,
         files={"src/default.sql": edits},
-        manifest={"lib": "src/default.sql", "libs": None},
+        manifest={"lib": "src/default.sql"},
     )
     argv = _argv(
         "COPY (SELECT me.edits(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'",
@@ -199,18 +199,32 @@ def test_an_alias_call_and_the_full_path_compile_to_identical_argv(tmp_path: Pat
     assert "volume=volume=0.5" in " ".join(full)
 
 
-def test_a_two_segment_call_on_a_package_with_no_default_export_names_its_libs(
+def test_a_two_segment_call_on_a_map_lib_package_names_its_exports(
     tmp_path: Path,
 ) -> None:
-    """`me.edits(...)` with no `lib` declared has nothing to reach; the libs are named instead."""
+    """`me.edits(...)` with a map `lib` has no root member; the exports are named instead."""
     _project(tmp_path, files={"src/tracks.sql": QUIETER})
+    error = _rejects(
+        "COPY (SELECT me.edits(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        _packages(tmp_path),
+        ErrorCode.UNKNOWN_FUNCTION,
+        "package 'me/edits' names its exports",
+    )
+    assert error.hint == "it exports: quieter"
+
+
+def test_a_two_segment_call_on_a_package_with_no_exports_at_all_says_so(
+    tmp_path: Path,
+) -> None:
+    """No `lib` at all is worded differently from a map `lib` with nothing to default to."""
+    _project(tmp_path, files={"queries/split.sql": PROGRAM}, manifest=_BIN)
     error = _rejects(
         "COPY (SELECT me.edits(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.UNKNOWN_FUNCTION,
         "package 'me/edits' has no default export",
     )
-    assert error.hint == "it exports: quieter"
+    assert error.hint == "me/edits exports nothing"
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +341,7 @@ def test_a_definition_libs_does_not_name_is_private(tmp_path: Path) -> None:
     _project(
         tmp_path,
         files={"src/tracks.sql": library},
-        manifest={"libs": {"quieter": "src/tracks.sql"}},
+        manifest={"lib": {"quieter": "src/tracks.sql"}},
     )
     packages = _packages(tmp_path)
     argv = _argv(
@@ -398,7 +412,7 @@ def test_an_export_naming_no_file_is_refused(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER},
-        manifest={"libs": {"quieter": "lib/tracks.sql"}},
+        manifest={"lib": {"quieter": "lib/tracks.sql"}},
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
@@ -409,7 +423,7 @@ def test_an_export_leaving_the_project_is_refused(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER},
-        manifest={"libs": {"quieter": "../tracks.sql"}},
+        manifest={"lib": {"quieter": "../tracks.sql"}},
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
@@ -420,7 +434,7 @@ def test_an_export_that_is_a_pattern_is_refused(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER},
-        manifest={"libs": {"quieter": "src/*.sql"}},
+        manifest={"lib": {"quieter": "src/*.sql"}},
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
@@ -431,7 +445,7 @@ def test_a_file_that_does_not_define_its_export_is_refused(tmp_path: Path) -> No
     _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER},
-        manifest={"libs": {"louder": "src/tracks.sql"}},
+        manifest={"lib": {"louder": "src/tracks.sql"}},
     )
     error = _rejects(
         "COPY (SELECT me.edits.louder(f.audio[1], 2) FROM input('film.mkv') f) TO 'out.mkv'",
@@ -446,7 +460,7 @@ def test_a_lib_file_that_does_not_define_the_default_is_refused(tmp_path: Path) 
     manifest = _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER},
-        manifest={"lib": "src/tracks.sql", "libs": None},
+        manifest={"lib": "src/tracks.sql"},
     )
     with pytest.raises(SqlmpegError) as caught:
         package_signatures(read_manifest(manifest))
@@ -458,7 +472,7 @@ def test_one_name_defined_twice_across_lib_files_is_refused(tmp_path: Path) -> N
     _project(
         tmp_path,
         files={"src/a.sql": QUIETER, "src/b.sql": QUIETER + NORMALIZE},
-        manifest={"libs": {"quieter": "src/a.sql", "normalize_lang": "src/b.sql"}},
+        manifest={"lib": {"quieter": "src/a.sql", "normalize_lang": "src/b.sql"}},
     )
     error = _rejects(
         "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
@@ -473,7 +487,7 @@ def test_a_lib_file_that_fails_to_parse_names_the_file(tmp_path: Path) -> None:
     _project(
         tmp_path,
         files={"src/tracks.sql": "CREATE FUNCTION oops("},
-        manifest={"libs": {"quieter": "src/tracks.sql"}},
+        manifest={"lib": {"quieter": "src/tracks.sql"}},
     )
     error = _rejects(
         "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
@@ -618,7 +632,18 @@ def test_exports_is_no_longer_a_key(tmp_path: Path) -> None:
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
     assert "unknown key 'exports'" in caught.value.message
-    assert "libs" in (caught.value.hint or "")
+    assert '"lib"' in (caught.value.hint or "")
+
+
+@pytest.mark.parametrize("retired", ["libs", "bins"])
+def test_libs_and_bins_are_no_longer_keys(tmp_path: Path, retired: str) -> None:
+    """`lib`/`bin` replaced them; the hint names the singular that did."""
+    singular = "lib" if retired == "libs" else "bin"
+    manifest = _project(tmp_path, manifest={retired: {}})
+    with pytest.raises(SqlmpegError) as caught:
+        read_manifest(manifest)
+    assert f"unknown key {retired!r}" in caught.value.message
+    assert f'"{singular}"' in (caught.value.hint or "")
 
 
 def test_an_unknown_key_gets_a_did_you_mean(tmp_path: Path) -> None:
@@ -643,42 +668,46 @@ def test_a_description_and_dependencies_are_accepted(tmp_path: Path) -> None:
     assert package.aliases == {"tracks": Dependency(name="broadcast/tracks", range="^1.2.0")}
 
 
-def test_the_default_export_comes_first_and_is_named_for_the_segment(tmp_path: Path) -> None:
-    edits = QUIETER.replace("quieter", "edits")
+def test_a_map_libs_members_are_named_and_ordered(tmp_path: Path) -> None:
+    """A map `lib` has no default: every member is named, in the manifest's own order."""
+    brighten = QUIETER.replace("quieter", "brighten")
     manifest = _project(
         tmp_path,
-        files={"src/default.sql": edits, "src/tracks.sql": QUIETER},
-        manifest={"lib": "src/default.sql", "libs": {"quieter": "src/tracks.sql"}},
+        files={"src/other.sql": brighten, "src/tracks.sql": QUIETER},
+        manifest={"lib": {"brighten": "src/other.sql", "quieter": "src/tracks.sql"}},
     )
     package = read_manifest(manifest)
-    assert list(package.exports) == ["edits", "quieter"]
-    assert package.export() == tmp_path / "src" / "default.sql"
+    assert list(package.exports) == ["brighten", "quieter"]
+    assert package.export("brighten") == tmp_path / "src" / "other.sql"
     assert package.export("quieter") == tmp_path / "src" / "tracks.sql"
     assert package.export("nothing") is None
+    assert package.export() is None  # a map has no root-callable member
 
 
-def test_libs_may_not_claim_the_packages_own_name(tmp_path: Path) -> None:
-    edits = QUIETER.replace("quieter", "edits")
+def test_a_map_member_may_carry_the_packages_own_name(tmp_path: Path) -> None:
+    """The growth path: a one-program package adds a second and keeps the name.
+
+    The member is reached at three segments like any other; only the string
+    form answers at the package's own name.
+    """
     manifest = _project(
         tmp_path,
-        files={"src/default.sql": edits},
-        manifest={"libs": {"edits": "src/default.sql"}},
+        files={"queries/split.sql": PROGRAM, "queries/other.sql": PROGRAM},
+        manifest={"bin": {"edits": "queries/split.sql", "other": "queries/other.sql"}},
     )
-    with pytest.raises(SqlmpegError) as caught:
-        read_manifest(manifest)
-    assert "libs declares 'edits', the package's own name" in caught.value.message
-    assert '"lib"' in (caught.value.hint or "")
+    package = read_manifest(manifest)
+    assert package.program("edits") == manifest.parent / "queries" / "split.sql"
+    assert package.program() is None
 
 
-def test_bins_may_not_claim_the_packages_own_name(tmp_path: Path) -> None:
+def test_a_string_bin_answers_at_the_packages_own_name(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"queries/split.sql": PROGRAM},
-        manifest={"bins": {"edits": "queries/split.sql"}},
+        manifest={"bin": "queries/split.sql"},
     )
-    with pytest.raises(SqlmpegError) as caught:
-        read_manifest(manifest)
-    assert "bins declares 'edits', the package's own name" in caught.value.message
+    package = read_manifest(manifest)
+    assert package.program() == package.program("edits")
 
 
 @pytest.mark.parametrize("alias", ["Tracks", "a-b", ""])
@@ -721,7 +750,7 @@ PROGRAM = (
     "COPY (SELECT f.video[1] FROM input(:'source') f) TO :'dest';\n"
 )
 
-_BINS = {"bins": {"split-chapters": "queries/split.sql"}}
+_BIN = {"bin": {"split-chapters": "queries/split.sql"}}
 
 
 def _manifest_text(**declared: object) -> str:
@@ -739,11 +768,11 @@ def test_a_manifest_declaring_neither_half_is_a_package(tmp_path: Path) -> None:
     assert dict(package.programs) == {}
 
 
-def test_bins_declares_a_program_beside_the_exports(tmp_path: Path) -> None:
+def test_a_map_bin_declares_named_programs_beside_the_exports(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER, "queries/split.sql": PROGRAM},
-        manifest=_BINS,
+        manifest=_BIN,
     )
     package = read_manifest(manifest)
     assert list(package.programs) == ["split-chapters"]
@@ -764,7 +793,7 @@ def test_bin_declares_the_default_program(tmp_path: Path) -> None:
 
 def test_a_package_may_ship_programs_and_export_nothing(tmp_path: Path) -> None:
     manifest = _project(
-        tmp_path, files={"queries/split.sql": PROGRAM}, text=_manifest_text(**_BINS)
+        tmp_path, files={"queries/split.sql": PROGRAM}, text=_manifest_text(**_BIN)
     )
     package = read_manifest(manifest)
     assert dict(package.exports) == {}
@@ -777,7 +806,7 @@ def test_a_program_is_a_query_and_the_lib_rule_never_reaches_it(tmp_path: Path) 
     _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER, "queries/split.sql": PROGRAM},
-        manifest=_BINS,
+        manifest=_BIN,
     )
     argv = _argv(
         "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
@@ -791,7 +820,7 @@ def test_a_program_name_is_a_command_name(tmp_path: Path, claimed: str) -> None:
     manifest = _project(
         tmp_path,
         files={"queries/split.sql": PROGRAM},
-        text=_manifest_text(bins={claimed: "queries/split.sql"}),
+        text=_manifest_text(bin={claimed: "queries/split.sql"}),
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
@@ -799,32 +828,33 @@ def test_a_program_name_is_a_command_name(tmp_path: Path, claimed: str) -> None:
     assert caught.value.line == 5
 
 
-def test_bins_that_is_not_an_object_is_refused(tmp_path: Path) -> None:
+def test_bin_that_is_neither_a_string_nor_an_object_is_refused(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"queries/split.sql": PROGRAM},
-        text=_manifest_text(bins=["queries/split.sql"]),
+        text=_manifest_text(bin=["queries/split.sql"]),
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
-    assert '"bins" must be a JSON object' in caught.value.message
+    assert '"bin" must be a string or a JSON object' in caught.value.message
 
 
-def test_bin_that_is_an_object_is_refused(tmp_path: Path) -> None:
-    """The old shape: a map under `bin`. One file now; the map is `bins`."""
+def test_bin_may_be_a_map_with_several_named_programs(tmp_path: Path) -> None:
+    """The old shape rejected a map under `bin`; it is now the map form itself."""
     manifest = _project(
         tmp_path,
         files={"queries/split.sql": PROGRAM},
         text=_manifest_text(bin={"split": "queries/split.sql"}),
     )
-    with pytest.raises(SqlmpegError) as caught:
-        read_manifest(manifest)
-    assert '"bin" must name one file' in caught.value.message
+    package = read_manifest(manifest)
+    assert list(package.programs) == ["split"]
+    assert package.program("split") == tmp_path / "queries" / "split.sql"
+    assert package.program() is None  # a map has no root-callable member
 
 
 def test_a_program_that_names_no_string_is_refused(tmp_path: Path) -> None:
     manifest = _project(
-        tmp_path, files={"queries/split.sql": PROGRAM}, text=_manifest_text(bins={"split": 1})
+        tmp_path, files={"queries/split.sql": PROGRAM}, text=_manifest_text(bin={"split": 1})
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
@@ -835,7 +865,7 @@ def test_a_program_leaving_the_project_is_refused(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"queries/split.sql": PROGRAM},
-        text=_manifest_text(bins={"split": "../split.sql"}),
+        text=_manifest_text(bin={"split": "../split.sql"}),
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
@@ -846,7 +876,7 @@ def test_a_program_matching_no_file_is_refused(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"queries/split.sql": PROGRAM},
-        text=_manifest_text(bins={"split": "queries/gone.sql"}),
+        text=_manifest_text(bin={"split": "queries/gone.sql"}),
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
@@ -857,7 +887,7 @@ def test_a_program_that_is_a_pattern_is_refused(tmp_path: Path) -> None:
     manifest = _project(
         tmp_path,
         files={"queries/split.sql": PROGRAM},
-        text=_manifest_text(bins={"split": "queries/*.sql"}),
+        text=_manifest_text(bin={"split": "queries/*.sql"}),
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
@@ -871,13 +901,13 @@ def test_two_programs_written_under_one_name_are_refused(tmp_path: Path) -> None
         files={"queries/split.sql": PROGRAM, "queries/other.sql": PROGRAM},
         text=(
             '{\n  "name": "me/edits",\n  "version": "0.1.0",\n'
-            '  "bins": {\n    "split": "queries/split.sql",\n'
+            '  "bin": {\n    "split": "queries/split.sql",\n'
             '    "split": "queries/other.sql"\n  }\n}\n'
         ),
     )
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
-    assert "bins declares 'split' twice" in caught.value.message
+    assert "bin declares 'split' twice" in caught.value.message
     assert caught.value.line == 5
 
 
@@ -1041,7 +1071,7 @@ def _library(
             {
                 "name": f"{namespace}/{package}",
                 "version": version,
-                "libs": {"quieter": "src/lib.sql"},
+                "lib": {"quieter": "src/lib.sql"},
             }
         )
         + "\n",
@@ -1797,7 +1827,7 @@ def test_list_prints_the_exports_programs_and_aliases_a_project_provides(
     _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER + PICK, "queries/split.sql": PROGRAM},
-        manifest={**_BINS, "dependencies": {"tracks": "broadcast/tracks@^1.2.0"}},
+        manifest={**_BIN, "dependencies": {"tracks": "broadcast/tracks@^1.2.0"}},
     )
     code, out, _err = _list(tmp_path, monkeypatch, capsys)
     assert code == 0
@@ -1826,7 +1856,7 @@ def test_list_as_json_carries_the_signatures_and_the_variables(
     _project(
         tmp_path,
         files={"src/tracks.sql": QUIETER, "queries/split.sql": PROGRAM},
-        manifest={**_BINS, "dependencies": {"tracks": "broadcast/tracks@^1.2.0"}},
+        manifest={**_BIN, "dependencies": {"tracks": "broadcast/tracks@^1.2.0"}},
     )
     code, out, _err = _list(tmp_path, monkeypatch, capsys, "--json")
     assert code == 0
@@ -1999,16 +2029,32 @@ def test_a_written_manifest_reads_back_as_the_package_it_declares(tmp_path: Path
         name="me/edits",
         version="0.1.0",
         description="what it is",
-        libs={"quieter": "src/lib.sql"},
-        bin="queries/split.sql",
-        bins={"split-chapters": "queries/split.sql"},
+        lib={"quieter": "src/lib.sql"},
+        bin={"split-chapters": "queries/split.sql"},
         dependencies={"tracks": "broadcast/tracks@^1.2.0"},
     )
     package = read_manifest(path)
     assert package.name == "me/edits" and package.version == "0.1.0"
-    assert list(package.programs) == ["edits", "split-chapters"]
+    assert list(package.exports) == ["quieter"]
+    assert list(package.programs) == ["split-chapters"]
     assert package.aliases == {"tracks": Dependency(name="broadcast/tracks", range="^1.2.0")}
     assert b"\r" not in path.read_bytes()
+
+
+def test_a_written_manifest_takes_the_string_form_of_lib_and_bin(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "lib.sql").write_text(QUIETER.replace("quieter", "edits"), encoding="utf-8")
+    (tmp_path / "queries").mkdir()
+    (tmp_path / "queries" / "split.sql").write_text(PROGRAM, encoding="utf-8")
+    path = tmp_path / "sqlmpeg.json"
+    write_manifest(
+        path, name="me/edits", version="0.1.0", lib="src/lib.sql", bin="queries/split.sql"
+    )
+    package = read_manifest(path)
+    assert list(package.exports) == ["edits"]
+    assert list(package.programs) == ["edits"]
+    assert package.export() == tmp_path / "src" / "lib.sql"
+    assert package.program() == tmp_path / "queries" / "split.sql"
 
 
 def test_a_manifest_leaves_out_what_it_was_not_given(tmp_path: Path) -> None:
@@ -2358,7 +2404,7 @@ def test_every_subcommand_taking_a_query_takes_a_program_name(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BINS,
+        manifest=_BIN,
     )
     if command == "run":
         # The default tier executes no ffmpeg: reaching the check for one is
@@ -2403,14 +2449,14 @@ def test_the_default_program_is_reached_as_the_package_segment(
     assert code == 0, err
 
 
-def test_a_qualified_program_name_runs_one_packages_bins_entry(
+def test_a_qualified_program_name_runs_one_packages_bin_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`me.edits.split-chapters` names one package's `bins` entry, for `compile` and `run` alike."""
+    """`me.edits.split-chapters` names one entry of a map `bin`, for `compile` and `run` alike."""
     _project(
         tmp_path,
         files={"queries/split.sql": PROGRAM},
-        manifest=_BINS,
+        manifest=_BIN,
     )
     code, _out, err = _run(
         tmp_path,
@@ -2448,7 +2494,7 @@ def test_a_program_name_is_not_looked_up_when_the_text_is_sql(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BINS,
+        manifest=_BIN,
     )
     code, out, _err = _run(tmp_path, monkeypatch, capsys, "compile", _MEDIA_QUERY)
     assert code == 0
@@ -2461,7 +2507,7 @@ def test_a_leading_comment_does_not_hide_that_the_text_is_sql(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BINS,
+        manifest=_BIN,
     )
     code, out, _err = _run(
         tmp_path, monkeypatch, capsys, "compile", f"-- a header\n/* and a block */\n{_MEDIA_QUERY}"
@@ -2478,14 +2524,14 @@ def test_a_bare_name_two_packages_ship_is_refused(
     (linked / "queries").mkdir()
     (linked / "queries" / "split.sql").write_text(PROGRAM, encoding="utf-8")
     written = json.loads((linked / "sqlmpeg.json").read_text(encoding="utf-8"))
-    written["bins"] = {"split-chapters": "queries/split.sql"}
+    written["bin"] = {"split-chapters": "queries/split.sql"}
     (linked / "sqlmpeg.json").write_text(json.dumps(written) + "\n", encoding="utf-8")
 
     project = tmp_path / "work"
     _project(
         project,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BINS,
+        manifest=_BIN,
     )
     _lock(project, [_link(linked)])
     code, _out, err = _run(project, monkeypatch, capsys, "validate", "split-chapters")
@@ -2513,7 +2559,7 @@ def test_an_undefined_variable_names_what_the_program_declares(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BINS,
+        manifest=_BIN,
     )
     code, _out, err = _run(
         tmp_path, monkeypatch, capsys, "validate", "split-chapters", "-v", "source=in.mkv"
@@ -2529,7 +2575,7 @@ def test_a_name_matching_nothing_fails_as_sql_and_names_the_programs(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BINS,
+        manifest=_BIN,
     )
     code, _out, err = _run(tmp_path, monkeypatch, capsys, "compile", "split-chapter")
     assert code == 1
@@ -2542,7 +2588,7 @@ def test_a_failing_query_is_not_offered_a_program(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest=_BINS,
+        manifest=_BIN,
     )
     code, _out, err = _run(tmp_path, monkeypatch, capsys, "compile", "SELECT nope(1)")
     assert code == 1
@@ -2559,7 +2605,7 @@ def test_a_program_that_resolved_is_not_offered_the_other_programs(
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": BAD_PROGRAM},
-        manifest=_BINS,
+        manifest=_BIN,
     )
     code, _out, err = _run(tmp_path, monkeypatch, capsys, "compile", "split-chapters")
     assert code == 1
@@ -2570,7 +2616,7 @@ def test_a_program_named_for_a_statement_word_is_refused(tmp_path: Path) -> None
     _project(
         tmp_path,
         files={"src/own.sql": NORMALIZE, "queries/split.sql": PROGRAM},
-        manifest={"bins": {"select": "queries/split.sql"}},
+        manifest={"bin": {"select": "queries/split.sql"}},
     )
     error = _refuses(tmp_path, "program name 'select' is a word a query begins with")
     assert "rename it" in (error.hint or "")

@@ -61,9 +61,9 @@ definition read out of that package's lib files and inlines through this
 same expander -- same hygiene, same source map, same arity and type checks.
 Nothing is spliced into the script and the flat script namespace is untouched,
 because a package's definitions never enter it. What a package EXPORTS is its
-manifest's ``lib``/``libs`` map: each exported name must be defined in the
-file the manifest names for it -- checked here, where the file is parsed --
-and every other definition in a lib file is private to the package.
+manifest's ``lib``, a string or a map: each exported name must be defined in
+the file the manifest names for it -- checked here, where the file is parsed
+-- and every other definition in a lib file is private to the package.
 
 One rule differs by where a definition was written. A package's lib files are
 a LIBRARY: it exports more than any one query calls, so an uncalled definition
@@ -746,7 +746,7 @@ def _source_definitions(
             f"package '{package.name}': could not read {path}: "
             f"{err.strerror or err}",
             anchor,
-            hint=f"{package.manifest} names it in lib or libs",
+            hint=f"{package.manifest} names it in lib",
         ) from err
     try:
         statements = _statements(parse(text))
@@ -762,7 +762,7 @@ def _source_definitions(
                 "is not a CREATE FUNCTION",
                 anchor,
                 hint="a lib file is a library: it defines functions, and a "
-                "query of its own is a program, declared in bin or bins",
+                "query of its own is a program, declared in bin",
             )
         try:
             function = _define(statement)
@@ -809,9 +809,9 @@ def _check_exported(
         if exported in scope and origin[exported] == path:
             continue
         hint = (
-            "lib's file must define a function named for the package segment"
+            "a string lib's file must define a function named for the package segment"
             if exported == package.package
-            else "libs is keyed by exported function name; the file must define "
+            else "a map lib is keyed by exported function name; the file must define "
             f"CREATE FUNCTION {exported}"
         )
         raise _error(
@@ -1313,8 +1313,11 @@ class _Expander:
     ) -> _Function:
         """The definition `package` exports at `member`, or its default at None.
 
-        A missing default names the package's libs instead of guessing which
-        one was meant; a missing named member gets the usual did-you-mean.
+        A missing default names the package's exports instead of guessing
+        which one was meant -- worded one way for a package with no exports
+        at all, another for one whose `lib` is a map and so names its exports
+        rather than offering a default; a missing named member gets the usual
+        did-you-mean.
         """
         exports = self._scope_of(package, anchor)
         key = package.package if member is None else member
@@ -1322,13 +1325,19 @@ class _Expander:
         if function is not None:
             return function
         if member is None:
-            libs = sorted(self.exported[package.name])
-            hint = f"it exports: {', '.join(libs)}" if libs else f"{package.name} exports nothing"
+            named = sorted(self.exported[package.name])
+            if named:
+                raise _error(
+                    ErrorCode.UNKNOWN_FUNCTION,
+                    f"package '{package.name}' names its exports",
+                    anchor,
+                    hint=f"it exports: {', '.join(named)}",
+                )
             raise _error(
                 ErrorCode.UNKNOWN_FUNCTION,
                 f"package '{package.name}' has no default export",
                 anchor,
-                hint=hint,
+                hint=f"{package.name} exports nothing",
             )
         exported = sorted(self.exported[package.name])
         near = difflib.get_close_matches(member, exported, n=1, cutoff=0.6)

@@ -58,7 +58,7 @@ def _package(
                 "name": name,
                 "version": version,
                 "description": description,
-                "libs": {"quieter": "src/lib.sql"},
+                "lib": {"quieter": "src/lib.sql"},
             },
             indent=2,
         )
