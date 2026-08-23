@@ -2,8 +2,9 @@
 
 Seed corpus: the ``.sql`` text of every fixture under ``tests/golden/`` (both
 the accepted queries and the ones that are expected to be rejected -- the
-mutation strategy does not care which) plus every program under ``queries/``,
-which is where the row/grouping surface lives: ``unnest``, ``array_agg`` +
+mutation strategy does not care which) plus every program under
+``packages/*/*/queries/``, which is where the row/grouping surface lives:
+``unnest``, ``array_agg`` +
 ``GROUP BY``, chapter fan-out, CSV to STDOUT, and the ``:'name'`` variable
 forms. Each example takes a seed, applies a handful of random mutations to it
 -- slice deletion, slice duplication, single-character swap, random-token
@@ -52,10 +53,10 @@ from sqlmpeg.vars import substitute
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _GOLDEN_DIR = _REPO_ROOT / "tests" / "golden"
-_QUERIES_DIR = _REPO_ROOT / "queries"
+_QUERIES_DIR = _REPO_ROOT / "packages"
 _CORPUS: list[str] = sorted(
     p.read_text(encoding="utf-8")
-    for p in [*_GOLDEN_DIR.glob("*.sql"), *_QUERIES_DIR.glob("*.sql")]
+    for p in [*_GOLDEN_DIR.glob("*.sql"), *_QUERIES_DIR.glob("*/*/queries/*.sql")]
 )
 assert _CORPUS, f"no seed queries found under {_GOLDEN_DIR}"
 
@@ -89,6 +90,19 @@ _VARIABLE_VALUES = {
     "h": "480",
     "x": "100",
     "y": "50",
+    "high_w": "1920",
+    "mid_w": "1280",
+    "low_w": "854",
+    "vcodec": "libx264",
+    "acodec": "aac",
+    "video_bitrate": "4M",
+    "audio_bitrate": "192k",
+    "preset": "slow",
+    "scale": "iw/2",
+    "i": "-23",
+    "tp": "-2",
+    "lra": "7",
+    "fps": "12",
 }
 _REFERENCE_RE = re.compile(r"(?<![:\w]):['\"]?([A-Za-z_][A-Za-z0-9_]*)")
 _VARIABLES = {

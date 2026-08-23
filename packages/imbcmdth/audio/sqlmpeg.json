@@ -1,0 +1,11 @@
+{
+  "name": "imbcmdth/audio",
+  "version": "1.0.0",
+  "description": "Adjust, normalize and swap out audio.",
+  "bin": "queries/volume.sql",
+  "bins": {
+    "loudnorm-all": "queries/loudnorm-all.sql",
+    "duck": "queries/duck.sql",
+    "replace-audio": "queries/replace-audio.sql"
+  }
+}

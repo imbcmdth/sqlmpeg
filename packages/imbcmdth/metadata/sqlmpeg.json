@@ -1,0 +1,9 @@
+{
+  "name": "imbcmdth/metadata",
+  "version": "1.0.0",
+  "description": "Inspect and rewrite a file's tags.",
+  "bin": "queries/tracks-to-csv.sql",
+  "bins": {
+    "retitle": "queries/retitle.sql"
+  }
+}

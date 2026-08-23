@@ -1804,7 +1804,7 @@ def test_list_prints_the_exports_programs_and_aliases_a_project_provides(
     assert "quieter(track audio_stream, factor number) | audio_stream" in out
     assert "pick(path text)" in out and "TABLE(track audio_stream)" in out
     assert "split-chapters" in out
-    assert "source (input media path), dest (output path)" in out
+    assert "source (input media path), dest (output path)" in out  # required column
     assert "queries/split.sql" in out
     assert "me/edits | 0.1.0   | project | false" in out
     assert "broadcast/tracks@^1.2.0" in out
@@ -1850,10 +1850,11 @@ def test_list_as_json_carries_the_signatures_and_the_variables(
         {
             "name": "split-chapters",
             "file": "queries/split.sql",
-            "variables": [
+            "required": [
                 {"name": "source", "description": "input media path"},
                 {"name": "dest", "description": "output path"},
             ],
+            "optional": [],
         }
     ]
     assert package["aliases"] == [

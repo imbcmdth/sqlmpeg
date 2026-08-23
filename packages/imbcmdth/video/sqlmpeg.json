@@ -1,0 +1,16 @@
+{
+  "name": "imbcmdth/video",
+  "version": "1.0.0",
+  "description": "Reshape, transform and overlay the picture.",
+  "bin": "queries/resize.sql",
+  "bins": {
+    "crop": "queries/crop.sql",
+    "rotate": "queries/rotate.sql",
+    "pip": "queries/pip.sql",
+    "side-by-side": "queries/side-by-side.sql",
+    "blur-region": "queries/blur-region.sql",
+    "watermark": "queries/watermark.sql",
+    "fade": "queries/fade.sql",
+    "speed": "queries/speed.sql"
+  }
+}

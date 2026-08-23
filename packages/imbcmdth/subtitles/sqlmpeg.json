@@ -1,0 +1,9 @@
+{
+  "name": "imbcmdth/subtitles",
+  "version": "1.0.0",
+  "description": "Burn in or mux subtitle tracks.",
+  "bin": "queries/burn-subtitles.sql",
+  "bins": {
+    "mux-subtitles": "queries/mux-subtitles.sql"
+  }
+}

@@ -2,7 +2,7 @@
 
 Real tasks. Every shown output on this page is real - a test reruns all of them and diffs the resulting ffmpeg commands, so if a recipe is here, it works.
 
-Most recipes are parameterized (`:'source'`-style variables, filled by the `-v` flags in the shown command), so they are programs: swap the `-v` values and they run against your files. Recipe 33 explains the mechanism; [queries/](../queries/) collects a few handy ready-made programs.
+Most recipes are parameterized (`:'source'`-style variables, filled by the `-v` flags in the shown command), so they are programs: swap the `-v` values and they run against your files. Recipe 33 explains the mechanism; [packages/imbcmdth/](../packages/imbcmdth/) collects ready-made ones as installable packages.
 
 ## 1. Transcode a file to H.264/AAC
 
@@ -800,7 +800,7 @@ $ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=out.mkv
 ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:0 libx264 -crf:0 20 -c:1 aac out.mkv
 ```
 
-Swap the `-v` values and the same file transcodes anything. The [queries/](../queries/) directory collects ready-to-run programs built this way.
+Swap the `-v` values and the same file transcodes anything. The [packages/imbcmdth/](../packages/imbcmdth/) packages collect ready-to-run programs built this way.
 
 ## 34. Grab a poster frame
 

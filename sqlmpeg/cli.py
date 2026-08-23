@@ -945,11 +945,15 @@ def _echo_command(argv: list[str]) -> None:
 
 @dataclass(frozen=True)
 class _ListedProgram:
-    """One program and the variables its query declares."""
+    """One program: the variables its query declares, split required from optional.
+
+    The split is derived, not read off the header -- see :func:`_required_variables`.
+    """
 
     name: str
     path: Path
-    variables: tuple[Variable, ...]
+    required: tuple[Variable, ...]
+    optional: tuple[Variable, ...]
 
 
 @dataclass(frozen=True)
@@ -969,23 +973,86 @@ def _relative(path: Path, root: Path) -> str:
         return path.as_posix()
 
 
-def _listed(package: Package) -> _Listed:
+def _try_compile(
+    text: str, packages: PackageSet | None, unset: dict[tuple[int, int], str]
+) -> SqlmpegError | None:
+    """None on a clean compile, else the rejection -- streaming first, then table.
+
+    Mirrors `_is_table_capable_query`: a query with no streaming
+    representation (metadata columns, an un-COALESCEd join gap) is retried as
+    a table query before giving up, exactly as `compile`/`validate` do, so a
+    program of either shape gets the same required/optional derivation.
+    """
+    try:
+        compile_commands(text, packages=packages, unset=unset)
+        return None
+    except SqlmpegError as err:
+        stream_err = err
+    try:
+        is_table_capable, _has_copy = classify(text, packages=packages, unset=unset)
+    except SqlmpegError as err:
+        return err
+    if not is_table_capable:
+        return stream_err
+    try:
+        compile_table_sql(text, packages=packages, unset=unset)
+        return None
+    except SqlmpegError as err:
+        return err
+
+
+def _required_variables(
+    text: str, names: frozenset[str], packages: PackageSet | None
+) -> frozenset[str]:
+    """Every declared variable a compile rejects as required when it alone is unset.
+
+    One compile per name: every OTHER declared variable gets a placeholder,
+    leaving only this one NULL, so a rejection this round can only be about
+    it -- and counts only when it IS (:func:`unset_variable`, the shape wave
+    A gives every required NULL: `input(NULL)`, `TO NULL`, a NULL stream
+    position, or a NULL on the curated required-options list). Testing one
+    name at a time, rather than accumulating placeholders across rounds,
+    survives a query where an earlier position's own NULL would otherwise
+    block ever reaching a later one -- a UNION branch's trim bound ahead of
+    its own `input()`, say -- so every declared name gets an independent
+    read regardless of where in the query it sits.
+    """
+    required: set[str] = set()
+    for name in names:
+        values = {other: "1" for other in names if other != name}
+        sub = substitute(text, values)
+        err = _try_compile(sub.text, packages, sub.unset)
+        if err is not None and unset_variable(err) == name:
+            required.add(name)
+    return frozenset(required)
+
+
+def _listed(package: Package, packages: PackageSet | None) -> _Listed:
     """Read one package's exports and programs. Raises like any other read.
 
     The export list is the manifest's; `package_signatures` parses the files
     only for the parameter types, and checks each export is defined where the
-    manifest says.
+    manifest says. `packages` is the whole discovered set (not just `package`
+    itself), the same one a real compile of one of its programs would resolve
+    namespaced calls against.
     """
-    programs = tuple(
-        _ListedProgram(
-            name=name,
-            path=path,
-            variables=declared_variables(path.read_text(encoding="utf-8")),
+    programs = []
+    for name, path in package.programs.items():
+        text = path.read_text(encoding="utf-8")
+        declared = declared_variables(text)
+        required = _required_variables(
+            text, frozenset(variable.name for variable in declared), packages
         )
-        for name, path in package.programs.items()
-    )
+        programs.append(
+            _ListedProgram(
+                name=name,
+                path=path,
+                required=tuple(v for v in declared if v.name in required),
+                optional=tuple(v for v in declared if v.name not in required),
+            )
+        )
     return _Listed(
-        package=package, functions=package_signatures(package), programs=programs
+        package=package, functions=package_signatures(package), programs=tuple(programs)
     )
 
 
@@ -1013,9 +1080,13 @@ def _listing_json(listed: list[_Listed]) -> str:
                 {
                     "name": listed_program.name,
                     "file": _relative(listed_program.path, entry.package.root),
-                    "variables": [
+                    "required": [
                         {"name": variable.name, "description": variable.description}
-                        for variable in listed_program.variables
+                        for variable in listed_program.required
+                    ],
+                    "optional": [
+                        {"name": variable.name, "description": variable.description}
+                        for variable in listed_program.optional
                     ],
                 }
                 for listed_program in entry.programs
@@ -1062,13 +1133,16 @@ def _program_rows(listed: list[_Listed]) -> TableResult:
         [
             entry.package.name,
             listed_program.name,
-            _written_variables(listed_program.variables),
+            _written_variables(listed_program.required),
+            _written_variables(listed_program.optional),
             _relative(listed_program.path, entry.package.root),
         ]
         for entry in listed
         for listed_program in entry.programs
     ]
-    return TableResult(columns=["package", "program", "variables", "file"], rows=rows)
+    return TableResult(
+        columns=["package", "program", "required", "optional", "file"], rows=rows
+    )
 
 
 def _alias_rows(listed: list[_Listed]) -> TableResult:
@@ -1097,7 +1171,7 @@ def _cmd_list(args: argparse.Namespace, on_warning: OnWarning) -> int:
     try:
         found = discover(Path.cwd())
         packages = [] if found is None else [found.packages[name] for name in found.names()]
-        listed = [_listed(package) for package in packages]
+        listed = [_listed(package, found) for package in packages]
     except SqlmpegError as err:
         _print_error(err)
         return 1
