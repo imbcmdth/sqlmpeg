@@ -382,6 +382,7 @@ from sqlmpeg.types import (
     RowColumnType,
 )
 from sqlmpeg.vars import unset_error
+from sqlmpeg.warnings import OnWarning, SqlmpegWarning, WarningCode
 
 __all__ = ["lower", "lower_table"]
 
@@ -2313,10 +2314,12 @@ class _Lowerer:
         fanout_index: int = 0,
         *,
         fanout_sinks: bool = False,
+        on_warning: OnWarning | None = None,
     ) -> None:
         self.res = res
         self.probes = probes
         self.registry = registry
+        self.on_warning = on_warning
         self.graph = Graph(input_paths=list(res.input_paths), sources=dict(res.sources))
         self.ctx = _NodeFactory(self.graph)
         self.cte_columns: dict[str, tuple[_Column, ...]] = {}
@@ -2558,6 +2561,17 @@ class _Lowerer:
             option_nodes["metadata_from"] = metadata_from_opt.value
         _check_sink_option_conflicts(options, option_nodes, raw.path_node)
         outputs = _outputs(columns, self._layered_tags(), self._layered_dispositions())
+        if not outputs:
+            # An empty column contributes nothing and only warns, but a sink
+            # left with nothing at all would write a file with no streams in
+            # it, which is never what anyone meant.
+            raise _error(
+                ErrorCode.STREAM_NOT_FOUND,
+                f"'{raw.path}' would have no streams: every column selected is empty",
+                raw.path_node,
+                hint="the file has none of the tracks this query names; check the "
+                "input, or select * to take whatever it holds",
+            )
         _check_two_pass_outputs(options, outputs, raw.path_node)
         path = raw.path
         if raw.path_expr is not None:
@@ -6489,21 +6503,42 @@ class _Lowerer:
             )
         count = len(result.by_type(stream_type))
         if count == 0:
+            # An empty array is a column the file has no tracks for, and
+            # selecting it contributes no streams - what `unnest` of it already
+            # does, and what `SELECT *` already does. Worth saying, not worth
+            # refusing; a sink left with no streams at all is the rejection.
             path = self.res.input_paths[self.graph.sources[alias]]
-            raise _error(
-                ErrorCode.STREAM_NOT_FOUND,
+            self._warn(
+                WarningCode.EMPTY_STREAM_ARRAY,
+                f"{alias}.{stream_type}",
                 f"'{alias}.{stream_type}' is empty: '{path}' has no "
-                f"{stream_type} streams",
+                f"{stream_type} streams, so this column contributes nothing",
                 anchor,
-                fallback=select,
-                hint="an empty stream array would select nothing; drop the column",
+                hint="name the column only when the file has those tracks, or "
+                "select * to take whatever it holds",
             )
+            return _array(stream_type, [])
         streams = [self._source_stream(alias, stream_type, k) for k in range(count)]
         for k, stream in enumerate(streams):
             self._reject_codecless(
                 stream.source, f"'{alias}.{stream_type}[{k + 1}]'", anchor, select
             )
         return _array(stream_type, streams)
+
+    def _warn(
+        self,
+        code: WarningCode,
+        about: str,
+        message: str,
+        anchor: exp.Expr,
+        *,
+        hint: str | None = None,
+    ) -> None:
+        """Say something about the compile without refusing it."""
+        if self.on_warning is None:
+            return
+        line, col = _pos(anchor)
+        self.on_warning(SqlmpegWarning(code, about, message, line=line, col=col, hint=hint))
 
     def _cte_value(
         self,
@@ -8758,6 +8793,7 @@ def lower(
     probes: dict[str, ProbeResult | None],
     *,
     registry: Registry | None = None,
+    on_warning: OnWarning | None = None,
 ) -> Graph:
     """Lower a resolved query into an IR graph -- its FIRST command's.
 
@@ -8776,7 +8812,7 @@ def lower(
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
-    return lower_commands(res, probes, registry=registry)[0]
+    return lower_commands(res, probes, registry=registry, on_warning=on_warning)[0]
 
 
 def lower_commands(
@@ -8784,6 +8820,7 @@ def lower_commands(
     probes: dict[str, ProbeResult | None],
     *,
     registry: Registry | None = None,
+    on_warning: OnWarning | None = None,
 ) -> list[Graph]:
     """Lower a resolved query into one IR graph per ffmpeg COMMAND.
 
@@ -8801,7 +8838,7 @@ def lower_commands(
     -- and nothing else -- on every rejection.
     """
     try:
-        shared = _Lowerer(res, probes, registry, fanout_sinks=True)
+        shared = _Lowerer(res, probes, registry, fanout_sinks=True, on_warning=on_warning)
         graph = shared.run()
         count = shared.fanout_count
         if count is None:
@@ -8812,7 +8849,7 @@ def lower_commands(
         if not _fanout_keeps_chain(graph, conflict=shared.fanout_window_conflict):
             return [graph]
         return [
-            _Lowerer(res, probes, registry, fanout_index=index).run()
+            _Lowerer(res, probes, registry, fanout_index=index, on_warning=on_warning).run()
             for index in range(count)
         ]
     except SqlmpegError:
@@ -8888,6 +8925,7 @@ def lower_table(
     probes: dict[str, ProbeResult | None],
     *,
     registry: Registry | None = None,
+    on_warning: OnWarning | None = None,
 ) -> list[TableSink]:
     """Lower a resolved TABLE query into its printable result set(s).
 
@@ -8899,7 +8937,7 @@ def lower_table(
     rejection.
     """
     try:
-        return _Lowerer(res, probes, registry).run_table()
+        return _Lowerer(res, probes, registry, on_warning=on_warning).run_table()
     except SqlmpegError:
         raise
     except Exception as err:  # backstop: guardrail #7, no panics on user input

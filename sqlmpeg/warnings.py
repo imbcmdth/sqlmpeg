@@ -31,6 +31,7 @@ __all__ = ["OnWarning", "SqlmpegWarning", "WarningCode", "WarningLog"]
 class WarningCode(str, Enum):
     GLOBAL_PACKAGE = "GLOBAL_PACKAGE"  # resolved outside the project the query is in
     LINKED_PACKAGE = "LINKED_PACKAGE"  # a linked directory, so no lockfile pins it
+    EMPTY_STREAM_ARRAY = "EMPTY_STREAM_ARRAY"  # a column the file has no tracks for
 
 
 @dataclass(frozen=True)

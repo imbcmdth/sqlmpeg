@@ -109,7 +109,7 @@ def compile_commands(
     try:
         res = resolve(parse(text, unset), packages=packages, on_warning=on_warning)
         probes = _probe_inputs(res)
-        graphs = lower_commands(res, probes, registry=registry_module.load())
+        graphs = lower_commands(res, probes, registry=registry_module.load(), on_warning=on_warning)
         return [insert_splits(graph) for graph in graphs]
     except SqlmpegError:
         raise
@@ -172,7 +172,7 @@ def compile_table_sql(
     try:
         res = resolve(parse(text, unset), packages=packages, on_warning=on_warning)
         probes = _probe_inputs(res)
-        return lower_table(res, probes, registry=registry_module.load())
+        return lower_table(res, probes, registry=registry_module.load(), on_warning=on_warning)
     except SqlmpegError:
         raise
     except RecursionError as err:

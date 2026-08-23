@@ -63,6 +63,7 @@ from sqlmpeg.registry import Registry, load_reference
 from sqlmpeg.split import insert_splits
 from sqlmpeg.table import ArrayCell, RecordCell, StreamCell, render_csv, render_table
 from sqlmpeg.types import DISPOSITION_KEYS
+from sqlmpeg.warnings import OnWarning, SqlmpegWarning, WarningCode
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures"
@@ -115,8 +116,14 @@ def _snapshot_registry() -> Registry:
     return load_reference(SNAPSHOT_PATH)
 
 
-def _lower(sql: str, probes: dict[str, ProbeResult | None] | None = None) -> Graph:
-    return lower(resolve(parse(sql)), probes or {}, registry=_snapshot_registry())
+def _lower(
+    sql: str,
+    probes: dict[str, ProbeResult | None] | None = None,
+    on_warning: OnWarning | None = None,
+) -> Graph:
+    return lower(
+        resolve(parse(sql)), probes or {}, registry=_snapshot_registry(), on_warning=on_warning
+    )
 
 
 def _serialized_sinks(d: dict[str, object]) -> list[dict[str, object]]:
@@ -1788,12 +1795,27 @@ def test_subtitle_subscript_is_bounds_checked_when_probed() -> None:
     assert "1 subtitle stream" in err.message
 
 
-def test_empty_subtitle_array_is_a_typed_error() -> None:
+def test_an_empty_stream_array_warns_and_contributes_nothing() -> None:
+    """A column the file has no tracks for selects nothing, as unnest does."""
+    said: list[SqlmpegWarning] = []
+    g = _lower(
+        "SELECT a.video, a.subtitle FROM input('x.mkv') a",
+        {"a": _layout_probe("va")},
+        on_warning=said.append,
+    )
+    assert [o.type for o in g.outputs] == ["video"]
+    assert [w.code for w in said] == [WarningCode.EMPTY_STREAM_ARRAY]
+    assert "no subtitle streams" in said[0].message
+
+
+def test_a_sink_left_with_no_streams_is_still_a_typed_error() -> None:
+    """One empty column is a warning; every column empty is not."""
     err = _reject_lower(
-        "SELECT a.subtitle FROM input('x.mkv') a", {"a": _layout_probe("va")}
+        "COPY (SELECT a.subtitle FROM input('x.mkv') a) TO 'o.mkv'",
+        {"a": _layout_probe("va")},
     )
     assert err.code is ErrorCode.STREAM_NOT_FOUND
-    assert "no subtitle streams" in err.message
+    assert "would have no streams" in err.message
 
 
 def test_unprobed_subtitle_subscript_stays_symbolic() -> None:
@@ -3648,13 +3670,26 @@ def test_probed_fixture_accepts_its_real_streams(_av_fixture: str) -> None:
 
 
 @pytest.mark.exec
-def test_empty_stream_array_is_a_typed_error(_fixtures: None) -> None:
-    """testsrc.mp4 is video-only: splatting its audio must not silently
-    produce a zero-output graph (a command with no -map)."""
+def test_an_empty_array_never_reaches_a_command_with_no_maps(_fixtures: None) -> None:
+    """testsrc.mp4 is video-only, so its audio array is empty.
+
+    Selecting it contributes nothing and warns. What must not happen is a
+    COMMAND with no -map, and two separate rules see to that: a COPY left
+    with no streams is a rejection, and a bare SELECT names no destination
+    so it never becomes a command at all.
+    """
     path = (FIXTURES_DIR / "testsrc.mp4").as_posix()
-    err = _reject(f"SELECT a.audio FROM input('{path}') a")
+    said: list[SqlmpegWarning] = []
+    graph = compile_sql(
+        f"COPY (SELECT a.video, a.audio FROM input('{path}') a) TO 'o.mkv'",
+        on_warning=said.append,
+    )
+    assert [o.type for o in graph.sinks[0].outputs] == ["video"]
+    assert [w.code for w in said] == [WarningCode.EMPTY_STREAM_ARRAY]
+
+    err = _reject(f"COPY (SELECT a.audio FROM input('{path}') a) TO 'o.mkv'")
     assert err.code is ErrorCode.STREAM_NOT_FOUND
-    assert "no audio streams" in err.message
+    assert "would have no streams" in err.message
 
 
 # ---------------------------------------------------------------------------

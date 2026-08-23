@@ -227,6 +227,14 @@ line on stderr from the CLI, in the `warnings` array of an MCP tool
 result, and through `compile_sql`'s optional `on_warning` callback for
 a library caller.
 
+A third travels the same channel and is not about packages at all. A
+stream array a file has no tracks for - `f.subtitle` where the file
+carries none - is empty, contributes no streams, and warns
+(`EMPTY_STREAM_ARRAY`). That is what `unnest` of it already does and
+what `SELECT *` already does; naming the column is the third spelling
+of the same thing. A sink left with NO streams at all is still a
+rejection, since it would write a file with nothing in it.
+
 ### The registry
 
 Packages come from a static site: `index.json` is the catalogue,
