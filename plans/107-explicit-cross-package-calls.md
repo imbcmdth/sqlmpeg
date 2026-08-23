@@ -85,19 +85,44 @@ installs `images` and stops, so a package with a dependency is broken on
 arrival — the consumer gets `unknown namespace` for a name they never
 wrote.
 
-Plan 101 deferred dependency SOLVING, and that stands: there is no
-resolver and ranges are still recorded rather than solved. But not
-solving a range is not the same as not fetching the package. `install`
-should walk the fetched manifest's `dependencies`, install each at its
-highest published version, and record each in the lockfile — no
-backtracking, no unification, just not stopping at depth one.
+**Install's only job is to put packages into the store by hash**
+(maintainer, 2026-08-23). It walks the fetched manifest's
+`dependencies`, installs each at the declared version, and recurses. A
+package already there at that exact version is skipped — not refetched,
+not walked again. A cycle is a rejection naming the loop.
 
-Two rules keep that honest:
+**Two versions of one package are not a conflict.** They are different
+content with different digests, they coexist in the store, and install
+never arbitrates between them. It installs both and records both.
 
-- A dependency already in the lockfile at a different version is a
-  rejection naming both. Choosing between them is a solver's job, and
-  there is no solver; saying so is better than picking.
-- A cycle is a rejection naming the loop.
+## Versions are per manifest, because calls are inlined
+
+Install can stay that simple because the compiler INLINES every call at
+its call site. There is no shared runtime for two versions to fight
+over — a version exists only as a body pasted into a caller.
+
+So if A depends on B and C, and B depends on D@1 while C depends on D@2:
+expanding B's function resolves B's `imbcmdth.d.foo(...)` against
+**D@1**, expanding C's resolves against **D@2**, and A ends up holding
+both inlined bodies. Nothing has to agree, and no resolver is needed to
+make them.
+
+Which sharpens what removing aliases bought. It makes the NAME global
+and unambiguous; it does not make the VERSION global.
+`imbcmdth.video.shot` written inside package P means *the
+`imbcmdth/video` that P declares*. Resolution still has to know whose
+source it is expanding — `_Expander._scoped` already tracks the owning
+package so a bare call finds that package's own definitions, and the
+same hook answers which version to reach.
+
+Consequences:
+
+- The lockfile records every installed package as name, version and
+  digest; several versions of one name are legal.
+- `PackageSet` must answer "package `<name>` at the version P declares",
+  not merely "package `<name>`".
+- A call site in the user's own query resolves against the version the
+  PROJECT manifest declares.
 
 ## The registry follows
 
@@ -119,7 +144,9 @@ That is a republish, and the version it replaces resolves by luck.
   which is the case that could not work before.
 - `install` of a package with a dependency bringing the dependency, and
   the program running with nothing installed by hand.
-- A version conflict and a cycle, each rejected by name.
+- Two packages depending on different versions of one package: both
+  installed, both inlined, each caller reaching its own.
+- A cycle rejected by name.
 
 ## Order
 
