@@ -382,12 +382,23 @@ Each wave lands green, with its recipes in `docs/examples.md` first.
 | wave | what | depends on |
 | --- | --- | --- |
 | A | 1.1–1.4: unset → NULL, the drop at every binding site, required errors naming the variable, the reversed `-v` check, the curated list | — |
-| B | Part 2: `DEFAULT` in signatures, the NULL-takes-default deviation, `list` showing defaults | A |
+| B | Part 2: `DEFAULT` in signatures, the NULL-takes-default deviation, `list` showing defaults | A; **deferred** — nothing else needs it |
 | C | 3.1–3.2: the manifest, the lockfile v2, `--as` deleted, reserved first segment | — |
 | D | 3.3–3.4: three-segment and alias resolution | C |
-| E | Part 4: the culls, the optional sweep, the grouping; `list` deriving required-ness | A, B |
+| E | Part 4: the culls, the optional sweep, the grouping; `list` deriving required-ness | A |
 | F | Part 5: the registry seed and build | C, D, E |
 
-A and C are independent and can run in parallel. Everything stays on
-the `packages` branch; `main` remains at 0.26.0 until the whole set is
-in.
+A and C are independent and can run in parallel, as are B and D.
+Everything stays on the `packages` branch; `main` remains at 0.26.0
+until the set is in.
+
+**B is deferred.** It only matters for a package that EXPORTS functions,
+and after the sweep none of the eight does — they are programs. A
+library author has `COALESCE` in the body meanwhile, which works today;
+B moves the default into the signature so `list` and the package page
+can show it. Worth doing when there is a library package to show it for.
+
+That is also the gap the seed leaves: with nothing exporting, the `libs`
+half ships exercised only by tests. The answer is eventually a package
+whose point IS to be called from other queries, not a demo rewritten as
+a function.
