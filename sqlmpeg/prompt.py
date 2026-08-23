@@ -4,8 +4,9 @@
 like as a system prompt, so that "describe the edit in English, get a runnable
 ffmpeg command" works without sqlmpeg ever calling an API itself.
 
-There is ONE calling convention: every function is either a filter of the
-installed ffmpeg (bare or ``ffmpeg.<name>``) or a ``sqlmpeg.<name>`` macro.
+Every function is a filter of the installed ffmpeg (bare or
+``ffmpeg.<name>``), a ``sqlmpeg.<name>`` macro, or -- inside a project with
+packages installed -- a qualified call into one of them.
 ``build_system_prompt(registry)`` takes a
 :class:`~sqlmpeg.registry.Registry` and renders one "Functions" section
 from it.
@@ -546,10 +547,12 @@ _DIALECT_TAIL = """\
 - Legal at the top level and as a CTE body.
 
 ### Calling convention
-Every function name resolves in exactly one of three namespaces. There is no
-curated function table to memorize -- what a name means, how many positional
-arguments it takes, and what options it has all come from the installed
-ffmpeg itself (except the four `sqlmpeg.*` macros, which are sqlmpeg's own).
+Every function name resolves in one of three fixed namespaces, or -- inside a
+project that has installed packages -- a qualified call into one of them.
+There is no curated function table to memorize -- what a name means, how many
+positional arguments it takes, and what options it has all come from the
+installed ffmpeg itself (except the four `sqlmpeg.*` macros, which are
+sqlmpeg's own).
 
 1. **A bare filter name** -- `<filter>(<streams...>, <positional
    options...>, <named options...>)` -- resolves directly against the
@@ -609,6 +612,19 @@ ffmpeg itself (except the four `sqlmpeg.*` macros, which are sqlmpeg's own).
      live stream, or a file you have already measured).
 
    `sqlmpeg` is a reserved name too: never use it as an alias or a CTE name.
+4. **A package call** -- only inside a project with a `sqlmpeg.json`, and only
+   for a package it installed (`sqlmpeg list` shows what one provides).
+   `<namespace>.<package>.<member>(...)` always reaches that package's export
+   named `<member>`; `<namespace>.<package>(...)`, two segments, reaches its
+   DEFAULT export instead; `<alias>.<member>(...)`, also two segments, reaches
+   `<member>` through an alias the project's manifest bound in
+   `dependencies` (Cargo-style: an alias is never the package's own
+   namespace, so a two-segment call is never ambiguous between the two
+   readings). `ffmpeg.<filter>` and `sqlmpeg.<name>` above stay two-part and
+   reserved regardless of any package installed under those names -- there
+   are none, since a package's namespace may never be `ffmpeg`, `sqlmpeg` or
+   `wasm`. A project's own `CREATE FUNCTION` definitions are always called
+   bare, never qualified.
 
 For any filter (namespace 1 or 2): option names are case-sensitive and are
 exactly ffmpeg's own (`sigmaV`, `luma_msize_x`), checked against the

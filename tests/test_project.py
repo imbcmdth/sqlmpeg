@@ -138,7 +138,7 @@ def test_a_package_call_compiles_to_the_inline_argv(tmp_path: Path) -> None:
     query = (
         "COPY (SELECT f.video[1], {call}(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'"
     )
-    packaged = _argv(query.format(call="me.quieter"), _packages(tmp_path))
+    packaged = _argv(query.format(call="me.edits.quieter"), _packages(tmp_path))
     inline = _argv(QUIETER + query.format(call="quieter"))
     assert packaged == inline
     assert "[0:a:0]volume=volume=0.5[out1]" in " ".join(packaged)
@@ -147,7 +147,7 @@ def test_a_package_call_compiles_to_the_inline_argv(tmp_path: Path) -> None:
 def test_a_table_returning_package_function_is_a_row_source(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/tracks.sql": PICK})
     query = "COPY (SELECT t.track FROM {call}('a.mka') t) TO 'out.mka'"
-    packaged = _argv(query.format(call="me.pick"), _packages(tmp_path))
+    packaged = _argv(query.format(call="me.edits.pick"), _packages(tmp_path))
     inline = _argv(PICK + query.format(call="pick"))
     assert packaged == inline
     assert packaged[:3] == ["ffmpeg", "-i", "a.mka"]
@@ -157,7 +157,7 @@ def test_a_package_function_reads_rows_as_a_table_query(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/lang.sql": NORMALIZE})
     sinks = compile_table_sql(
         "WITH said(raw) AS (VALUES ('english'), ('de'))\n"
-        "SELECT me.normalize_lang(said.raw) AS language FROM said",
+        "SELECT me.edits.normalize_lang(said.raw) AS language FROM said",
         packages=_packages(tmp_path),
     )
     assert sinks[0].result.rows == [["eng"], ["de"]]
@@ -180,6 +180,37 @@ def test_the_default_lib_is_reached_as_the_package_segment(tmp_path: Path) -> No
         _packages(tmp_path),
     )
     assert "volume=volume=0.5" in " ".join(argv)
+
+
+def test_an_alias_call_and_the_full_path_compile_to_identical_argv(tmp_path: Path) -> None:
+    """`tracks.quieter(...)` through an alias is `broadcast.tracks.quieter(...)`, one function."""
+    entry = _installed(_library(tmp_path / "built", "broadcast", "0.5", package="tracks"))
+    project = tmp_path / "work"
+    _project(
+        project,
+        files={"src/own.sql": NORMALIZE},
+        manifest={"dependencies": {"tracks": "broadcast/tracks@^1.0.0"}},
+    )
+    _lock(project, [entry])
+    packages = _packages(project)
+    aliased = _argv(QUERY.format(call="tracks.quieter"), packages)
+    full = _argv(QUERY.format(call="broadcast.tracks.quieter"), packages)
+    assert aliased == full
+    assert "volume=volume=0.5" in " ".join(full)
+
+
+def test_a_two_segment_call_on_a_package_with_no_default_export_names_its_libs(
+    tmp_path: Path,
+) -> None:
+    """`me.edits(...)` with no `lib` declared has nothing to reach; the libs are named instead."""
+    _project(tmp_path, files={"src/tracks.sql": QUIETER})
+    error = _rejects(
+        "COPY (SELECT me.edits(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        _packages(tmp_path),
+        ErrorCode.UNKNOWN_FUNCTION,
+        "package 'me/edits' has no default export",
+    )
+    assert error.hint == "it exports: quieter"
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +256,7 @@ def test_without_a_project_a_query_compiles_exactly_as_before(tmp_path: Path) ->
 def test_without_a_project_a_namespaced_call_is_rejected_as_it_always_was(tmp_path: Path) -> None:
     bare = tmp_path / "no_project"
     bare.mkdir()
-    sql = "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'"
+    sql = "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'"
     with pytest.raises(SqlmpegError) as without_project:
         compile_commands(sql, packages=discover(bare))
     with pytest.raises(SqlmpegError) as never_asked:
@@ -241,7 +272,7 @@ def test_without_a_project_a_namespaced_call_is_rejected_as_it_always_was(tmp_pa
 def test_an_uncalled_package_definition_is_fine(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/tracks.sql": QUIETER + NORMALIZE})
     argv = _argv(
-        "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
     )
     assert argv[-1] == "out.mkv"
@@ -274,7 +305,7 @@ def test_a_package_body_calls_its_own_sibling_not_the_script(tmp_path: Path) -> 
         "$$ LANGUAGE sql;\n"
     )
     argv = _argv(
-        shadow + "COPY (SELECT me.quieter(f.audio[1]), helper(f.audio[2]) "
+        shadow + "COPY (SELECT me.edits.quieter(f.audio[1]), helper(f.audio[2]) "
         "FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
     )
@@ -300,11 +331,11 @@ def test_a_definition_libs_does_not_name_is_private(tmp_path: Path) -> None:
     )
     packages = _packages(tmp_path)
     argv = _argv(
-        "COPY (SELECT me.quieter(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'", packages
+        "COPY (SELECT me.edits.quieter(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'", packages
     )
     assert "volume=volume=0.25" in " ".join(argv)
     error = _rejects(
-        "COPY (SELECT me.helper(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT me.edits.helper(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'",
         packages,
         ErrorCode.UNKNOWN_FUNCTION,
         "package 'me/edits' has no export 'helper'",
@@ -349,18 +380,18 @@ def test_a_near_miss_namespace_gets_a_did_you_mean(tmp_path: Path) -> None:
         ErrorCode.UNKNOWN_FUNCTION,
         "unknown namespace 'mien'",
     )
-    assert error.hint == "did you mean mine.quieter()?"
+    assert error.hint == "did you mean 'mine'?"
 
 
 def test_an_unknown_member_gets_a_did_you_mean(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/tracks.sql": QUIETER})
     error = _rejects(
-        "COPY (SELECT me.quiter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT me.edits.quiter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.UNKNOWN_FUNCTION,
         "package 'me/edits' has no export 'quiter'",
     )
-    assert error.hint == "did you mean me.quieter()?"
+    assert error.hint == "did you mean me.edits.quieter()?"
 
 
 def test_an_export_naming_no_file_is_refused(tmp_path: Path) -> None:
@@ -403,7 +434,7 @@ def test_a_file_that_does_not_define_its_export_is_refused(tmp_path: Path) -> No
         manifest={"libs": {"louder": "src/tracks.sql"}},
     )
     error = _rejects(
-        "COPY (SELECT me.louder(f.audio[1], 2) FROM input('film.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT me.edits.louder(f.audio[1], 2) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.UNSUPPORTED_SQL,
         "does not define 'louder'",
@@ -430,7 +461,7 @@ def test_one_name_defined_twice_across_lib_files_is_refused(tmp_path: Path) -> N
         manifest={"libs": {"quieter": "src/a.sql", "normalize_lang": "src/b.sql"}},
     )
     error = _rejects(
-        "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.UNSUPPORTED_SQL,
         "package 'me/edits' defines 'quieter' twice",
@@ -445,7 +476,7 @@ def test_a_lib_file_that_fails_to_parse_names_the_file(tmp_path: Path) -> None:
         manifest={"libs": {"quieter": "src/tracks.sql"}},
     )
     error = _rejects(
-        "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.PARSE_ERROR,
         "tracks.sql",
@@ -458,7 +489,7 @@ def test_a_lib_file_that_fails_to_parse_names_the_file(tmp_path: Path) -> None:
 def test_a_lib_file_holding_a_query_is_refused(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/tracks.sql": QUIETER + "SELECT 1;"})
     _rejects(
-        "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.UNSUPPORTED_SQL,
         "is not a CREATE FUNCTION",
@@ -468,36 +499,58 @@ def test_a_lib_file_holding_a_query_is_refused(tmp_path: Path) -> None:
 def test_a_value_function_called_in_from_is_refused(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/tracks.sql": NORMALIZE})
     _rejects(
-        "COPY (SELECT t.x FROM me.normalize_lang('en') t) TO 'out.mkv'",
+        "COPY (SELECT t.x FROM me.edits.normalize_lang('en') t) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.UNSUPPORTED_SQL,
-        "function 'me.normalize_lang' returns a value, not a table",
+        "function 'me.edits.normalize_lang' returns a value, not a table",
     )
 
 
 def test_a_table_function_called_as_a_value_is_refused(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/tracks.sql": PICK})
     _rejects(
-        "COPY (SELECT me.pick('a.mka') FROM input('film.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT me.edits.pick('a.mka') FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.UNSUPPORTED_SQL,
-        "function 'me.pick' returns a table, not a value",
+        "function 'me.edits.pick' returns a table, not a value",
     )
 
 
 def test_the_wrong_argument_count_names_the_qualified_signature(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/tracks.sql": QUIETER})
     error = _rejects(
-        "COPY (SELECT me.quieter(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT me.edits.quieter(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.UDF_ARG_TYPE,
-        "me.quieter() got 1 argument, but it declares 2",
+        "me.edits.quieter() got 1 argument, but it declares 2",
     )
-    assert error.hint == "me.quieter(track audio_stream, factor number) RETURNS audio_stream"
+    assert error.hint == "me.edits.quieter(track audio_stream, factor number) RETURNS audio_stream"
 
 
-def test_two_packages_in_one_namespace_reject_a_two_part_call(tmp_path: Path) -> None:
-    """The interim rule: `ns.fn` reaches the ONE package under `ns`."""
+def test_two_packages_share_one_namespace_and_resolve_by_full_path(tmp_path: Path) -> None:
+    """The real rule: `ns.pkg.member` reaches the right package even when `ns` holds several."""
+    first = _library(tmp_path / "one", "me", "0.5", package="alpha")
+    second = _library(tmp_path / "two", "me", "0.25", package="beta")
+    project = tmp_path / "work"
+    _project(project, files={}, manifest={"name": "other/edits"})
+    _lock(project, [_link(first), _link(second)])
+    packages = _packages(project)
+    alpha = _argv(
+        "COPY (SELECT me.alpha.quieter(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'",
+        packages,
+    )
+    beta = _argv(
+        "COPY (SELECT me.beta.quieter(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'",
+        packages,
+    )
+    assert "volume=volume=0.5" in " ".join(alpha)
+    assert "volume=volume=0.25" in " ".join(beta)
+
+
+def test_a_two_segment_call_naming_no_package_in_a_shared_namespace_says_what_it_holds(
+    tmp_path: Path,
+) -> None:
+    """`me.quieter` is decidable neither as an alias nor as `me/quieter`; `me` holds two others."""
     first = _library(tmp_path / "one", "me", "0.5", package="alpha")
     second = _library(tmp_path / "two", "me", "0.25", package="beta")
     project = tmp_path / "work"
@@ -507,9 +560,9 @@ def test_two_packages_in_one_namespace_reject_a_two_part_call(tmp_path: Path) ->
         "COPY (SELECT me.quieter(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(project),
         ErrorCode.UNKNOWN_FUNCTION,
-        "namespace 'me' holds more than one package",
+        "namespace 'me' has no package 'quieter'",
     )
-    assert "me/alpha" in error.message and "me/beta" in error.message
+    assert error.hint == "me holds: alpha, beta"
 
 
 # ---------------------------------------------------------------------------
@@ -727,7 +780,7 @@ def test_a_program_is_a_query_and_the_lib_rule_never_reaches_it(tmp_path: Path) 
         manifest=_BINS,
     )
     argv = _argv(
-        "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
     )
     assert "volume=volume=0.5" in " ".join(argv)
@@ -898,7 +951,7 @@ def test_the_cli_finds_the_project_above_the_query_file(
     query = tmp_path / "queries" / "out.sql"
     query.parent.mkdir()
     query.write_text(
-        "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('film.mkv') f) TO 'out.mkv'",
         encoding="utf-8",
     )
     assert cli.main(["compile", "-f", str(query)]) == 0
@@ -913,7 +966,10 @@ def test_the_cli_finds_the_project_above_the_working_directory(
     deep.mkdir()
     monkeypatch.chdir(deep)
     code = cli.main(
-        ["compile", "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('f.mkv') f) TO 'o.mkv'"]
+        [
+            "compile",
+            "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('f.mkv') f) TO 'o.mkv'",
+        ]
     )
     assert code == 0
     assert "volume=volume=0.5" in capsys.readouterr().out
@@ -935,7 +991,7 @@ def test_the_cli_reports_a_malformed_manifest(
 
 def test_the_mcp_tools_resolve_against_the_named_project(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/tracks.sql": QUIETER})
-    query = "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('f.mkv') f) TO 'o.mkv'"
+    query = "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('f.mkv') f) TO 'o.mkv'"
     assert mcp_tools.validate_query(query, None, str(tmp_path)) == {}
     result = mcp_tools.compile_query(query, None, str(tmp_path))
     assert "volume=volume=0.5" in result["filter_complex"][0]
@@ -943,7 +999,7 @@ def test_the_mcp_tools_resolve_against_the_named_project(tmp_path: Path) -> None
 
 def test_the_mcp_tools_see_no_project_without_one(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/tracks.sql": QUIETER})
-    query = "COPY (SELECT me.quieter(f.audio[1], 0.5) FROM input('f.mkv') f) TO 'o.mkv'"
+    query = "COPY (SELECT me.edits.quieter(f.audio[1], 0.5) FROM input('f.mkv') f) TO 'o.mkv'"
     assert mcp_tools.validate_query(query)["code"] == ErrorCode.UNSUPPORTED_SQL.value
 
 
@@ -1074,7 +1130,7 @@ def test_a_locked_package_resolves_out_of_the_store(store_home: Path, tmp_path: 
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     _lock(project, [entry])
-    argv, said = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
+    argv, said = _heard(QUERY.format(call="tracks.lib.quieter"), _packages(project))
     assert argv == _argv(_quieter("0.5") + QUERY.format(call="quieter"))
     assert said == []
 
@@ -1295,7 +1351,7 @@ def test_a_link_resolves_through_the_directorys_own_manifest(tmp_path: Path) -> 
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     _lock(project, [_link(linked)])
-    argv, said = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
+    argv, said = _heard(QUERY.format(call="tracks.lib.quieter"), _packages(project))
     assert argv == _argv(_quieter("0.5") + QUERY.format(call="quieter"))
     assert _codes(said) == [WarningCode.LINKED_PACKAGE]
 
@@ -1305,9 +1361,9 @@ def test_a_link_picks_up_an_edit_made_after_the_lockfile_was_written(tmp_path: P
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     _lock(project, [_link(linked)])
-    before, _ = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
+    before, _ = _heard(QUERY.format(call="tracks.lib.quieter"), _packages(project))
     (linked / "src" / "lib.sql").write_text(_quieter("0.25"), encoding="utf-8")
-    after, _ = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
+    after, _ = _heard(QUERY.format(call="tracks.lib.quieter"), _packages(project))
     assert "volume=volume=0.5" in " ".join(before)
     assert "volume=volume=0.25" in " ".join(after)
 
@@ -1317,7 +1373,7 @@ def test_a_link_by_relative_path_resolves_against_the_lockfile(tmp_path: Path) -
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     _lock(project, [{"kind": "link", "path": "../dev"}])
-    argv, _ = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
+    argv, _ = _heard(QUERY.format(call="tracks.lib.quieter"), _packages(project))
     assert "volume=volume=0.5" in " ".join(argv)
 
 
@@ -1327,7 +1383,7 @@ def test_a_link_warns_once_however_many_call_sites(tmp_path: Path) -> None:
     _project(project, files={"src/own.sql": NORMALIZE})
     _lock(project, [_link(linked)])
     _compiled, said = _heard(
-        "COPY (SELECT tracks.quieter(f.audio[1]), tracks.quieter(f.audio[2]) "
+        "COPY (SELECT tracks.lib.quieter(f.audio[1]), tracks.lib.quieter(f.audio[2]) "
         "FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(project),
     )
@@ -1357,7 +1413,7 @@ def test_a_linked_package_may_rename_itself_without_a_re_link(tmp_path: Path) ->
     (linked / "sqlmpeg.json").write_text(json.dumps(renamed) + "\n", encoding="utf-8")
     packages = _packages(project)
     assert "broadcast/audio" in packages.names()
-    argv, _ = _heard(QUERY.format(call="broadcast.quieter"), packages)
+    argv, _ = _heard(QUERY.format(call="broadcast.audio.quieter"), packages)
     assert "volume=volume=0.5" in " ".join(argv)
 
 
@@ -1366,7 +1422,7 @@ def test_the_manifest_wins_over_a_lockfile_naming_its_package(tmp_path: Path) ->
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": _quieter("0.5")})
     _lock(project, [_link(linked)])
-    argv, said = _heard(QUERY.format(call="me.quieter"), _packages(project))
+    argv, said = _heard(QUERY.format(call="me.edits.quieter"), _packages(project))
     assert "volume=volume=0.5" in " ".join(argv)
     # The link lost the claim, so nothing resolves in it and nothing warns.
     assert said == []
@@ -1377,7 +1433,7 @@ def test_the_local_lockfile_wins_over_the_global_one(store_home: Path, tmp_path:
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     _lock(project, [_installed(_library(tmp_path / "near", "tracks", "0.5"))])
-    argv, said = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
+    argv, said = _heard(QUERY.format(call="tracks.lib.quieter"), _packages(project))
     assert "volume=volume=0.5" in " ".join(argv)
     assert said == []
 
@@ -1404,8 +1460,8 @@ def test_all_three_layers_answer_in_order(store_home: Path, tmp_path: Path) -> N
     ]
     graph = " ".join(
         _heard(
-            "COPY (SELECT me.quieter(f.audio[1]), tracks.quieter(f.audio[2]), "
-            "far.quieter(f.audio[3]) FROM input('film.mkv') f) TO 'out.mkv'",
+            "COPY (SELECT me.edits.quieter(f.audio[1]), tracks.lib.quieter(f.audio[2]), "
+            "far.lib.quieter(f.audio[3]) FROM input('film.mkv') f) TO 'out.mkv'",
             packages,
         )[0]
     )
@@ -1420,7 +1476,7 @@ def test_landing_on_the_global_layer_inside_a_project_warns(
     _lock(store_home, [_installed(_library(tmp_path / "far", "tracks", "0.5"))])
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _compiled, said = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
+    _compiled, said = _heard(QUERY.format(call="tracks.lib.quieter"), _packages(project))
     assert _codes(said) == [WarningCode.GLOBAL_PACKAGE]
     assert said[0].package == "tracks/lib"
     assert "tracks/lib" in (said[0].hint or "")
@@ -1434,7 +1490,7 @@ def test_a_global_package_outside_a_project_has_nothing_to_warn_about(
     bare.mkdir()
     packages = discover(bare)
     assert packages is not None and not packages.in_project
-    argv, said = _heard(QUERY.format(call="tracks.quieter"), packages)
+    argv, said = _heard(QUERY.format(call="tracks.lib.quieter"), packages)
     assert "volume=volume=0.5" in " ".join(argv)
     assert said == []
 
@@ -1444,7 +1500,7 @@ def test_a_global_link_warns_about_both(store_home: Path, tmp_path: Path) -> Non
     _lock(store_home, [_link(linked)])
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    _compiled, said = _heard(QUERY.format(call="tracks.quieter"), _packages(project))
+    _compiled, said = _heard(QUERY.format(call="tracks.lib.quieter"), _packages(project))
     assert set(_codes(said)) == {WarningCode.LINKED_PACKAGE, WarningCode.GLOBAL_PACKAGE}
 
 
@@ -1452,7 +1508,7 @@ def test_a_package_nothing_calls_is_never_warned_about(store_home: Path, tmp_pat
     _lock(store_home, [_installed(_library(tmp_path / "far", "tracks", "0.5"))])
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": _quieter("0.5")})
-    _compiled, said = _heard(QUERY.format(call="me.quieter"), _packages(project))
+    _compiled, said = _heard(QUERY.format(call="me.edits.quieter"), _packages(project))
     assert said == []
 
 
@@ -1655,7 +1711,7 @@ def test_the_cli_prints_the_warning_on_stderr_and_the_command_on_stdout(
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     monkeypatch.chdir(project)
-    assert cli.main(["compile", QUERY.format(call="tracks.quieter")]) == 0
+    assert cli.main(["compile", QUERY.format(call="tracks.lib.quieter")]) == 0
     captured = capsys.readouterr()
     assert "volume=volume=0.5" in captured.out
     assert "warning:" not in captured.out
@@ -1673,7 +1729,7 @@ def test_the_cli_says_it_once_though_it_compiles_twice(
     monkeypatch.chdir(project)
     # A bare SELECT: `compile` refuses it, then tries the table fallback, so
     # the same text compiles twice in one command.
-    assert cli.main(["compile", "SELECT tracks.quieter(f.audio[1]) FROM input('f.mkv') f"]) == 2
+    assert cli.main(["compile", "SELECT tracks.lib.quieter(f.audio[1]) FROM input('f.mkv') f"]) == 2
     assert capsys.readouterr().err.count("warning:") == 1
 
 
@@ -1685,7 +1741,7 @@ def test_validate_keeps_the_warning_off_stdout(
     _project(project, files={"src/own.sql": NORMALIZE})
     _lock(project, [_link(linked)])
     monkeypatch.chdir(project)
-    assert cli.main(["validate", QUERY.format(call="tracks.quieter")]) == 0
+    assert cli.main(["validate", QUERY.format(call="tracks.lib.quieter")]) == 0
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "warning: package 'tracks/lib' is linked to" in captured.err
@@ -1695,7 +1751,7 @@ def test_the_mcp_compile_tool_returns_the_warnings(store_home: Path, tmp_path: P
     _lock(store_home, [_installed(_library(tmp_path / "far", "tracks", "0.5"))])
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
-    result = mcp_tools.compile_query(QUERY.format(call="tracks.quieter"), None, str(project))
+    result = mcp_tools.compile_query(QUERY.format(call="tracks.lib.quieter"), None, str(project))
     assert [w["code"] for w in result["warnings"]] == [WarningCode.GLOBAL_PACKAGE.value]
     assert result["warnings"][0]["package"] == "tracks/lib"
 
@@ -1705,14 +1761,14 @@ def test_the_mcp_validate_tool_answers_with_warnings_and_no_code(tmp_path: Path)
     project = tmp_path / "work"
     _project(project, files={"src/own.sql": NORMALIZE})
     _lock(project, [_link(linked)])
-    result = mcp_tools.validate_query(QUERY.format(call="tracks.quieter"), None, str(project))
+    result = mcp_tools.validate_query(QUERY.format(call="tracks.lib.quieter"), None, str(project))
     assert "code" not in result
     assert [w["code"] for w in result["warnings"]] == [WarningCode.LINKED_PACKAGE.value]
 
 
 def test_the_mcp_tools_stay_silent_with_nothing_to_say(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/own.sql": _quieter("0.5")})
-    query = QUERY.format(call="me.quieter")
+    query = QUERY.format(call="me.edits.quieter")
     assert mcp_tools.validate_query(query, None, str(tmp_path)) == {}
     assert mcp_tools.compile_query(query, None, str(tmp_path))["warnings"] == []
 
@@ -2153,7 +2209,7 @@ def test_a_linked_package_is_callable_right_after_linking(
     _lock(project, [])
     assert _run(project, monkeypatch, capsys, "link", "../dev")[0] == 0
     code, out, err = _run(
-        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.quieter")
+        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.lib.quieter")
     )
     assert code == 0
     assert "volume=volume=0.5" in out
@@ -2346,6 +2402,43 @@ def test_the_default_program_is_reached_as_the_package_segment(
     assert code == 0, err
 
 
+def test_a_qualified_program_name_runs_one_packages_bins_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`me.edits.split-chapters` names one package's `bins` entry, for `compile` and `run` alike."""
+    _project(
+        tmp_path,
+        files={"queries/split.sql": PROGRAM},
+        manifest=_BINS,
+    )
+    code, _out, err = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        "compile",
+        "me.edits.split-chapters",
+        "-v",
+        "source=in.mkv",
+        "-v",
+        "dest=out.mkv",
+    )
+    assert code == 0, err
+
+    monkeypatch.setattr(cli.binaries, "ffmpeg_path", lambda: None)
+    code, _out, err = _run(
+        tmp_path,
+        monkeypatch,
+        capsys,
+        "run",
+        "me.edits.split-chapters",
+        "-v",
+        "source=in.mkv",
+        "-v",
+        "dest=out.mkv",
+    )
+    assert code == 1 and "ffmpeg not found" in err
+
+
 def test_a_program_name_is_not_looked_up_when_the_text_is_sql(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2397,14 +2490,14 @@ def test_a_bare_name_two_packages_ship_is_refused(
     code, _out, err = _run(project, monkeypatch, capsys, "validate", "split-chapters")
     assert code == 1
     assert "more than one package ships a program named 'split-chapters'" in err
-    assert "me.split-chapters, tracks.split-chapters" in err
+    assert "me.edits.split-chapters, tracks.lib.split-chapters" in err
 
     code, _out, err = _run(
         project,
         monkeypatch,
         capsys,
         "validate",
-        "tracks.split-chapters",
+        "tracks.lib.split-chapters",
         "-v",
         "source=in.mkv",
         "-v",
@@ -2439,7 +2532,7 @@ def test_a_name_matching_nothing_fails_as_sql_and_names_the_programs(
     )
     code, _out, err = _run(tmp_path, monkeypatch, capsys, "compile", "split-chapter")
     assert code == 1
-    assert "hint: installed programs: me.split-chapters" in err
+    assert "hint: installed programs: me.edits.split-chapters" in err
 
 
 def test_a_failing_query_is_not_offered_a_program(

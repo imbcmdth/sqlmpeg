@@ -245,8 +245,13 @@ class _Function:
 
     @property
     def qualified(self) -> str:
-        """The name as a call site writes it: ``ns.fn`` for a package's, ``fn`` for a script's."""
-        return f"{self.namespace}.{self.name}" if self.package else self.name
+        """The full call path: ``ns.pkg.fn`` for a package's, ``fn`` for a script's.
+
+        Always the three-segment form, which reaches any export regardless of
+        whether the calling project bound an alias to it -- unlike an alias,
+        it never collides between two packages sharing a namespace.
+        """
+        return f"{self.package.replace('/', '.')}.{self.name}" if self.package else self.name
 
     @property
     def signature(self) -> str:
@@ -877,6 +882,23 @@ def _leftmost(column: exp.Column) -> str | None:
     return None
 
 
+def _dot_segments(node: exp.Expr) -> tuple[str, ...] | None:
+    """The plain identifiers `node` chains, left to right, or None if it is not one.
+
+    `node` is the qualifier written before a call's parens: a bare identifier
+    for a two-part call, or a `Dot` of identifiers for a three-part one --
+    sqlglot parses ``a.b.c(...)`` as ``Dot(Dot(a, b), Anonymous(c))``, so a
+    three-part call's qualifier is itself a `Dot`, and this walks its left
+    spine to flatten it back into segments.
+    """
+    if isinstance(node, exp.Identifier):
+        return (_ident_name(node),)
+    if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Identifier):
+        left = _dot_segments(node.this)
+        return None if left is None else (*left, _ident_name(node.expression))
+    return None
+
+
 def _path_after(column: exp.Column, key: str) -> list[exp.Identifier]:
     """The identifiers written to the right of `key`, in written order."""
     rest = _QUALIFIERS[_QUALIFIERS.index(key) + 1 :]
@@ -1216,59 +1238,108 @@ class _Expander:
             return self.scopes.get(self.scope, {}).get(name)
         return self.functions.get(name)
 
-    def _member(self, namespace: str, call: exp.Anonymous, anchor: exp.Expr) -> _Function | None:
-        """The definition `namespace.<call>` names, or None if there is no project.
+    def _member(
+        self, segments: tuple[str, ...], call: exp.Anonymous, anchor: exp.Expr
+    ) -> _Function | None:
+        """The definition a qualified call names, or None if there is no project.
 
-        None keeps a qualified call exactly what it was before packages
-        existed: outside a project, ``me.pick(...)`` is not a package call and
-        the rejection it earns downstream is the one it has always earned.
+        `segments` is the identifiers written before the call name: one for a
+        two-part call (``x.fn(...)``), two for a three-part one
+        (``ns.pkg.fn(...)``). None keeps a qualified call exactly what it was
+        before packages existed: outside a project, ``me.pick(...)`` is not a
+        package call and the rejection it earns downstream is the one it has
+        always earned.
 
-        Interim resolution: a two-part ``ns.fn`` call reaches an export of the
-        ONE package under `ns`, rejecting when the namespace holds more.
-        Three-segment ``namespace.package.member`` calls, the two-part default
-        (``namespace.package``) and alias resolution replace this rule.
+        Two-part resolution tries `segments[0]` as an ALIAS first, then as a
+        namespace holding a package named for the call itself (its default
+        export). Aliases and namespaces are disjoint by construction --
+        ``install`` refuses an alias equal to any installed namespace -- so
+        exactly one of the two ever applies. Three-part resolution is
+        `namespace.package.member` outright.
         """
         packages = self.packages
         if packages is None or not packages.packages:
             return None
         name = _call_name(call)
-        candidates = packages.in_namespace(namespace)
-        if not candidates:
-            known = packages.namespaces()
+        if len(segments) == 1:
+            (qualifier,) = segments
+            aliased = packages.aliased(qualifier)
+            if aliased is not None:
+                return self._reach(aliased, name, qualifier, anchor)
+            package = self._package_at(qualifier, name, anchor)
+            return self._reach(package, None, package.name.replace("/", "."), anchor)
+        namespace, package_name = segments
+        package = self._package_at(namespace, package_name, anchor)
+        return self._reach(package, name, f"{namespace}.{package_name}", anchor)
+
+    def _package_at(self, namespace: str, package_name: str, anchor: exp.Expr) -> Package:
+        """The package `namespace.package_name` names, or a typed rejection.
+
+        An unknown namespace says what is installed; a known namespace with
+        no such package says what it holds.
+        """
+        packages = self.packages
+        assert packages is not None
+        found = packages.find(namespace, package_name)
+        if found is not None:
+            return found
+        known = packages.namespaces()
+        if namespace not in known:
             near = difflib.get_close_matches(namespace, list(known), n=1, cutoff=0.6)
             raise _error(
                 ErrorCode.UNKNOWN_FUNCTION,
                 f"unknown namespace '{namespace}'",
                 anchor,
-                hint=f"did you mean {near[0]}.{name}()?"
+                hint=f"did you mean '{near[0]}'?"
                 if near
-                else f"namespaces this project can call: {', '.join(known)}",
+                else (
+                    f"namespaces this project can call: {', '.join(known)}"
+                    if known
+                    else "no packages are installed"
+                ),
             )
-        if len(candidates) > 1:
-            names = ", ".join(package.name for package in candidates)
-            raise _error(
-                ErrorCode.UNKNOWN_FUNCTION,
-                f"namespace '{namespace}' holds more than one package: {names}",
-                anchor,
-                hint="a two-part call reaches one package per namespace; keep one of them",
-            )
-        package = candidates[0]
-        exports = self._scope_of(package, anchor)
-        function = (
-            exports.get(name) if name in self.exported[package.name] else None
+        held = [package.package for package in packages.in_namespace(namespace)]
+        raise _error(
+            ErrorCode.UNKNOWN_FUNCTION,
+            f"namespace '{namespace}' has no package '{package_name}'",
+            anchor,
+            hint=f"{namespace} holds: {', '.join(held)}"
+            if held
+            else f"{namespace} holds no packages",
         )
-        if function is None:
-            exported = sorted(self.exported[package.name])
-            near = difflib.get_close_matches(name, exported, n=1, cutoff=0.6)
+
+    def _reach(
+        self, package: Package, member: str | None, written: str, anchor: exp.Expr
+    ) -> _Function:
+        """The definition `package` exports at `member`, or its default at None.
+
+        A missing default names the package's libs instead of guessing which
+        one was meant; a missing named member gets the usual did-you-mean.
+        """
+        exports = self._scope_of(package, anchor)
+        key = package.package if member is None else member
+        function = exports.get(key) if key in self.exported[package.name] else None
+        if function is not None:
+            return function
+        if member is None:
+            libs = sorted(self.exported[package.name])
+            hint = f"it exports: {', '.join(libs)}" if libs else f"{package.name} exports nothing"
             raise _error(
                 ErrorCode.UNKNOWN_FUNCTION,
-                f"package '{package.name}' has no export '{name}'",
+                f"package '{package.name}' has no default export",
                 anchor,
-                hint=f"did you mean {namespace}.{near[0]}()?"
-                if near
-                else f"{package.name} exports: {', '.join(exported) or 'nothing'}",
+                hint=hint,
             )
-        return function
+        exported = sorted(self.exported[package.name])
+        near = difflib.get_close_matches(member, exported, n=1, cutoff=0.6)
+        raise _error(
+            ErrorCode.UNKNOWN_FUNCTION,
+            f"package '{package.name}' has no export '{member}'",
+            anchor,
+            hint=f"did you mean {written}.{near[0]}()?"
+            if near
+            else f"{package.name} exports: {', '.join(exported) or 'nothing'}",
+        )
 
     def _warn_about(self, package: Package, anchor: exp.Expr) -> None:
         """Say what resolving in `package` cost, at the first call that reaches it.
@@ -1415,31 +1486,39 @@ class _Expander:
         return None if function is None else _CallSite(function, call, call)
 
     def _qualified_site(self, node: exp.Dot) -> _CallSite | None:
-        """A ``ns.fn(...)`` value call, if `ns` is a namespace a package claims."""
-        call, qualifier = node.expression, node.this
-        if not isinstance(call, exp.Anonymous) or not isinstance(qualifier, exp.Identifier):
+        """A qualified value call -- ``x.fn(...)`` or ``ns.pkg.fn(...)`` -- if it names one."""
+        call = node.expression
+        if not isinstance(call, exp.Anonymous):
             return None
-        namespace = _ident_name(qualifier)
-        if namespace in RESERVED_NAMESPACES:  # a filter or a macro; lower resolves it
+        segments = _dot_segments(node.this)
+        if segments is None or len(segments) > 2:
             return None
-        function = self._member(namespace, call, node)
+        if segments[0] in RESERVED_NAMESPACES:  # a filter or a macro; lower resolves it
+            return None
+        function = self._member(segments, call, node)
         return None if function is None else _CallSite(function, call, node)
 
     def _row_source_site(self, item: exp.Table) -> _CallSite | None:
-        """A FROM-position call, bare or namespaced, if something defines it."""
+        """A FROM-position call, bare or qualified, if something defines it."""
         call = item.this
         if not isinstance(call, exp.Anonymous):
             return None
-        if item.args.get("catalog"):  # `x.ns.fn()` names a schema, not a namespace
-            return None
-        db = item.args.get("db")
-        if not isinstance(db, exp.Identifier):
+        catalog, db = item.args.get("catalog"), item.args.get("db")
+        if catalog is None and db is None:
             function = self._visible(_call_name(call))
+        elif not isinstance(db, exp.Identifier) or (
+            catalog is not None and not isinstance(catalog, exp.Identifier)
+        ):
+            return None  # something stranger than a plain qualified path
         else:
-            namespace = _ident_name(db)
-            if namespace in RESERVED_NAMESPACES:  # `ffmpeg.<source>()`; lower resolves it
+            segments = (
+                (_ident_name(catalog), _ident_name(db))
+                if isinstance(catalog, exp.Identifier)
+                else (_ident_name(db),)
+            )
+            if segments[0] in RESERVED_NAMESPACES:  # `ffmpeg.<source>()`; lower resolves it
                 return None
-            function = self._member(namespace, call, item)
+            function = self._member(segments, call, item)
         return None if function is None else _CallSite(function, call, item)
 
     def _check_shape(self, site: _CallSite) -> None:
@@ -1560,9 +1639,12 @@ class _Expander:
         if not isinstance(item, exp.Table):  # unreachable: only a Table is a row source
             return
         function = site.function
-        # `db` is the namespace qualifier of a package call, and nothing else
-        # reaches here with one: an unclaimed qualifier never resolves.
-        _check_query_args(item, frozenset({"this", "alias", "db"}), "a table function call")
+        # `db` (two-part) and `catalog` (three-part) are a package call's own
+        # qualifiers, and nothing else reaches here carrying one: an unclaimed
+        # qualifier never resolves.
+        _check_query_args(
+            item, frozenset({"this", "alias", "db", "catalog"}), "a table function call"
+        )
         self._enter(function, item, stack)
         arguments = self._arguments(function, site.call, host, position)
         body, index = self._instance(site, arguments)

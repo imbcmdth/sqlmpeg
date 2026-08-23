@@ -219,7 +219,7 @@ def test_init_then_install_then_a_query_calling_it(
     assert entry.store == store.entry_path(entry.sha256)
 
     code, out, _err = _run(
-        project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.quieter")
+        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.quieter")
     )
     assert code == 0
     assert "volume=volume=0.5" in out
@@ -303,7 +303,7 @@ def test_an_exact_version_is_taken_and_pinned(
     assert _run(project, monkeypatch, capsys, "install", "broadcast/tracks@1.9.0")[0] == 0
     assert read_lockfile(project / "sqlmpeg.lock").entries[0].version == "1.9.0"
     code, out, _err = _run(
-        project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.quieter")
+        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.quieter")
     )
     assert code == 0 and "volume=volume=0.9" in out
 
@@ -511,7 +511,7 @@ def test_installing_another_version_replaces_the_pin(
         "tracks": "broadcast/tracks@2.0.0"
     }
     code, out, _err = _run(
-        project, monkeypatch, capsys, "compile", QUERY.format(call="broadcast.quieter")
+        project, monkeypatch, capsys, "compile", QUERY.format(call="tracks.quieter")
     )
     assert code == 0 and "volume=volume=0.25" in out
 
@@ -592,8 +592,9 @@ def test_a_default_alias_colliding_with_an_existing_alias_names_the_flag(
         "tracks": "broadcast/tracks@1.0.0",
         "quiet": "other/tracks@1.0.0",
     }
-    # Calling THROUGH an alias is resolution, and lands with three-segment
-    # names; recording the alias is what this checks.
+    # Calling THROUGH an alias (`tracks.quieter(...)`, `quiet.quieter(...)`) is
+    # compile-time resolution, covered in test_project.py; recording the two
+    # aliases here is all this checks.
 
 
 def test_an_alias_colliding_with_an_installed_namespace_is_refused(

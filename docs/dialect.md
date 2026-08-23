@@ -88,12 +88,32 @@ keeps the installed package's name and the version range together,
 never solved. An alias may not be reserved, and may not equal the
 namespace of any installed package.
 
-A query calls into the package: `imbcmdth.quieter(f.audio[1], 0.5)` as
-a value, `FROM imbcmdth.pick('a.mka') t` as a row source. The call is
-expanded exactly as a definition written into the query would be -
-same hygiene, same arity and type checks, same command out. Nothing is
-prepended to the script, and a package's names never enter the
-script's flat namespace.
+A query calls into an installed package one of three ways:
+
+- **Three segments**, `<namespace>.<package>.<member>(...)` -
+  `imbcmdth.audio.quieter(f.audio[1], 0.5)` - always valid, reaching any
+  export whatever a project's own `dependencies` say.
+- **Two segments**, `<namespace>.<package>(...)` - `imbcmdth.audio(...)`
+  - the package's DEFAULT export, the one `lib` names.
+- **Two segments through an alias**, `<alias>.<member>(...)` -
+  `tracks.pick(...)` when `dependencies` binds `tracks` to a package.
+  The default export is not reachable through an alias - write the
+  full three-segment path for that.
+
+Aliases and namespaces are disjoint by construction (`install` refuses
+an alias equal to an installed namespace), so a two-segment call is
+decidable: sqlmpeg tries it as an alias first, then as a
+namespace/package pair. `ffmpeg.<filter>` and `sqlmpeg.<macro>` stay
+two-part and reserved, and take precedence over all of this - they are
+never read as a package call.
+
+Called as a value (`imbcmdth.audio.quieter(...)`) or as a row source
+(`FROM imbcmdth.audio.pick('a.mka') t`), the call is expanded exactly
+as a definition written into the query would be - same hygiene, same
+arity and type checks, same command out. Nothing is prepended to the
+script, and a package's names never enter the script's flat namespace.
+A project's own definitions stay bare - `normalize(...)` inside the
+project that defines it; unqualified names are never a package lookup.
 
 `sqlmpeg list` prints what the project at the working directory and its
 dependencies provide: the packages with their layer, the exports with
@@ -143,10 +163,13 @@ Which the positional is, in order:
 
 A manifest declaring a program named for one of those four words is
 rejected where it is written: rule 1 would never let it be reached.
-`ns.program` says which package when a bare name matches programs in
-more than one; a bare name that does is rejected naming each `ns.program`
-it could mean. Variables still come from `-v name=value`; an unset one
-substitutes to `NULL` (see [Variables](#variables)), and a rejection at
+A program name may also be qualified: `<namespace>.<package>.<name>`
+names one package's `bins` entry, `<namespace>.<package>` its default
+`bin`. Either says which package when a bare name matches programs in
+more than one; a bare name that does is rejected naming each
+`<namespace>.<package>.<name>` it could mean. Variables still come
+from `-v name=value`; an unset one substitutes to `NULL` (see
+[Variables](#variables)), and a rejection at
 its point of use names what the program's `-- variables:` header
 declares.
 
@@ -470,9 +493,11 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   referencing anything but its parameters and its own `FROM` aliases, a
   definition in the query's own text that nothing calls, and a
   `TABLE`-returning call in the `SELECT` list.
-- **Packages**: a namespace no package claims; a member the package
-  does not export; a manifest that is not one JSON object with `name`
-  and `version`; a name that is not `<namespace>/<package>` in plain
+- **Packages**: a namespace no package claims; a namespace with no
+  package by that name; a call with no default export naming the
+  package's `libs` instead; a member the package does not export; a
+  manifest that is not one JSON object with `name` and `version`; a
+  name that is not `<namespace>/<package>` in plain
   identifiers, or whose namespace is reserved; a `lib`, `libs`, `bin`
   or `bins` value naming a pattern, a missing file, or a path outside
   the project; an exported name not defined in the file named for it;

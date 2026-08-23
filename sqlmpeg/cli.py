@@ -88,8 +88,9 @@ split-chapters -v source=film.mkv``). One rule decides which it is, in
 ``_resolve_query`` so every one of the four subcommands reads it the same
 way: text beginning with ``SELECT``, ``COPY``, ``CREATE`` or ``WITH`` is SQL,
 always; anything else that matches a program's name is that program's file;
-anything else is SQL and fails as it always did. ``ns.program`` says which
-package when two ship one name.
+anything else is SQL and fails as it always did. ``ns.pkg.program`` names one
+package's ``bins`` entry, ``ns.pkg`` its default ``bin``; either says which
+package when a bare name matches more than one.
 
 A compile can also have something to say short of refusing: a call that
 resolved to a machine-wide package rather than to one this project installed,
@@ -430,12 +431,19 @@ def _starts_a_statement(text: str) -> bool:
     return word is not None and word.group().lower() in STATEMENT_KEYWORDS
 
 
+def _qualified_program(package: Package, program: str) -> str:
+    """`program` written the way `run` reaches it: two segments for the default, three otherwise."""
+    if program == package.package:
+        return f"{package.namespace}.{package.package}"
+    return f"{package.namespace}.{package.package}.{program}"
+
+
 def _program_names(packages: PackageSet | None) -> list[str]:
-    """Every program the discovered packages ship, written as ``ns.program``."""
+    """Every program the discovered packages ship, each qualified."""
     if packages is None:
         return []
     return [
-        f"{package.namespace}.{program}"
+        _qualified_program(package, program)
         for name in packages.names()
         for package in [_package(packages, name)]
         for program in package.programs
@@ -451,18 +459,21 @@ def _package(packages: PackageSet, name: str) -> Package:
 def _matching_programs(name: str, packages: PackageSet | None) -> list[tuple[Package, str]]:
     """The (package, program name) pairs `name` names, qualified or bare.
 
-    A qualified ``ns.program`` is matched against every package under `ns` --
-    the interim two-part rule, which three-segment names replace.
+    Three segments (``ns.pkg.program``) name one package's `bins` entry; two
+    (``ns.pkg``) name its default `bin`. A bare name is looked up across every
+    installed package, which may match more than one.
     """
     if packages is None:
         return []
-    namespace, dot, unqualified = name.partition(".")
-    if dot:
-        return [
-            (package, unqualified)
-            for package in packages.in_namespace(namespace)
-            if package.program(unqualified) is not None
-        ]
+    parts = name.split(".")
+    if len(parts) in (2, 3):
+        namespace, package_name = parts[0], parts[1]
+        package = packages.find(namespace, package_name)
+        if package is None:
+            return []
+        member = parts[2] if len(parts) == 3 else None
+        program = package.program(member)
+        return [] if program is None else [(package, package.package if member is None else member)]
     found: list[tuple[Package, str]] = []
     for claimed in packages.names():
         package = _package(packages, claimed)
@@ -481,7 +492,7 @@ def _program_text(name: str, packages: PackageSet | None) -> str | None:
     if not found:
         return None
     if len(found) > 1:
-        written = ", ".join(f"{package.namespace}.{program}" for package, program in found)
+        written = ", ".join(_qualified_program(package, program) for package, program in found)
         raise SqlmpegError(
             ErrorCode.UNSUPPORTED_SQL,
             f"more than one package ships a program named '{name}'",
@@ -495,7 +506,7 @@ def _program_text(name: str, packages: PackageSet | None) -> str | None:
     except OSError as err:
         raise SqlmpegError(
             ErrorCode.UNSUPPORTED_SQL,
-            f"program '{package.namespace}.{program}' could not be read: "
+            f"program '{_qualified_program(package, program)}' could not be read: "
             f"{err.strerror or err}",
             hint=f"its file is {file}",
         ) from err
@@ -1303,11 +1314,10 @@ def _cmd_init(args: argparse.Namespace, on_warning: OnWarning) -> int:
         )
         return 1
 
-    namespace = name.partition("/")[0]
     print(f"wrote {MANIFEST_NAME}, {LOCKFILE_NAME} and {_STARTER_FILE} in {directory}")
     print(
-        f"package '{name}' (namespace from {namespace_source}); a query calls its "
-        f"functions as {namespace}.name()"
+        f"package '{name}' (namespace from {namespace_source}); a project that installs "
+        f"it calls its functions as {name.replace('/', '.')}.name()"
     )
     print(
         f"run the starter program: sqlmpeg run {_STARTER_PROGRAM} "
@@ -1432,11 +1442,16 @@ def _cmd_install(args: argparse.Namespace, on_warning: OnWarning) -> int:
             f"  recorded in {installed.manifest.name} as a dependency, "
             f"alias '{installed.alias}'"
         )
-    namespace = release.name.partition("/")[0]
-    print(
-        f"a query calls it as {namespace}.name() -- "
-        "`sqlmpeg list` shows what it provides"
-    )
+    full = release.name.replace("/", ".")
+    if installed.alias is not None:
+        print(
+            f"a query calls it as {installed.alias}.<name>(), or {full}.<name>() -- "
+            "`sqlmpeg list` shows what it provides"
+        )
+    else:
+        print(
+            f"a query calls it as {full}.<name>() -- `sqlmpeg list` shows what it provides"
+        )
     return 0
 
 
