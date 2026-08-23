@@ -230,7 +230,7 @@ version, and per version the archive's sha256 and size), and
 `archives/<sha256>` is the archive. There is no service and no API
 beyond those files.
 
-The base URL is one setting, `https://imbcmdth.github.io/sqlmpeg-registry`,
+The base URL is one setting, `https://want.video`,
 overridden by the `SQLMPEG_REGISTRY` environment variable. It may also
 be a `file://` URL or a plain directory path holding those same files,
 which is what a private registry behind any static host is.

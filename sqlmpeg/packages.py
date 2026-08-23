@@ -84,7 +84,7 @@ __all__ = [
 ]
 
 # Where packages come from unless the environment says otherwise.
-DEFAULT_REGISTRY = "https://imbcmdth.github.io/sqlmpeg-registry"
+DEFAULT_REGISTRY = "https://want.video"
 
 REGISTRY_ENV = "SQLMPEG_REGISTRY"
 
