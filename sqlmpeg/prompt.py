@@ -306,6 +306,25 @@ _DIALECT_TAIL = """\
   fill -- avoid its gaps with an `INNER`/`LEFT` join that never selects the
   missing side.
 
+### Variables
+- `:'name'` (string literal), `:"name"` (identifier) and bare `:name` (raw
+  text) are psql-style references, filled at compile time by `-v name=value`
+  (the MCP tools' `vars`). An UNSET reference substitutes to `NULL`.
+- NULL is absence: a NULL in any option position -- filter option
+  (positional or named, `enable` included), source option, `input()` option,
+  `WITH (...)` option -- means the option is not written and ffmpeg's own
+  default applies. So an optional knob is just `crf :crf` or
+  `scale(v, :w, :h)`: leave the variable unset and the option disappears; a
+  dropped positional still occupies its slot, nothing shifts.
+- What cannot be absent rejects at compile time, naming the variable:
+  `input()`'s path, `COPY`'s destination, a stream position, and a few
+  filters' required options (`subtitles`' `filename`, `drawtext`'s
+  `text`/`textfile`, `frei0r`'s `filter_name`, ...).
+- A tag column written NULL CLEARS the tag, so `:'title' AS title` unset
+  clears; "keep unless told otherwise" is
+  `COALESCE(:'title', f.tags.title) AS title`.
+- A `-v` for a name the text never references is a usage error.
+
 ### Chapters
 - `chapters` is an array column of the input alias, an array of records;
   unnest it like a track array: `FROM input('film.mkv') f,

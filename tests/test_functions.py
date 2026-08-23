@@ -271,7 +271,7 @@ def test_a_function_reads_a_command_line_variable() -> None:
     sql = substitute(
         FIRST_TRACK + "COPY (SELECT first_track(:'src')) TO 'out.mka'",
         {"src": "a.mka"},
-    )
+    ).text
     assert _argv(sql) == ["ffmpeg", "-i", "a.mka", "-map", "0:a:0", "-c:0", "copy", "out.mka"]
 
 

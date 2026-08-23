@@ -117,11 +117,27 @@ def test_validate_error_object_survives_json_round_trip() -> None:
     assert json.loads(json.dumps(result)) == result
 
 
-def test_validate_reports_an_undefined_variable_instead_of_raising() -> None:
+def test_validate_reports_an_unset_variable_instead_of_raising() -> None:
+    # Unset means NULL; input() cannot take an absent path, and the error
+    # names the variable.
     result = tools.validate_query("COPY (SELECT a.video[1] FROM input(:'src') a) TO 'o.mp4'")
     _validate(result, _load_schema())
     assert result["code"] == ErrorCode.UNSUPPORTED_SQL.value
-    assert ":src" in str(result["message"])
+    assert result["message"] == "':src' was not set"
+
+
+def test_validate_reports_an_unreferenced_vars_entry() -> None:
+    result = tools.validate_query(MEDIA_QUERY, {"nope": "1"})
+    _validate(result, _load_schema())
+    assert result["code"] == ErrorCode.UNSUPPORTED_SQL.value
+    assert "'nope'" in str(result["message"])
+    assert "never references" in str(result["message"])
+
+
+def test_compile_drops_an_unset_optional_variable() -> None:
+    query = "COPY (SELECT scale(a.video[1], :w, 480) FROM input('in.mp4') a) TO 'o.mp4'"
+    result = tools.compile_query(query)
+    assert "scale=height=480" in result["filter_complex"][0]
 
 
 @pytest.mark.parametrize(

@@ -1600,3 +1600,55 @@ ffmpeg -i tests/fixtures/av-2eng.mp4 -i tests/fixtures/av2.mp4 -map 1:v:0 -c:0 c
 
 The call contributes its body's rows, so everything that applies to a CTE applies here - cross joins, `WHERE`, grouping, the one-row rule. Calling a table-returning function in the `SELECT` list is rejected: reading a field off the call would read it once per field, minting one input per read.
 
+## 69. Leave a knob unset
+
+An unset variable is `NULL`, and NULL in an option position means the option is not written - ffmpeg's own default applies. One query serves every combination of knobs: here only the height is set, so `scale` gets no `width` and nothing shifts, the positions hold:
+
+```pgsql
+COPY (
+  SELECT scale(f.video[1], :w, :h), f.audio[1]
+  FROM input(:'source') f
+) TO :'dest'
+```
+$ sqlmpeg compile -f query.sql -v h=480 -v source=film.mp4 -v dest=small.mp4
+ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=height=480[out0]' -map '[out0]' -map 0:a:0 -c:1 copy small.mp4
+```
+$ sqlmpeg compile -f query.sql -v h=480 -v source=film.mp4 -v dest=small.mp4
+ffmpeg -i film.mp4 -filter_complex '[0:v:0]scale=height=480[out0]' -map '[out0]' -map \
+  0:a:0 -c:1 copy small.mp4
+```
+
+The same rule at the sink: an unset `crf` writes no `-crf`, the encoder decides, while the options that were set are written as usual:
+
+```sql
+COPY (
+  SELECT f.video[1], f.audio[1]
+  FROM input(:'source') f
+) TO :'dest' WITH (video_codec 'libx264', crf :crf, preset :'preset')
+```
+$ sqlmpeg compile -f query.sql -v preset=fast -v source=film.mkv -v dest=out.mkv
+ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:1 copy -c:0 libx264 -preset:0 fast out.mkv
+```
+$ sqlmpeg compile -f query.sql -v preset=fast -v source=film.mkv -v dest=out.mkv
+ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:1 copy -c:0 libx264 -preset:0 fast out.mkv
+```
+
+Tags are the one place absence acts: writing a tag column with NULL clears the tag, so `:'artist' AS artist` unset clears the artist. "Keep unless told otherwise" is ordinary SQL - `COALESCE(:'title', f.tags.title)` falls back to the file's own title when `:title` is unset:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1],
+         :'artist' AS artist,
+         COALESCE(:'title', f.tags.title) AS title
+  FROM input('tests/fixtures/tagged.mp4') f
+) TO :'dest'
+```
+$ sqlmpeg compile -f query.sql -v dest=out.mkv
+ffmpeg -i tests/fixtures/tagged.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata artist= -metadata 'title=Angel One' out.mkv
+```
+$ sqlmpeg compile -f query.sql -v dest=out.mkv
+ffmpeg -i tests/fixtures/tagged.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata \
+  artist= -metadata 'title=Angel One' out.mkv
+```
+
+Where a value is required - `input()`'s path, `COPY`'s destination, a stream position, `subtitles`' `filename` - an unset variable is a compile-time rejection that names it: `':source' was not set`.

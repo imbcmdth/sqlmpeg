@@ -1089,13 +1089,16 @@ def test_malformed_v_exits_2(bad_pair: str, capsys: pytest.CaptureFixture[str]) 
 
 
 def test_missing_var_through_compile(capsys: pytest.CaptureFixture[str]) -> None:
+    # An unset variable is NULL; input() cannot take an absent path, and the
+    # rejection names the variable.
     code = cli.main(["compile", VAR_QUERY])
     captured = capsys.readouterr()
     assert code == 1
     assert captured.out == ""
     assert captured.err.startswith("error: ")
     assert "UNSUPPORTED_SQL" in captured.err
-    assert "path" in captured.err
+    assert "':path' was not set" in captured.err
+    assert "-v path=" in captured.err
 
 
 def test_missing_var_through_validate_json(capsys: pytest.CaptureFixture[str]) -> None:
@@ -1105,7 +1108,7 @@ def test_missing_var_through_validate_json(capsys: pytest.CaptureFixture[str]) -
 
     data = json.loads(captured.out)
     assert data["code"] == "UNSUPPORTED_SQL"
-    assert "path" in data["message"]
+    assert data["message"] == "':path' was not set"
 
 
 def test_naked_dispatch_accepts_v(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -1118,11 +1121,37 @@ def test_naked_dispatch_accepts_v(tmp_path: Path, capsys: pytest.CaptureFixture[
     assert "(1 row)" in captured.out
 
 
-def test_unused_v_is_silent(capsys: pytest.CaptureFixture[str]) -> None:
+def test_unreferenced_v_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    # The check reversed: an unset reference is legal (NULL), so a -v naming
+    # a variable the text never references is the mistake worth catching.
     code = cli.main(["compile", MEDIA_QUERY, "-v", "unused=1"])
     captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out == ""
+    assert "unused=..." in captured.err
+    assert "never references" in captured.err
+    assert "it references no variables" in captured.err
+
+
+def test_unreferenced_v_names_what_the_query_references(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code = cli.main(["compile", MEDIA_VAR_QUERY, "-v", "paht=x.mp4"])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "paht=..." in captured.err
+    assert "it references :path" in captured.err
+
+
+def test_an_unset_optional_variable_compiles_to_absence(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    query = "COPY (SELECT scale(a.video[1], :w, :h) FROM input('x.mp4') a) TO 'o.mp4'"
+    code = cli.main(["compile", query, "-v", "h=480"])
+    out = capsys.readouterr().out
     assert code == 0
-    assert captured.err == ""
+    assert "scale=height=480" in out
+    assert "width" not in out
 
 
 def test_v_accepted_on_explain(capsys: pytest.CaptureFixture[str]) -> None:

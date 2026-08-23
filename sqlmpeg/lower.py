@@ -328,6 +328,7 @@ from sqlmpeg.parser import (
     map_noun,
     map_path,
     map_ref,
+    null_variable,
     record_cast_type,
     record_unnest_hint,
     references_row_alias,
@@ -380,6 +381,7 @@ from sqlmpeg.types import (
     TIME_COLUMN,
     RowColumnType,
 )
+from sqlmpeg.vars import unset_error
 
 __all__ = ["lower", "lower_table"]
 
@@ -522,6 +524,24 @@ _NO_TIMELINE_HINT = (
     "(the T column of `ffmpeg -filters`: gblur has it, scale does not); drop it, "
     "or express the timing with a WHERE window over the input"
 )
+
+# Options a filter cannot run without. ffmpeg has no required-option
+# metadata -- AVOption carries no such flag; each filter enforces its own in
+# init() -- so this table is hand-kept, curated knowledge like MACROS. Each
+# value is a tuple of groups; a group is satisfied when any one of its names
+# is written (drawtext runs on `text` OR `textfile`). xfade's conditional
+# requirement -- `expr`, only when `transition` is 'custom' -- cannot be a
+# name list and lives in `_check_required_options` directly.
+REQUIRED_OPTIONS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "subtitles": (("filename",),),
+    "lut3d": (("file",),),
+    "frei0r": (("filter_name",),),
+    # plugin only matters when the library holds more than one; file always.
+    "ladspa": (("file",),),
+    "movie": (("filename",),),
+    "amovie": (("filename",),),
+    "drawtext": (("text", "textfile"),),
+}
 
 # Longest option/constant list a hint or message renders before it stops
 # counting (xfade's `transition` alone has 59 constants).
@@ -2518,6 +2538,11 @@ class _Lowerer:
         option_nodes: dict[str, exp.Expr] = {}
         metadata_from_opt: RawSinkOption | None = None
         for option in raw.options:
+            if isinstance(_unwrap(option.value), exp.Null):
+                # NULL is absence: the option is not written, the encoder's /
+                # muxer's own default applies, and the option table never
+                # sees the value.
+                continue
             if option.name == "metadata_from":
                 metadata_from_opt = option
                 continue
@@ -2650,6 +2675,10 @@ class _Lowerer:
 
     def _null_field(self, expression: exp.Expr, env: _Env, anchor: exp.Select) -> str:
         """Which column of the path expression read NULL, for the message."""
+        for sub in expression.walk():
+            variable = null_variable(sub)
+            if variable is not None:
+                return f"':{variable}' was not set"
         for sub in expression.walk():
             if not isinstance(sub, exp.Column):
                 continue
@@ -3019,6 +3048,8 @@ class _Lowerer:
         for alias, raw_options in self.res.input_options.items():
             options: dict[str, object] = {}
             for option in raw_options:
+                if isinstance(_unwrap(option.value), exp.Null):
+                    continue  # NULL is absence: the option is not written
                 line, col = _pos(option.name_node, option.value, option.path_node)
                 options[option.name] = validate_input_option(
                     option.name, _input_value(option.value), line=line, col=col
@@ -4361,6 +4392,7 @@ class _Lowerer:
         # No `timeline=`: SourceFilter has no such field, because a generator
         # is never timeline-capable -- there is no upstream frame to switch
         # on/off. `enable => ...` on a source rejects unconditionally.
+        dropped: dict[str, exp.Expr] = {}
         args = self._check_named_args(
             raw.name,
             options,
@@ -4368,7 +4400,9 @@ class _Lowerer:
             raw.call_node,
             owner=f"{FILTER_NAMESPACE}.{raw.name}",
             occupied=set(),
+            dropped=dropped,
         )
+        self._check_required_options(raw.name, args, dropped, raw.call_node, select)
         env.bindings[alias] = _SourceBinding(
             alias=alias, name=raw.name, output=source.output, options=args
         )
@@ -4839,6 +4873,14 @@ class _Lowerer:
             return self._row_value_of(value, env, rows, select)
         if isinstance(value, exp.Case):
             return self._eval_case(value, env, rows, select)
+        if isinstance(value, exp.Coalesce) and is_value_expr(value):
+            # A value COALESCE (first argument a value, never a stream): the
+            # first non-NULL argument, or NULL when every one is absent.
+            for argument in [value.this, *value.args.get("expressions", [])]:
+                result = self._eval_value(argument, env, rows, select)
+                if result is not None:
+                    return result
+            return None
         if isinstance(value, exp.DPipe):
             return self._eval_concat(value, env, rows, select)
         if isinstance(value, _ARITHMETIC):
@@ -6042,6 +6084,7 @@ class _Lowerer:
         )
         self._check_fill_type(source.output, call.display, binding, node, select)
         options = self._filter_options(name, node, select)
+        dropped: dict[str, exp.Expr] = {}
         args = self._check_named_args(
             name,
             options,
@@ -6049,7 +6092,9 @@ class _Lowerer:
             node,
             owner=f"{FILTER_NAMESPACE}.{name}",
             occupied=set(),
+            dropped=dropped,
         )
+        self._check_required_options(name, args, dropped, node, select)
         for option, value in self._inherited_fill_options(binding.type, paired).items():
             if value is None or option in args or option not in options:
                 continue
@@ -6707,6 +6752,7 @@ class _Lowerer:
             )
         stream_pos = macro.stream_positions[0]
         stream_param = macro.params[stream_pos]
+        self._reject_null_stream(call.display, call.args[stream_pos], select)
         kind = self._classify(call.args[stream_pos], env, select)
         self._reject_passthrough_args(call.display, [kind], call, call.args[stream_pos])
         if kind != stream_param.stream_type:
@@ -7160,6 +7206,8 @@ class _Lowerer:
         classifier. A short call classifies what it has, so the caller's
         comparison against the pad signature reports the missing argument.
         """
+        for arg in call.args[:arity]:
+            self._reject_null_stream(call.display, arg, select)
         kinds = [self._classify(arg, env, select) for arg in call.args[:arity]]
         if kinds:
             self._reject_passthrough_args(call.display, kinds, call, call.args[0])
@@ -7356,9 +7404,17 @@ class _Lowerer:
                 else f"the '{filter_name}' filter has no options sqlmpeg can set",
             )
         bound: dict[str, object] = {}
+        dropped: dict[str, exp.Expr] = {}
         for index, arg in enumerate(extras):
             option = options[order[index]]
             self._reject_stream_option(filter_name, option, arg, node, env, select)
+            if isinstance(_unwrap(arg), exp.Null):
+                # NULL is absence: the option is not written and ffmpeg's own
+                # default applies. The position stays occupied, so later
+                # positionals keep their slots and a named repeat still
+                # collides. `_option_value` never sees a NULL.
+                dropped[option.name] = arg
+                continue
             bound[option.name] = _option_value(
                 filter_name, option, _NamedArg(name=option.name, value=arg), node
             )
@@ -7369,10 +7425,12 @@ class _Lowerer:
                 call.named,
                 node,
                 owner=call.display,
-                occupied=set(bound),
+                occupied=set(bound) | set(dropped),
                 timeline=timeline,
+                dropped=dropped,
             )
         )
+        self._check_required_options(filter_name, bound, dropped, node, select)
         return bound
 
     def _expand_call(
@@ -7472,8 +7530,15 @@ class _Lowerer:
         owner: str,
         occupied: set[str],
         timeline: bool = False,
+        dropped: dict[str, exp.Expr] | None = None,
     ) -> dict[str, object]:
         """Validate every named argument against `options`, in written order.
+
+        A NULL value -- an unset variable's, or a literal one -- means the
+        option is not written: it is recorded in `dropped` (when the caller
+        passes one) and never reaches `_option_value`. An UNKNOWN name still
+        rejects whatever its value, NULL included: the name is wrong before
+        the value matters.
 
         `occupied` holds the option names this call already bound
         POSITIONALLY, so ``crop(f, 100, 50, 10, 20, out_w => 5)`` reads as the
@@ -7505,7 +7570,12 @@ class _Lowerer:
                     hint="a named argument never overrides what the call itself "
                     "set; drop one of the two spellings",
                 )
+            is_null = isinstance(_unwrap(arg.value), exp.Null)
             if arg.name == _ENABLE:
+                if is_null:
+                    if dropped is not None:
+                        dropped[_ENABLE] = arg.value
+                    continue
                 checked[_ENABLE] = _enable_value(filter_name, arg, call, timeline)
                 continue
             option = options.get(arg.name)
@@ -7517,8 +7587,93 @@ class _Lowerer:
                     fallback=call,
                     hint=_option_hint(arg.name, options),
                 )
+            if is_null:
+                if dropped is not None:
+                    dropped[arg.name] = arg.value
+                continue
             checked[arg.name] = _option_value(filter_name, option, arg, call)
         return checked
+
+    def _check_required_options(
+        self,
+        filter_name: str,
+        bound: dict[str, object],
+        dropped: dict[str, exp.Expr],
+        node: exp.Expr,
+        select: exp.Select,
+    ) -> None:
+        """The curated :data:`REQUIRED_OPTIONS` check, on what was WRITTEN.
+
+        A NULL dropped the option before this runs, so an unset variable and
+        an omitted option fail the same way -- ffmpeg's init() would refuse
+        both at run time, and this says so at compile time, naming the
+        variable when the NULL came from one.
+        """
+        required: list[tuple[tuple[str, ...], str]] = [
+            (group, "") for group in REQUIRED_OPTIONS.get(filter_name, ())
+        ]
+        if filter_name == "xfade" and bound.get("transition") == "custom":
+            required.append((("expr",), " when transition is 'custom'"))
+        for group, because in required:
+            if any(option in bound for option in group):
+                continue
+            option_name = next((o for o in group if o in dropped), None)
+            if option_name is not None:
+                anchor = dropped[option_name]
+                variable = null_variable(_unwrap(anchor))
+                if variable is not None:
+                    line, col = _pos(anchor, node)
+                    raise unset_error(
+                        ErrorCode.FILTER_OPTION_TYPE,
+                        variable,
+                        what=f"option '{option_name}' of filter "
+                        f"'{filter_name}' is required{because}",
+                        line=line,
+                        col=col,
+                    )
+                raise _error(
+                    ErrorCode.FILTER_OPTION_TYPE,
+                    f"option '{option_name}' of filter '{filter_name}' is "
+                    f"required{because}, got NULL",
+                    anchor,
+                    fallback=node,
+                    hint="NULL is absence, and this filter cannot run "
+                    "without the option; write a value",
+                )
+            spelled = " or ".join(f"'{option}'" for option in group)
+            raise _error(
+                ErrorCode.FILTER_OPTION_TYPE,
+                f"filter '{filter_name}' requires option {spelled}{because}",
+                node,
+                fallback=select,
+                hint=f"ffmpeg would refuse the filter at run time; write "
+                f"{group[0]} => <value>",
+            )
+
+    def _reject_null_stream(
+        self, display: str, arg: exp.Expr, select: exp.Select
+    ) -> None:
+        """A NULL where a stream input belongs: absence has no stream to offer."""
+        inner = _unwrap(arg)
+        if not isinstance(inner, exp.Null):
+            return
+        variable = null_variable(inner)
+        if variable is not None:
+            line, col = _pos(inner, select)
+            raise unset_error(
+                ErrorCode.UDF_ARG_TYPE,
+                variable,
+                what=f"{display}() needs a stream in this position",
+                line=line,
+                col=col,
+            )
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{display}() takes a stream in this position, got NULL",
+            inner,
+            fallback=select,
+            hint="a stream input cannot be absent; pass one, e.g. f.video[1]",
+        )
 
     def _unknown_function_hint(self, name: str) -> str:
         """Did-you-mean over the registry (there is nothing else)."""
@@ -7716,6 +7871,8 @@ class _Lowerer:
         result = self._lower_table_query(list(raw.branches), raw.query)
         header = False
         for option in raw.options:
+            if isinstance(_unwrap(option.value), exp.Null):
+                continue  # NULL is absence: the option is not written
             line, col = _pos(option.name_node, option.value, raw.path_node)
             value = validate_csv_option(option.name, _sink_value(option.value), line=line, col=col)
             if option.name == "header":

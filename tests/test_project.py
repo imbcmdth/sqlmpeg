@@ -2052,7 +2052,7 @@ def test_an_undefined_variable_names_what_the_program_declares(
         tmp_path, monkeypatch, capsys, "validate", "split-chapters", "-v", "source=in.mkv"
     )
     assert code == 1
-    assert "undefined variable ':dest'" in err
+    assert "':dest' was not set" in err
     assert "'split-chapters' declares source, dest" in err
 
 

@@ -43,7 +43,7 @@ from ..ir import Graph, SinkUnit
 from ..project import LOCKFILE_NAME, MANIFEST_NAME, PackageSet, discover, find_lockfile
 from ..prompt import build_system_prompt
 from ..table import TableResult, render_csv, render_table
-from ..vars import substitute
+from ..vars import Substitution, referenced, substitute
 from ..warnings import OnWarning, WarningLog
 
 __all__ = [
@@ -72,9 +72,32 @@ _NO_PATH_MESSAGE = "a sink in this query names no destination path"
 _NO_PATH_HINT = "give every COPY a TO '<path>'; TO STDOUT has no file to write"
 
 
-def _prepare(query: str, variables: dict[str, str] | None) -> str:
-    """The query text with its :name references substituted."""
-    return substitute(query, dict(variables or {}))
+def _prepare(query: str, variables: dict[str, str] | None) -> Substitution:
+    """`query` with its :name references substituted.
+
+    An UNSET reference becomes NULL -- absence, judged by the compile itself
+    -- so the check points the other way: a `vars` entry for a name the query
+    never references is the rejection, naming what the query does reference.
+    """
+    supplied = dict(variables or {})
+    names = referenced(query)
+    unknown = sorted(name for name in supplied if name not in names)
+    if unknown:
+        written = ", ".join(f"'{name}'" for name in unknown)
+        verb = "names a variable" if len(unknown) == 1 else "name variables"
+        listed = (
+            "it references " + ", ".join(f":{name}" for name in sorted(names))
+            if names
+            else "it references no variables"
+        )
+        raise SqlmpegError(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"vars {written} {verb} the query never references",
+            line=1,
+            col=1,
+            hint=f"drop the entry, or fix the query text; {listed}",
+        )
+    return substitute(query, supplied)
 
 
 def _packages(project: str | None) -> PackageSet | None:
@@ -140,16 +163,18 @@ def compile_query(
     query: str, variables: dict[str, str] | None = None, project: str | None = None
 ) -> dict[str, Any]:
     """The ffmpeg command(s) `query` compiles to."""
-    text = _prepare(query, variables)
+    sub = _prepare(query, variables)
     packages = _packages(project)
     warnings = WarningLog()
     try:
-        graphs = compile_commands(text, packages=packages, on_warning=warnings)
+        graphs = compile_commands(
+            sub.text, packages=packages, on_warning=warnings, unset=sub.unset
+        )
     except SqlmpegError:
         # A query with no streaming representation fails here; table mode is
         # the fallback, tried only for a query that could BE one. If it is,
         # the refusal names the tool that handles it.
-        if _is_table_query(text, packages, warnings):
+        if _is_table_query(sub.text, packages, warnings):
             raise _table_error() from None
         raise
     # A bare SELECT compiles, but names no destination -- compile never
@@ -180,22 +205,22 @@ def validate_query(
     A query that compiled with something to say answers with a ``warnings``
     array and no ``code``; an error always carries one.
     """
-    text: str | None = None
+    sub: Substitution | None = None
     packages: PackageSet | None = None
     compiling = False
     warnings = WarningLog()
     try:
-        text = _prepare(query, variables)
+        sub = _prepare(query, variables)
         # Inside the try: a malformed manifest is a rejection like any other,
         # and this tool returns every rejection as data.
         packages = _packages(project)
         compiling = True
-        compile_commands(text, packages=packages, on_warning=warnings)
+        compile_commands(sub.text, packages=packages, on_warning=warnings, unset=sub.unset)
     except SqlmpegError as err:
         # The table fallback answers only for a query that failed to COMPILE.
-        # An undefined :name or a malformed manifest failed before that, and
-        # is the answer itself.
-        if compiling and text is not None and _is_table_query(text, packages, warnings):
+        # An unreferenced `vars` name or a malformed manifest failed before
+        # that, and is the answer itself.
+        if compiling and sub is not None and _is_table_query(sub.text, packages, warnings):
             return _warnings_only(warnings)
         return err.to_dict()
     except Exception as err:  # no input may make a validate call fail
@@ -214,8 +239,9 @@ def explain_query(
 ) -> dict[str, Any]:
     """The IR graph `query` compiles to, one per ffmpeg command."""
     warnings = WarningLog()
+    sub = _prepare(query, variables)
     graphs = compile_commands(
-        _prepare(query, variables), packages=_packages(project), on_warning=warnings
+        sub.text, packages=_packages(project), on_warning=warnings, unset=sub.unset
     )
     return {"graphs": [graph.to_dict() for graph in graphs], "warnings": _reported(warnings)}
 
@@ -233,15 +259,17 @@ def inspect_query(
     query: str, variables: dict[str, str] | None = None, project: str | None = None
 ) -> dict[str, Any]:
     """The rows of a table query: what tracks, chapters, cues or attachments a file has."""
-    text = _prepare(query, variables)
+    sub = _prepare(query, variables)
     packages = _packages(project)
     warnings = WarningLog()
-    is_table_capable, _has_copy = classify(text, packages=packages, on_warning=warnings)
+    is_table_capable, _has_copy = classify(
+        sub.text, packages=packages, on_warning=warnings, unset=sub.unset
+    )
     if not is_table_capable:
         raise SqlmpegError(
             ErrorCode.UNSUPPORTED_SQL, _MEDIA_MESSAGE, line=1, col=1, hint=_MEDIA_HINT
         )
-    sinks = compile_table_sql(text, packages=packages, on_warning=warnings)
+    sinks = compile_table_sql(sub.text, packages=packages, on_warning=warnings, unset=sub.unset)
     return {
         "warnings": _reported(warnings),
         "results": [
@@ -329,14 +357,16 @@ def run_query(
     project: str | None = None,
 ) -> dict[str, Any]:
     """Compile `query` and run ffmpeg, writing the files its COPY names."""
-    text = _prepare(query, variables)
+    sub = _prepare(query, variables)
     packages = _packages(project)
     warnings = WarningLog()
-    is_table_capable, _has_copy = classify(text, packages=packages, on_warning=warnings)
+    is_table_capable, _has_copy = classify(
+        sub.text, packages=packages, on_warning=warnings, unset=sub.unset
+    )
     if is_table_capable:
         raise _table_error()
 
-    graphs = compile_commands(text, packages=packages, on_warning=warnings)
+    graphs = compile_commands(sub.text, packages=packages, on_warning=warnings, unset=sub.unset)
     if any(unit.path is None for unit in _sinks(graphs)):
         raise SqlmpegError(
             ErrorCode.UNSUPPORTED_SQL, _NO_PATH_MESSAGE, line=1, col=1, hint=_NO_PATH_HINT

@@ -1577,10 +1577,10 @@ def test_an_unknown_nested_call_in_an_option_slot_still_names_it() -> None:
     assert "nope()" in err.message
 
 
-def test_non_literal_scalar_argument_is_rejected() -> None:
-    err = _reject("SELECT gblur(a.video[1], NULL) FROM input('x.mp4') a")
-    assert err.code is ErrorCode.FILTER_OPTION_TYPE
-    assert "'sigma' of filter 'gblur' expects a number" in err.message
+def test_a_null_scalar_argument_drops_the_option() -> None:
+    """NULL is absence: the option is not written and ffmpeg's default stands."""
+    g = _lower("SELECT gblur(a.video[1], NULL) FROM input('x.mp4') a")
+    assert g.nodes["n1"].args == {}
 
 
 def test_arithmetic_scalar_argument_is_folded() -> None:
@@ -2327,7 +2327,6 @@ def test_unknown_sink_option_suggests_the_near_miss() -> None:
         ("crf true", "expects an int, got True"),
         ("faststart 1", "expects a bool, got 1"),
         ("faststart 'yes'", "expects a bool, got 'yes'"),
-        ("faststart NULL", "expects a bool, got NULL"),
         # a bare word and a double-quoted word are neither a string nor a bool
         ("preset slow", "expects a str, got the bare word slow"),
         ('preset "slow"', 'expects a str, got the identifier "slow"'),
@@ -4792,12 +4791,13 @@ def test_ladspa_takes_any_number_of_streams_and_emits_no_count_option(
     _registry: Registry,
 ) -> None:
     g = _dyn(
-        "SELECT ladspa(a.audio[1], a.audio[2]) FROM input('x.mp4') a", _registry
+        "SELECT ladspa(a.audio[1], a.audio[2], file => 'amp') FROM input('x.mp4') a",
+        _registry
     )
     node = g.nodes["n1"]
     assert node.filter == "ladspa"
     assert node.inputs == ["src:a:a:0", "src:a:a:1"]
-    assert node.args == {}
+    assert node.args == {"file": "amp"}
     assert "inputs" not in node.args
 
 
@@ -9452,10 +9452,11 @@ def test_a_computed_named_argument_is_evaluated_per_row() -> None:
 
 
 def test_a_computed_argument_still_meets_the_option_table() -> None:
+    """Evaluating to a value, not to NULL, still faces the option's type."""
     err = _reject_lower(
         "SELECT gblur(t, t.tags.language || 'x') "
         "FROM input('f.mkv') f, unnest(f.video) t",
-        {"f": ProbeResult(streams=[_track("video", 0, width=320)])},
+        {"f": ProbeResult(streams=[_track("video", 0, width=320, language="eng")])},
     )
     assert err.code is ErrorCode.FILTER_OPTION_TYPE
     assert "'sigma' of filter 'gblur' expects a number" in err.message
@@ -10332,3 +10333,251 @@ def test_a_chapter_list_still_needs_its_span() -> None:
     with pytest.raises(SqlmpegError) as excinfo:
         compile_sql(query)
     assert "'chapters.end_t' must be a number, got NULL" in excinfo.value.message
+
+
+# ---------------------------------------------------------------------------
+# NULL is absence: unset variables drop options, required positions reject
+# ---------------------------------------------------------------------------
+
+from sqlmpeg.vars import substitute as _substitute  # noqa: E402
+
+
+def _compile_vars(sql: str, variables: dict[str, str] | None = None) -> Graph:
+    sub = _substitute(sql, variables or {})
+    return compile_sql(sub.text, unset=sub.unset)
+
+
+def _compile_vars_error(sql: str, variables: dict[str, str] | None = None) -> SqlmpegError:
+    sub = _substitute(sql, variables or {})
+    with pytest.raises(SqlmpegError) as excinfo:
+        compile_sql(sub.text, unset=sub.unset)
+    return excinfo.value
+
+
+def _only_filter(g: Graph, name: str):
+    found = [node for node in g.nodes.values() if node.filter == name]
+    assert len(found) == 1
+    return found[0]
+
+
+def test_unset_positional_option_drops_and_the_next_slot_holds() -> None:
+    g = _compile_vars(
+        "COPY (SELECT scale(f.video[1], :w, :h) FROM input('a.mkv') f) TO 'o.mp4'",
+        {"h": "480"},
+    )
+    assert _only_filter(g, "scale").args == {"height": 480}
+
+
+def test_literal_null_positional_option_drops_identically() -> None:
+    g = compile_sql(
+        "COPY (SELECT scale(f.video[1], NULL, 480) FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert _only_filter(g, "scale").args == {"height": 480}
+
+
+def test_unset_named_option_drops() -> None:
+    g = _compile_vars(
+        "COPY (SELECT scale(f.video[1], width => :w, height => 480) "
+        "FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert _only_filter(g, "scale").args == {"height": 480}
+
+
+def test_dropped_position_still_occupies_its_slot() -> None:
+    err = _compile_vars_error(
+        "COPY (SELECT scale(f.video[1], :w, width => 640) "
+        "FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "already set positionally" in err.message
+
+
+def test_unknown_named_option_still_rejects_with_a_null_value() -> None:
+    err = _compile_vars_error(
+        "COPY (SELECT scale(f.video[1], nope => :x) FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+
+
+def test_null_enable_drops_like_any_option() -> None:
+    g = _compile_vars(
+        "COPY (SELECT gblur(f.video[1], 5, enable => :'win') "
+        "FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert _only_filter(g, "gblur").args == {"sigma": 5}
+
+
+def test_unset_source_filter_option_drops() -> None:
+    g = _compile_vars(
+        "COPY (SELECT s.audio[1] FROM ffmpeg.sine(frequency => :f, duration => 2) s) "
+        "TO 'o.mp4'"
+    )
+    assert _only_filter(g, "sine").args == {"duration": 2}
+
+
+def test_unset_input_option_drops() -> None:
+    g = _compile_vars(
+        "COPY (SELECT f.video[1] FROM input('a.mkv', hwaccel => :'hw') f) TO 'o.mp4'"
+    )
+    assert g.input_options == {}
+
+
+def test_unset_sink_option_drops_and_the_set_one_stays() -> None:
+    g = _compile_vars(
+        "COPY (SELECT f.video[1] FROM input('a.mkv') f) TO 'o.mp4' "
+        "WITH (crf :crf, preset :'preset')",
+        {"preset": "fast"},
+    )
+    assert g.sinks[0].options == {"preset": "fast"}
+
+
+def test_computed_option_evaluating_to_null_drops() -> None:
+    g = _compile_vars(
+        "COPY (SELECT scale(f.video[1], :w / 2, 480) FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert _only_filter(g, "scale").args == {"height": 480}
+
+
+# -- required, derived from use --
+
+
+def test_unset_input_path_names_the_variable() -> None:
+    err = _compile_vars_error(
+        "COPY (SELECT f.video[1] FROM input(:'source') f) TO 'o.mp4'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert err.message == "':source' was not set"
+    assert err.hint is not None and "-v source=" in err.hint
+
+
+def test_literal_null_input_path_rejects_plainly() -> None:
+    err = _compile_vars_error("COPY (SELECT f.video[1] FROM input(NULL) f) TO 'o.mp4'")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "input() needs a path, got NULL" in err.message
+
+
+def test_unset_destination_names_the_variable() -> None:
+    err = _compile_vars_error("COPY (SELECT f.video[1] FROM input('a.mkv') f) TO :'dest'")
+    assert err.message == "':dest' was not set"
+    assert err.hint is not None and "-v dest=" in err.hint
+
+
+def test_literal_null_destination_rejects_plainly() -> None:
+    err = _compile_vars_error("COPY (SELECT f.video[1] FROM input('a.mkv') f) TO NULL")
+    assert "COPY needs a destination path, got NULL" in err.message
+
+
+def test_unset_to_expression_names_the_variable() -> None:
+    err = _compile_vars_error(
+        "COPY (SELECT f.video[1] FROM input('a.mkv') f) TO (:'dest')"
+    )
+    assert err.message == "':dest' was not set"
+
+
+def test_unset_stream_position_names_the_variable() -> None:
+    err = _compile_vars_error(
+        "COPY (SELECT scale(:clip, 640, 480) FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert err.message == "':clip' was not set"
+    assert err.hint is not None and "stream" in err.hint
+
+
+def test_literal_null_stream_position_rejects_plainly() -> None:
+    err = _compile_vars_error(
+        "COPY (SELECT scale(NULL, 640, 480) FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "got NULL" in err.message
+
+
+def test_null_macro_stream_rejects() -> None:
+    err = _compile_vars_error(
+        "COPY (SELECT sqlmpeg.delay(:clip, 2) FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert err.message == "':clip' was not set"
+
+
+# -- the curated required list --
+
+
+def test_omitted_required_option_rejects() -> None:
+    err = _compile_vars_error(
+        "COPY (SELECT subtitles(f.video[1]) FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert "requires option 'filename'" in err.message
+
+
+def test_required_option_dropped_by_unset_variable_names_it() -> None:
+    err = _compile_vars_error(
+        "COPY (SELECT subtitles(f.video[1], filename => :'subs') "
+        "FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert err.code is ErrorCode.FILTER_OPTION_TYPE
+    assert err.message == "':subs' was not set"
+    assert err.hint is not None and "filename" in err.hint and "-v subs=" in err.hint
+
+
+def test_required_option_dropped_positionally_names_it_too() -> None:
+    err = _compile_vars_error(
+        "COPY (SELECT subtitles(f.video[1], :'subs') FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert err.message == "':subs' was not set"
+
+
+def test_drawtext_either_of_text_and_textfile_satisfies() -> None:
+    g = _compile_vars(
+        "COPY (SELECT drawtext(f.video[1], text => :'text', textfile => 'x.txt') "
+        "FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert _only_filter(g, "drawtext").args == {"textfile": "x.txt"}
+
+
+def test_drawtext_with_neither_rejects_naming_both() -> None:
+    err = _compile_vars_error(
+        "COPY (SELECT drawtext(f.video[1], text => :'text') "
+        "FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert err.message == "':text' was not set"
+
+
+def test_xfade_requires_expr_only_for_a_custom_transition() -> None:
+    base = (
+        "COPY (SELECT xfade(a.video[1], b.video[1], transition => '{t}') "
+        "FROM input('a.mkv') a, input('b.mkv') b) TO 'o.mp4'"
+    )
+    err = _compile_vars_error(base.format(t="custom"))
+    assert "requires option 'expr' when transition is 'custom'" in err.message
+    assert _only_filter(_compile_vars(base.format(t="fade")), "xfade").args == {
+        "transition": "fade"
+    }
+
+
+# -- tags: NULL clears, COALESCE keeps --
+
+
+def test_unset_tag_variable_clears_the_tag() -> None:
+    """A cleared tag is an ABSENT key: nothing carries through to -metadata."""
+    g = _compile_vars(
+        "COPY (SELECT f.video[1], :'title' AS title FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert g.sinks[0].tags == {"title": None}
+
+
+def test_coalesce_keeps_a_tag_when_the_variable_is_unset() -> None:
+    g = _compile_vars(
+        "COPY (SELECT f.video[1], COALESCE(:'title', 'Untitled') AS title "
+        "FROM input('a.mkv') f) TO 'o.mp4'"
+    )
+    assert g.sinks[0].tags == {"title": "Untitled"}
+
+
+def test_coalesce_prefers_the_set_variable() -> None:
+    g = _compile_vars(
+        "COPY (SELECT f.video[1], COALESCE(:'title', 'Untitled') AS title "
+        "FROM input('a.mkv') f) TO 'o.mp4'",
+        {"title": "Named"},
+    )
+    assert g.sinks[0].tags == {"title": "Named"}

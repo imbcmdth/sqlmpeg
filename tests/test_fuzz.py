@@ -286,7 +286,7 @@ def _mutated(data: st.DataObject) -> str | None:
     for _ in range(num_mutations):
         text = _mutate_once(text, data.draw)
     try:
-        return substitute(text, _VARIABLES)
+        return substitute(text, _VARIABLES).text
     except SqlmpegError as err:
         assert err.code is not ErrorCode.INTERNAL, f"INTERNAL on: {text!r}"
         return None

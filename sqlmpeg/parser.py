@@ -170,12 +170,13 @@ from __future__ import annotations
 
 import difflib
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import sqlglot
-from sqlglot import exp
+from sqlglot import TokenType, exp
+from sqlglot.dialects.postgres import Postgres
 from sqlglot.errors import ParseError, SqlglotError
 
 from sqlmpeg.errors import ErrorCode, SqlmpegError
@@ -199,6 +200,7 @@ from sqlmpeg.types import (
     UNNEST_COLUMNS,
     is_array,
 )
+from sqlmpeg.vars import unset_error
 from sqlmpeg.warnings import OnWarning
 
 if TYPE_CHECKING:  # sqlmpeg.project imports this module for its namespace names
@@ -237,6 +239,7 @@ __all__ = [
     "map_noun",
     "map_path",
     "map_ref",
+    "null_variable",
     "parse",
     "resolve",
     "star_qualifier",
@@ -662,7 +665,15 @@ def is_value_expr(node: exp.Expr | None) -> bool:
     value grammar, a call argument deciding whether it is computed per row.
     Bare literals and columns are left out on purpose -- they are already
     handled where they appear, and a bare column may well be a stream.
+
+    ``COALESCE`` is claimed by the STREAM grammar as the join-gap fill, so it
+    counts as a value only when its first argument already is one -- which is
+    exactly the ``COALESCE(:'title', f.tags.title)`` shape, where the
+    variable's substitution (a string literal, or NULL when unset) decides.
     """
+    if isinstance(node, exp.Coalesce):
+        first = _unwrap_paren(node.this) if isinstance(node.this, exp.Expr) else None
+        return isinstance(first, exp.Null | exp.Literal | exp.Neg) or is_value_expr(first)
     return isinstance(node, exp.Case | exp.DPipe | exp.Cast | _ARITHMETIC)
 
 
@@ -1048,12 +1059,56 @@ def _parse_error_message(err: Exception) -> str:
     return text.splitlines()[0] if text else err.__class__.__name__
 
 
-def parse(text: str) -> exp.Expression:
+class _SqlmpegPostgres(Postgres):
+    """Postgres, with ``NULL`` tokens carrying their position.
+
+    sqlglot leaves ``exp.Null`` unpositioned; the absence rules anchor
+    rejections on the NULL itself, and matching an unset variable's NULL back
+    to its name needs the keyword's own (line, col).
+    """
+
+    class Parser(Postgres.Parser):  # type: ignore[misc, valid-type]
+        PRIMARY_PARSERS = {
+            **Postgres.Parser.PRIMARY_PARSERS,
+            TokenType.NULL: lambda self, token: self.expression(exp.Null(), token),
+        }
+
+
+def null_variable(node: exp.Expr | None) -> str | None:
+    """The unset variable a ``NULL`` node stands for, or None.
+
+    Reads the annotation :func:`parse` stamps from the substitution's unset
+    map; a literal NULL, or one synthesized by evaluation, carries none.
+    """
+    if not isinstance(node, exp.Null):
+        return None
+    name = node.meta.get("variable")
+    return name if isinstance(name, str) else None
+
+
+def _annotate_unset(tree: exp.Expression, unset: Mapping[tuple[int, int], str]) -> None:
+    """Stamp each NULL that an unset variable substituted with the name."""
+    for node in tree.walk():
+        if not isinstance(node, exp.Null):
+            continue
+        found = _node_pos(node)
+        if found is not None and found in unset:
+            node.meta["variable"] = unset[found]
+
+
+def parse(
+    text: str, unset: Mapping[tuple[int, int], str] | None = None
+) -> exp.Expression:
     """Parse SQL text into a sqlglot AST using the Postgres dialect.
 
     ONE statement comes back as itself; a SCRIPT comes back as an
     ``exp.Block`` whose ``expressions`` are the statements. :func:`_statements`
     is the only thing that should look at that distinction.
+
+    `unset` is variable substitution's map from a NULL's (line, col) in `text`
+    to the unset variable it came from; each matching ``exp.Null`` is stamped
+    with the name (``meta["variable"]``), which is what lets a rejection at
+    the NULL's point of use say ``':source' was not set``.
 
     ``sqlglot.parse_one`` is deliberately kept over the plural
     ``sqlglot.parse``. VERIFIED (sqlglot 30.17, ``read="postgres"``) they agree
@@ -1076,7 +1131,7 @@ def parse(text: str) -> exp.Expression:
             hint="write a SELECT statement",
         )
     try:
-        tree = sqlglot.parse_one(text, read="postgres")
+        tree = sqlglot.parse_one(text, read=_SqlmpegPostgres)
     except ParseError as err:
         line, col = _parse_error_position(err)
         raise SqlmpegError(
@@ -1103,6 +1158,8 @@ def parse(text: str) -> exp.Expression:
         ) from err
     if not isinstance(tree, exp.Expression):
         raise SqlmpegError(ErrorCode.PARSE_ERROR, "no statement found", line=1, col=1)
+    if unset:
+        _annotate_unset(tree, unset)
     return tree
 
 
@@ -1927,6 +1984,25 @@ def _sink(
             hint=_SINK_HINT,
         )
     target = files[0]
+    if isinstance(target, exp.Null):
+        name = null_variable(target)
+        if name is not None:
+            line, col = _pos(target, copy)
+            raise unset_error(
+                ErrorCode.UNSUPPORTED_SQL,
+                name,
+                what="COPY needs a destination path",
+                line=line,
+                col=col,
+            )
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "COPY needs a destination path, got NULL",
+            target,
+            fallback=copy,
+            hint="a NULL destination is absence, and nothing can be written "
+            "without one; write TO '<path>'",
+        )
     if not isinstance(target, exp.Literal | exp.Identifier | exp.Paren):
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -2907,6 +2983,16 @@ class _Resolver:
         kind = self._check_value_expr(node, scope, select)
         if kind == "text":
             return
+        name = null_variable(_unwrap_paren(node))
+        if name is not None:
+            line, col = _pos(node, select)
+            raise unset_error(
+                ErrorCode.UNSUPPORTED_SQL,
+                name,
+                what="the TO expression needs a text destination",
+                line=line,
+                col=col,
+            )
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             "a TO expression must be text, got " + ("NULL" if kind is None else kind),
@@ -3643,6 +3729,26 @@ class _Resolver:
                 hint=hint,
             )
         args = func.expressions
+        first = _unwrap_paren(args[0]) if args and isinstance(args[0], exp.Expr) else None
+        if isinstance(first, exp.Null):
+            name = null_variable(first)
+            if name is not None:
+                line, col = _pos(first, table)
+                raise unset_error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    name,
+                    what="input() needs a path",
+                    line=line,
+                    col=col,
+                )
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "input() needs a path, got NULL",
+                first,
+                fallback=table,
+                hint="a NULL path is absence, and there is no input without "
+                "one; write input('clip.mp4')",
+            )
         if not args or not (isinstance(args[0], exp.Literal) and args[0].is_string):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -4801,6 +4907,26 @@ class _Resolver:
             return self._check_arithmetic(value, scope, fallback)
         if isinstance(value, exp.Cast):
             return self._check_cast(value, scope, fallback)
+        if isinstance(value, exp.Coalesce) and is_value_expr(value):
+            # A value COALESCE: its arguments must agree on one type, NULL
+            # fitting any of them -- the same agreement rule CASE results use.
+            found: str | None = None
+            for argument in [value.this, *value.args.get("expressions", [])]:
+                arg_type = self._check_value_expr(argument, scope, fallback)
+                if arg_type is None:
+                    continue
+                if found is None:
+                    found = arg_type
+                elif arg_type != found:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"COALESCE mixes {found} and {arg_type}",
+                        value,
+                        fallback=fallback,
+                        hint="every argument of a value COALESCE takes the "
+                        "same type",
+                    )
+            return found
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
             f"unsupported value expression: {value.__class__.__name__.upper()}",

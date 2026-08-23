@@ -145,7 +145,7 @@ from .project import (
 )
 from .prompt import build_system_prompt
 from .table import CellValue, TableResult, TableSink, render_csv, render_table
-from .vars import Variable, declared_variables, substitute
+from .vars import Variable, declared_variables, referenced, substitute, unset_variable
 from .warnings import OnWarning, WarningLog
 
 __all__ = ["main"]
@@ -478,6 +478,23 @@ def _program_text(name: str, packages: PackageSet | None) -> str | None:
         ) from err
 
 
+@dataclass(frozen=True)
+class _Query:
+    """What `_resolve_query` hands the subcommand handlers.
+
+    `text` is the substituted query; `unset` is the substitution's map from an
+    unset variable's NULL to its name, threaded into every compile so a
+    rejection can say which variable was not set. `program` is the name the
+    positional resolved to (None for inline SQL or ``-f``), and `source` the
+    pre-substitution text, whose ``-- variables:`` header the error hint reads.
+    """
+
+    text: str
+    unset: dict[tuple[int, int], str]
+    program: str | None
+    source: str
+
+
 def _program_variables_error(err: SqlmpegError, name: str, text: str) -> SqlmpegError:
     """`err` again, its hint naming what the program's own header declares."""
     declared = declared_variables(text)
@@ -493,14 +510,17 @@ def _program_variables_error(err: SqlmpegError, name: str, text: str) -> Sqlmpeg
     )
 
 
-def _resolve_query(args: argparse.Namespace) -> tuple[str | None, PackageSet | None, int]:
+def _resolve_query(
+    args: argparse.Namespace,
+) -> tuple[_Query | None, PackageSet | None, int]:
     """Resolve the query text and its project for compile/explain/validate/run.
 
     Exactly one of the positional ``query`` (inline SQL) or ``-f/--file`` is
-    required. Returns ``(text, packages, 0)`` on success, or
-    ``(None, None, exit_code)`` with the error already printed to stderr: 2 for
-    a usage violation (both or neither given; a malformed ``-v``), 1 for a file
-    that could not be read.
+    required. Returns ``(query, packages, 0)`` on success, or
+    ``(None, None, exit_code)`` with the error already printed to stderr: 2
+    for a usage violation (both or neither given; a malformed ``-v``; a ``-v``
+    naming a variable the text never references), 1 for a file that could not
+    be read.
 
     ``packages`` is the project the query was written in, or None when the walk
     finds no manifest -- the ordinary case, and the one where a compile is
@@ -511,9 +531,11 @@ def _resolve_query(args: argparse.Namespace) -> tuple[str | None, PackageSet | N
     every subcommand taking a query takes a program name too.
 
     ``-v/--set`` substitution runs here, once, so every handler inherits it.
-    A `SqlmpegError` from an undefined variable reference or a malformed
-    manifest is not caught here; it propagates to the caller's own handling,
-    like any other rejection.
+    An UNSET reference substitutes to NULL rather than failing -- absence,
+    which the compile itself judges -- so the check points the other way: a
+    ``-v`` for a name the text never references is the usage error, naming
+    what the text does reference. A `SqlmpegError` from a malformed manifest
+    is not caught here; it propagates to the caller's own handling.
     """
     has_query = args.query is not None
     has_file = args.file is not None
@@ -547,13 +569,25 @@ def _resolve_query(args: argparse.Namespace) -> tuple[str | None, PackageSet | N
     variables, code = _parse_set_vars(args.set_vars, args.command)
     if variables is None:
         return None, None, code
-    try:
-        substituted = substitute(text, variables)
-    except SqlmpegError as err:
-        if program is None:
-            raise
-        raise _program_variables_error(err, program, text) from err
-    return substituted, packages, 0
+    names = referenced(text)
+    unknown = sorted(name for name in variables if name not in names)
+    if unknown:
+        what = f"program '{program}'" if program is not None else "the query"
+        listed = (
+            "it references " + ", ".join(f":{name}" for name in sorted(names))
+            if names
+            else "it references no variables"
+        )
+        written = ", ".join(f"{name}=..." for name in unknown)
+        verb = "names a variable" if len(unknown) == 1 else "name variables"
+        print(
+            f"error: {args.command}: -v {written} {verb} {what} never "
+            f"references; {listed}",
+            file=sys.stderr,
+        )
+        return None, None, 2
+    sub = substitute(text, variables)
+    return _Query(text=sub.text, unset=sub.unset, program=program, source=text), packages, 0
 
 
 def _maybe_print_file_hint(
@@ -596,8 +630,16 @@ def _print_warnings(warnings: WarningLog) -> None:
 
 
 def _print_error(
-    err: SqlmpegError, *, source: str | None = None, packages: PackageSet | None = None
+    err: SqlmpegError,
+    *,
+    source: str | None = None,
+    packages: PackageSet | None = None,
+    query: _Query | None = None,
 ) -> None:
+    # A program run by name gets the richer hint: an unset-variable rejection
+    # names what the program's own `-- variables:` header declares.
+    if query is not None and query.program is not None and unset_variable(err) is not None:
+        err = _program_variables_error(err, query.program, query.source)
     print(f"error: {err}", file=sys.stderr)
     _maybe_print_file_hint(err, source, packages)
 
@@ -676,13 +718,15 @@ def _print_table_sinks(sinks: list[TableSink]) -> int:
 
 
 def _cmd_compile(args: argparse.Namespace, on_warning: OnWarning) -> int:
-    text: str | None = None
+    query: _Query | None = None
     packages: PackageSet | None = None
     try:
-        text, packages, code = _resolve_query(args)
-        if text is None:
+        query, packages, code = _resolve_query(args)
+        if query is None:
             return code
-        graphs = compile_commands(text, packages=packages, on_warning=on_warning)
+        graphs = compile_commands(
+            query.text, packages=packages, on_warning=on_warning, unset=query.unset
+        )
         emitted = [emit(graph) for graph in graphs]
     except SqlmpegError as err:
         # A query with no streaming representation at all (metadata
@@ -690,12 +734,13 @@ def _cmd_compile(args: argparse.Namespace, on_warning: OnWarning) -> int:
         # fallback -- tried only after compilation failed, and only for a
         # query that could BE one. If the fallback fails too, the original
         # error surfaces; it is usually more informative.
-        # `text` is None only when `err` came from `-v` substitution, which
-        # cannot be table-capable either, so it is guarded out of `classify`.
-        if text is not None and _is_table_capable_query(text, packages, on_warning):
+        # `query` is None only when `_resolve_query` raised before it could
+        # return (a malformed manifest, an unreadable program), which cannot
+        # be table-capable either, so it is guarded out of `classify`.
+        if query is not None and _is_table_capable_query(query.text, packages, on_warning):
             print(_TABLE_USAGE_HINT, file=sys.stderr)
             return 2
-        _print_error(err, source=args.query, packages=packages)
+        _print_error(err, source=args.query, packages=packages, query=query)
         return 1
 
     if args.graph_only:
@@ -735,14 +780,17 @@ def _shell_commands(emitted: list[Emitted]) -> list[str]:
 
 
 def _cmd_explain(args: argparse.Namespace, on_warning: OnWarning) -> int:
+    query: _Query | None = None
     packages: PackageSet | None = None
     try:
-        text, packages, code = _resolve_query(args)
-        if text is None:
+        query, packages, code = _resolve_query(args)
+        if query is None:
             return code
-        graphs = compile_commands(text, packages=packages, on_warning=on_warning)
+        graphs = compile_commands(
+            query.text, packages=packages, on_warning=on_warning, unset=query.unset
+        )
     except SqlmpegError as err:
-        _print_error(err, source=args.query, packages=packages)
+        _print_error(err, source=args.query, packages=packages, query=query)
         return 1
 
     # One object for a single command, a JSON ARRAY for a sequence's.
@@ -754,17 +802,19 @@ def _cmd_explain(args: argparse.Namespace, on_warning: OnWarning) -> int:
 
 
 def _cmd_validate(args: argparse.Namespace, on_warning: OnWarning) -> int:
-    text: str | None = None
+    query: _Query | None = None
     packages: PackageSet | None = None
     try:
-        text, packages, code = _resolve_query(args)
-        if text is None:
+        query, packages, code = _resolve_query(args)
+        if query is None:
             return code
-        compile_commands(text, packages=packages, on_warning=on_warning)
+        compile_commands(
+            query.text, packages=packages, on_warning=on_warning, unset=query.unset
+        )
     except SqlmpegError as err:
         # "compiles = valid" still holds: a table/csv query compiles through
         # its own lenient pipeline, tried here exactly as in `_cmd_compile`.
-        if text is not None and _is_table_capable_query(text, packages, on_warning):
+        if query is not None and _is_table_capable_query(query.text, packages, on_warning):
             return 0
         if args.as_json:
             # Machine contract: stdout is pure JSON, the library error
@@ -772,38 +822,45 @@ def _cmd_validate(args: argparse.Namespace, on_warning: OnWarning) -> int:
             print(json.dumps(err.to_dict()))
             _maybe_print_file_hint(err, args.query, packages)
         else:
-            _print_error(err, source=args.query, packages=packages)
+            _print_error(err, source=args.query, packages=packages, query=query)
         return 1
 
     return 0
 
 
 def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
+    query: _Query | None = None
     packages: PackageSet | None = None
     try:
-        text, packages, code = _resolve_query(args)
-        if text is None:
+        query, packages, code = _resolve_query(args)
+        if query is None:
             return code
-        is_table_capable, _has_copy = classify(text, packages=packages, on_warning=on_warning)
+        is_table_capable, _has_copy = classify(
+            query.text, packages=packages, on_warning=on_warning, unset=query.unset
+        )
     except SqlmpegError as err:
-        _print_error(err, source=args.query, packages=packages)
+        _print_error(err, source=args.query, packages=packages, query=query)
         return 1
 
     # No media COPY -- a bare SELECT, or every COPY is FORMAT csv -- IS a
     # table query, always: the table/csv path, which needs no ffmpeg.
     if is_table_capable:
         try:
-            sinks = compile_table_sql(text, packages=packages, on_warning=on_warning)
+            sinks = compile_table_sql(
+                query.text, packages=packages, on_warning=on_warning, unset=query.unset
+            )
         except SqlmpegError as err:
-            _print_error(err, source=args.query, packages=packages)
+            _print_error(err, source=args.query, packages=packages, query=query)
             return 1
         return _print_table_sinks(sinks)
 
     try:
-        graphs: list[Graph] = compile_commands(text, packages=packages, on_warning=on_warning)
+        graphs: list[Graph] = compile_commands(
+            query.text, packages=packages, on_warning=on_warning, unset=query.unset
+        )
         emitted: list[Emitted] = [emit(graph) for graph in graphs]
     except SqlmpegError as err:
-        _print_error(err, source=args.query, packages=packages)
+        _print_error(err, source=args.query, packages=packages, query=query)
         return 1
 
     # A media COPY names its own destination, so this fires only for the rare

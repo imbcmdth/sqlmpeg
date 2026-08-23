@@ -20,12 +20,13 @@ resolves in it and nowhere else. :func:`sqlmpeg.registry.load` never raises
 and degrades to an empty registry when ffmpeg is missing, so a compile without
 ffmpeg is not an error — it is one where every call name is UNKNOWN_FUNCTION.
 
-Every entry point takes two optional keywords beyond the SQL: `packages`, the
-:class:`~sqlmpeg.project.PackageSet` a namespaced call resolves in, and
+Every entry point takes three optional keywords beyond the SQL: `packages`,
+the :class:`~sqlmpeg.project.PackageSet` a namespaced call resolves in;
 `on_warning`, the callback that hears what a compile has to say short of
-refusing it (:mod:`sqlmpeg.warnings`). Both default to None, and None for
-either is what a compile was before packages existed: no namespace to resolve
-in, nothing to report.
+refusing it (:mod:`sqlmpeg.warnings`); and `unset`, variable substitution's
+map from an unset variable's NULL (its (line, col) in the text) to the
+variable's name (:class:`sqlmpeg.vars.Substitution`), which is what lets a
+rejection at the NULL's point of use name the variable. All default to None.
 
 Guardrail #7 lives here: no input, however malformed, may produce anything but
 a compile result or a :class:`~sqlmpeg.errors.SqlmpegError`. Each pass carries
@@ -34,6 +35,8 @@ internals) as ``INTERNAL``, the code the fuzz corpus asserts never fires.
 """
 
 from __future__ import annotations
+
+from collections.abc import Mapping
 
 from . import registry as registry_module
 from .errors import ErrorCode, SqlmpegError
@@ -63,7 +66,11 @@ def _probe_inputs(res: Resolved) -> dict[str, ProbeResult | None]:
 
 
 def compile_sql(
-    text: str, *, packages: PackageSet | None = None, on_warning: OnWarning | None = None
+    text: str,
+    *,
+    packages: PackageSet | None = None,
+    on_warning: OnWarning | None = None,
+    unset: Mapping[tuple[int, int], str] | None = None,
 ) -> Graph:
     """Compile SQL `text` into a split-complete IR graph.
 
@@ -79,11 +86,15 @@ def compile_sql(
 
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
-    return compile_commands(text, packages=packages, on_warning=on_warning)[0]
+    return compile_commands(text, packages=packages, on_warning=on_warning, unset=unset)[0]
 
 
 def compile_commands(
-    text: str, *, packages: PackageSet | None = None, on_warning: OnWarning | None = None
+    text: str,
+    *,
+    packages: PackageSet | None = None,
+    on_warning: OnWarning | None = None,
+    unset: Mapping[tuple[int, int], str] | None = None,
 ) -> list[Graph]:
     """Compile SQL `text` into one split-complete IR graph per ffmpeg COMMAND.
 
@@ -96,7 +107,7 @@ def compile_commands(
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     try:
-        res = resolve(parse(text), packages=packages, on_warning=on_warning)
+        res = resolve(parse(text, unset), packages=packages, on_warning=on_warning)
         probes = _probe_inputs(res)
         graphs = lower_commands(res, probes, registry=registry_module.load())
         return [insert_splits(graph) for graph in graphs]
@@ -121,7 +132,11 @@ def compile_commands(
 
 
 def classify(
-    text: str, *, packages: PackageSet | None = None, on_warning: OnWarning | None = None
+    text: str,
+    *,
+    packages: PackageSet | None = None,
+    on_warning: OnWarning | None = None,
+    unset: Mapping[tuple[int, int], str] | None = None,
 ) -> tuple[bool, bool]:
     """``(is_table_capable, has_copy)`` for `text`.
 
@@ -133,12 +148,16 @@ def classify(
 
     Raises ``SqlmpegError`` on a query that does not even resolve.
     """
-    res = resolve(parse(text), packages=packages, on_warning=on_warning)
+    res = resolve(parse(text, unset), packages=packages, on_warning=on_warning)
     return all(sink.is_csv for sink in res.sinks), bool(res.sinks)
 
 
 def compile_table_sql(
-    text: str, *, packages: PackageSet | None = None, on_warning: OnWarning | None = None
+    text: str,
+    *,
+    packages: PackageSet | None = None,
+    on_warning: OnWarning | None = None,
+    unset: Mapping[tuple[int, int], str] | None = None,
 ) -> list[TableSink]:
     """Compile SQL `text` into its printable table/csv result set(s).
 
@@ -151,7 +170,7 @@ def compile_table_sql(
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     try:
-        res = resolve(parse(text), packages=packages, on_warning=on_warning)
+        res = resolve(parse(text, unset), packages=packages, on_warning=on_warning)
         probes = _probe_inputs(res)
         return lower_table(res, probes, registry=registry_module.load())
     except SqlmpegError:

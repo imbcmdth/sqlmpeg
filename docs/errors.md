@@ -94,6 +94,12 @@ The macro flavor:
 {"line": 1, "col": 22, "code": "UDF_ARG_TYPE", "message": "sqlmpeg.delay() takes a video stream as its 'f' argument, got audio", "hint": "sqlmpeg.delay() is the video (transparent-canvas) macro; delay an audio stream with the bare filter directly, in milliseconds, e.g. adelay(a.audio[1], delays => '2000')"}
 ```
 
+The NULL flavor: a stream position cannot be absent, so a NULL there — an unset variable's, or a literal one — is this code, naming the variable when there is one:
+
+```json
+{"line": 1, "col": 20, "code": "UDF_ARG_TYPE", "message": "':clip' was not set", "hint": "scale() needs a stream in this position; set it with -v clip=<value>"}
+```
+
 ## SINGLE_OUTPUT_ONLY
 
 **Reserved, not currently raised.** The SELECT list is the output stream list (every column is its own `-map`, in order), so a multi-column SELECT is ordinary usage rather than an error. The code stays in the enum, and in `docs/error-schema.json`'s `code` enum, purely for wire-format stability. No code path in `sqlmpeg/*.py` raises it, and no example JSON exists because none can.
@@ -144,11 +150,13 @@ FROM input('y.mp4') b
 
 **Meaning:** The catch-all for syntactically valid SQL outside the dialect that isn't one of the more specific codes above. No streaming-vs-batch philosophy involved; the surface just doesn't include it. This is the most common code in practice. Most of `sqlmpeg/parser.py`'s rejections use it: multiple statements, unsupported clause keys, explicit `JOIN` syntax (comma cross-joins only), aliased or nested subqueries, `WITH RECURSIVE`, malformed or duplicate CTE/alias names, an empty `WHERE`, a non-positive or non-literal array subscript, or a top-level statement that isn't a `SELECT`/`UNION ALL`. (`SELECT *` and `<alias>.*` compile now, so they are off this list; see [docs/trimming.md](trimming.md) for the caption rejections below.)
 
-One CLI-layer rejection lands here: a query referencing a `:'variable'` (psql-style, filled by `-v name=value`) that no `-v` defined. psql lets an undefined variable pass through as literal text and fail later; sqlmpeg rejects it at the reference, with the defined names in the hint when there are any:
+The unset-variable rejections land here when the NULL sits where a value is REQUIRED. An unset `:'variable'` (psql-style, filled by `-v name=value`) substitutes to `NULL` — absence, which drops an option cleanly — but `input()` needs a path, `COPY` needs a destination, and a `TO` expression must come out text, so a NULL there is rejected at its point of use, naming the variable when the NULL came from one:
 
 ```json
-{"line": 1, "col": 30, "code": "UNSUPPORTED_SQL", "message": "undefined variable ':source'", "hint": "define it with -v name=value"}
+{"line": 1, "col": 30, "code": "UNSUPPORTED_SQL", "message": "':source' was not set", "hint": "input() needs a path; set it with -v source=<value>"}
 ```
+
+A literal NULL in the same positions is the same rejection without the name (`"input() needs a path, got NULL"`). The reverse check — `-v name=value` for a name the text never references — is a CLI usage error (exit 2), not a compile error, and carries no code.
 
 One probed-reality rejection lands here: a stream ffprobe reports NO codec for (some DASH manifests' WebVTT tracks arrive this way - ffmpeg's demuxer sees them but cannot name them, an open ffmpeg limitation measured through 9.0) selected into a media sink. Such a stream can be neither copied (no tag to write) nor transcoded (no decoder to invoke), so the run is guaranteed to die at header-write; sqlmpeg knows at compile time and says so at compile time. Table queries are exempt on purpose - a codec-less track shows up as a row with a NULL codec column, which is how you discover it:
 
@@ -413,6 +421,12 @@ FROM input('x.mp4') a
 
 ```json
 {"line": 1, "col": 35, "code": "FILTER_OPTION_TYPE", "message": "option 'enable' of filter 'gblur' expects an ffmpeg timeline expression, got 5", "hint": "enable takes a single-quoted ffmpeg timeline expression over t (seconds), n (frame number) or pos, e.g. enable => 'between(t,2,5)'"}
+```
+
+**Also fires for a required option** (the hand-kept list in [docs/dialect.md](dialect.md#variables): `subtitles`' `filename`, `frei0r`'s `filter_name`, ...). A NULL value drops an option before validation — absence, ffmpeg's default applies — so a filter that cannot run without one rejects at compile time, whether the option was dropped by an unset variable (the message names it: `"':subs' was not set"`) or never written at all:
+
+```json
+{"line": 1, "col": 14, "code": "FILTER_OPTION_TYPE", "message": "filter 'subtitles' requires option 'filename'", "hint": "ffmpeg would refuse the filter at run time; write filename => <value>"}
 ```
 
 The expression's own *content* is never checked here (or anywhere at compile time) — see [docs/filters.md](filters.md). The same goes for expressions in ordinary string-typed options (`scale(a.video[1], 'iw/2', -2)`, `overlay(a.video[1], b.video[1], '(W-w)/2', '(H-h)/2')`): the string is accepted as the option's value, and a typo inside the quotes surfaces when the command runs.

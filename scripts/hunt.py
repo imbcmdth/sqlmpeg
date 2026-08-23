@@ -1045,7 +1045,7 @@ def main() -> None:
         use_probe = probe is not None
         compiler.probe_path = lambda p, _r=probe: _r
         try:
-            subbed = vars_module.substitute(text, _DUMMY)
+            subbed = vars_module.substitute(text, _DUMMY).text
         except SqlmpegError as err:
             if err.code is ErrorCode.INTERNAL:
                 record(findings, err, text, use_probe, "substitute")

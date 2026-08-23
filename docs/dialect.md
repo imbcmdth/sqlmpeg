@@ -127,8 +127,10 @@ A manifest declaring a program named for one of those four words is
 rejected where it is written: rule 1 would never let it be reached.
 `ns.program` says which package when a bare name matches programs in
 more than one; a bare name that does is rejected naming each `ns.program`
-it could mean. Variables still come from `-v name=value`, and an
-undefined one names what the program's `-- variables:` header declares.
+it could mean. Variables still come from `-v name=value`; an unset one
+substitutes to `NULL` (see [Variables](#variables)), and a rejection at
+its point of use names what the program's `-- variables:` header
+declares.
 
 ### Installed packages
 
@@ -320,6 +322,9 @@ value := literal | NULL | row-column | input-scalar
        | value (+|-|*|/) value     -- Postgres typing; int/int truncates
        | value ::text | CAST(value AS text)
        | CASE WHEN pred THEN value [ELSE value] END
+       | COALESCE(value, ...)      -- first argument a value, never a stream;
+                                   -- arguments agree on one type
+
        | :'var' | :"var" | :var    -- CLI -v substitution, psql's forms
        | ARRAY[ROW(...)::chapter, ...]   -- record arrays: chapter,
        | ARRAY[ROW(...)::cue, ...]       -- cue, attachment
@@ -353,6 +358,60 @@ group. Sink options (`WITH (...)`) cover codecs, quality, bitrate
 control, metadata copying, two-pass - the full table is
 generated into the prompt (`sqlmpeg prompt`) and validated per option
 with typed errors.
+
+## Variables
+
+`:'name'` (string literal), `:"name"` (identifier) and bare `:name`
+(raw text) are psql's reference forms, filled by `-v name=value`. An
+UNSET reference substitutes to the bare keyword `NULL` — never `''`,
+never the literal text, never an error. That is a deviation from psql,
+which leaves the text alone.
+
+**NULL is absence.** A NULL — an unset variable's, or written literally
+— in an option position means the option is not written and the thing
+being configured supplies its own default. This holds at every binding
+site: filter options (positional or named, `enable` included), source
+filter options, `input()` options, and `COPY ... WITH (...)` options. A
+dropped positional still occupies its slot: `scale(v, :w, :h)` with
+`:w` unset writes only `height`, nothing shifts, and a named repeat of
+the dropped option still collides.
+
+What is required is derived from use, and a NULL there is a
+compile-time rejection naming the variable when the NULL came from one
+(`':source' was not set`):
+
+- `input(NULL)` — a path is required.
+- `COPY ... TO NULL`, and a `TO (expression)` that evaluates to NULL
+  for a row — a destination is required.
+- a NULL in a stream position of any call.
+- a NULL for an option on the required list below — where omitting the
+  option entirely is the same rejection, since ffmpeg's own init()
+  would refuse it at run time.
+
+The required list is hand-kept (ffmpeg has no required-option
+metadata):
+
+| filter | required |
+| --- | --- |
+| `subtitles` | `filename` |
+| `lut3d` | `file` |
+| `frei0r` | `filter_name` |
+| `ladspa` | `file`, `plugin` |
+| `movie`, `amovie` | `filename` |
+| `drawtext` | `text` or `textfile` (either satisfies) |
+| `xfade` | `expr`, only when `transition` is `custom` |
+
+Everything else falls through to ffmpeg's own error at run time.
+
+One place absence is not "leave alone": writing a tag column with NULL
+clears the tag, so `:'title' AS title` unset clears the title. A
+program that means "keep unless told otherwise" writes
+`COALESCE(:'title', f.tags.title) AS title` — ordinary SQL.
+
+The check on `-v` points the other way: since an unset reference is
+legal, `-v name=value` for a name the text never references is the
+usage error (exit 2), naming the names the text does reference. The
+`-- variables:` header remains documentation, not a declaration.
 
 ## Not in the dialect
 
