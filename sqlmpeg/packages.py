@@ -644,11 +644,14 @@ def _taken_namespaces(
     the set a dependency alias must stay disjoint from.
     """
     taken = {project.namespace: project.name}
-    taken[release.name.partition("/")[0]] = release.name
     for entry in entries:
         name = stored_name(entry, lock)
         if name is not None:
             taken.setdefault(name.partition("/")[0], name)
+    # The installed package's own namespace counts too: `<alias>.<member>`
+    # and `<namespace>.<package>` mean different things in their second
+    # segment, so an alias equal to any namespace is ambiguous.
+    taken.setdefault(release.name.partition("/")[0], release.name)
     return taken
 
 

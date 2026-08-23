@@ -573,7 +573,7 @@ def test_an_unknown_key_gets_a_did_you_mean(tmp_path: Path) -> None:
     with pytest.raises(SqlmpegError) as caught:
         read_manifest(manifest)
     assert "unknown key 'binz'" in caught.value.message
-    assert caught.value.hint == "did you mean 'bins'?"
+    assert caught.value.hint == "did you mean 'bin'?"
 
 
 def test_a_description_and_dependencies_are_accepted(tmp_path: Path) -> None:
@@ -710,7 +710,9 @@ def test_bin_declares_the_default_program(tmp_path: Path) -> None:
 
 
 def test_a_package_may_ship_programs_and_export_nothing(tmp_path: Path) -> None:
-    manifest = _project(tmp_path, files={"queries/split.sql": PROGRAM}, text=_manifest_text(**_BINS))
+    manifest = _project(
+        tmp_path, files={"queries/split.sql": PROGRAM}, text=_manifest_text(**_BINS)
+    )
     package = read_manifest(manifest)
     assert dict(package.exports) == {}
     assert list(package.programs) == ["split-chapters"]

@@ -2393,7 +2393,7 @@ def test_init_writes_a_project_whose_starter_program_runs(
     project.mkdir()
     monkeypatch.chdir(project)
 
-    assert cli.main(["init"]) == 0
+    assert cli.main(["init", "--namespace", "demo"]) == 0
     assert cli.main(["list"]) == 0
 
     out_path = project / "smaller.mp4"
