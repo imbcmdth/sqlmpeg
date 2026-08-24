@@ -282,6 +282,7 @@ def expanded(
     *,
     packages: PackageSet | None = None,
     on_warning: OnWarning | None = None,
+    owner: tuple[str, str] | None = None,
 ) -> Iterator[exp.Expr]:
     """Yield `tree` with every function definition lifted out and every call inlined.
 
@@ -299,7 +300,7 @@ def expanded(
     A script with no ``CREATE FUNCTION`` and no packages to call into yields
     the tree untouched.
     """
-    expander = _Expander(packages=packages, on_warning=on_warning)
+    expander = _Expander(packages=packages, on_warning=on_warning, scope=owner)
     try:
         # Expansion's own rejections need translating too: a call written
         # inside a body was already stamped by the expansion around it.

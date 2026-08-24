@@ -70,6 +70,7 @@ def compile_sql(
     *,
     packages: PackageSet | None = None,
     on_warning: OnWarning | None = None,
+    owner: tuple[str, str] | None = None,
     unset: Mapping[tuple[int, int], str] | None = None,
 ) -> Graph:
     """Compile SQL `text` into a split-complete IR graph.
@@ -94,6 +95,7 @@ def compile_commands(
     *,
     packages: PackageSet | None = None,
     on_warning: OnWarning | None = None,
+    owner: tuple[str, str] | None = None,
     unset: Mapping[tuple[int, int], str] | None = None,
 ) -> list[Graph]:
     """Compile SQL `text` into one split-complete IR graph per ffmpeg COMMAND.
@@ -107,7 +109,7 @@ def compile_commands(
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     try:
-        res = resolve(parse(text, unset), packages=packages, on_warning=on_warning)
+        res = resolve(parse(text, unset), packages=packages, on_warning=on_warning, owner=owner)
         probes = _probe_inputs(res)
         graphs = lower_commands(res, probes, registry=registry_module.load(), on_warning=on_warning)
         return [insert_splits(graph) for graph in graphs]
@@ -136,6 +138,7 @@ def classify(
     *,
     packages: PackageSet | None = None,
     on_warning: OnWarning | None = None,
+    owner: tuple[str, str] | None = None,
     unset: Mapping[tuple[int, int], str] | None = None,
 ) -> tuple[bool, bool]:
     """``(is_table_capable, has_copy)`` for `text`.
@@ -148,7 +151,7 @@ def classify(
 
     Raises ``SqlmpegError`` on a query that does not even resolve.
     """
-    res = resolve(parse(text, unset), packages=packages, on_warning=on_warning)
+    res = resolve(parse(text, unset), packages=packages, on_warning=on_warning, owner=owner)
     return all(sink.is_csv for sink in res.sinks), bool(res.sinks)
 
 
@@ -157,6 +160,7 @@ def compile_table_sql(
     *,
     packages: PackageSet | None = None,
     on_warning: OnWarning | None = None,
+    owner: tuple[str, str] | None = None,
     unset: Mapping[tuple[int, int], str] | None = None,
 ) -> list[TableSink]:
     """Compile SQL `text` into its printable table/csv result set(s).
@@ -170,7 +174,7 @@ def compile_table_sql(
     Raises ``SqlmpegError`` — and nothing else — on every rejection.
     """
     try:
-        res = resolve(parse(text, unset), packages=packages, on_warning=on_warning)
+        res = resolve(parse(text, unset), packages=packages, on_warning=on_warning, owner=owner)
         probes = _probe_inputs(res)
         return lower_table(res, probes, registry=registry_module.load(), on_warning=on_warning)
     except SqlmpegError:

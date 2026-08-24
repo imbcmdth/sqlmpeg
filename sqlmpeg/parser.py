@@ -5258,6 +5258,7 @@ def resolve(
     *,
     packages: PackageSet | None = None,
     on_warning: OnWarning | None = None,
+    owner: tuple[str, str] | None = None,
 ) -> Resolved:
     """Validate the AST against the v0 dialect and build the input table.
 
@@ -5273,7 +5274,7 @@ def resolve(
     from .functions import expanded  # deferred: functions.py imports this module
 
     try:
-        with expanded(tree, packages=packages, on_warning=on_warning) as script:
+        with expanded(tree, packages=packages, on_warning=on_warning, owner=owner) as script:
             return _Resolver().run(script)
     except SqlmpegError:
         raise

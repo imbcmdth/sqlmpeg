@@ -476,7 +476,9 @@ def _matching_programs(name: str, packages: PackageSet | None) -> list[tuple[Pac
     return found
 
 
-def _program_text(name: str, packages: PackageSet | None) -> str | None:
+def _program_text(
+    name: str, packages: PackageSet | None
+) -> tuple[str, tuple[str, str]] | None:
     """The query text of the program `name` names, or None when it names none.
 
     Two packages shipping one name is a rejection rather than a pick: the
@@ -496,7 +498,7 @@ def _program_text(name: str, packages: PackageSet | None) -> str | None:
     file = package.program(program)
     assert file is not None  # _matching_programs only keeps shipped programs
     try:
-        return file.read_text(encoding="utf-8")
+        return file.read_text(encoding="utf-8"), (package.name, package.version)
     except OSError as err:
         raise SqlmpegError(
             ErrorCode.UNSUPPORTED_SQL,
@@ -521,6 +523,10 @@ class _Query:
     unset: dict[tuple[int, int], str]
     program: str | None
     source: str
+    #: The (name, version) of the package a program belongs to, so a call it
+    #: makes reaches the version THAT package declares rather than whatever
+    #: the project happens to have. None for inline SQL and for `-f`.
+    owner: tuple[str, str] | None = None
 
 
 def _program_variables_error(err: SqlmpegError, name: str, text: str) -> SqlmpegError:
@@ -589,10 +595,11 @@ def _resolve_query(
 
     packages = discover(_project_start(args))
     program: str | None = None
+    owner: tuple[str, str] | None = None
     if not has_file and not _starts_a_statement(text):
         shipped = _program_text(text, packages)
         if shipped is not None:
-            program, text = text, shipped
+            program, (text, owner) = text, shipped
 
     variables, code = _parse_set_vars(args.set_vars, args.command)
     if variables is None:
@@ -615,7 +622,11 @@ def _resolve_query(
         )
         return None, None, 2
     sub = substitute(text, variables)
-    return _Query(text=sub.text, unset=sub.unset, program=program, source=text), packages, 0
+    return (
+        _Query(text=sub.text, unset=sub.unset, program=program, source=text, owner=owner),
+        packages,
+        0,
+    )
 
 
 def _maybe_print_file_hint(
@@ -753,7 +764,11 @@ def _cmd_compile(args: argparse.Namespace, on_warning: OnWarning) -> int:
         if query is None:
             return code
         graphs = compile_commands(
-            query.text, packages=packages, on_warning=on_warning, unset=query.unset
+            query.text,
+            packages=packages,
+            on_warning=on_warning,
+            unset=query.unset,
+            owner=query.owner,
         )
         emitted = [emit(graph) for graph in graphs]
     except SqlmpegError as err:
@@ -815,7 +830,11 @@ def _cmd_explain(args: argparse.Namespace, on_warning: OnWarning) -> int:
         if query is None:
             return code
         graphs = compile_commands(
-            query.text, packages=packages, on_warning=on_warning, unset=query.unset
+            query.text,
+            packages=packages,
+            on_warning=on_warning,
+            unset=query.unset,
+            owner=query.owner,
         )
     except SqlmpegError as err:
         _print_error(err, source=args.query, packages=packages, query=query)
@@ -837,7 +856,11 @@ def _cmd_validate(args: argparse.Namespace, on_warning: OnWarning) -> int:
         if query is None:
             return code
         compile_commands(
-            query.text, packages=packages, on_warning=on_warning, unset=query.unset
+            query.text,
+            packages=packages,
+            on_warning=on_warning,
+            unset=query.unset,
+            owner=query.owner,
         )
     except SqlmpegError as err:
         # "compiles = valid" still holds: a table/csv query compiles through
@@ -864,7 +887,11 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
         if query is None:
             return code
         is_table_capable, _has_copy = classify(
-            query.text, packages=packages, on_warning=on_warning, unset=query.unset
+            query.text,
+            packages=packages,
+            on_warning=on_warning,
+            unset=query.unset,
+            owner=query.owner,
         )
     except SqlmpegError as err:
         _print_error(err, source=args.query, packages=packages, query=query)
@@ -875,7 +902,11 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
     if is_table_capable:
         try:
             sinks = compile_table_sql(
-                query.text, packages=packages, on_warning=on_warning, unset=query.unset
+                query.text,
+            packages=packages,
+            on_warning=on_warning,
+            unset=query.unset,
+            owner=query.owner,
             )
         except SqlmpegError as err:
             _print_error(err, source=args.query, packages=packages, query=query)
@@ -884,7 +915,11 @@ def _cmd_run(args: argparse.Namespace, on_warning: OnWarning) -> int:
 
     try:
         graphs: list[Graph] = compile_commands(
-            query.text, packages=packages, on_warning=on_warning, unset=query.unset
+            query.text,
+            packages=packages,
+            on_warning=on_warning,
+            unset=query.unset,
+            owner=query.owner,
         )
         emitted: list[Emitted] = [emit(graph) for graph in graphs]
     except SqlmpegError as err:

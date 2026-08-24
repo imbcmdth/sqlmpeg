@@ -1643,6 +1643,55 @@ def test_a_want_naming_a_version_nothing_installed_falls_back_to_the_canonical_e
     assert found is not None and found.version == "1.0.0"
 
 
+def _tool(root: Path, wants: str) -> Path:
+    """A package whose PROGRAM calls into another package at `wants`."""
+    (root / "queries").mkdir(parents=True, exist_ok=True)
+    program = [
+        "-- Quieten the first track.",
+        "-- variables: dest (output path)",
+        "-- example: sqlmpeg compile -f queries/go.sql -v dest=out.mkv",
+        "COPY (SELECT shared.d.quieter(f.audio[1]) FROM input('film.mkv') f) TO :'dest'",
+    ]
+    _write(root / "queries" / "go.sql", chr(10).join(program) + chr(10))
+    manifest = {
+        "name": "me/tool",
+        "version": "1.0.0",
+        "bin": {"go": "queries/go.sql"},
+        "dependencies": {"shared/d": wants},
+    }
+    _write(root / "sqlmpeg.json", json.dumps(manifest, indent=2) + chr(10))
+    return root
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def test_a_program_reaches_the_version_its_own_package_declares(
+    store_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A program is its package's source, not anonymous text.
+
+    The project binds shared/d at 2.0.0; the package whose program runs binds
+    1.0.0. The program must get the version it was written against.
+    """
+    d_low = _installed(_library(tmp_path / "d1", "shared", "0.1", package="d", version="1.0.0"))
+    d_high = _installed(_library(tmp_path / "d2", "shared", "0.2", package="d", version="2.0.0"))
+    tool = _installed(_tool(tmp_path / "tool", "1.0.0"), dependencies={"shared/d": "1.0.0"})
+    project = tmp_path / "work"
+    _project(project, files={}, manifest={"name": "other/edits"})
+    _lock(project, [d_low, d_high, tool], dependencies={"shared/d": "2.0.0"})
+
+    code, out, err = _run(
+        project, monkeypatch, capsys, "compile", "me.tool.go", "-v", "dest=o.mkv"
+    )
+    assert code == 0, err
+    assert "volume=volume=0.1" in out, out
+
 def test_two_dependents_resolve_a_shared_name_at_their_own_version(
     store_home: Path, tmp_path: Path
 ) -> None:
