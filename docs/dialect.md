@@ -378,13 +378,20 @@ Each column is one of:
   `ffmpeg.<name>`, plus the `sqlmpeg.<name>` macros - streams first,
   then options positionally in the filter's own order, then
   `name => value` ([filters.md](filters.md)). Bare arrays broadcast;
-  two arrays in one call zip elementwise.
+  two arrays in one call zip elementwise. `VARIADIC <array>` is a third
+  reading: a trailing, at-most-one argument that spreads the array as
+  the pad list instead, for a filter whose pad count follows its
+  argument count (the N-input set, `concat`) - `amix(VARIADIC f.audio)`
+  or `concat(intro, VARIADIC array_agg(v))`. An explicit count option
+  that disagrees, or an empty array, is a rejection; a fixed-arity
+  filter does not take `VARIADIC` at all.
 - **A tag column**: an ALIASED non-stream expression. Over track rows
   it tags the row's streams; over input rows only, the container;
   `NULL` clears ([rows.md](rows.md#tags)). Aliased `disposition`, it
   sets the row's flags instead of a tag.
 - **`array_agg(<per-row stream expression>)`**: gathers rows in row
-  order; must be a whole column ([rows.md](rows.md#combining-rows)).
+  order; must be a whole column, or the sole argument of `VARIADIC`
+  ([rows.md](rows.md#combining-rows)).
 - **A metadata column** (table queries): any row column prints as
   data.
 - **`*` / `<alias>.*`**: over an input, its array columns - the four
@@ -525,13 +532,15 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   without `::text`; division by a known zero.
 - **Multi-row into one path** (`ROW_COUNT_MISMATCH`): gather or fan
   out, explicitly.
-- **Filters**: variable-pad (`split`, `concat` - both are what UNION
-  ALL and the compiler's own split pass are for), multi-output
+- **Filters**: variable-pad (`split` - what the compiler's own split
+  pass is for; UNION ALL is `concat` without ever naming it), multi-output
   (`scale2ref`, `feedback`), sinks, multi-output sources
   (`movie`, `avsynctest`); options typed `binary` or `dictionary`;
   runtime filter commands (`sendcmd`, `zmq`). The N-input escape:
   `amix`, `hstack`, `vstack`, `amerge`, `ffmpeg.join`, `interleave`,
-  `ainterleave` take any stream count.
+  `ainterleave` take any stream count, positional or `VARIADIC`; so
+  does `ffmpeg.concat`/`concat`, but ONLY under `VARIADIC` - called
+  without it, `concat` is still `UNKNOWN_FUNCTION`.
 - **Functions**: `OR REPLACE`, `IF NOT EXISTS`, a schema-qualified
   name, any property but `RETURNS`/`LANGUAGE`, a language other than
   `sql`, parameter defaults or `OUT`/`VARIADIC`, overloading, recursion,

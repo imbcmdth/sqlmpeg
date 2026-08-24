@@ -45,6 +45,12 @@ FROM input('x.mp4') a
 
 The hint is a did-you-mean match against every filter name the installed ffmpeg reports. A `sqlmpeg.<name>` call matches against the macro names the same way (`sqlmpeg.dela()` suggests `sqlmpeg.delay()`). Should the registry come up empty - which since ffmpeg became a managed requirement means the provisioner failed - the hint states that real problem instead of guessing: check `static-ffmpeg` installed correctly, or put a system ffmpeg on `PATH`.
 
+`concat` is the one name this fires for even when spelled exactly right: it has a variable pad count, so it is unknown UNLESS the call carries `VARIADIC` (see `UDF_ARG_TYPE` and `UNSUPPORTED_SQL` below), and the hint says so instead of guessing a near miss:
+
+```json
+{"line": 1, "col": 8, "code": "UNKNOWN_FUNCTION", "message": "unknown function concat()", "hint": "concat has a variable pad count: call it with VARIADIC, e.g. concat(VARIADIC array_agg(v))"}
+```
+
 ## UNKNOWN_ALIAS
 
 **Meaning:** A `<alias>.video`/`<alias>.audio` reference (or a bare table reference in `FROM`) names an alias or CTE this query never introduced.
@@ -65,7 +71,7 @@ SELECT b.video[1] FROM input('x.mp4') a
 
 ## UDF_ARG_TYPE
 
-**Meaning:** A call's *stream* arguments don't match. For a filter, that is the pad signature: `gblur` is `V->V`, so exactly one video in; `xfade` is `VV->V`, so two. For a `sqlmpeg.<name>` macro it is the macro's own signature. Option problems are never this code - a positional option validates as the option it binds to, so those are `UNKNOWN_FILTER_OPTION`/`FILTER_OPTION_TYPE` below. The two exceptions: more positional options than the filter has options at all, and an N-input filter's `inputs` option disagreeing with the stream count you actually passed - both arity statements, both here.
+**Meaning:** A call's *stream* arguments don't match. For a filter, that is the pad signature: `gblur` is `V->V`, so exactly one video in; `xfade` is `VV->V`, so two. For a `sqlmpeg.<name>` macro it is the macro's own signature. Option problems are never this code - a positional option validates as the option it binds to, so those are `UNKNOWN_FILTER_OPTION`/`FILTER_OPTION_TYPE` below. The exceptions: more positional options than the filter has options at all; an N-input filter's count option (`inputs`, `n`, ...) disagreeing with the stream count you actually passed, written out or spread with `VARIADIC`; a `VARIADIC` argument that is not an array, or is an empty one (naming what produced it) - all arity statements, all here.
 
 **Fires when:** a stream is missing, one too many, or the wrong type - `gblur(a.audio[1], 5)` hands audio to a video filter, that sort of thing.
 

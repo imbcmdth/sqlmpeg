@@ -420,8 +420,9 @@ _AGG_HINT = (
     "unnest(f.audio) t"
 )
 _ARRAY_AGG_PLACE_HINT = (
-    "array_agg(...) is a whole SELECT column: write array_agg(volume(t, "
-    "0.5)), not volume(array_agg(t), 0.5)"
+    "array_agg(...) is a whole SELECT column, or a VARIADIC argument: write "
+    "array_agg(volume(t, 0.5)) or concat(VARIADIC array_agg(t)), not "
+    "volume(array_agg(t), 0.5)"
 )
 _GROUP_STREAM_HINT = (
     "a grouped query aggregates its streams: wrap it in array_agg(...), or "
@@ -3023,12 +3024,15 @@ class _Resolver:
 
         ``array_agg`` names the one node exempt from the aggregate rejection: the
         whole SELECT column of a track-row branch, which lower collapses into
-        the same stream list the bare splat produces. Every other aggregate,
-        and every array_agg written anywhere else, still has no equivalent.
+        the same stream list the bare splat produces. A ``VARIADIC`` argument
+        is exempt too, structurally rather than by identity -- VARIADIC gives
+        an array exactly one other place to go, and lower's own relation check
+        is what decides whether this branch actually has rows to aggregate.
+        Every other array_agg written anywhere else still has no equivalent.
         """
         for sub in node.walk():
             if isinstance(sub, exp.ArrayAgg):
-                if sub is not array_agg:
+                if sub is not array_agg and not isinstance(sub.parent, exp.Variadic):
                     raise _error(
                         ErrorCode.UNSUPPORTED_SQL,
                         "array_agg() is only supported as a whole SELECT column",

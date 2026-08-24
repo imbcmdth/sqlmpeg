@@ -14,12 +14,15 @@ output is plain ffmpeg, so the two mix freely in a script.
 
 ## Not callable
 
-- Variable-pad filters (`split`, `concat`) and multi-output filters
-  (`scale2ref`, `feedback`): `UNSUPPORTED_SQL`. `UNION ALL` is concat;
-  the compiler inserts its own splits. The N-input set (`amix`,
-  `hstack`, `vstack`, `amerge`, `ffmpeg.join`, `interleave`,
-  `ainterleave`, `ladspa`) and the array-returning trio
-  (`channelsplit`, `acrossover`, `extractplanes`) are the exceptions.
+- Variable-pad filters and multi-output filters (`scale2ref`,
+  `feedback`): `UNSUPPORTED_SQL`. `split` stays rejected regardless —
+  the compiler inserts its own. The N-input set (`amix`, `hstack`,
+  `vstack`, `amerge`, `ffmpeg.join`, `interleave`, `ainterleave`,
+  `ladspa`) and the array-returning trio (`channelsplit`,
+  `acrossover`, `extractplanes`) are callable, and `concat` joins them
+  under `VARIADIC` only — `concat(a, b)` is still `UNSUPPORTED_SQL`,
+  `concat(VARIADIC array_agg(v))` is a call. `UNION ALL` is concat too;
+  that spelling never needs `VARIADIC`.
 - Sources with more than one output pad (`avsynctest`, `movie`); all
   sinks.
 - Options typed `binary` or `dictionary`: setting one is

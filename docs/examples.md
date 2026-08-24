@@ -1652,3 +1652,41 @@ ffmpeg -i tests/fixtures/tagged.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -m
 ```
 
 Where a value is required - `input()`'s path, `COPY`'s destination, a stream position, `subtitles`' `filename` - an unset variable is a compile-time rejection that names it: `':source' was not set`.
+
+## 70. Join however many tracks a file has, with concat
+
+`concat` takes any number of segments, so plain SQL never had a way to call it - a filter whose input count isn't in its signature isn't callable at all. `VARIADIC` fixes that: the array it spreads IS the argument list, so `array_agg(t)` over a file's own track rows becomes as many concat inputs as the file actually has, two tracks or ten:
+
+```pgsql
+COPY (
+  SELECT ffmpeg.concat(VARIADIC array_agg(t))
+  FROM input('tests/fixtures/av-chapters.mkv') f, unnest(f.audio) t
+) TO 'joined.mka'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av-chapters.mkv -filter_complex \
+  '[0:a:0][0:a:1]concat=n=2:v=0:a=1[out0]' -map '[out0]' joined.mka
+```
+
+Called without `VARIADIC`, `concat(a, b)` is still `UNKNOWN_FUNCTION` - the hint says to add it. A bare array stays a broadcast (one node per element, same as ever); only the `VARIADIC` spelling means "spread this array into the pads", so the two never collide.
+
+## 71. Mix however many tracks a file has
+
+`amix` already took a written-out list of streams; `VARIADIC` adds a second way to reach it, spreading an already-countable array instead of listing positions by hand. No `GROUP BY` is needed for the common case - `f.audio` is already an array the moment the file is read:
+
+```pgsql
+COPY (
+  SELECT amix(VARIADIC f.audio)
+  FROM input('tests/fixtures/av2.mp4') f
+) TO 'mixed.mka'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:a:0][0:a:1]amix=inputs=2[out0]' \
+  -map '[out0]' mixed.mka
+```
+
+`inputs` still writes itself from the count, so `amix(VARIADIC xs, inputs => 3)` over a two-element array is a rejection naming both numbers, exactly as `amix(a, b, inputs => 3)` already was.

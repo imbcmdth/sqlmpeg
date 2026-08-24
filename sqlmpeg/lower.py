@@ -788,8 +788,12 @@ _ARRAY_INPUT_HINT = (
 # collides with a Postgres special form.
 #
 # The mechanism generalizes to any `N->1` filter whose input count is one
-# option (`concat`'s `n`, `mix`, ...), but stays scoped to the entries below
-# until array-CONSUMING calls exist.
+# option, and does now that VARIADIC gives an array-consuming call somewhere
+# to bind: every entry below takes VARIADIC too (`_lower_variadic_n_input_call`),
+# and `concat` (`N->N`, its own `n` option) joins them under VARIADIC only --
+# see `_lower_concat_call`. Still scoped to what is curated here; the ffmpeg
+# filter set has other `N->1` shapes (`mix`, `xstack`, ...) this table does
+# not carry.
 
 
 @dataclass(frozen=True)
@@ -853,6 +857,27 @@ N_INPUT: dict[str, _NInputFilter] = {
 _N_INPUT_HINT = (
     "the number of streams you pass IS the filter's input count; either pass "
     "that many streams, or set the count explicitly, e.g. amix(a, b, c, inputs => 3)"
+)
+
+# `concat` is excluded from the registry by the same pad-scope check as every
+# other `N->N` filter (see registry.py), but VARIADIC gives its count a
+# source, so it is callable on those terms alone -- never without VARIADIC.
+_CONCAT_NAME = "concat"
+
+_CONCAT_VARIADIC_HINT = (
+    "concat has a variable pad count: call it with VARIADIC, e.g. "
+    "concat(VARIADIC array_agg(v))"
+)
+
+
+def _variadic_capable_names() -> list[str]:
+    return sorted({*N_INPUT, _CONCAT_NAME})
+
+
+_VARIADIC_HINT = (
+    "VARIADIC spreads an array as the call's argument list, and only a filter "
+    "whose pad count follows its argument count takes it -- "
+    + ", ".join(_variadic_capable_names())
 )
 
 
@@ -1005,6 +1030,11 @@ class _Call:
     `is_macro` marks the ``sqlmpeg.<name>(...)`` spelling, which
     resolves against :data:`MACROS` and never touches the registry. The two
     are mutually exclusive (different Dot qualifiers).
+
+    `variadic` is the array expression inside a trailing ``VARIADIC <array>``
+    argument, already unwrapped from ``exp.Variadic`` and excluded from
+    `args` -- Postgres allows at most one, and it is always last, which
+    :func:`_split_args` enforces at parse time.
     """
 
     name: str
@@ -1012,6 +1042,7 @@ class _Call:
     named: list[_NamedArg]
     namespaced: bool = False
     is_macro: bool = False
+    variadic: exp.Expr | None = None
 
     @property
     def display(self) -> str:
@@ -1104,6 +1135,7 @@ def _split_args(
 ) -> _Call:
     positional: list[exp.Expr] = []
     named: list[_NamedArg] = []
+    variadic: exp.Expr | None = None
     for arg in call.expressions:
         if not isinstance(arg, exp.Expr):
             continue
@@ -1124,8 +1156,26 @@ def _split_args(
                 arg,
                 fallback=call,
             )
+        if variadic is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "VARIADIC must be the last argument",
+                arg,
+                fallback=call,
+            )
+        if isinstance(arg, exp.Variadic):
+            inner = arg.this
+            if not isinstance(inner, exp.Expr):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "VARIADIC needs an array expression",
+                    arg,
+                    fallback=call,
+                )
+            variadic = inner
+            continue
         positional.append(arg)
-    return _Call(name, positional, named, namespaced, is_macro)
+    return _Call(name, positional, named, namespaced, is_macro, variadic)
 
 
 # literal coercion
@@ -3416,7 +3466,7 @@ class _Lowerer:
             # No row survived: lower the column as it stands, which is where
             # the empty-row-set rejection lives.
             return self._lower_expr(projection, env, select)
-        aggregate = isinstance(_unwrap(projection), exp.ArrayAgg)
+        aggregate = _contains_array_agg(_unwrap(projection))
         original = relation.tuples
         gathered: list[_Stream] = []
         stream_type: StreamType = "video"  # every pass overwrites it
@@ -6681,12 +6731,27 @@ class _Lowerer:
         * then the registry proper, whose pad signature is the call's stream
           signature.
 
+        A ``VARIADIC`` call is dispatched separately (:meth:`_lower_variadic_call`)
+        before any of that: it only ever means "spread this array as the pad
+        list", which is meaningless for a fixed-arity filter or a macro.
+
         ``ffmpeg.<filter>(...)`` differs from the bare spelling only in what a
         message calls the function (``call.display``) and in skipping the
         Postgres special forms at PARSE time.
         """
         name = call.name.lower()
+        if call.variadic is not None and not call.is_macro:
+            return self._lower_variadic_call(node, name, call, env, select)
         if call.is_macro:
+            if call.variadic is not None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{call.display}() does not take VARIADIC: sqlmpeg macros "
+                    "take a fixed number of streams",
+                    node,
+                    fallback=select,
+                    hint=_VARIADIC_HINT,
+                )
             return self._lower_macro_call(node, name, call, env, select)
         if call.namespaced:
             options = self._array_options(name)
@@ -6709,6 +6774,45 @@ class _Lowerer:
                 else self._unknown_function_hint(name),
             )
         return self._lower_dynamic_call(node, name, dynamic, call, env, select)
+
+    def _lower_variadic_call(
+        self, node: exp.Expr, name: str, call: _Call, env: _Env, select: exp.Select
+    ) -> _Value:
+        """Dispatch a call carrying ``VARIADIC``: the pad count follows the array.
+
+        Only :data:`N_INPUT` and ``concat`` have a pad count that can follow
+        anything -- every other filter's arity is fixed by its pad signature,
+        so ``VARIADIC`` on one of those is a rejection naming that, and an
+        unknown name is the ordinary ``UNKNOWN_FUNCTION`` either way.
+        """
+        n_input = self._n_input_options(name)
+        if n_input is not None:
+            return self._lower_variadic_n_input_call(
+                node, N_INPUT[name], n_input, call, env, select
+            )
+        concat = self._concat_options(name)
+        if concat is not None:
+            return self._lower_concat_call(node, concat, call, env, select)
+        dynamic = self.registry.get(name) if self.registry is not None else None
+        array_returning = call.namespaced and self._array_options(name) is not None
+        if dynamic is not None or array_returning:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{call.display}() takes a fixed number of streams: VARIADIC "
+                "only spreads an array over a filter whose pad count follows it",
+                node,
+                fallback=select,
+                hint=_VARIADIC_HINT,
+            )
+        raise _error(
+            ErrorCode.UNKNOWN_FUNCTION,
+            f"unknown function {call.display}()",
+            node,
+            fallback=select,
+            hint=self._namespaced_function_hint(name)
+            if call.namespaced
+            else self._unknown_function_hint(name),
+        )
 
     # -- the sqlmpeg macro namespace -----------------------------
 
@@ -7091,6 +7195,195 @@ class _Lowerer:
             except ValueError:
                 pass
         return spec.fallback
+
+    # -- VARIADIC: an array IS the argument list --------------------------
+
+    def _variadic_array(
+        self, call: _Call, node: exp.Expr, env: _Env, select: exp.Select
+    ) -> _Value:
+        """The array a call's ``VARIADIC`` argument lowers to, validated.
+
+        Every VARIADIC caller wants the same three checks: an array (a bare
+        array is broadcast, never spread -- see the module's own rules), a
+        non-empty one (a filter call with no inputs is not a filter call, and
+        this is the one place that says so), and the streams themselves,
+        already lowered.
+        """
+        variadic = call.variadic
+        assert variadic is not None  # callers only reach here when it is
+        value = self._lower_expr(variadic, env, select)
+        if not value.is_array:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"VARIADIC needs an array: {_sql_text(variadic)} is a single "
+                f"{value.type} stream",
+                variadic,
+                fallback=node,
+                hint="drop VARIADIC to pass it as one ordinary stream argument",
+            )
+        if not value.streams:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() has no inputs: {_sql_text(variadic)} is empty",
+                variadic,
+                fallback=node,
+                hint="VARIADIC spreads the array as the call's argument list; "
+                "an empty array leaves the filter nothing to run on",
+            )
+        return value
+
+    def _lower_variadic_n_input_call(
+        self,
+        node: exp.Expr,
+        spec: _NInputFilter,
+        options: dict[str, FilterOption],
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Value:
+        """``spec.name(<streams...>, VARIADIC <array>)``: the array supplies
+        every pad past the positional streams.
+
+        Positional streams ahead of VARIADIC bind exactly as they do without
+        it; the array's elements follow them in argument order, so
+        ``concat(intro, VARIADIC array_agg(v))`` feeds ``intro`` then every
+        element of the aggregate. No positional OPTION can follow a variable
+        number of streams, so every option here is named -- unlike the
+        leading-run count guess :meth:`_lower_n_input_call` makes, the array's
+        length already IS the count, checked against a written ``option =>``
+        the same way a plain call's count is.
+        """
+        kinds = self._stream_kinds(call, env, select, len(call.args))
+        if any(kind != spec.stream for kind in kinds):
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() is an ffmpeg filter: its stream inputs are "
+                f"all {spec.stream}, got ({', '.join(kinds) or 'no streams'})",
+                node,
+                fallback=select,
+                hint=_N_INPUT_HINT,
+            )
+        array_value = self._variadic_array(call, node, env, select)
+        if array_value.type != spec.stream:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() is an ffmpeg filter: its stream inputs are "
+                f"all {spec.stream}, got VARIADIC {array_value.type}",
+                call.variadic if call.variadic is not None else node,
+                fallback=node,
+                hint=_N_INPUT_HINT,
+            )
+        prefix = [self._lower_expr(arg, env, select).at(0) for arg in call.args]
+        streams = prefix + list(array_value.streams)
+        count = len(streams)
+        args = self._bind_options(
+            spec.name, call, node, select, env, options=options, extras=[], timeline=False,
+        )
+        self._check_variadic_count(spec.option, count, args, call, node, select, _N_INPUT_HINT)
+        if spec.option is not None and (
+            spec.emit_default or spec.option in args or count != spec.fallback
+        ):
+            args[spec.option] = count
+        node_id = self.ctx.node(
+            spec.name, args, [stream.ref for stream in streams], [spec.output]
+        )
+        source = streams[0].source if count == 1 else _agreed_source(streams)
+        return _scalar(_Stream(ref=node_id, type=spec.output, source=source))
+
+    def _check_variadic_count(
+        self,
+        option_name: str | None,
+        count: int,
+        args: dict[str, object],
+        call: _Call,
+        node: exp.Expr,
+        select: exp.Select,
+        hint: str,
+    ) -> None:
+        """A WRITTEN count option must agree with the array's length.
+
+        Unlike the positional call (:meth:`_lower_n_input_call`), there is no
+        "did you forget to write it" ambiguity here: the array's length IS the
+        count, full stop, so an unwritten option is simply set to it below --
+        only a value the query itself wrote can possibly disagree.
+        """
+        if option_name is None:
+            return
+        written = args.get(option_name)
+        if not isinstance(written, (int, float)) or isinstance(written, bool):
+            return
+        if int(written) == count:
+            return
+        anchor = next((arg.value for arg in call.named if arg.name == option_name), node)
+        raise _error(
+            ErrorCode.UDF_ARG_TYPE,
+            f"{call.display}() was given {_stream_count(count)} but its "
+            f"'{option_name}' option says {int(written)}",
+            anchor,
+            fallback=select,
+            hint=hint,
+        )
+
+    # -- VARIADIC concat: N segments of one stream type --------------------
+
+    def _concat_options(self, name: str) -> dict[str, FilterOption] | None:
+        """``concat``'s option table, but ONLY for a call under VARIADIC.
+
+        Mirrors :meth:`_n_input_options`: ``concat`` is ``N->N`` and excluded
+        from the registry's own table by the pad-scope check (see
+        registry.py), and ``excluded_options`` is the one door back in --
+        also the evidence that this ffmpeg actually ships the filter at all.
+        """
+        if name != _CONCAT_NAME or self.registry is None:
+            return None
+        return self.registry.excluded_options(name)
+
+    def _lower_concat_call(
+        self,
+        node: exp.Expr,
+        options: dict[str, FilterOption],
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Value:
+        """``concat(<streams...>, VARIADIC <array>)``: one segment per stream.
+
+        ffmpeg's ``concat`` multiplexes video AND audio pads per segment, set
+        by its own ``v``/``a`` options; VARIADIC only ever spreads ONE
+        homogeneous array, so this is ``concat`` run as a plain N-input
+        filter over whichever type the array carries. ``v``/``a`` follow that
+        type unconditionally -- writing either is rejected, the same
+        ``UNKNOWN_FILTER_OPTION`` a made-up option name gets, since a call
+        with one array has nothing for a split segment shape to mean. ``n``
+        stays an ordinary count option: written or not, it is checked against
+        the array's length exactly as an N-input filter's is.
+        """
+        array_value = self._variadic_array(call, node, env, select)
+        stream_type = array_value.type
+        kinds = self._stream_kinds(call, env, select, len(call.args))
+        if any(kind != stream_type for kind in kinds):
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{call.display}() is an ffmpeg filter: its stream inputs are "
+                f"all one type, got ({', '.join([*kinds, stream_type])})",
+                node,
+                fallback=select,
+                hint=_CONCAT_VARIADIC_HINT,
+            )
+        prefix = [self._lower_expr(arg, env, select).at(0) for arg in call.args]
+        streams = prefix + list(array_value.streams)
+        count = len(streams)
+        bindable = {key: option for key, option in options.items() if key not in ("v", "a")}
+        args = self._bind_options(
+            "concat", call, node, select, env, options=bindable, extras=[], timeline=False,
+        )
+        self._check_variadic_count("n", count, args, call, node, select, _CONCAT_VARIADIC_HINT)
+        args["n"] = count
+        args["v"] = 1 if stream_type == "video" else 0
+        args["a"] = 1 if stream_type == "audio" else 0
+        node_id = self.ctx.node("concat", args, [stream.ref for stream in streams], [stream_type])
+        source = streams[0].source if count == 1 else _agreed_source(streams)
+        return _scalar(_Stream(ref=node_id, type=stream_type, source=source))
 
     # -- array-returning filters -----------------------
 
@@ -7714,6 +8007,8 @@ class _Lowerer:
         """Did-you-mean over the registry (there is nothing else)."""
         registry = self.registry
         if registry is not None and registry.available():
+            if name == _CONCAT_NAME:
+                return _CONCAT_VARIADIC_HINT
             if registry.get_source(name) is not None:
                 return (
                     f"{name} is a generated source, not a function: put it in FROM, "
@@ -7722,7 +8017,7 @@ class _Lowerer:
             # `name` itself can be in the candidate set -- N_INPUT lists three
             # names unconditionally, and this ffmpeg may simply not have one --
             # and "did you mean amix()?" for `amix()` helps nobody.
-            candidates = sorted((set(registry.names()) | set(N_INPUT)) - {name})
+            candidates = sorted((set(registry.names()) | set(N_INPUT) | {_CONCAT_NAME}) - {name})
             matches = difflib.get_close_matches(name, candidates, n=1, cutoff=0.6)
             if matches:
                 return f"did you mean {matches[0]}()?"
@@ -7741,6 +8036,8 @@ class _Lowerer:
         """
         registry = self.registry
         if registry is not None and registry.available():
+            if name == _CONCAT_NAME:
+                return _CONCAT_VARIADIC_HINT
             if registry.get_source(name) is not None:
                 # A generated source IS usable -- in FROM, where it belongs
                 #. Say where rather than "unknown".
@@ -7750,7 +8047,8 @@ class _Lowerer:
                     f"{name}(duration => 2) s"
                 )
             candidates = sorted(
-                (set(registry.names()) | set(ARRAY_RETURNING) | set(N_INPUT)) - {name}
+                (set(registry.names()) | set(ARRAY_RETURNING) | set(N_INPUT) | {_CONCAT_NAME})
+                - {name}
             )
             matches = difflib.get_close_matches(name, candidates, n=1, cutoff=0.6)
             if matches:
@@ -8015,7 +8313,7 @@ class _Lowerer:
             for group in groups:
                 row: list[CellValue] = []
                 for projection in projections:
-                    aggregate = isinstance(_projection_expr(projection), exp.ArrayAgg)
+                    aggregate = _contains_array_agg(_projection_expr(projection))
                     relation.tuples = list(group) if aggregate else group[:1]
                     row += [
                         cells[0]
@@ -8783,6 +9081,20 @@ def _sql_text(node: exp.Expr) -> str:
 
 def _stream_count(count: int) -> str:
     return f"{count} stream" + ("" if count == 1 else "s")
+
+
+def _contains_array_agg(node: exp.Expr) -> bool:
+    """True if `node` is, or contains anywhere, an ``array_agg(...)`` call.
+
+    A grouped branch's projection needs the WHOLE group's tuples exactly when
+    it contains an aggregate somewhere -- ``array_agg(t)`` at the top, same as
+    always, and now also under ``VARIADIC`` (``concat(VARIADIC array_agg(t))``)
+    or alongside a positional stream (``concat(intro, VARIADIC array_agg(t))``).
+    Grouping validity already forbids a bare row-column reference OUTSIDE an
+    array_agg in the same projection, so "contains one anywhere" and "needs
+    the group, not just its first tuple" are the same question.
+    """
+    return any(isinstance(sub, exp.ArrayAgg) for sub in node.walk())
 
 
 # public entry point

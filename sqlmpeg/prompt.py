@@ -278,6 +278,28 @@ _DIALECT_TAIL = """\
   a.tags.language) TO (a.tags.language || '.mka')`. `ORDER BY` inside
   `array_agg` is
   rejected; `ORDER BY` before the aggregate defines the order.
+  `array_agg` is otherwise a whole-column-only aggregate, with ONE other
+  legal spot: the sole argument of `VARIADIC` (below).
+- `VARIADIC <array>` in a filter call spreads the array as the argument
+  list -- as many pads as the array has elements, instead of the bare
+  array's own meaning (broadcast, one node per element). It is how a
+  query calls a filter whose pad count is not fixed: `amix(VARIADIC
+  f.audio)` mixes however many audio tracks a file has, no `GROUP BY`
+  needed; `concat(VARIADIC array_agg(v))` joins however many rows a
+  relation produced. Rules: at most one `VARIADIC` argument, always
+  last, with any ordinary streams positional before it
+  (`concat(intro, VARIADIC array_agg(v))`); both a plain array
+  (`f.audio`) and an `array_agg(...)` are accepted, since either has a
+  compile-time-known length; an explicit count option that disagrees
+  with the array's length (`amix(VARIADIC xs, inputs => 2)` over a
+  three-element array) is a rejection naming both numbers; an empty
+  array is a rejection, naming what produced it. `concat` takes no
+  other spelling -- `concat(a, b)` is `UNKNOWN_FUNCTION`, since ffmpeg's
+  `concat` has no fixed pad count for sqlmpeg to check against without
+  `VARIADIC` -- and `split` takes none at all, since the compiler
+  inserts its own. `VARIADIC` on a fixed-arity filter (`scale(VARIADIC
+  f.video)`) is also a rejection: only a filter whose pad count follows
+  its argument count takes it.
 - `unnest(...) a JOIN unnest(...) b ON <predicate>` matches ROWS between two
   unnest tables: `INNER JOIN`, `LEFT [OUTER] JOIN`, `FULL OUTER JOIN` (a
   bare `FULL JOIN` means the same thing), each requiring its own `ON`.
@@ -660,7 +682,9 @@ A handful of names are exceptions to "one stream in, one filter, one call":
   are the same shape, but their count option is `nb_inputs`, not `inputs`.
   `ladspa(audio, ..., file => '<library>', plugin => '<label>')` is the
   same shape with no count option at all - the loaded plugin's ports
-  decide.
+  decide. Every one of these also takes `VARIADIC` instead of a written-out
+  list (`amix(VARIADIC f.audio)`), and `concat` joins them under `VARIADIC`
+  ONLY (see the `array_agg`/`VARIADIC` entry above).
 - Plugin filters compile like any other call when the build ships them:
   `frei0r(video, filter_name => '<plugin>', filter_params => 'a|b')` and
   the source `ffmpeg.frei0r_src(...)` (found via the `FREI0R_PATH`
@@ -673,10 +697,12 @@ A handful of names are exceptions to "one stream in, one filter, one call":
   Splat it into the SELECT list, subscript one element through a CTE column
   (`s.ch[2]`), or broadcast a call over every element. These three resolve
   ONLY through the namespace -- the bare name reaches nowhere.
-- A filter with a variable pad count (`split`, `concat`) or more than one
-  output is not callable under either filter spelling. Neither is a
-  zero-input filter: `ffmpeg.testsrc(...)` is a generated SOURCE, and it
-  belongs in `FROM` (see Dialect > Sources), never in the SELECT list.
+- A filter with a variable pad count is not callable under either filter
+  spelling UNLESS it is one of the N-input set or `concat`, and `concat`
+  only under `VARIADIC` (above) -- `split` stays uncallable regardless,
+  since the compiler inserts its own. Neither is a filter with more than one
+  output, or a zero-input one: `ffmpeg.testsrc(...)` is a generated SOURCE,
+  and it belongs in `FROM` (see Dialect > Sources), never in the SELECT list.
 
 Function names are case-insensitive; option names are not. Filter calls are
 machine-dependent -- a query naming a filter (or an option) only compiles
