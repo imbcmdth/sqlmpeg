@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import functools
 import warnings
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -70,21 +71,15 @@ def pinned_ffmpeg() -> None:
         pytest.skip(message)
 
 
-@pytest.fixture
-def _store_home(tmp_path: Path) -> Path:
-    """A cache directory of this test's own.
-
-    Per test, not per session: a test that writes the machine-wide lockfile
-    would otherwise leak it into every later one, and what a project can see
-    is exactly what several of them assert.
-    """
-    home = tmp_path / "store-home"
-    home.mkdir()
-    return home
+@pytest.fixture(scope="session")
+def _store_home(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return tmp_path_factory.mktemp("store-home")
 
 
 @pytest.fixture(autouse=True)
-def _isolated_store(_store_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolated_store(
+    _store_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
     """No test reads or writes the real ``~/.cache/sqlmpeg``.
 
     `discover` consults the machine-wide lockfile, so without this a developer
@@ -95,6 +90,13 @@ def _isolated_store(_store_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from sqlmpeg import store
 
     monkeypatch.setattr(store, "_cache_dir", lambda: _store_home)
+    yield
+    # The directory is shared for speed - a per-test one costs four times the
+    # suite's runtime. Only the machine-wide lockfile leaks between tests, so
+    # only it is cleared: what a project can SEE is what several tests assert.
+    lock = store.global_lock_path()
+    if lock.exists():
+        lock.unlink()
 
 
 @pytest.fixture(autouse=True)
