@@ -436,6 +436,10 @@ _STREAM_HINT = (
     "a SELECT column must be a stream, e.g. a.video[1] or scale(a.video[1], 640, -2)"
 )
 _SUBSCRIPT_HINT = "stream subscripts are 1-based: a.video[1] is the first video stream"
+_FROM_ITEM_MESSAGE = (
+    "only input('path'), ffmpeg.<source>(...), generate_series(...), and CTE "
+    "or view names are allowed in FROM"
+)
 _ZIP_HINT = (
     "broadcast arrays zip elementwise, one output per element; "
     "subscript one of them to pair a single stream with the other, e.g. a.audio[1]"
@@ -4276,7 +4280,7 @@ class _Lowerer:
         if not isinstance(table, exp.Table):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                "only input('path') and CTE names are allowed in FROM",
+                _FROM_ITEM_MESSAGE,
                 table,
                 fallback=select,
             )
@@ -4287,6 +4291,26 @@ class _Lowerer:
             # `FROM ffmpeg.<source>(...) alias`: resolve already
             # shape-checked it and parked the record in `res.source_filters`.
             self._add_source(table, alias_node, env, select)
+            return
+        if isinstance(inner, exp.GenerateSeries):
+            if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
+                raise _error(  # defensive: resolve already required one
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "generate_series(...) requires an alias",
+                    table,
+                    fallback=select,
+                )
+            alias = _fold(alias_node.this)
+            series_values = self.res.series.get(alias)
+            if series_values is None:  # defensive: resolve records every series alias
+                raise _error(
+                    ErrorCode.UNKNOWN_ALIAS,
+                    f"unknown alias '{alias}'",
+                    alias_node,
+                    fallback=table,
+                    hint=self._known_hint(),
+                )
+            self._add_series_rows(alias, series_values, inner, env, select)
             return
         if isinstance(inner, exp.Anonymous):
             if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
@@ -4335,7 +4359,7 @@ class _Lowerer:
             return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            "only input('path') and CTE names are allowed in FROM",
+            _FROM_ITEM_MESSAGE,
             table,
             fallback=select,
         )
@@ -4371,6 +4395,37 @@ class _Lowerer:
             type="data",  # filler: a written row has no track
             relation=env.relation,
             values=values,
+        )
+        self._join_rows(env.relation, local, rows, None, env, select)
+
+    def _add_series_rows(
+        self,
+        local: str,
+        values: tuple[int, ...],
+        node: exp.Expr,
+        env: _Env,
+        select: exp.Select,
+    ) -> None:
+        """Bind one ``generate_series`` table: its computed rows join the
+        branch's relation exactly like a VALUES table's written ones.
+
+        `values` is the whole computed sequence -- resolve already did the
+        arithmetic and rejected a zero step or an empty/descending range,
+        since bounds and step are literals by the time it runs. No stream and
+        no ``-i``: the rows are computed, not read.
+        """
+        if env.relation is None:
+            env.relation = _RowRelation()
+        rows = [_TrackRow(stream=_STREAMLESS_ROW, columns={local: v}) for v in values]
+        env.bindings[local] = _RowBinding(
+            alias=local,
+            source="",
+            column=local,
+            type="data",  # filler: a computed row has no track
+            relation=env.relation,
+            values=RawValuesTable(
+                alias=local, columns=(local,), rows=(), node=node, types=("number",)
+            ),
         )
         self._join_rows(env.relation, local, rows, None, env, select)
 

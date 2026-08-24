@@ -93,6 +93,20 @@ Notes for downstream passes (lower):
   take, is the installed ffmpeg's business: this pass checks SHAPE only (alias
   mandatory, arguments named-only).
 
+* ``FROM generate_series(start, stop[, step]) alias`` is a compile-time
+  INTEGER row table, one row per value the range reaches. VERIFIED under
+  sqlglot 30.17 ``read="postgres"``: it is its OWN node type, never
+  ``exp.Anonymous`` — ``FROM generate_series(1, 5) i`` parses as
+  ``exp.Table(this=ExplodingGenerateSeries(start=Literal(1), end=Literal(5)),
+  alias=TableAlias(i))``, a subclass of ``exp.GenerateSeries`` this pass
+  checks against directly, bounds and step read off ``start``/``end``/``step``
+  rather than an ``expressions`` list. A negative bound is ``exp.Neg``
+  wrapping the literal, same as everywhere else. A 4th positional argument
+  lands in ``is_end_exclusive`` — a shape this dialect has no spelling for —
+  and is rejected by name. The alias is mandatory and names both the row
+  table and its one column, exactly like ``input()``/``unnest()``/
+  ``ffmpeg.<source>()``: ``generate_series(1, 5) i`` reads back as ``i.i``.
+
 * Stream subscripts (``a.video[1]``) arrive as ``exp.Bracket`` wrapping the
   ``exp.Column``. **sqlglot rebases the index at parse time**: under
   ``read="postgres"`` (``INDEX_OFFSET = 1``) it rewrites the single subscript
@@ -385,6 +399,23 @@ _KWARG_HINT = (
 _UNNEST_HINT = (
     "unnest takes one bare array column of an input alias and needs a name for "
     "its rows, e.g. FROM input('film.mkv') f, unnest(f.audio) t"
+)
+_SERIES_HINT = (
+    "generate_series(start, stop[, step]) takes integer literals only -- a "
+    "substituted variable is fine (generate_series(1, :count)), a column "
+    "reference or any other expression is not"
+)
+_SERIES_ALIAS_HINT = (
+    "the alias names both the row table and its one column, e.g. FROM "
+    "generate_series(1, 5) i"
+)
+_SERIES_RANGE_HINT = (
+    "a series that produces no rows is rejected rather than silently empty; "
+    "swap the bounds, or the step's sign, to make it ascend"
+)
+_FROM_ITEM_MESSAGE = (
+    "only input('path'), ffmpeg.<source>(...), generate_series(...), and CTE "
+    "or view names are allowed in FROM"
 )
 _ROW_WHERE_HINT = (
     "a track-row predicate compares one row column against a literal: "
@@ -1447,6 +1478,14 @@ class Resolved:
     Disjoint from ``ctes``: a VALUES CTE is never FROM-selectable, only usable
     as a sink option's value (``chapters <alias>``)."""
 
+    series: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    """``FROM generate_series(start, stop[, step]) alias`` records, keyed by
+    alias, in FROM order across the whole script. Each value is the WHOLE
+    computed sequence -- resolve already did the arithmetic, since bounds and
+    step are literals by the time it runs, and already rejected a zero step
+    or a range that would produce no rows. No ``-i`` and no probe: lower reads
+    this directly to build the row table's ``_TrackRow``s."""
+
 
 def _listed_columns(names: Iterable[str]) -> str:
     return ", ".join(sorted(names))
@@ -1576,6 +1615,63 @@ def _describe_unnest_arg(node: object) -> str:
     if isinstance(node, exp.Expr):
         return f"{node.__class__.__name__.lower()}(...)"
     return "that"
+
+
+def _describe_series_bound(node: exp.Expr | None) -> str:
+    """What an unusable ``generate_series`` bound is, for its rejection message."""
+    if isinstance(node, exp.Column):
+        return "a column reference"
+    if isinstance(node, exp.Null):
+        return "NULL"
+    if isinstance(node, exp.Boolean):
+        return "a boolean"
+    if isinstance(node, exp.Kwarg):
+        return "a named argument (generate_series takes positional arguments only)"
+    if isinstance(node, exp.Literal) and node.is_string:
+        return "a string"
+    if isinstance(node, exp.Literal):
+        return "a non-integer number"
+    if isinstance(node, exp.Expr):
+        return "a computed expression"
+    return "that"
+
+
+def _series_bound(node: exp.Expr | None, label: str, series: exp.Expr) -> int:
+    """One ``generate_series`` bound (or step) as a python int, or its rejection.
+
+    Bounds are literals BY THE TIME resolve runs -- substitution already
+    replaced a variable reference with the number it names -- so anything
+    else here, a column reference included, is rejected rather than
+    deferred: that is what keeps the row count known before anything runs.
+    """
+    value = _unwrap_paren(node) if isinstance(node, exp.Expr) else None
+    name = null_variable(value)
+    if name is not None:
+        line, col = _pos(node, series)
+        raise unset_error(
+            ErrorCode.UNSUPPORTED_SQL,
+            name,
+            what=f"generate_series's {label} needs an integer",
+            line=line,
+            col=col,
+        )
+    negative = False
+    if isinstance(value, exp.Neg) and isinstance(value.this, exp.Expr):
+        negative = True
+        value = _unwrap_paren(value.this)
+    if isinstance(value, exp.Literal) and not value.is_string:
+        text = str(value.this)
+        if _DIGITS_RE.match(text):
+            whole = int(text)
+            return -whole if negative else whole
+    raise _error(
+        ErrorCode.UNSUPPORTED_SQL,
+        f"generate_series's {label} must be an integer literal, not "
+        f"{_describe_series_bound(value)}",
+        node if isinstance(node, exp.Expr) else series,
+        fallback=series,
+        hint=_SERIES_HINT,
+    )
 
 
 def _join_spec(join: exp.Join) -> RawRowJoin:
@@ -1748,11 +1844,13 @@ def _normalize_map_paths(select: exp.Select, path_expr: exp.Expr | None = None) 
 
 
 def _has_row_source(select: exp.Select, visible: set[str]) -> bool:
-    """True if this branch's FROM clause holds rows: ``unnest(...)`` or a
-    reference to a CTE or view -- each of which contributes rows to group
-    over, and admits the ORDER BY carve-out."""
+    """True if this branch's FROM clause holds rows: ``unnest(...)``,
+    ``generate_series(...)``, or a reference to a CTE or view -- each of
+    which contributes rows to group over, and admits the ORDER BY carve-out."""
     for item in from_items(select):
         if isinstance(item, exp.Unnest):
+            return True
+        if isinstance(item, exp.Table) and isinstance(item.this, exp.GenerateSeries):
             return True
         if (
             isinstance(item, exp.Table)
@@ -2227,6 +2325,7 @@ class _Resolver:
         # it read them under. Branch-local, so `_collect_scope` clears it: two
         # branches may each spell their own table `m`.
         self.values_rows: dict[str, RawValuesTable] = {}
+        self.series: dict[str, tuple[int, ...]] = {}
 
     # -- entry point ------------------------------------------------------
 
@@ -2335,6 +2434,7 @@ class _Resolver:
             source_filters=self.source_filters,
             track_rows=self.track_rows,
             values_ctes=self.values_ctes,
+            series=self.series,
         )
 
     def _check_fanout_is_alone(self, sinks: list[RawSink]) -> None:
@@ -2783,6 +2883,7 @@ class _Resolver:
             or name in self.source_filters
             or name in self.track_rows
             or name in self.values_ctes
+            or name in self.series
         ):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -3453,7 +3554,7 @@ class _Resolver:
         if not isinstance(table, exp.Table):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                "only input('path') and CTE names are allowed in FROM",
+                _FROM_ITEM_MESSAGE,
                 table,
                 hint="use a WITH ... AS (...) CTE instead of a subquery",
             )
@@ -3493,6 +3594,9 @@ class _Resolver:
 
         if namespaced:
             self._add_source(table, inner, alias_node, scope)
+            return
+        if isinstance(inner, exp.GenerateSeries):
+            self._add_series(table, inner, alias_node, scope)
             return
         if isinstance(inner, exp.Anonymous):
             self._add_input(table, inner, alias_node, scope)
@@ -3540,7 +3644,7 @@ class _Resolver:
             return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
-            "only input('path') and CTE names are allowed in FROM",
+            _FROM_ITEM_MESSAGE,
             table,
         )
 
@@ -3712,7 +3816,10 @@ class _Resolver:
     ) -> None:
         func_name = str(func.this).lower()
         if func_name != "input":
-            hint = "the only table function is input('path')"
+            hint = (
+                "known table functions are input('path') and "
+                "generate_series(start, stop[, step])"
+            )
             if func_name == CHAPTERS_COLUMN:
                 argument = func.expressions[0] if func.expressions else None
                 source = (
@@ -3865,6 +3972,91 @@ class _Resolver:
             alias=alias, name=name, options=options, call_node=inner
         )
         scope[alias] = "source"
+
+    # -- FROM generate_series(start, stop[, step]) alias ------------
+
+    def _add_series(
+        self,
+        table: exp.Table,
+        series: exp.GenerateSeries,
+        alias_node: exp.Expr | None,
+        scope: dict[str, str],
+    ) -> None:
+        """``FROM generate_series(start, stop[, step]) alias`` -- a compile-time
+        row table of integers, one row per value in the range.
+
+        Bounds and the optional step are integer literals by the time
+        substitution has run, so the row count is known here, before anything
+        runs -- a column reference or any other computed expression is
+        rejected rather than deferred. A zero step, and a range that would
+        produce no rows, are rejected too: a series that silently produces
+        nothing is a mistake worth naming, not a valid empty table.
+
+        The row VALUES are computed here rather than deferred to lower, the
+        same way a VALUES CTE's column types are (:meth:`_values_types`) --
+        pure-literal arithmetic is resolve's business. `values_rows` gets a
+        schema-only descriptor (empty ``rows``, since nothing after this reads
+        them) purely so the existing VALUES-row machinery -- WHERE, SELECT,
+        GROUP BY, array_agg over `scope[alias] == "row"` -- picks the column
+        up for free; `series` on `Resolved` carries the actual sequence lower
+        builds the rows from.
+
+        The alias is mandatory, like every other call-shaped FROM item
+        (``input()``, ``unnest()``, ``ffmpeg.<source>()``), and it names both
+        the row table and its one column -- ``generate_series(1, 5) i`` reads
+        back as ``i.i``.
+        """
+        extra = series.args.get("is_end_exclusive")
+        if extra:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "generate_series takes at most 3 arguments (start, stop, step)",
+                _first_expression(extra),
+                fallback=series,
+                hint=_SERIES_HINT,
+            )
+        start = _series_bound(series.args.get("start"), "start", series)
+        stop = _series_bound(series.args.get("end"), "stop", series)
+        step_node = series.args.get("step")
+        step = _series_bound(step_node, "step", series) if step_node is not None else 1
+        if step == 0:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "generate_series's step cannot be 0",
+                step_node,
+                fallback=series,
+                hint=_SERIES_HINT,
+            )
+        limit = stop + 1 if step > 0 else stop - 1
+        values = tuple(range(start, limit, step))
+        if not values:
+            written = f"{start}, {stop}" + (f", {step}" if step_node is not None else "")
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"generate_series({written}) is a descending or empty range",
+                series,
+                fallback=table,
+                hint=_SERIES_RANGE_HINT,
+            )
+        if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "generate_series(...) requires an alias",
+                series,
+                fallback=table,
+                hint=_SERIES_ALIAS_HINT,
+            )
+        alias = _ident_name(alias_node.this)
+        self._reserve(alias, alias_node.this)
+        if alias in scope:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
+            )
+        self.series[alias] = values
+        self.values_rows[alias] = RawValuesTable(
+            alias=alias, columns=(alias,), rows=(), node=series, types=("number",)
+        )
+        scope[alias] = "row"
 
     def _known_hint(self, names: set[str] | dict[str, str]) -> str:
         known = ", ".join(sorted(names))

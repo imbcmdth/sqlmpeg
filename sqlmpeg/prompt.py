@@ -329,6 +329,31 @@ _DIALECT_TAIL = """\
   fill -- avoid its gaps with an `INNER`/`LEFT` join that never selects the
   missing side.
 
+### Series rows
+- `FROM generate_series(start, stop[, step]) alias` is a compile-time row
+  table of integers, one row per value in the range -- a count rather than a
+  file, joined into the branch exactly like a `VALUES` row table (see CTEs
+  below). The alias is mandatory, like every other call-shaped FROM item
+  (`input()`, `unnest()`, `ffmpeg.<source>()`), and it names both the row
+  table and its one column: `generate_series(1, 5) i` reads its value back as
+  `i.i`, not bare `i` -- there is no bare-column spelling, same rule as any
+  other row.
+- `start` and `stop` (and the optional `step`) must be integer literals BY
+  THE TIME this compiler sees them, which is after `-v` substitution -- so
+  `generate_series(1, :count)` is fine and a column reference or any other
+  computed expression is `UNSUPPORTED_SQL`. That is what keeps the row count
+  known before anything runs: `stop - start` over `step`, inclusive.
+- A zero `step` is a rejection, and so is a range that would produce no
+  rows (descending bounds with the default ascending step, or vice versa) --
+  a series that silently produces nothing is a mistake worth naming, not a
+  valid empty table.
+- The rows are streamless, ordinary compile-time rows: cross-join them
+  against an input or another row source with a comma, filter them in
+  `WHERE`, gather them with `array_agg`, read `i.i` in a SELECT expression --
+  exactly the rules a `VALUES` row follows. What they do NOT yet do: key a
+  trim-bound window or a fan-out `TO (expression)` -- that reach is track-
+  and chapter-row-only today.
+
 ### Variables
 - `:'name'` (string literal), `:"name"` (identifier) and bare `:name` (raw
   text) are psql-style references, filled at compile time by `-v name=value`
@@ -814,9 +839,13 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   casts (`::` or `CAST`), arithmetic or any non-literal in an argument,
   unqualified columns, schema-qualified tables, an alias that shadows
   another alias/CTE/view name already in scope, `WITH RECURSIVE`, nested
-  `WITH`, CTE column lists, table functions other than `input()` and
-  `unnest()`, a statement that is neither a `SELECT` nor (in a script)
+  `WITH`, CTE column lists, table functions other than `input()`, `unnest()`
+  and `generate_series()`, a statement that is neither a `SELECT` nor (in a script)
   `CREATE VIEW` / `COPY`, a zero/negative/computed array subscript.
+- `generate_series(...)`: a bound or step that is not an integer literal
+  after `-v` substitution (a column reference included), a `0` step, a
+  descending or empty range, and an unaliased call -- the alias is
+  mandatory, same as `input()`/`unnest()`/`ffmpeg.<source>()`.
 - Any name that is neither one of the four `sqlmpeg.*` macros nor a filter
   the installed ffmpeg provides (see Calling convention), including
   transitions between concatenated branches, motion tracking,
@@ -991,6 +1020,15 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
         "TO '360.mp4' WITH (video_codec 'libx264', crf 26, audio_codec 'aac');\n"
         "COPY (SELECT m.a FROM master m)\n"
         "TO 'audio.m4a' WITH (audio_codec 'aac', audio_bitrate '128k')",
+    ),
+    (
+        "Give film.mkv four evenly spaced chapter markers, ten seconds each.",
+        "COPY (\n"
+        "  SELECT f.video[1], f.audio[1],\n"
+        "         array_agg(ROW('Chapter ' || i.i::text, (i.i - 1) * 10, "
+        "i.i * 10)::chapter) AS chapters\n"
+        "  FROM input('film.mkv') f, generate_series(1, 4) i\n"
+        ") TO 'chaptered.mkv'",
     ),
 )
 

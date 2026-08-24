@@ -357,6 +357,7 @@ Every FROM item is a compile-time table; the column model per shape is
 | `input('path', name => value, ...) alias` | 1 | alias mandatory; path is a literal, never computed; trailing named options are ffmpeg's per-input flags |
 | `ffmpeg.<source>(name => value, ...) alias` | 1 | generated stream (testsrc2, sine, color, anullsrc, ...), no `-i`; options named-only |
 | `unnest(alias.<array>) alias` | one per element | the four stream arrays, or `chapters` / `cues` / `attachments`, of an input declared earlier in the same FROM |
+| `generate_series(start, stop[, step]) alias` | `stop - start` over `step`, inclusive | alias mandatory, names both the row table and its one column (`i.i`); bounds and step are integer literals after substitution |
 | `cte_or_view_name [alias]` | its body's rows | a multi-row body is a multi-row source; a `VALUES` list is one too |
 | `function_name(args) alias` | its body's rows | a table-returning function, expanded at compile time |
 
@@ -530,6 +531,9 @@ Every one of these is a typed rejection, never a silent reinterpretation:
 - **Values**: casts other than to text; computed input paths;
   computed subscripts; `0` or negative subscripts; `||` over numbers
   without `::text`; division by a known zero.
+- **`generate_series`**: a bound or step that is not an integer literal
+  after substitution (a column reference included); a `0` step; a
+  descending or empty range; an unaliased call.
 - **Multi-row into one path** (`ROW_COUNT_MISMATCH`): gather or fan
   out, explicitly.
 - **Filters**: variable-pad (`split` - what the compiler's own split

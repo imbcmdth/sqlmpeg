@@ -95,6 +95,14 @@ Writing takes a third field, `path` - the file to read - which is **write-only**
 
 A CTE exposes whatever its body named with `AS`, and referencing it in FROM contributes its body's ROWS - a two-row CTE is a two-row source, and comma between sources is a cross join with real multiplicity, exactly as SQL says. Tag columns in the body ride on its streams (see Tags below). No other columns exist on a CTE alias; there is no natural naming from a bare `a`. Views referenced in FROM follow the same rules.
 
+## Series rows - `generate_series(1, 5) i`
+
+A count rather than a file: one row per integer in the range, computed at compile time from `start`, `stop`, and an optional `step` - a `VALUES` row with its cells computed instead of written. The alias is mandatory, like every other call-shaped FROM item (`input()`, `unnest()`, `ffmpeg.<source>()`), and it names both the row table and its one column: `generate_series(1, 5) i` reads its value back as `i.i`, the same dot-qualified spelling a `VALUES` column takes - there is no bare `i` for the value, and no other column.
+
+`start`, `stop`, and `step` must be integer literals by the time this pass runs, which is after `-v` substitution - `generate_series(1, :count)` is fine, a column reference or any other computed expression is a typed rejection, because that is what keeps the row count (`stop - start` over `step`, inclusive) known before anything runs. A `0` step is rejected, and so is a range that would produce no rows (descending bounds under the default ascending step, or the reverse under a negative one): a series that silently produces nothing is a mistake worth naming, not a valid empty table.
+
+The rows are streamless - no track, no `-i` - and join, filter, and gather exactly like a `VALUES` row: cross join them against an input or another row source with a comma, narrow them in `WHERE`, `array_agg` them, read `i.i` in a SELECT expression. What they do not yet do is key a trim-bound window or a fan-out `TO (expression)` - both reach only track and chapter rows today, `known_gaps.md` records it, and it is the reason a series alone has limited pull until that widens.
+
 ## Joins
 
 ```sql

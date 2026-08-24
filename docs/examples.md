@@ -1690,3 +1690,47 @@ ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:a:0][0:a:1]amix=inputs=2[ou
 ```
 
 `inputs` still writes itself from the count, so `amix(VARIADIC xs, inputs => 3)` over a two-element array is a rejection naming both numbers, exactly as `amix(a, b, inputs => 3)` already was.
+## 72. Write evenly-spaced chapters, however many you want
+
+`generate_series(start, stop[, step])` in `FROM` is a row source that is a count rather than a file - a `VALUES` table with its cells computed instead of written. The alias names both the table and its one column, so `generate_series(1, :count) i` reads back as `i.i`; gather it into a chapter list the same way any row source builds one, and the count becomes a parameter instead of a wall of copy-pasted `ROW(...)`s:
+
+```sql
+COPY (
+  SELECT f.video[1], f.audio[1],
+         array_agg(ROW('Chapter ' || i.i::text, (i.i - 1) * 10, i.i * 10)::chapter) AS chapters
+  FROM input(:'source') f, generate_series(1, :count) i
+) TO :'dest'
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mkv -v count=4 -v dest=chaptered.mkv
+ffmpeg -i film.mkv -f ffmetadata -i \
+  'data:text/plain;'\
+'base64,'\
+'O0ZGTUVUQURBVEExCltDSEFQVEVSXQpUSU1FQkFTRT0xLzEKU1RBUlQ9MApFTkQ9MTAKdGl0bGU9Q2hhcHRlciAxCltDSEFQVEVSXQpUSU1FQkFTRT0xLzEKU1RBUlQ9MTAKRU5EPTIwCnRpdGxlPUNoYXB0ZXIgMgpbQ0hBUFRFUl0KVElNRUJBU0U9MS8xClNUQVJUPTIwCkVORD0zMAp0aXRsZT1DaGFwdGVyIDMKW0NIQVBURVJdClRJTUVCQVNFPTEvMQpTVEFSVD0zMApFTkQ9NDAKdGl0bGU9Q2hhcHRlciA0Cg==' \
+  -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map_chapters 1 chaptered.mkv
+```
+
+`i.i` runs 1 to `:count`, so `(i.i - 1) * 10` and `i.i * 10` lay out four back-to-back ten-second chapters here - swap `:count` and every chapter boundary moves with it, no query edit. Bounds and step are checked at compile time (an integer literal or a substituted variable, never a column), so the row count - and therefore how many chapters get written - is known before anything runs.
+
+## 73. Join a series against a file's tracks
+
+A series row is an ordinary compile-time row, so it cross-joins with any other row source exactly like a second `unnest`: each track pairs with each series value, real multiplicity, previewable as a table before it feeds anything real:
+
+```pgsql
+SELECT t.tags.language, i.i AS pass
+FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t, generate_series(1, 2) i
+```
+
+```
+$ sqlmpeg -f query.sql
+ language | pass
+----------+------
+ eng      | 1
+ eng      | 2
+ fra      | 1
+ fra      | 2
+(4 rows)
+```
+
+Two audio tracks times two passes is four rows, in the left side's order - the whole point of a compile-time row model: what a fan-out or a gather will do is inspectable before it writes anything. Actually driving N different files or N different filter passes from a series needs it to key a fan-out or bound a trim window, which - like combining an unknown number of streams into one filter call without writing each one out by hand - is not wired up yet; until then, a series pulls its weight as a parameterized count to gather over (recipe 70) and as a row to join, filter, and preview.
