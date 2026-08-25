@@ -48,15 +48,54 @@ compile time, because probe already told it everything:
 
 | edge | format | parameters |
 | --- | --- | --- |
-| video stream | `rawvideo` | width, height, rate, pix_fmt |
-| audio stream | `f32le` | rate, channels |
-| rows | NDJSON | the UDF's declared row schema |
+| video stream | NUT (`rawvideo` inside) | pix_fmt, size, timebase |
+| audio stream | NUT (`pcm_f32le` inside) | rate, channels |
+| rows | NDJSON, its own file | the UDF's declared row schema |
 | file artifact | whatever the sink says | path |
 
-The `-f rawvideo -s WxH -r N -pix_fmt X` incantations on BOTH ends of
+The `-f nut -c:v rawvideo -pix_fmt X` incantations on BOTH ends of
 every pipe are exactly the plumbing humans get wrong by hand. The
 compiler emits them from facts it already holds; that is the whole
 value proposition, extended one level up.
+
+### Why NUT and not raw bytes
+
+An earlier draft carried frames as bare `rawvideo`/`f32le`: fixed frame
+size, byte offsets as frame boundaries, no framing at all. That is
+enough for a module that pushes pixels one frame in, one frame out —
+and not enough for anything interesting. A UDF that ramps time, doubles
+a frame rate, drops frames or generates them consumes N frames and
+emits M, each with a timestamp of its own, and raw carries no
+timestamps and no frame identity.
+
+NUT is ffmpeg's own low-overhead streaming container, and it earns the
+edge on measurements rather than reputation (ffmpeg 9.0.1, this
+machine, 30 frames of 320x240 yuv420p):
+
+| property | measured |
+| --- | --- |
+| round trip through two pipes, ffmpeg as the middle process | 30 frames in, 30 out |
+| timestamp manipulation survives (`setpts=2.0*PTS`) | 3.02s became 5.90s |
+| frame-COUNT change survives (`fps=25`) | 30 frames became 75 |
+| audio survives (`pcm_f32le`) | 44100/1 intact |
+| overhead vs raw bytes | **42.5 B/frame, 0.037%** |
+
+Timebase is a rational the muxer takes (`1/1000` by default,
+`-video_track_timescale` moves it), so NTSC-style rates are
+representable rather than rounded into millisecond drift.
+
+Two consequences of choosing it. **Variable frame rate survives the
+wire** — nothing is normalized at a process boundary, and an analysis
+module's row timestamps refer to the source's real timeline. And
+**there is no second, faster spelling**: 0.037% buys nothing worth a
+second code path in the sidecar, and one way to say a thing is the
+rule the dialect already runs on.
+
+One trap, recorded so nobody rediscovers it: `-syncpoints none`, the
+tempting "low overhead and unseekable" mode for exactly this case,
+requires `-f_strict experimental` because NUT v4 is unfinalized. Not
+something to build a protocol on. The default configuration's overhead
+is already noise.
 
 File edges are not new: the two-pass loudnorm sequence is already a
 DAG whose edges are files with a happens-before ordering. One IR
@@ -96,7 +135,7 @@ Per-stage timeout, same knob as today's per-command one.
 
 A linear chain prints as a shell pipeline —
 
-    ffmpeg ... -f rawvideo pipe:1 | wasm0r-pipe ... | ffmpeg -f rawvideo ... out.mkv
+    ffmpeg ... -f nut pipe:1 | <sidecar> ... | ffmpeg -f nut -i pipe:0 ... out.mkv
 
 — with the same POSIX-only caveat the printed loudnorm2 chain already
 carries in `known_gaps.md`. A DAG that needs fan-in cannot be spelled
@@ -110,8 +149,10 @@ courtesy, execution is the contract.
 ### Findings, 2026-08-24, native Windows (ffmpeg 9.0.1, Python 3.14)
 
 Measured with real ffmpeg on both ends; the middle process where used
-was ffmpeg itself (`-f rawvideo -i pipe:0 -vf negate -f rawvideo
-pipe:1`), so nothing here depends on wasm existing.
+was ffmpeg itself (`-f nut -i pipe:0 -vf negate -c:v rawvideo -f nut
+pipe:1`), so nothing here depends on wasm existing. NUT keeps that
+property: ffmpeg reads and writes it natively, so a stand-in middle
+process is still one command.
 
 | candidate | verdict |
 | --- | --- |
@@ -152,9 +193,40 @@ an ordinary path on every platform. TCP stays a proven fallback if a
 platform's pipes hit a wall. Final confirmation waits on the POSIX
 column.
 
+## A frame UDF is a table function
+
+The wire format decides the shape of the contract, and the contract
+turns out to be one the language already has. A module receives
+**rows** — metadata (timestamps included) plus a frame payload — and
+returns rows, N in and M out. That is a table function whose row type
+carries a frame, and rows carrying values beside their streams is
+exactly what the language gained with value columns.
+
+So `LANGUAGE wasm` is not a new kind of thing. It is a
+`RETURNS TABLE(...)` function implemented somewhere else, and time
+ramping, frame-rate doubling, frame generation and frame dropping are
+all one idea: a function returning a different number of rows than it
+consumed. SQL has always allowed that; only the transport was missing.
+
+**Dependency this creates:** the sidecar must demux and mux NUT. Either
+a minimal implementation (NUT was designed to be simple, and the
+compiler controls both ends, so the subset is small — one stream, no
+seeking, a known codec) or an existing crate. That is a scoping item
+for the sidecar's own packaging work and for wasm0r's world, not a
+language question, but nothing here runs until it exists.
+
+**And it must be introspectable at compile time.** The compiler writes
+the pixel format on the ffmpeg side of every edge, so it has to ask a
+module what formats it accepts before emitting anything — the same way
+the filter registry asks the local ffmpeg what it can do. The sidecar
+therefore needs a describe mode, not only a run mode.
+
 ## Rows, and the line that keeps the language honest
 
-A row-returning UDF writes NDJSON to a file edge. Two consumers exist
+Frames and rows never share a channel. Frames are the bulk and ride
+the NUT edge; a row-returning UDF writes NDJSON to a file edge of its
+own, which is where structured analysis output belongs — low volume,
+read after the run, never parsed out of a frame stream. Two consumers exist
 today conceptually: a table the user sees (`TO STDOUT` queries), and a
 second-pass substitution (the loudnorm2 shape: run, parse, fold into
 the next command). Both stay. What rows must NEVER do is drive the
