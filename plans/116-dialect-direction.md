@@ -81,14 +81,28 @@ gathering whole.
   in every doc, recipe, published program and user query, probe order
   is 1-based everywhere it is described, and the churn buys no new
   capability. Keep 1-based subscripts.
-- **`@param` variables.** psql's `:'name'` already does this and the
-  substitution layer is load-bearing (absence rule). Nothing gained.
+- **`@param` variables.** Not merely redundant — they FIGHT the
+  absence rule. `:'name'` is textual substitution before parse, which
+  is what lets an unset variable become the keyword `NULL` with a
+  source map back to its name ("':source' was not set"), feeding the
+  absence machinery everywhere a NULL lands. BigQuery's `@param` is a
+  RUNTIME bind parameter — a value the engine slots in at execution —
+  and this compiler has no runtime; everything must be text by compile
+  time. Adopting `@` would respell `:` while discarding the psql
+  muscle memory of the exact audience that lives in shells, and break
+  every `-v name=value` invocation ever written.
 - **Procedural scripting (`DECLARE`/`BEGIN`/loops).** The language is
   declarative on purpose; loops are what `generate_series` and rows
   are for.
-- **`EXPORT DATA OPTIONS(...)`.** BigQuery's sink statement, and the
-  one place BigQuery duplicates something we have. `COPY TO` is more
-  widely understood and already ours.
+- **`EXPORT DATA OPTIONS(...)`.** The one case where BigQuery's
+  spelling is a WORSE domain fit, not an equal one. `EXPORT DATA
+  OPTIONS(uri='gs://bucket/*.csv', format='CSV')` is designed around
+  cloud storage export — wildcard URIs, sharded outputs, a closed
+  format enum. This language's sink options are encoder and muxer
+  knobs (`video_codec`, `crf`, `frames`, `subtitle_codec`) mapping
+  onto ffmpeg's own surface, and `COPY (query) TO 'file' WITH (...)`
+  carries them naturally — plus the fan-out `TO (expression)`, which
+  has no EXPORT DATA analog at all.
 - **Window functions / `QUALIFY`.** No motivating media case yet;
   revisit when one appears (chapter gap analysis is the nearest
   candidate).
@@ -138,6 +152,61 @@ custom dialect already subclasses one and borrows from the other
 The README should say this in one sentence once adopted — roughly:
 "the query surface is Postgres; the data model is BigQuery's structs
 and arrays, because a media file is an array of structured things."
+
+## How the two halves cooperate
+
+The hybrid is not a truce between competing grammars — the two
+dialects occupy different STRATA of one grammar, so they compose
+instead of colliding.
+
+**BigQuery contributes expression-level grammar only**: literals and
+constructors (`STRUCT`, `ARRAY(subquery)`), projection modifiers
+(`* EXCEPT`, `* REPLACE`), and unnest decorations (`WITH OFFSET`).
+**Postgres contributes clause- and statement-level grammar only**:
+`COPY ... TO ... WITH`, `CREATE FUNCTION ... $$ ... $$`, `=>` binding,
+`VARIADIC`, `DEFAULT`, `::`. An expression nests inside a clause;
+a clause never appears inside an expression — so there is no token
+where the two dialects could disagree, and sqlglot holds both in one
+AST (the STRUCT borrowing needed zero parser work for exactly this
+reason).
+
+One query wearing both, every line annotated:
+
+    COPY (
+      SELECT * REPLACE(scale(f.video[1], :width, -2) AS video),
+             -- BQ: * REPLACE        psql: :width      PG-shaped call
+             f.tags || STRUCT(:'title' AS title) AS tags
+             -- BQ: STRUCT, || merge          psql: :'title'
+      FROM input(:'source') f, unnest(f.chapters) c WITH OFFSET i
+             -- PG: FROM/alias shape          BQ: WITH OFFSET
+      WHERE f.t BETWEEN c.start_t AND c.end_t
+    ) TO (:'prefix' || i::text || '.mp4')
+             -- PG: COPY TO expression, :: cast
+      WITH (video_codec 'libx264', crf :crf)
+             -- PG: sink options
+
+(`* REPLACE` and `WITH OFFSET` are proposed borrowings, not yet
+landed; the rest compiles today.)
+
+Three seams, each with a rule:
+
+1. **Substitution runs before parsing, so psql variables appear
+   inside BigQuery constructs freely.** `STRUCT(:'title' AS title)`
+   with the variable unset becomes `STRUCT(NULL AS title)` — and the
+   absence rule then does what it always does (a NULL field clears
+   its key). One pipeline; the halves never negotiate.
+2. **Calls are where they meet**: Postgres binding applied to
+   BigQuery-shaped values. `VARIADIC ARRAY(SELECT frame FROM shots)`
+   is the emblem — a PG spread operator consuming a BQ array
+   constructor. Same for `=>` options taking struct-typed values, and
+   `::chapter` casts on STRUCT literals (already shipping).
+3. **The tie-breaker for every future feature**: if the question is
+   what a VALUE is — construct, destructure, reshape — take
+   BigQuery's spelling. If it is how a STATEMENT binds or directs —
+   sinks, variables, bodies, argument binding — take Postgres's. A
+   feature that genuinely straddles the line gets decided by the
+   maintainer and documented as a deviation either way; none is known
+   today.
 
 ## If adopted, the order
 
