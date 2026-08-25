@@ -2412,10 +2412,13 @@ def test_star_replace_argv_is_byte_identical_to_the_longhand_columns() -> None:
 def test_star_replace_composes_with_a_sink_and_its_with_options() -> None:
     """A `* REPLACE` result is an ordinary column list downstream: it feeds a
     sink, WITH options included, exactly like writing the columns out."""
-    g = compile_sql(
-        "COPY (SELECT * REPLACE(scale(a.video[1], 640, -2) AS video) "
-        "FROM input('tests/fixtures/avs.mkv') a) "
-        "TO 'out.mp4' WITH (video_codec 'libx264', crf 20, subtitle_codec 'mov_text')"
+    g = insert_splits(
+        _lower(
+            "COPY (SELECT * REPLACE(scale(a.video[1], 640, -2) AS video) "
+            "FROM input('x.mkv') a) "
+            "TO 'out.mp4' WITH (video_codec 'libx264', crf 20, subtitle_codec 'mov_text')",
+            {"a": _layout_probe("vas")},
+        )
     )
     args = build_ffmpeg_args(emit(g))
     assert "libx264" in args
@@ -6282,20 +6285,20 @@ def test_the_real_trim_filter_runs_through_the_namespace(
 # ---------------------------------------------------------------------------
 
 
-def test_a_trim_written_straight_to_output_gets_a_pts_reset(_av_fixture: str) -> None:
+def test_a_trim_written_straight_to_output_gets_a_pts_reset() -> None:
     g = compile_sql(
-        f"SELECT ffmpeg.trim(a.video[1], starti => 1) FROM input('{_av_fixture}') a"
+        "SELECT ffmpeg.trim(a.video[1], starti => 1) FROM input('x.mp4') a"
     )
     assert [node.filter for node in g.nodes.values()] == ["trim", "setpts"]
     assert g.nodes["n1_pts"].args == {"expr": "PTS-STARTPTS"}
     assert g.nodes["n1_pts"].inputs == ["n1"]
 
 
-def test_two_trims_concatenated_each_get_their_own_pts_reset(_av_fixture: str) -> None:
+def test_two_trims_concatenated_each_get_their_own_pts_reset() -> None:
     g = compile_sql(
-        f"SELECT ffmpeg.trim(a.video[1], starti => 0, endi => 1) FROM input('{_av_fixture}') a "
+        "SELECT ffmpeg.trim(a.video[1], starti => 0, endi => 1) FROM input('x.mp4') a "
         "UNION ALL "
-        f"SELECT ffmpeg.trim(b.video[1], starti => 2, endi => 3) FROM input('{_av_fixture}') b"
+        "SELECT ffmpeg.trim(b.video[1], starti => 2, endi => 3) FROM input('x.mp4') b"
     )
     filters = [node.filter for node in g.nodes.values()]
     assert filters.count("setpts") == 2
@@ -6305,24 +6308,22 @@ def test_two_trims_concatenated_each_get_their_own_pts_reset(_av_fixture: str) -
     assert set(concat.inputs) == resets
 
 
-def test_a_video_and_an_audio_trim_in_one_query_get_setpts_and_asetpts(
-    _av_fixture: str,
-) -> None:
+def test_a_video_and_an_audio_trim_in_one_query_get_setpts_and_asetpts() -> None:
     g = compile_sql(
         "SELECT ffmpeg.trim(a.video[1], starti => 1), ffmpeg.atrim(a.audio[1], starti => 1) "
-        f"FROM input('{_av_fixture}') a"
+        "FROM input('x.mp4') a"
     )
     filters_by_type = {node.filter: node.outputs[0] for node in g.nodes.values()}
     assert filters_by_type["setpts"] == "video"
     assert filters_by_type["asetpts"] == "audio"
 
 
-def test_sqlmpeg_speed_on_a_trim_takes_over_timing_no_extra_reset(_av_fixture: str) -> None:
+def test_sqlmpeg_speed_on_a_trim_takes_over_timing_no_extra_reset() -> None:
     """`sqlmpeg.speed` expands to its own `setpts`; that already takes
     control of the trimmed stream's timing, so nothing extra is inserted."""
     g = compile_sql(
-        f"SELECT sqlmpeg.speed(ffmpeg.trim(a.video[1], starti => 1), 2) "
-        f"FROM input('{_av_fixture}') a"
+        "SELECT sqlmpeg.speed(ffmpeg.trim(a.video[1], starti => 1), 2) "
+        "FROM input('x.mp4') a"
     )
     assert [node.filter for node in g.nodes.values()] == ["trim", "setpts"]
     assert g.nodes["n2"].args == {"expr": "PTS/2"}

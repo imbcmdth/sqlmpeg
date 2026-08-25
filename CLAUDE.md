@@ -85,6 +85,13 @@ When a tier gets slow, cut its shape rather than accept the time. One
 representative fixture — a file with several video and audio tracks,
 plus a negative case — beats a matrix of hand-tuned ones.
 
+A unit test never reads `tests/fixtures/` and never invokes ffmpeg —
+CI's unit step runs on a bare machine with neither, so such a test is
+green locally and red in CI. Real files and real ffmpeg are the exec
+tier's, by definition; a lowering property wants a synthetic
+`ProbeResult`, and a subscripted stream lowers symbolically against a
+path that does not even exist.
+
 ## Releasing
 
 Never publish by hand.
