@@ -98,7 +98,13 @@ from .parser import (
     parse,
 )
 from .project import RESERVED_NAMESPACES, Package, PackageSet
-from .types import TYPES, element_type, is_array
+from .types import (
+    STREAM_ARRAY_COLUMNS,
+    TAGS_COLUMN,
+    TYPES,
+    element_type,
+    is_array,
+)
 from .warnings import OnWarning, SqlmpegWarning, WarningCode
 
 __all__ = ["NAMEABLE_TYPES", "Parameter", "Signature", "expanded", "package_signatures"]
@@ -515,7 +521,17 @@ def _body_select(
         )
     except SqlmpegError as err:
         raise _reanchor(err, name, anchor) from err
-    written = len(parsed.expressions)
+    # The metadata map is not a declared column: it is an assertion about the
+    # body's own streams, so it does not count against the RETURNS TABLE arity.
+    written = sum(
+        1
+        for projection in parsed.expressions
+        if not (
+            isinstance(projection, exp.Expr)
+            and columns is not None
+            and _projection_alias(projection) == TAGS_COLUMN
+        )
+    )
     if written != wanted:
         plural = "" if written == 1 else "s"
         said = (
@@ -708,7 +724,20 @@ def _table_columns(
             fallback=create,
             hint=_TABLE_HINT,
         )
-    return _column_defs(nodes, name, anchor, create, _TABLE_COLUMN)
+    declared = _column_defs(nodes, name, anchor, create, _TABLE_COLUMN)
+    for column in declared:
+        if column.name != TAGS_COLUMN:
+            continue
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{name}' declares a column called '{TAGS_COLUMN}'",
+            anchor,
+            fallback=create,
+            hint=f"'{TAGS_COLUMN}' names the metadata map, which the body writes "
+            f"directly (STRUCT('Main' AS title) AS {TAGS_COLUMN}); a declared "
+            "column is a stream or a value",
+        )
+    return declared
 
 
 def _define(create: exp.Create) -> _Function:
@@ -1118,19 +1147,102 @@ def _splice(host: exp.Select, body: exp.Select) -> None:
         _and_into(host, where.this)
 
 
-def _name_columns(body: exp.Select, columns: tuple[Parameter, ...]) -> None:
+def _name_columns(
+    body: exp.Select, columns: tuple[Parameter, ...], name: str, anchor: exp.Expr
+) -> None:
     """Alias each projection to the column ``RETURNS TABLE`` named for it, in order.
 
     Naming the projections is what makes the generated CTE expose the declared
-    columns: a CTE exposes what its body wrote ``AS``, and nothing else.
+    columns: a CTE exposes what its body wrote ``AS``, and nothing else. The
+    declared TYPE is checked here too: a stream column has to be written as a
+    stream and a value column as a value, so what a caller reads off the alias
+    is what the signature promised.
+
+    A projection the body already aliased ``tags`` is not one of them: the
+    metadata map is an assertion about the body's own streams, not a column of
+    its rows, so it keeps its name, rides the streams the call contributes, and
+    is skipped when the declared columns are handed out in order.
     """
     named: list[exp.Expr] = []
-    for column, projection in zip(columns, body.expressions):
+    declared = iter(columns)
+    for projection in body.expressions:
+        if not isinstance(projection, exp.Expr):
+            continue
+        if _projection_alias(projection) == TAGS_COLUMN:
+            named.append(projection)
+            continue
+        column = next(declared, None)
+        if column is None:
+            break
         inner = projection.this if isinstance(projection, exp.Alias) else projection
+        if isinstance(inner, exp.Expr):
+            _check_column_kind(inner, column, name, anchor)
         named.append(
             exp.Alias(this=inner, alias=exp.Identifier(this=column.name, quoted=False))
         )
     body.set("expressions", named)
+
+
+def _projection_alias(projection: exp.Expr) -> str | None:
+    """The name a body projection was written ``AS``, folded, else None."""
+    if not isinstance(projection, exp.Alias):
+        return None
+    alias = projection.args.get("alias")
+    return _ident_name(alias) if isinstance(alias, exp.Expr) else None
+
+
+def _check_column_kind(
+    projection: exp.Expr, column: Parameter, name: str, anchor: exp.Expr
+) -> None:
+    """One body projection against the column type ``RETURNS TABLE`` declares.
+
+    What is checked is stream-ness, which is the whole difference a caller
+    sees: a stream column becomes an output, a value column becomes a value
+    its rows carry. A shape that says nothing (a bare NULL, a CASE) is left to
+    lowering, which sees the values.
+    """
+    declared_stream = _declared_kind(column.type) == "stream"
+    written_stream = _writes_stream(projection)
+    if written_stream is None or written_stream == declared_stream:
+        return
+    if declared_stream:
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"column '{column.name}' of '{name}' is declared {column.type} but "
+            "its body writes a value",
+            projection,
+            fallback=anchor,
+            hint=f"select a stream for {column.name} -- the row itself names "
+            f"one -- or declare {column.name} text or number",
+        )
+    raise _error(
+        ErrorCode.UNSUPPORTED_SQL,
+        f"column '{column.name}' of '{name}' is declared {column.type} but its "
+        "body writes a stream",
+        projection,
+        fallback=anchor,
+        hint=f"declare {column.name} a stream type, e.g. video_stream, or "
+        f"select a value for {column.name}",
+    )
+
+
+def _writes_stream(node: exp.Expr) -> bool | None:
+    """Whether a body projection's SHAPE makes it a stream, or None if open.
+
+    A bare alias IS its row's stream and a subscript or filter call names one;
+    a qualified column is that row's metadata, except the stream ARRAYS an
+    input carries.
+    """
+    if isinstance(node, exp.Paren) and isinstance(node.this, exp.Expr):
+        return _writes_stream(node.this)
+    if isinstance(node, exp.Bracket):
+        return True
+    if isinstance(node, exp.Column):
+        if node.args.get("table") is None:
+            return True
+        return _ident_name(node.this) in STREAM_ARRAY_COLUMNS
+    kind = _argument_kind(node)
+    return None if kind is None else kind == "stream"
 
 
 def _query_node(statement: exp.Expr) -> exp.Expr | None:
@@ -1667,8 +1779,8 @@ class _Expander:
                 ErrorCode.UNSUPPORTED_SQL,
                 f"function '{function.qualified}' returns a value, not a table",
                 site.node,
-                hint="call it where its value belongs: a SELECT column, a "
-                "WHERE predicate, a tag column",
+                hint="call it where its value belongs: a WHERE predicate, a "
+                "tags field, a fan-out TO",
             )
         if not site.row_source and function.returns_rows:
             raise _error(
@@ -1809,7 +1921,7 @@ class _Expander:
         # The body is its own query now, so its own calls expand into it.
         with self._scoped(function.identity):
             self._expand_within(body, body, position, (*stack, function.qualified))
-        _name_columns(body, function.columns or ())
+        _name_columns(body, function.columns or (), function.name, item)
         name = self._fresh_name(f"{function.name}_{index + 1}")
         self._add_cte(name, body)
 

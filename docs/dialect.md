@@ -389,10 +389,16 @@ Each column is one of:
   or `concat(intro, VARIADIC array_agg(v))`. An explicit count option
   that disagrees, or an empty array, is a rejection; a fixed-arity
   filter does not take `VARIADIC` at all.
-- **A tag column**: an ALIASED non-stream expression. Over track rows
-  it tags the row's streams; over input rows only, the container;
-  `NULL` clears ([rows.md](rows.md#tags)). Aliased `disposition`, it
-  sets the row's flags instead of a tag.
+- **A `tags` column**: a column named `tags` holding a map. Over track
+  rows its keys land on the row's streams; over input rows only, on the
+  container; a `NULL` field clears its key ([rows.md](rows.md#tags)).
+  It is the ONLY column that writes metadata.
+- **A `disposition` column**: an aliased value that sets the row's
+  flags rather than a tag.
+- **A value column** (CTE bodies): any other aliased compile-time
+  value becomes a column of the body's rows, readable downstream. At a
+  media sink such a column is a rejection - a SELECT column there is an
+  output stream.
 - **`array_agg(<per-row stream expression>)`**: gathers rows in row
   order; must be a whole column, or the sole argument of `VARIADIC`
   ([rows.md](rows.md#combining-rows)).
@@ -403,18 +409,29 @@ Each column is one of:
   media query, every array column including `chapters` in a table
   one. Over rows, the record's scalar fields (`tags` and `disposition`
   excluded, read them by name), which a table query prints and a media
-  query rejects. Over a CTE, the columns its body named.
+  query rejects. Over a CTE, the stream columns its body named.
 
 Subscripts are positive integer literals, 1-based.
 `(f.audio[1]).codec`-style accessors reach row columns without
 unnest; in WHERE they are assertions. A tag is read by path,
 `f.tags.title` / `t.tags.language`, one key at a time, and so is a
-disposition flag, `t.disposition.forced`, over a closed key set.
+disposition flag, `t.disposition.forced`, over a closed key set. A bare
+`f.tags` is the whole map: no value on its own, but an operand of `||`
+in a `tags` column.
 
 ## Values and predicates
 
-One compile-time value grammar serves predicates, tag columns, trim
-bounds, computed filter arguments, and fan-out destinations:
+`STRUCT(value AS name, ...)` is a **deviation**: Postgres has no such
+literal, and the spelling is borrowed (BigQuery's). It is the dialect's
+one way to write a map or a record by field name — the `tags` column
+takes a map, and a `::chapter` / `::cue` / `::attachment` cast turns one
+into that record. Postgres's own positional `ROW(...)::chapter` stays
+valid.
+
+
+One compile-time value grammar serves predicates, `tags` fields, value
+columns, trim bounds, computed filter arguments, and fan-out
+destinations:
 
 ```
 value := literal | NULL | row-column | input-scalar
@@ -426,8 +443,11 @@ value := literal | NULL | row-column | input-scalar
                                    -- arguments agree on one type
 
        | :'var' | :"var" | :var    -- CLI -v substitution, psql's forms
-       | ARRAY[ROW(...)::chapter, ...]   -- record arrays: chapter,
-       | ARRAY[ROW(...)::cue, ...]       -- cue, attachment
+       | STRUCT(value AS name, ...)          -- a map, or a record with a cast
+       | map || map                          -- merge, right side wins
+       | ARRAY[STRUCT(...)::chapter, ...]    -- record arrays: chapter,
+       | ARRAY[STRUCT(...)::cue, ...]        -- cue, attachment
+                                             -- ROW(...)::chapter also works
 ```
 
 Predicates: `= != < <= > >= BETWEEN IS [NOT] NULL [NOT] IN (literals)`,
@@ -515,10 +535,11 @@ unset variable, say) has no other way to omit it. A parameter with no
 `DEFAULT` still takes a written NULL unchanged — that stays the way to
 mean NULL itself.
 
-One place absence is not "leave alone": writing a tag column with NULL
-clears the tag, so `:'title' AS title` unset clears the title. A
-program that means "keep unless told otherwise" writes
-`COALESCE(:'title', f.tags.title) AS title` — ordinary SQL.
+One place absence is not "leave alone": a NULL field of a `tags` column
+clears that key, so `STRUCT(:'title' AS title) AS tags` unset clears the
+title. A program that means "keep unless told otherwise" writes
+`STRUCT(COALESCE(:'title', f.tags.title) AS title) AS tags` — ordinary
+SQL.
 
 The check on `-v` points the other way: since an unset reference is
 legal, `-v name=value` for a name the text never references is the
@@ -541,7 +562,7 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   aggregates other than `array_agg` (`count`, `sum`, ...), `ORDER BY`
   inside `array_agg`.
 - **Aggregation context**: GROUP BY / array_agg inside a CTE body, a
-  view body, or a UNION ALL branch; a per-stream tag column in a
+  view body, or a UNION ALL branch; a per-stream `tags` column in a
   grouped query (tag inside a CTE, aggregate outside).
 - **Values**: casts other than to text; computed input paths;
   computed subscripts; `0` or negative subscripts; `||` over numbers

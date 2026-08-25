@@ -251,8 +251,9 @@ def test_compile_writes_container_tags_read_from_the_input(
     code = cli.main(
         [
             "compile",
-            "COPY (SELECT f.video[1], f.tags.title || ' (restored)' AS title, "
-            "NULL AS artist FROM input('film.mkv') f) TO 'out.mkv'",
+            "COPY (SELECT f.video[1], "
+            "STRUCT(f.tags.title || ' (restored)' AS title, NULL AS artist) AS tags "
+            "FROM input('film.mkv') f) TO 'out.mkv'",
         ]
     )
     captured = capsys.readouterr()

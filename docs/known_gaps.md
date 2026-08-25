@@ -44,14 +44,15 @@ output is plain ffmpeg, so the two mix freely in a script.
   back to fontconfig, which depends on how the local ffmpeg was built —
   some Windows builds crash instead of picking a default. When in
   doubt, name the font.
-- **A CTE-keyed group cannot fan out.** A fan-out `TO (expression)`
-  builds its filename from row metadata columns, and a CTE's columns
-  are streams - so a `GROUP BY` over a CTE column with more than one
-  group has no way to name its files yet. Group inside the CTE's body
-  (where metadata columns exist) instead. A table-returning function is
-  a CTE by the time lowering sees it, so a `RETURNS TABLE(n number,
-  ...)` column cannot name files either; fan out in the caller's own
-  FROM, over a row source it binds itself.
+- **A fan-out over a CTE needs a value column to name its files.** A
+  fan-out `TO (expression)` builds its filename from row columns, and a
+  CTE exposes only what its body selected. Select the value you want to
+  name files with - `SELECT v AS frame, i.i AS n ...` - and the outer
+  `TO` reads `x.n` like any other row column; the same goes for a
+  `GROUP BY` over a CTE column. A body that selects streams alone still
+  has nothing to name files with, and the `ROW_COUNT_MISMATCH` says so.
+  A table-returning function is a CTE by the time lowering sees it, so
+  its `RETURNS TABLE(n number, ...)` column works the same way.
 - **Filter outputs carry no facts.** Metadata columns describe probed
   input streams only; a filter's output is a stream with no readable
   `channel_layout`, `width`, `codec` and so on, even where ffmpeg

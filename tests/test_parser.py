@@ -2388,7 +2388,7 @@ def test_a_subscript_accessor_over_a_cte_is_rejected() -> None:
         "SELECT c.v FROM c WHERE c.v[1].tags.language = 'eng'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "is a CTE" in err.message
+    assert "needs a row column on one side" in err.message
 
 
 def test_a_subscript_accessor_over_a_generated_source_is_rejected() -> None:
@@ -2592,7 +2592,7 @@ def test_a_lone_cue_record_is_not_a_value() -> None:
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "a cue record is not a value on its own" in err.message
-    assert err.hint == "gather records into an array, e.g. ARRAY[ROW(...)::cue, ...]"
+    assert err.hint == "gather records into an array, e.g. ARRAY[STRUCT(...)::cue, ...]"
 
 
 def test_a_lone_chapter_record_still_names_the_chapters_column() -> None:
@@ -2600,7 +2600,7 @@ def test_a_lone_chapter_record_still_names_the_chapters_column() -> None:
         "SELECT f.video[1], ROW('Hi', 0, 1)::chapter AS x FROM input('f.mkv') f"
     )
     assert err.hint == (
-        "gather records into an array, e.g. ARRAY[ROW(...)::chapter, ...] AS chapters"
+        "gather records into an array, e.g. ARRAY[STRUCT(...)::chapter, ...] AS chapters"
     )
 
 

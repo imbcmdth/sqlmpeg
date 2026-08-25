@@ -47,7 +47,7 @@ from sqlmpeg import registry as registry_module
 from sqlmpeg.compiler import compile_sql
 from sqlmpeg.emit import build_ffmpeg_args, emit
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import NO_CHAPTERS, Attachment, Graph, StreamType
+from sqlmpeg.ir import NO_CHAPTERS, NO_METADATA, Attachment, Graph, StreamType
 from sqlmpeg.lower import lower, lower_table
 from sqlmpeg.parser import parse, resolve
 from sqlmpeg.probe import (
@@ -7168,7 +7168,10 @@ def test_a_chapters_element_must_be_a_chapter_record() -> None:
         "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "a chapter is written as ROW(title, start_t, end_t)::chapter" in err.message
+    assert (
+        "a chapter is written as STRUCT(... AS title, ... AS start_t, "
+        "... AS end_t)::chapter"
+    ) in err.message
 
 
 def test_a_chapters_column_in_a_cte_body_is_rejected() -> None:
@@ -7329,9 +7332,9 @@ def test_a_chapters_column_accepts_back_to_back_records() -> None:
 
 
 def test_a_tag_column_over_chapter_rows_tags_the_container() -> None:
-    """A chapter row carries no track, so the value goes on the file itself."""
+    """A chapter row carries no track, so the map goes on the file itself."""
     g = _lower(
-        "COPY (SELECT f.video[1], 'Ch: ' || c.title AS title "
+        "COPY (SELECT f.video[1], STRUCT('Ch: ' || c.title AS title) AS tags "
         "FROM input('f.mkv') f, unnest(f.chapters) c WHERE c.index = 1) TO 'o.mkv'",
         _chapter_probes(*_TWO_CHAPTERS),
     )
@@ -7605,7 +7608,8 @@ def test_a_cues_start_must_be_a_number() -> None:
 
 def test_a_cues_column_alias_is_not_something_a_query_can_set() -> None:
     err = _reject_lower(
-        "COPY (SELECT f.video[1], 'x' AS cues FROM input('f.mkv') f) TO 'out.mkv'",
+        "COPY (SELECT f.video[1], STRUCT('x' AS cues) AS tags "
+        "FROM input('f.mkv') f) TO 'out.mkv'",
         _cue_probes(),
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -7814,10 +7818,10 @@ def test_two_branches_may_not_write_two_attachment_lists() -> None:
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'attachments' takes two different attachment lists" in err.message
 def test_a_bare_chapter_column_tags_the_container_like_any_other_value() -> None:
-    """A chapter row's columns feed tag columns exactly as a track row's do, so
+    """A chapter row's columns feed a tags map exactly as a track row's do, so
     the BARE column is the tag value the concatenation around it already was."""
     g = _lower(
-        "COPY (SELECT f.video[1], c.title AS title "
+        "COPY (SELECT f.video[1], STRUCT(c.title AS title) AS tags "
         "FROM input('f.mkv') f, unnest(f.chapters) c WHERE c.index = 1) TO 'o.mkv'",
         _chapter_probes(*_TWO_CHAPTERS),
     )
@@ -7877,7 +7881,7 @@ def test_a_tag_column_over_written_rows_tags_the_container() -> None:
     """Rows with no track have nothing to tag per stream, so the file gets it."""
     g = _lower(
         "COPY (WITH marks(name) AS (VALUES ('Doc')) "
-        "SELECT f.video[1], 'T: ' || m.name AS title "
+        "SELECT f.video[1], STRUCT('T: ' || m.name AS title) AS tags "
         "FROM input('f.mkv') f, marks m) TO 'o.mkv'",
         {"f": ProbeResult(streams=[_track("video", 0)])},
     )
@@ -7885,10 +7889,10 @@ def test_a_tag_column_over_written_rows_tags_the_container() -> None:
 
 
 def test_a_bare_written_column_tags_the_container_like_any_other_value() -> None:
-    """Same for a written row: the alias is the key, the column is the value."""
+    """Same for a written row: the field name is the key, the column the value."""
     g = _lower(
         "COPY (WITH marks(name) AS (VALUES ('Doc')) "
-        "SELECT f.video[1], m.name AS title "
+        "SELECT f.video[1], STRUCT(m.name AS title) AS tags "
         "FROM input('f.mkv') f, marks m) TO 'o.mkv'",
         {"f": ProbeResult(streams=[_track("video", 0)])},
     )
@@ -7922,55 +7926,73 @@ def test_comment_is_no_longer_a_sink_option() -> None:
     assert err.code is ErrorCode.UNKNOWN_SINK_OPTION
 
 
-def test_metadata_from_resolves_an_input_alias_to_its_index() -> None:
+def test_a_copied_tags_map_names_its_inputs_index() -> None:
+    """`f.tags ||` is what makes the copy explicit; the index is that input's."""
     g = _lower(
+        "COPY (SELECT f.video[1], f.audio[1], f.tags AS tags "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    assert g.sinks[0].metadata == 0
+
+
+def test_a_copied_tags_map_names_the_second_input() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], g.audio[1], g.tags AS tags "
+        "FROM input('film.mkv') f, input('extra.mkv') g) TO 'out.mkv'"
+    )
+    assert g.sinks[0].metadata == 1
+
+
+def test_a_copied_map_layers_the_keys_written_over_it() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], f.tags || STRUCT('Cut' AS title) AS tags "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    assert g.sinks[0].metadata == 0
+    assert g.sinks[0].tags == {"title": "Cut"}
+
+
+def test_an_empty_map_writes_no_globals() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], f.audio[1], STRUCT() AS tags "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    assert g.sinks[0].metadata == NO_METADATA
+
+
+def test_a_map_that_both_copies_and_empties_is_rejected() -> None:
+    err = _reject(
+        "COPY (SELECT f.video[1], f.tags || STRUCT() AS tags "
+        "FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "both copies and writes no tags" in err.message
+
+
+def test_an_unwritten_map_leaves_ffmpegs_own_copying_alone() -> None:
+    g = _lower(
+        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) TO 'out.mkv'"
+    )
+    assert g.sinks[0].metadata is None
+
+
+def test_metadata_from_is_no_longer_a_sink_option() -> None:
+    """The map is a column now, and the rejection says which spelling replaced it."""
+    err = _reject(
         "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
         "TO 'out.mkv' WITH (metadata_from f)"
     )
-    assert g.sinks[0].options["metadata_from"] == 0
+    assert err.code is ErrorCode.UNKNOWN_SINK_OPTION
+    assert err.hint is not None and "f.tags AS tags" in err.hint
 
 
-def test_metadata_from_names_the_second_inputs_index() -> None:
-    g = _lower(
-        "COPY (SELECT f.video[1], g.audio[1] FROM input('film.mkv') f, "
-        "input('extra.mkv') g) TO 'out.mkv' WITH (metadata_from g)"
-    )
-    assert g.sinks[0].options["metadata_from"] == 1
-
-
-def test_metadata_from_must_name_a_real_input_alias() -> None:
+def test_strip_metadata_is_no_longer_a_sink_option() -> None:
     err = _reject(
-        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (metadata_from nope)"
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "names an input() alias" in err.message
-
-
-def test_metadata_from_rejects_a_quoted_string() -> None:
-    err = _reject(
-        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (metadata_from 'f')"
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "names an input() alias" in err.message
-
-
-def test_strip_metadata_lands_in_sink_options() -> None:
-    g = _lower(
         "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
         "TO 'out.mkv' WITH (strip_metadata true)"
     )
-    assert g.sinks[0].options["strip_metadata"] is True
-
-
-def test_strip_metadata_and_metadata_from_together_are_rejected() -> None:
-    err = _reject(
-        "COPY (SELECT f.video[1], f.audio[1] FROM input('film.mkv') f) "
-        "TO 'out.mkv' WITH (strip_metadata true, metadata_from f)"
-    )
-    assert err.code is ErrorCode.SINK_OPTION_TYPE
-    assert "both set" in err.message
+    assert err.code is ErrorCode.UNKNOWN_SINK_OPTION
+    assert err.hint is not None and "STRUCT() AS tags" in err.hint
 
 
 # ---------------------------------------------------------------------------
@@ -8571,17 +8593,19 @@ def test_a_chapter_list_built_from_cues_keeps_its_fractional_bounds(
 # shapes are the cookbook's (recipes 37-38, exec tier).
 
 
-def _tag_query(tag: str, projection: str = "t", column: str = "audio") -> str:
+def _tag_query(fields: str, projection: str = "t", column: str = "audio") -> str:
     """Tag every row, then gather the rows into one file.
 
-    Two scopes, and the tags need the inner one: rows are tracks inside the
-    CTE body, so the tag column is per stream there, while the outer SELECT
-    aggregates the body's streams into the single file this writes. The tags
-    ride the streams across the boundary, which is what these tests check.
+    `fields` is the body of the tags map, so a caller writes just the
+    ``<value> AS <key>`` pairs. Two scopes, and the tags need the inner one:
+    rows are tracks inside the CTE body, so the map is per stream there,
+    while the outer SELECT aggregates the body's streams into the single file
+    this writes. The tags ride the streams across the boundary, which is what
+    these tests check.
     """
     return (
         "WITH tagged AS ("
-        f"SELECT {projection} AS track, {tag} "
+        f"SELECT {projection} AS track, STRUCT({fields}) AS tags "
         f"FROM input('f.mkv') f, unnest(f.{column}) t"
         ") SELECT array_agg(tagged.track) FROM tagged"
     )
@@ -8707,7 +8731,7 @@ def test_a_tag_is_row_scoped_across_every_track_the_row_carries() -> None:
     the row computes lands on both."""
     probes = _row_probes(_track("video", 0), _track("audio", 0, language="eng"))
     g = _lower(
-        "SELECT v, a, 'Feature' AS title FROM input('f.mkv') f, "
+        "SELECT v, a, STRUCT('Feature' AS title) AS tags FROM input('f.mkv') f, "
         "unnest(f.video) v, unnest(f.audio) a",
         probes,
     )
@@ -8728,7 +8752,7 @@ def test_a_joined_row_tags_one_sides_track_from_the_others_column() -> None:
     )
     g = _lower(
         "WITH titled AS ("
-        "  SELECT a AS track, b.tags.title AS title"
+        "  SELECT a AS track, STRUCT(b.tags.title AS title) AS tags"
         "  FROM input('f.mkv') f, input('g.mkv') g,"
         "       unnest(f.audio) a JOIN unnest(g.audio) b ON a.tags.language = b.tags.language"
         ") SELECT array_agg(titled.track) FROM titled",
@@ -8752,7 +8776,8 @@ def test_one_track_cannot_take_two_values_for_the_same_tag() -> None:
         ],
     )
     err = _reject_lower(
-        "SELECT a, b.tags.language AS language FROM input('f.mkv') f, "
+        "SELECT a, STRUCT(b.tags.language AS language) AS tags "
+        "FROM input('f.mkv') f, "
         "input('g.mkv') g, unnest(f.audio) a, unnest(g.audio) b",
         probes,
     )
@@ -8770,7 +8795,8 @@ def test_a_tag_survives_a_filter_that_threads_provenance() -> None:
 
 def test_a_query_of_nothing_but_tags_selects_no_stream() -> None:
     err = _reject_lower(
-        "SELECT 'Main' AS title FROM input('f.mkv') f, unnest(f.audio) t",
+        "SELECT STRUCT('Main' AS title) AS tags "
+        "FROM input('f.mkv') f, unnest(f.audio) t",
         _row_probes(),
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -8778,7 +8804,9 @@ def test_a_query_of_nothing_but_tags_selects_no_stream() -> None:
 
 
 def test_a_media_query_with_no_row_tables_tags_the_container() -> None:
-    g = _lower("SELECT f.audio[1], 'Main' AS title FROM input('f.mkv') f")
+    g = _lower(
+        "SELECT f.audio[1], STRUCT('Main' AS title) AS tags FROM input('f.mkv') f"
+    )
     assert g.sinks[0].tags == {"title": "Main"}
     assert [o.metadata for o in g.outputs] == [{}]
 
@@ -8794,20 +8822,24 @@ def test_an_unaliased_value_column_is_still_not_a_stream() -> None:
 
 def test_a_case_column_over_literals_is_still_not_a_row_predicate() -> None:
     err = _reject(
-        "SELECT f.audio[1], CASE WHEN 'a' = 'a' THEN 'x' END AS title "
+        "SELECT f.audio[1], "
+        "STRUCT(CASE WHEN 'a' = 'a' THEN 'x' END AS title) AS tags "
         "FROM input('f.mkv') f"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
 # ---------------------------------------------------------------------------
-# read-only fields: an alias that names one is a rejection, not a tag key
+# read-only fields: a tags FIELD that names one is a rejection, not a tag key
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     ("column", "field"),
-    [("'h264' AS codec", "codec"), ("3 AS index", "index")],
+    [
+        ("STRUCT('h264' AS codec) AS tags", "codec"),
+        ("STRUCT(3 AS index) AS tags", "index"),
+    ],
 )
 def test_setting_a_read_only_track_field_is_rejected(column: str, field: str) -> None:
     err = _reject_lower(
@@ -8822,7 +8854,8 @@ def test_setting_a_read_only_track_field_is_rejected(column: str, field: str) ->
 def test_setting_a_read_only_field_of_the_rows_own_type_is_rejected() -> None:
     """The row's type decides: `width` is a video field, so a video row rejects."""
     err = _reject_lower(
-        "SELECT t, 1920 AS width FROM input('f.mkv') f, unnest(f.video) t",
+        "SELECT t, STRUCT(1920 AS width) AS tags "
+        "FROM input('f.mkv') f, unnest(f.video) t",
         _row_probes(),
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -8831,7 +8864,8 @@ def test_setting_a_read_only_field_of_the_rows_own_type_is_rejected() -> None:
 
 def test_a_free_form_key_is_still_a_tag() -> None:
     g = _lower(
-        "SELECT t, 'x' AS whatever FROM input('f.mkv') f, unnest(f.audio) t "
+        "SELECT t, STRUCT('x' AS whatever) AS tags "
+        "FROM input('f.mkv') f, unnest(f.audio) t "
         "WHERE t.index = 1",
         _row_probes(),
     )
@@ -8839,14 +8873,17 @@ def test_a_free_form_key_is_still_a_tag() -> None:
 
 
 def test_setting_a_read_only_container_field_is_rejected() -> None:
-    err = _reject("SELECT f.audio[1], 12 AS duration FROM input('f.mkv') f")
+    err = _reject(
+        "SELECT f.audio[1], STRUCT(12 AS duration) AS tags FROM input('f.mkv') f"
+    )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'duration' is a probed field of the container" in err.message
 
 
 def test_a_read_only_field_is_rejected_inside_a_cte_body_too() -> None:
     err = _reject_lower(
-        "WITH c AS (SELECT t, 'h264' AS codec FROM input('f.mkv') f, unnest(f.audio) t) "
+        "WITH c AS (SELECT t, STRUCT('h264' AS codec) AS tags "
+        "FROM input('f.mkv') f, unnest(f.audio) t) "
         "SELECT array_agg(c.t) FROM c",
         _row_probes(),
     )
@@ -8877,8 +8914,9 @@ def _tagged_probes(**tags: str) -> dict[str, ProbeResult | None]:
     }
 
 
-def _container_query(projection: str) -> str:
-    return f"SELECT f.video[1], {projection} FROM input('f.mkv') f"
+def _container_query(fields: str) -> str:
+    """A container-level tags map over one input row; `fields` is its body."""
+    return f"SELECT f.video[1], STRUCT({fields}) AS tags FROM input('f.mkv') f"
 
 
 def test_a_container_tag_column_reads_the_probed_value() -> None:
@@ -8961,20 +8999,33 @@ def test_a_number_container_tag_is_spelled_out() -> None:
 
 
 def test_a_container_has_no_disposition() -> None:
-    err = _reject(_container_query("'default' AS disposition"))
+    err = _reject(
+        "SELECT f.video[1], 'default' AS disposition FROM input('f.mkv') f"
+    )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "'disposition' is a stream field, not a container one" in err.message
 
 
-def test_one_container_tag_key_cannot_take_two_values() -> None:
+def test_a_map_names_each_key_once() -> None:
+    """A repeated field is a mistake whatever the values: one entry per key."""
     err = _reject(_container_query("'a' AS title, 'b' AS title"))
     assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "names the field 'title' twice" in err.message
+
+
+def test_a_repeated_key_is_rejected_even_with_the_same_value() -> None:
+    err = _reject(_container_query("'a' AS title, 'a' AS title"))
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "names the field 'title' twice" in err.message
+
+
+def test_two_tags_columns_cannot_disagree_on_one_container_key() -> None:
+    err = _reject(
+        "SELECT f.video[1], STRUCT('a' AS title) AS tags, "
+        "STRUCT('b' AS title) AS tags FROM input('f.mkv') f"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
     assert "two different values" in err.message
-
-
-def test_one_container_tag_key_repeated_with_the_same_value_is_fine() -> None:
-    g = _lower(_container_query("'a' AS title, 'a' AS title"))
-    assert g.sinks[0].tags == {"title": "a"}
 
 
 def test_a_row_table_branch_still_tags_per_stream() -> None:
@@ -9004,8 +9055,10 @@ def test_a_row_table_branch_reads_container_tags_onto_its_streams() -> None:
 
 def test_two_copys_get_their_own_container_tags() -> None:
     g = _lower(
-        "COPY (SELECT f.video[1], 'one' AS title FROM input('f.mkv') f) TO 'a.mkv'; "
-        "COPY (SELECT g.video[1], 'two' AS title FROM input('g.mkv') g) TO 'b.mkv'"
+        "COPY (SELECT f.video[1], STRUCT('one' AS title) AS tags "
+        "FROM input('f.mkv') f) TO 'a.mkv'; "
+        "COPY (SELECT g.video[1], STRUCT('two' AS title) AS tags "
+        "FROM input('g.mkv') g) TO 'b.mkv'"
     )
     assert [unit.tags for unit in g.sinks] == [{"title": "one"}, {"title": "two"}]
 
@@ -9082,7 +9135,7 @@ def test_a_written_tag_reads_back_out_of_the_file(tmp_path: Path) -> None:
     and ffprobe reads it back off the muxed stream."""
     out = tmp_path / "tagged.mka"
     query = (
-        "SELECT t, 'Audio (' || t.tags.language || ')' AS title "
+        "SELECT t, STRUCT('Audio (' || t.tags.language || ')' AS title) AS tags "
         f"FROM input('{(FIXTURES_DIR / 'av-eng.mp4').as_posix()}') f, "
         "unnest(f.audio) t"
     )
@@ -9286,7 +9339,8 @@ def test_a_subscripted_array_column_still_keeps_its_plain_cell() -> None:
 
 _TAGGED_CTE = (
     "WITH tagged AS ("
-    "  SELECT t AS track, 'Audio (' || t.tags.language || ')' AS title"
+    "  SELECT t AS track,"
+    "         STRUCT('Audio (' || t.tags.language || ')' AS title) AS tags"
     "  FROM input('f.mkv') f, unnest(f.audio) t"
     ") "
 )
@@ -9333,7 +9387,7 @@ def test_a_cte_tag_survives_a_filter_in_the_outer_query() -> None:
 def test_a_null_cte_tag_clears_the_key_as_it_does_in_a_sink() -> None:
     g = _lower(
         "WITH tagged AS ("
-        "  SELECT t AS track, NULL AS language"
+        "  SELECT t AS track, STRUCT(NULL AS language) AS tags"
         "  FROM input('f.mkv') f, unnest(f.audio) t"
         ") SELECT array_agg(tagged.track) FROM tagged",
         _row_probes(),
@@ -9350,9 +9404,10 @@ def test_the_sinks_own_tag_wins_over_the_ctes_on_the_same_key() -> None:
     """
     g = _lower(
         "WITH tagged AS ("
-        "  SELECT t AS track, 'Audio (' || t.tags.language || ')' AS title"
+        "  SELECT t AS track,"
+        "         STRUCT('Audio (' || t.tags.language || ')' AS title) AS tags"
         "  FROM input('f.mkv') f, unnest(f.audio) t WHERE t.index = 1"
-        ") SELECT tagged.track, 'Outer' AS title "
+        ") SELECT tagged.track, STRUCT('Outer' AS title) AS tags "
         "FROM tagged, input('f.mkv') g, unnest(g.audio) u WHERE u.index = 1",
         _shared_probes(),
     )
@@ -9362,7 +9417,7 @@ def test_the_sinks_own_tag_wins_over_the_ctes_on_the_same_key() -> None:
 def test_two_sinks_over_one_tagged_view_each_carry_its_tags() -> None:
     g = _lower(
         "CREATE VIEW tagged AS"
-        "  SELECT t AS track, 'Inner' AS title"
+        "  SELECT t AS track, STRUCT('Inner' AS title) AS tags"
         "  FROM input('f.mkv') f, unnest(f.audio) t;"
         "COPY (SELECT array_agg(tagged.track) FROM tagged) TO 'a.mka';"
         "COPY (SELECT array_agg(tagged.track) FROM tagged) TO 'b.mka';",
@@ -9380,10 +9435,10 @@ def test_two_cte_bodies_cannot_tag_one_track_two_ways() -> None:
     carry-over dict, so a disagreement between them has no representation."""
     err = _reject_lower(
         "WITH one AS ("
-        "  SELECT t AS track, 'One' AS title"
+        "  SELECT t AS track, STRUCT('One' AS title) AS tags"
         "  FROM input('f.mkv') f, unnest(f.audio) t"
         "), two AS ("
-        "  SELECT u AS track, 'Two' AS title"
+        "  SELECT u AS track, STRUCT('Two' AS title) AS tags"
         "  FROM input('g.mkv') g, unnest(g.audio) u"
         ") SELECT one.track FROM one",
         _shared_probes(),
@@ -9392,15 +9447,85 @@ def test_two_cte_bodies_cannot_tag_one_track_two_ways() -> None:
     assert "two different values on the same track" in err.message
 
 
+def test_a_cte_body_scalar_becomes_a_value_column_of_its_rows() -> None:
+    """The body names it, the alias exposes it, a table query prints it."""
+    result = lower_table(
+        resolve(
+            parse(
+                "WITH x AS ("
+                "  SELECT t AS track, t.index AS n"
+                "  FROM input('f.mkv') f, unnest(f.audio) t"
+                ") SELECT x.n FROM x"
+            )
+        ),
+        _row_probes(),
+    )[0]
+    assert result.result.columns == ["n"]
+    assert [row[0] for row in result.result.rows] == [1, 2, 3]
+
+
+def test_a_value_column_selected_at_a_media_sink_is_rejected() -> None:
+    """A SELECT column of a media query is an output stream; the hint says
+    where a value belongs instead."""
+    err = _reject_lower(
+        "COPY (WITH x AS ("
+        "  SELECT t AS track, t.index AS n"
+        "  FROM input('f.mkv') f, unnest(f.audio) t WHERE t.index = 1"
+        ") SELECT x.track, x.n FROM x) TO 'out.mka'",
+        _row_probes(),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'x.n' is a value" in err.message
+    assert err.hint is not None and "TO expression" in err.hint
+
+
+def test_a_value_column_the_compiler_cannot_evaluate_names_itself() -> None:
+    """Nothing probed a filter's output, so a value read off one has no value
+    to carry; the rejection names the read."""
+    err = _reject_lower(
+        "COPY (WITH x AS ("
+        "  SELECT v AS frame, scale(v, 640, -2).width AS w"
+        "  FROM input('f.mkv') f, unnest(f.video) v WHERE v.index = 1"
+        ") SELECT x.frame FROM x) TO ('o' || x.w::text || '.mkv')",
+        _row_probes(_track("video", 0)),
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'.width' reads a field of the output of scale()" in err.message
+    assert err.hint is not None
+
+
+def test_a_value_column_filters_the_rows_it_sits_on() -> None:
+    g = _lower(
+        "COPY (WITH x AS ("
+        "  SELECT t AS track, t.tags.language AS lang"
+        "  FROM input('f.mkv') f, unnest(f.audio) t"
+        ") SELECT x.track FROM x WHERE x.lang = 'fra') TO 'out.mka'",
+        _row_probes(),
+    )
+    assert _refs(g) == ["src:f:a:1"]
+
+
+def test_a_value_column_reaches_a_further_cte() -> None:
+    units = _lower(
+        "COPY (WITH x AS ("
+        "  SELECT t AS track, t.index AS n"
+        "  FROM input('f.mkv') f, unnest(f.audio) t"
+        "), y AS (SELECT x.track AS track, x.n AS n2 FROM x) "
+        "SELECT y.track FROM y) TO ('y' || y.n2::text || '.mka')",
+        _row_probes(),
+    ).sinks
+    assert [unit.path for unit in units] == ["y1.mka", "y2.mka", "y3.mka"]
+
+
 def test_a_cte_body_with_no_track_rows_cannot_tag_a_container() -> None:
     """A CTE writes no file, so there is no container for a rowless tag column
     to name."""
     err = _reject(
-        "WITH tagged AS (SELECT f.audio[1] AS snd, 'Main' AS title "
+        "WITH tagged AS (SELECT f.audio[1] AS snd, STRUCT('Main' AS title) AS tags "
         "FROM input('f.mkv') f) SELECT tagged.snd FROM tagged"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "tag column 'title' in a CTE body has no track row to tag" in err.message
+    assert "a 'tags' column in a CTE body has no track row to tag" in err.message
     assert err.hint is not None and "outer SELECT" in err.hint
 
 
@@ -9409,7 +9534,8 @@ def test_the_two_level_query_tags_the_streams_and_the_container() -> None:
     from the outer SELECT, one query."""
     g = _lower(
         _TAGGED_CTE + "SELECT g.video, array_agg(tagged.track), "
-        "'Director Cut' AS title FROM input('f.mkv') g, tagged GROUP BY g.video",
+        "STRUCT('Director Cut' AS title) AS tags "
+        "FROM input('f.mkv') g, tagged GROUP BY g.video",
         _shared_probes(),
     )
     assert g.sinks[0].tags == {"title": "Director Cut"}
@@ -10104,12 +10230,12 @@ def test_a_grouped_scalar_tags_the_container_not_the_tracks() -> None:
     file; ungrouped and single-row, the same column tags the track."""
     probes = _row_probes()
     grouped = _agg_copy(
-        "SELECT array_agg(t), 'Set' AS album FROM input('f.mkv') f, "
-        "unnest(f.audio) t GROUP BY f.video"
+        "SELECT array_agg(t), STRUCT('Set' AS album) AS tags "
+        "FROM input('f.mkv') f, unnest(f.audio) t GROUP BY f.video"
     )
     per_row = _agg_copy(
-        "SELECT t, 'Set' AS album FROM input('f.mkv') f, unnest(f.audio) t "
-        "WHERE t.index = 1"
+        "SELECT t, STRUCT('Set' AS album) AS tags "
+        "FROM input('f.mkv') f, unnest(f.audio) t WHERE t.index = 1"
     )
     assert _lower(grouped, probes).sinks[0].tags == {"album": "Set"}
     assert _lower(per_row, probes).sinks[0].tags == {}
@@ -10121,7 +10247,7 @@ def test_the_group_key_itself_reads_as_a_container_tag() -> None:
         _track("audio", 1, language="eng", codec="aac"),
     )
     g = _lower(
-        "COPY (SELECT array_agg(t), t.tags.language AS title "
+        "COPY (SELECT array_agg(t), STRUCT(t.tags.language AS title) AS tags "
         "FROM input('f.mkv') f, unnest(f.audio) t GROUP BY t.tags.language) "
         "TO (t.tags.language || '.mka')",
         probes,
@@ -10642,8 +10768,8 @@ def test_a_bare_row_tags_column_prints_the_whole_map() -> None:
 
 def test_a_bare_row_tags_column_is_not_a_value() -> None:
     err = _reject_lower(
-        "COPY (SELECT t, t.tags AS x FROM input('f.mkv') f, unnest(f.audio) t) "
-        "TO 'out.mka'",
+        "COPY (SELECT t, STRUCT(t.tags AS x) AS tags "
+        "FROM input('f.mkv') f, unnest(f.audio) t) TO 'out.mka'",
         {"f": _probe_result(audios=1, audio_tags={"language": "eng"})},
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -11082,14 +11208,16 @@ def test_xfade_requires_expr_only_for_a_custom_transition() -> None:
 def test_unset_tag_variable_clears_the_tag() -> None:
     """A cleared tag is an ABSENT key: nothing carries through to -metadata."""
     g = _compile_vars(
-        "COPY (SELECT f.video[1], :'title' AS title FROM input('a.mkv') f) TO 'o.mp4'"
+        "COPY (SELECT f.video[1], STRUCT(:'title' AS title) AS tags "
+        "FROM input('a.mkv') f) TO 'o.mp4'"
     )
     assert g.sinks[0].tags == {"title": None}
 
 
 def test_coalesce_keeps_a_tag_when_the_variable_is_unset() -> None:
     g = _compile_vars(
-        "COPY (SELECT f.video[1], COALESCE(:'title', 'Untitled') AS title "
+        "COPY (SELECT f.video[1], "
+        "STRUCT(COALESCE(:'title', 'Untitled') AS title) AS tags "
         "FROM input('a.mkv') f) TO 'o.mp4'"
     )
     assert g.sinks[0].tags == {"title": "Untitled"}
@@ -11097,7 +11225,8 @@ def test_coalesce_keeps_a_tag_when_the_variable_is_unset() -> None:
 
 def test_coalesce_prefers_the_set_variable() -> None:
     g = _compile_vars(
-        "COPY (SELECT f.video[1], COALESCE(:'title', 'Untitled') AS title "
+        "COPY (SELECT f.video[1], "
+        "STRUCT(COALESCE(:'title', 'Untitled') AS title) AS tags "
         "FROM input('a.mkv') f) TO 'o.mp4'",
         {"title": "Named"},
     )

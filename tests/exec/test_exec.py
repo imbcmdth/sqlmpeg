@@ -1908,8 +1908,8 @@ def test_ladspa_runs_and_produces_one_audio_stream(tmp_path: Path) -> None:
     assert streams[0]["codec_type"] == "audio"
 
 
-def test_metadata_from_copies_an_inputs_global_tags_through(tmp_path: Path) -> None:
-    """`metadata_from <alias>` round-trips a real input's container-level
+def test_a_copied_tags_map_carries_an_inputs_globals_through(tmp_path: Path) -> None:
+    """`f.tags AS tags` round-trips a real input's container-level
     tags onto the output via ffprobe's format tags, not just the compiled
     command's shape (recipe 42, exec tier, only proves that offline)."""
     _require_fixture(_AV)
@@ -1932,9 +1932,9 @@ def test_metadata_from_copies_an_inputs_global_tags_through(tmp_path: Path) -> N
 
     out_path = tmp_path / "copied.mkv"
     query = (
-        "COPY (SELECT f.video[1], f.audio[1] "
+        "COPY (SELECT f.video[1], f.audio[1], f.tags AS tags "
         f"FROM input('{_sql_path(tagged)}') f) "
-        f"TO '{_sql_path(out_path)}' WITH (metadata_from f);"
+        f"TO '{_sql_path(out_path)}';"
     )
 
     _run_sink_query(query, out_path)
@@ -1955,9 +1955,10 @@ def test_container_tag_columns_round_trip_through_real_ffmpeg(tmp_path: Path) ->
     out_path = tmp_path / "restored.mkv"
     query = (
         "COPY (SELECT f.video[1], f.audio[1], "
-        "f.tags.title || ' (restored)' AS title, "
-        "CASE WHEN f.tags.comment IS NULL THEN 'no notes' ELSE f.tags.comment END AS comment, "
-        "NULL AS artist "
+        "STRUCT(f.tags.title || ' (restored)' AS title, "
+        "CASE WHEN f.tags.comment IS NULL THEN 'no notes' "
+        "ELSE f.tags.comment END AS comment, "
+        "NULL AS artist) AS tags "
         f"FROM input('{_sql_path(_TAGGED)}') f) TO '{_sql_path(out_path)}';"
     )
 
@@ -2004,10 +2005,12 @@ def test_a_cte_tags_the_streams_while_the_outer_select_tags_the_file(
     query = (
         "COPY ("
         "  WITH tagged AS ("
-        "    SELECT a AS track, 'Audio (' || a.tags.language || ')' AS title"
+        "    SELECT a AS track,"
+        "           STRUCT('Audio (' || a.tags.language || ')' AS title) AS tags"
         f"    FROM input('{_sql_path(_AV2)}') f, unnest(f.audio) a"
         "  )"
-        "  SELECT g.video, array_agg(tagged.track), 'Director Cut' AS title"
+        "  SELECT g.video, array_agg(tagged.track),"
+        "         STRUCT('Director Cut' AS title) AS tags"
         f"  FROM input('{_sql_path(_AV2)}') g, tagged GROUP BY g.video"
         f") TO '{_sql_path(out_path)}';"
     )

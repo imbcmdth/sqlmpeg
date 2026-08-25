@@ -858,7 +858,7 @@ A non-stream column in a media query sets a tag on that row's output. The alias 
 
 ```pgsql
 COPY (
-  SELECT t, 'Audio (' || t.tags.language || ')' AS title
+  SELECT t, STRUCT('Audio (' || t.tags.language || ')' AS title) AS tags
   FROM input('tests/fixtures/av-eng.mp4') f, unnest(f.audio) t
 ) TO 'titled.mka'
 ```
@@ -871,13 +871,14 @@ ffmpeg -i tests/fixtures/av-eng.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=
 
 ## 38. Normalize language tags
 
-CASE makes the edit conditional, and it runs over every row - one expression fixes the whole file. Tags you don't select pass through unchanged; `NULL` as the value clears one. Rows are tracks inside the `WITH`, which is where a tag column can name one; the outer `array_agg` puts the tagged tracks in the file:
+CASE makes the edit conditional, and it runs over every row - one expression fixes the whole file. A `tags` column sets the keys it names and leaves the rest alone; a `NULL` field clears its key. Rows are tracks inside the `WITH`, which is where a `tags` column lands on one; the outer `array_agg` puts the tagged tracks in the file:
 
 ```pgsql
 COPY (
   WITH retagged AS (
     SELECT t AS track,
-           CASE WHEN t.tags.language = 'fra' THEN 'fre' ELSE t.tags.language END AS language
+           STRUCT(CASE WHEN t.tags.language = 'fra' THEN 'fre'
+                       ELSE t.tags.language END AS language) AS tags
     FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
   )
   SELECT array_agg(retagged.track) FROM retagged
@@ -917,8 +918,9 @@ A `chapters` column IS the file's chapter list, the same shape `unnest(f.chapter
 ```pgsql
 COPY (
   SELECT f.video[1], f.audio[1],
-         ARRAY[ROW('Intro', 0, 60)::chapter,
-               ROW('Act One', 60, 300)::chapter] AS chapters
+         ARRAY[STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)::chapter,
+               STRUCT('Act One' AS title, 60 AS start_t, 300 AS end_t)::chapter]
+           AS chapters
   FROM input(:'source') f
 ) TO :'dest'
 ```
@@ -972,19 +974,19 @@ $ sqlmpeg -f query.sql
 
 ## 42. Title the file and keep its global tags
 
-In a query without track rows an aliased non-stream column tags the container (not a stream); `metadata_from` copies an input's global tags through, and the tag column overrides its key:
+In a query without track rows a `tags` column is the container's map. Naming an input's own `tags` on the left of `||` copies that input's globals through, and the keys on the right override theirs:
 
 ```pgsql
 COPY (
-  SELECT f.video[1], f.audio[1], 'Director Cut' AS title
+  SELECT f.video[1], f.audio[1], f.tags || STRUCT('Director Cut' AS title) AS tags
   FROM input(:'source') f
-) TO :'dest' WITH (metadata_from f)
+) TO :'dest'
 ```
 
 ```
 $ sqlmpeg compile -f query.sql -v source=film.mkv -v dest=cut.mkv
-ffmpeg -i film.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata \
-  'title=Director Cut' -map_metadata 0 cut.mkv
+ffmpeg -i film.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -map_metadata 0 -metadata \
+  'title=Director Cut' cut.mkv
 ```
 
 ## 43. Two-pass encode to a target bitrate
@@ -1158,11 +1160,12 @@ For SRT use `format 'mpegts'` with an `srt://` destination; UDP the same. Verifi
 
 ## 51. Set the container's title, clear its artist
 
-In a query without track rows, an aliased non-stream column tags the CONTAINER - the alias is the key, free-form, same as track-row tags. `NULL` clears the tag in the output (ffmpeg copies input globals by default, so clearing is explicit):
+In a query without track rows, a `tags` column is the CONTAINER's map - each field name is a key, free-form, same as track-row tags. A `NULL` field clears the key in the output (ffmpeg copies input globals by default, so clearing is explicit):
 
 ```pgsql
 COPY (
-  SELECT f.video[1], f.audio[1], 'Remastered 2026' AS title, NULL AS artist
+  SELECT f.video[1], f.audio[1],
+         STRUCT('Remastered 2026' AS title, NULL AS artist) AS tags
   FROM input(:'source') f
 ) TO :'dest'
 ```
@@ -1180,8 +1183,9 @@ Container tags are a map on the input alias, read by path - `f.tags.title`, `f.t
 ```pgsql
 COPY (
   SELECT f.video[1], f.audio[1],
-    f.tags.title || ' (restored)' AS title,
-    CASE WHEN f.tags.comment IS NULL THEN 'no notes' ELSE f.tags.comment END AS comment
+    STRUCT(f.tags.title || ' (restored)' AS title,
+           CASE WHEN f.tags.comment IS NULL THEN 'no notes'
+                ELSE f.tags.comment END AS comment) AS tags
   FROM input('tests/fixtures/tagged.mp4') f
 ) TO 'restored.mp4'
 ```
@@ -1196,15 +1200,15 @@ Reading needs the probe (the values live in the file), so this one is fixture-bo
 
 ## 53. Tag the tracks and the container in one query
 
-Two levels, two scopes, visible in the query text: inside the `WITH`, rows are tracks, so the tag column titles each stream; outside it, the CTE's streams are just streams, so the tag column titles the container:
+Two levels, two scopes, visible in the query text: inside the `WITH`, rows are tracks, so the `tags` column titles each stream; outside it, the CTE's streams are just streams, so the `tags` column titles the container:
 
 ```pgsql
 COPY (
   WITH tagged AS (
-    SELECT a AS track, 'Audio (' || a.tags.language || ')' AS title
+    SELECT a AS track, STRUCT('Audio (' || a.tags.language || ')' AS title) AS tags
     FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) a
   )
-  SELECT g.video, array_agg(tagged.track), 'Director Cut' AS title
+  SELECT g.video, array_agg(tagged.track), STRUCT('Director Cut' AS title) AS tags
   FROM input('tests/fixtures/av2.mp4') g, tagged
   GROUP BY g.video
 ) TO 'out.mkv'
@@ -1241,7 +1245,7 @@ Explicit grouping unlocks what the plain fan-out rejects as a collision: rows th
 
 ```pgsql
 COPY (
-  SELECT array_agg(a), a.tags.language AS title
+  SELECT array_agg(a), STRUCT(a.tags.language AS title) AS tags
   FROM input('tests/fixtures/av-2eng.mp4') f, unnest(f.audio) a
   GROUP BY a.tags.language
 ) TO (a.tags.language || '.mka')
@@ -1457,7 +1461,8 @@ COPY (
     VALUES (0, 60, 'Intro'), (60, 300, 'Act One')
   )
   SELECT f.video[1], f.audio[1],
-         array_agg(ROW(m.title, m.start_t, m.end_t)::chapter) AS chapters
+         array_agg(STRUCT(m.title AS title, m.start_t AS start_t,
+                          m.end_t AS end_t)::chapter) AS chapters
   FROM input(:'source') f, marks m
   GROUP BY f.video[1], f.audio[1]
 ) TO :'dest'
@@ -1498,7 +1503,8 @@ Cues and chapters are the same shape - a title over a time span - so converting 
 ```pgsql
 COPY (
   SELECT f.video[1], f.audio[1],
-         array_agg(ROW(c.title, c.start_t, c.end_t)::cue)
+         array_agg(STRUCT(c.title AS text, c.start_t AS start_t,
+                          c.end_t AS end_t)::cue)
   FROM input('tests/fixtures/av-chapters.mkv') f, unnest(f.chapters) c
   GROUP BY f.video[1], f.audio[1]
 ) TO 'with-cues.mkv'
@@ -1514,7 +1520,7 @@ ffmpeg -i tests/fixtures/av-chapters.mkv -f webvtt -i \
   copy with-cues.mkv
 ```
 
-The reverse - a `.vtt` file's cues becoming a chapter list - is the same expression with the types swapped: `array_agg(ROW(c.text, c.start_t, c.end_t)::chapter) AS chapters` over `unnest(v.cues) c`.
+The reverse - a `.vtt` file's cues becoming a chapter list - is the same expression with the types swapped: `array_agg(STRUCT(c.text AS title, c.start_t AS start_t, c.end_t AS end_t)::chapter) AS chapters` over `unnest(v.cues) c`.
 
 ## 66. Attach a font, and list what a file carries
 
@@ -1523,8 +1529,10 @@ An attachment is a file riding inside the container - a subtitle font, cover art
 ```pgsql
 COPY (
   SELECT f.video[1], f.audio[1],
-         ARRAY[ROW('font.ttf', 'application/x-truetype-font',
-                   'tests/fixtures/font.ttf')::attachment] AS attachments
+         ARRAY[STRUCT('font.ttf' AS filename,
+                      'application/x-truetype-font' AS mimetype,
+                      'tests/fixtures/font.ttf' AS path)::attachment]
+           AS attachments
   FROM input('tests/fixtures/av2.mp4') f
 ) TO 'fonted.mkv'
 ```
@@ -1561,7 +1569,7 @@ CREATE FUNCTION normalize_lang(raw text) RETURNS text AS $$
 $$ LANGUAGE sql;
 
 COPY (
-  SELECT t, normalize_lang(t.tags.language) AS language
+  SELECT t, STRUCT(normalize_lang(t.tags.language) AS language) AS tags
   FROM input('tests/fixtures/av2.mp4') f, unnest(f.audio) t
 ) TO (normalize_lang(t.tags.language) || '.mka')
 ```
@@ -1572,7 +1580,7 @@ ffmpeg -i tests/fixtures/av2.mp4 -map 0:a:0 -c:0 copy -metadata:s:0 language=eng
   -map 0:a:1 -c:0 copy -metadata:s:0 language=fra fra.mka
 ```
 
-One definition, two uses - the tag it writes and the filename it picks. A function is legal anywhere a value of its return type is: `SELECT` columns, `WHERE`, tag columns, fan-out destinations.
+One definition, two uses - the tag it writes and the filename it picks. A function is legal anywhere a value of its return type is: a `tags` field, `WHERE`, a fan-out destination.
 
 ## 68. A function that returns rows
 
@@ -1598,7 +1606,7 @@ ffmpeg -i tests/fixtures/av-2eng.mp4 -i tests/fixtures/av2.mp4 -map 1:v:0 -c:0 c
   language=eng out.mkv
 ```
 
-The call contributes its body's rows, so everything that applies to a CTE applies here - cross joins, `WHERE`, grouping, the one-row rule. Calling a table-returning function in the `SELECT` list is rejected: reading a field off the call would read it once per field, minting one input per read.
+The call contributes its body's rows, so everything that applies to a CTE applies here - cross joins, `WHERE`, grouping, the one-row rule, and a `tags` column in the body tagging the streams it returns (it is not a declared column, so it stays out of `RETURNS TABLE` and off the caller's alias). Calling a table-returning function in the `SELECT` list is rejected: reading a field off the call would read it once per field, minting one input per read.
 
 ## 69. Leave a knob unset
 
@@ -1633,13 +1641,13 @@ $ sqlmpeg compile -f query.sql -v preset=fast -v source=film.mkv -v dest=out.mkv
 ffmpeg -i film.mkv -map 0:v:0 -map 0:a:0 -c:1 copy -c:0 libx264 -preset:0 fast out.mkv
 ```
 
-Tags are the one place absence acts: writing a tag column with NULL clears the tag, so `:'artist' AS artist` unset clears the artist. "Keep unless told otherwise" is ordinary SQL - `COALESCE(:'title', f.tags.title)` falls back to the file's own title when `:title` is unset:
+Tags are the one place absence acts: a NULL field of a `tags` column clears that key, so `:'artist' AS artist` unset clears the artist. "Keep unless told otherwise" is ordinary SQL - `COALESCE(:'title', f.tags.title)` falls back to the file's own title when `:title` is unset:
 
 ```pgsql
 COPY (
   SELECT f.video[1], f.audio[1],
-         :'artist' AS artist,
-         COALESCE(:'title', f.tags.title) AS title
+         STRUCT(:'artist' AS artist,
+                COALESCE(:'title', f.tags.title) AS title) AS tags
   FROM input('tests/fixtures/tagged.mp4') f
 ) TO :'dest'
 ```
@@ -1692,12 +1700,14 @@ ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:a:0][0:a:1]amix=inputs=2[ou
 `inputs` still writes itself from the count, so `amix(VARIADIC xs, inputs => 3)` over a two-element array is a rejection naming both numbers, exactly as `amix(a, b, inputs => 3)` already was.
 ## 72. Write evenly-spaced chapters, however many you want
 
-`generate_series(start, stop[, step])` in `FROM` is a row source that is a count rather than a file - a `VALUES` table with its cells computed instead of written. The alias names both the table and its one column, so `generate_series(1, :count) i` reads back as `i.i`; gather it into a chapter list the same way any row source builds one, and the count becomes a parameter instead of a wall of copy-pasted `ROW(...)`s:
+`generate_series(start, stop[, step])` in `FROM` is a row source that is a count rather than a file - a `VALUES` table with its cells computed instead of written. The alias names both the table and its one column, so `generate_series(1, :count) i` reads back as `i.i`; gather it into a chapter list the same way any row source builds one, and the count becomes a parameter instead of a wall of copy-pasted `STRUCT(...)`s:
 
 ```sql
 COPY (
   SELECT f.video[1], f.audio[1],
-         array_agg(ROW('Chapter ' || i.i::text, (i.i - 1) * 10, i.i * 10)::chapter) AS chapters
+         array_agg(STRUCT('Chapter ' || i.i::text AS title,
+                          (i.i - 1) * 10 AS start_t,
+                          i.i * 10 AS end_t)::chapter) AS chapters
   FROM input(:'source') f, generate_series(1, :count) i
 ) TO :'dest'
 ```
@@ -1858,7 +1868,7 @@ CREATE FUNCTION label(prefix text DEFAULT 'clip') RETURNS text AS $$
 $$ LANGUAGE sql;
 
 COPY (
-  SELECT f.video[1], f.audio[1], label() AS title
+  SELECT f.video[1], f.audio[1], STRUCT(label() AS title) AS tags
   FROM input(:'source') f
 ) TO :'dest'
 ```
@@ -1891,3 +1901,49 @@ ffmpeg -i film.mp4 -filter_complex \
   '[0:v:0]fade=type=in:duration=1[out0];[0:a:0]afade=type=in:duration=1[out1]' -map \
   '[out0]' -map '[out1]' faded.mp4
 ```
+
+## 81. Grab N evenly-spaced frames, one file each
+
+A row's own value can name the file it writes. Cross a file against a series, bound each row's window to its share of the duration, and select the series value as a column of the rows - `i.i AS n` - so the fan-out `TO` has something to build a name from. `:count` decides how many frames come out; nothing else moves:
+
+```pgsql
+COPY (
+  WITH shots AS (
+    SELECT v AS frame, i.i AS n
+    FROM input(:'source') f, unnest(f.video) v, generate_series(1, :count) i
+    WHERE v.index = 1 AND f.t >= f.duration * (i.i - 0.5) / :count
+  )
+  SELECT shots.frame FROM shots
+) TO ('shot' || shots.n::text || '.png') WITH (video_codec 'png', frames 1)
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=tests/fixtures/av2.mp4 -v count=4
+ffmpeg -ss 0.5 -i tests/fixtures/av2.mp4 -ss 1.5 -i tests/fixtures/av2.mp4 -ss 2.5 -i \
+  tests/fixtures/av2.mp4 -ss 3.5 -i tests/fixtures/av2.mp4 -map 0:v:0 -c:0 png -frames:0 \
+  1 shot1.png -map 1:v:0 -c:0 png -frames:0 1 shot2.png -map 2:v:0 -c:0 png -frames:0 1 \
+  shot3.png -map 3:v:0 -c:0 png -frames:0 1 shot4.png
+```
+
+The window rides on the row, so each frame arrives already seeked, and `n` is an ordinary value column: readable in `WHERE`, in a `GROUP BY`, in a further CTE, or - as here - in the destination.
+
+## 82. Keep a file's tags and change one
+
+`tags` is a map, and `||` merges two of them: whatever the right side names wins, everything else on the left survives. Naming an input's own `tags` on the left is what copies its globals through - without it, ffmpeg's default copying still applies and only the keys written land:
+
+```pgsql
+COPY (
+  SELECT f.video[1], f.audio[1],
+         f.tags || STRUCT('Angel One (restored)' AS title, NULL AS comment) AS tags
+  FROM input('tests/fixtures/tagged.mp4') f
+) TO 'restored.mp4'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/tagged.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy \
+  -map_metadata 0 -metadata comment= -metadata 'title=Angel One (restored)' restored.mp4
+```
+
+A `NULL` field clears exactly its key. `STRUCT() AS tags` on its own writes no globals at all, which is how a file ships without the tags it was built from.
+

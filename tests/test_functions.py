@@ -114,7 +114,7 @@ def test_a_scalar_function_binds_its_argument_per_row() -> None:
 
 def test_a_scalar_function_writes_the_tag_it_computes() -> None:
     sql = NORMALIZE_LANG + (
-        "COPY (SELECT t, normalize_lang(t.tags.language) AS language\n"
+        "COPY (SELECT t, STRUCT(normalize_lang(t.tags.language) AS language) AS tags\n"
         "      FROM input('a.mka') f, unnest(f.audio) t)\n"
         "TO 'out.mka'"
     )
@@ -257,7 +257,8 @@ def test_a_function_takes_no_parameters_at_all() -> None:
         "CREATE FUNCTION house_style() RETURNS text AS $$\n"
         "  SELECT 'eng'\n"
         "$$ LANGUAGE sql;\n"
-        "COPY (SELECT f.audio[1], house_style() AS language FROM input('a.mka') f) "
+        "COPY (SELECT f.audio[1], STRUCT(house_style() AS language) AS tags "
+        "FROM input('a.mka') f) "
         "TO 'out.mka'"
     )
     assert "language=eng" in _argv(sql)
@@ -718,7 +719,7 @@ def test_a_body_rejection_lands_on_the_call_site() -> None:
         "  SELECT 'a' || 1\n"
         "$$ LANGUAGE sql;\n"
         "COPY (SELECT f.audio[1],\n"
-        "             rate(2) AS r\n"
+        "             STRUCT(rate(2) AS r) AS tags\n"
         "      FROM input('a.mka') f)\n"
         "TO 'out.mka'"
     )
@@ -749,7 +750,7 @@ def test_a_rejection_after_resolve_still_lands_on_the_call_site() -> None:
         "  SELECT 1 / 0 + x\n"
         "$$ LANGUAGE sql;\n"
         "COPY (SELECT f.audio[1],\n"
-        "             rate(2) AS r\n"
+        "             STRUCT(rate(2) AS r) AS tags\n"
         "      FROM input('a.mka') f)\n"
         "TO 'out.mka'"
     )
@@ -882,7 +883,9 @@ def test_an_ungrouped_multi_row_call_into_one_path_is_rejected() -> None:
 
 
 def test_a_table_functions_columns_are_named_by_returns_table() -> None:
-    """The alias exposes the declared names, mapped from the projections in order."""
+    """The alias exposes the declared names, mapped from the projections in
+    order. A declared SCALAR column is a value the rows carry, not metadata:
+    nothing of it reaches the command line unless the caller reads it."""
     sql = TAGGED_AUDIO + (
         "COPY (SELECT array_agg(t.track) FROM tagged_audio('a.mka', 'eng') AS t)\n"
         "TO 'out.mka'"
@@ -890,10 +893,21 @@ def test_a_table_functions_columns_are_named_by_returns_table() -> None:
     probes = {"tagged_audio_1_f": _audio_probe({}, {})}
     assert _argv(sql, probes) == [
         "ffmpeg", "-i", "a.mka",
-        "-map", "0:a:0", "-c:0", "copy", "-metadata:s:0", "language=eng",
-        "-map", "0:a:1", "-c:1", "copy", "-metadata:s:1", "language=eng",
+        "-map", "0:a:0", "-c:0", "copy",
+        "-map", "0:a:1", "-c:1", "copy",
         "out.mka",
     ]
+
+
+def test_a_declared_value_column_names_the_files_a_fan_out_writes() -> None:
+    """What the value column IS for: the caller reads it where values read."""
+    sql = TAGGED_AUDIO + (
+        "COPY (SELECT array_agg(t.track) FROM tagged_audio('a.mka', 'eng') AS t\n"
+        "      GROUP BY t.language)\n"
+        "TO (t.language || '.mka')"
+    )
+    probes = {"tagged_audio_1_f": _audio_probe({}, {})}
+    assert _argv(sql, probes)[-1] == "eng.mka"
 
 
 def test_an_undeclared_column_of_the_alias_is_rejected() -> None:
@@ -960,6 +974,8 @@ def test_a_call_joins_a_cte_the_query_already_wrote() -> None:
 
 
 def test_a_table_function_body_may_call_a_value_function() -> None:
+    """The call computes the declared value column; the stream rides beside it,
+    keeping whatever tags it already carried."""
     sql = NORMALIZE_LANG + (
         "CREATE FUNCTION langs(path text) RETURNS TABLE(track audio_stream, language text) AS $$\n"
         "  SELECT a, normalize_lang(a.tags.language) FROM input(path) g, unnest(g.audio) a\n"
@@ -969,9 +985,77 @@ def test_a_table_function_body_may_call_a_value_function() -> None:
     probes = {"langs_1_g": _audio_probe({"language": "english"})}
     assert _argv(sql, probes) == [
         "ffmpeg", "-i", "a.mka",
+        "-map", "0:a:0", "-c:0", "copy", "-metadata:s:0", "language=english",
+        "out.mka",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# a table function's body may tag its own streams
+# ---------------------------------------------------------------------------
+
+
+TAGGING_LANGS = (
+    "CREATE FUNCTION langs(path text) RETURNS TABLE(track audio_stream, language text) AS $$\n"
+    "  SELECT a, normalize_lang(a.tags.language),\n"
+    "         STRUCT(normalize_lang(a.tags.language) AS language) AS tags\n"
+    "  FROM input(path) g, unnest(g.audio) a\n"
+    "$$ LANGUAGE sql;\n"
+)
+
+
+def test_a_table_function_body_tags_the_streams_it_returns() -> None:
+    """The metadata map is an assertion about the body's own streams, not a
+    column of its rows, so it rides to the caller's output un-renamed."""
+    sql = NORMALIZE_LANG + TAGGING_LANGS + (
+        "COPY (SELECT array_agg(t.track) FROM langs('a.mka') AS t) TO 'out.mka'"
+    )
+    probes = {"langs_1_g": _audio_probe({"language": "english"})}
+    assert _argv(sql, probes) == [
+        "ffmpeg", "-i", "a.mka",
         "-map", "0:a:0", "-c:0", "copy", "-metadata:s:0", "language=eng",
         "out.mka",
     ]
+
+
+def test_a_body_tags_map_and_a_value_column_do_not_interfere() -> None:
+    """Both at once: the map tags the streams, the declared column stays a
+    value the caller reads -- here to name the file."""
+    sql = NORMALIZE_LANG + TAGGING_LANGS + (
+        "COPY (SELECT t.track FROM langs('a.mka') AS t) TO (t.language || '.mka')"
+    )
+    probes = {"langs_1_g": _audio_probe({"language": "english"})}
+    args = _argv(sql, probes)
+    assert args[-1] == "eng.mka"
+    assert "language=eng" in args
+
+
+def test_a_body_tags_map_is_not_a_column_of_the_alias() -> None:
+    """It is spent on the body's streams; the caller sees only what was declared."""
+    sql = NORMALIZE_LANG + TAGGING_LANGS + (
+        "COPY (SELECT array_agg(t.track), t.tags AS tags FROM langs('a.mka') AS t)\n"
+        "TO 'out.mka'"
+    )
+    probes = {"langs_1_g": _audio_probe({"language": "english"})}
+    with pytest.raises(SqlmpegError) as caught:
+        lower(_resolved(sql), probes, registry=_snapshot_registry())
+    error = caught.value
+    assert error.code is ErrorCode.UNSUPPORTED_SQL
+    assert "unknown column 't.tags'" in error.message
+    assert error.hint is not None and "exposes" in error.hint
+
+
+def test_returns_table_cannot_declare_a_column_called_tags() -> None:
+    """The name belongs to the metadata map; a declared column is a stream or
+    a value."""
+    sql = (
+        "CREATE FUNCTION bad(path text) RETURNS TABLE(track audio_stream, tags text) AS $$\n"
+        "  SELECT a, 'x' FROM input(path) g, unnest(g.audio) a\n"
+        "$$ LANGUAGE sql;\n"
+        "COPY (SELECT array_agg(t.track) FROM bad('a.mka') AS t) TO 'out.mka'"
+    )
+    error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "declares a column called 'tags'")
+    assert error.hint is not None and "STRUCT('Main' AS title)" in error.hint
 
 
 # ---------------------------------------------------------------------------

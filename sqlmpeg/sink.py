@@ -264,30 +264,15 @@ SINK_OPTIONS: dict[str, SinkOptionSpec] = {
         flag="-movflags",
         per_stream=False,
     ),
-    # `metadata_from`'s value is a bare identifier (an input() alias), never a
-    # str/int/bool/num literal -- lower resolves it directly (bypassing
-    # `validate_option`) into `options["metadata_from"]`, the input index
-    # `-map_metadata` renders. Here only so it validates, docs, and hints like
-    # every other option.
-    "metadata_from": SinkOptionSpec(
-        name="metadata_from",
-        scope="container",
-        type="str",
-        doc="Copy an input()'s global tags through (bare name, not quoted), "
-        "e.g. metadata_from f. Conflicts with strip_metadata.",
-        flag="-map_metadata",
-        per_stream=False,
-    ),
-    "strip_metadata": SinkOptionSpec(
-        name="strip_metadata",
-        scope="container",
-        type="bool",
-        doc="Drop the tags the muxer would otherwise copy implicitly "
-        "(sqlmpeg's own per-stream tags still apply). Conflicts with metadata_from.",
-        flag="-map_metadata",
-        per_stream=False,
-        value_template="-1",
-    ),
+}
+
+# Options that were sink options and are SELECT columns now, with the spelling
+# that replaced each. Named separately so the rejection can say where to go.
+REPLACED_OPTIONS = {
+    "metadata_from": "copy an input's global tags with a tags column, "
+    "e.g. SELECT ..., f.tags AS tags",
+    "strip_metadata": "drop the tags the muxer would copy with an empty tags "
+    "column, e.g. SELECT ..., STRUCT() AS tags",
 }
 
 
@@ -376,12 +361,13 @@ def _validate_against(
 ) -> object:
     spec = table.get(name)
     if spec is None:
+        replacement = REPLACED_OPTIONS.get(name)
         raise SqlmpegError(
             ErrorCode.UNKNOWN_SINK_OPTION,
             f"unknown sink option {name!r}",
             line=line,
             col=col,
-            hint=_unknown_option_hint(name, table),
+            hint=replacement or _unknown_option_hint(name, table),
         )
 
     if spec.type == "bool":

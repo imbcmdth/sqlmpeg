@@ -36,9 +36,11 @@ Every field is one or the other, and the distinction is enforced:
 
 - **Writable** — an assertion your query may make: a stream's `tags`
   and `disposition`, a container's `tags`, a chapter's, cue's or
-  attachment's own fields. A stream's maps are written with a tag
-  column (`'eng' AS language`, `NULL` clears); a record's fields are
-  written positionally in a literal, `ROW('Intro', 0, 60)::chapter`.
+  attachment's own fields. A `tags` map is written with a `tags` column
+  (`STRUCT('eng' AS language) AS tags`, a `NULL` field clears); a
+  record's fields are written by name in a literal,
+  `STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)::chapter`, or
+  positionally in the older `ROW('Intro', 0, 60)::chapter`.
 - **Write-only** — one field, `attachment.path`: it names the file to
   attach when constructing a record and has nothing to report back, so
   reading it is a rejection.
@@ -47,10 +49,11 @@ Every field is one or the other, and the distinction is enforced:
   `duration`, `color_transfer`. Setting one is a typed rejection
   naming the field as probed.
 
-The reserved names are the read-only fields **of the record the column
-sits over**, so `1920 AS width` is rejected over a video row and is an
-ordinary tag over an audio row, which has no `width`. Every other alias
-is a free-form tag key.
+The reserved keys are the read-only fields **of the record the column
+sits over**, so `STRUCT(1920 AS width) AS tags` is rejected over a video
+row and is an ordinary tag over an audio row, which has no `width`.
+`disposition` is reserved everywhere - it is the row's own field, not
+metadata. Every other field name is a free-form tag key.
 
 ## Maps: tags and disposition
 
@@ -68,10 +71,13 @@ typed rejection with a did-you-mean. Naming a map without a key
 of `(key,value)` records in a table query - handy for seeing every tag
 a file carries.
 
-Writing keeps the tag-column spelling: `'eng' AS language` sets that
-entry, `'default+forced' AS disposition` sets the whole flag map (a
-relative spec like `'+forced'` is rejected - the column sets the map,
-so there is nothing to adjust), and `NULL` clears either.
+Writing: `STRUCT('eng' AS language) AS tags` sets that entry and
+leaves the rest of the map alone, and a `NULL` field clears its key.
+`||` merges two maps with the right side winning, so
+`t.tags || STRUCT(...) AS tags` is copy-and-override.
+`'default+forced' AS disposition` stays its own column and sets the
+whole flag map (a relative spec like `'+forced'` is rejected - the
+column sets the map, so there is nothing to adjust); `NULL` clears it.
 
 Tags that ride: only `language` and `title` follow a stream through a
 filter to the output. The rest describe the source.

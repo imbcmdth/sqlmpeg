@@ -272,6 +272,10 @@ _ANALYSIS_FORMAT = "null"
 # The chapter list is an output COLUMN, not a sink option, so its flag is not
 # table data. It names the input the chapters come from and renders last.
 MAP_CHAPTERS_FLAG = "-map_chapters"
+
+# The input a file's GLOBAL tags are copied from, or -1 for none. Rendered
+# ahead of `-metadata`, which ffmpeg applies after it whatever the argv order.
+MAP_METADATA_FLAG = "-map_metadata"
 # One attached file. An output option: it applies to the output file that
 # follows it, and adds one output stream after that file's mapped ones.
 ATTACH_FLAG = "-attach"
@@ -304,7 +308,10 @@ class OutputGroup:
     ``-to`` ahead of the maps; it re-encodes, so a group carrying one never
     renders ``-c:<i> copy``. `chapters` is the input index the file's chapter
     list comes from (``ir.NO_CHAPTERS`` for none), rendered last as
-    ``-map_chapters``; None leaves ffmpeg's default alone. `attachments` are
+    ``-map_chapters``; None leaves ffmpeg's default alone. `metadata` is the
+    input the file's global tags are copied from (``ir.NO_METADATA`` for
+    none), rendered as ``-map_metadata``; None leaves ffmpeg's default alone.
+    `attachments` are
     the files this one carries, rendered as ``-attach`` ahead of the maps;
     each takes an output stream index after every map of this group.
     """
@@ -315,6 +322,7 @@ class OutputGroup:
     tags: dict[str, str | None] = field(default_factory=dict)
     window: tuple[float | None, float | None] | None = None
     chapters: int | None = None
+    metadata: int | None = None
     attachments: list[Attachment] = field(default_factory=list)
 
 
@@ -395,6 +403,7 @@ def _output_group(g: Graph, unit: SinkUnit, labels: dict[str, str]) -> OutputGro
         tags=dict(unit.tags),
         window=unit.window,
         chapters=unit.chapters,
+        metadata=unit.metadata,
         attachments=list(unit.attachments),
     )
 
@@ -660,8 +669,10 @@ def _render_command(e: Emitted, out_path: str | None, pass_: _Pass | None) -> li
                 ]
         args += _render_attachment_tags(group.attachments, len(group.maps))
         # Ahead of the sink options. ffmpeg applies `-metadata` after
-        # `-map_metadata` whatever the argv order, so a tag column wins over
-        # `metadata_from`/`strip_metadata` either way.
+        # `-map_metadata` whatever the argv order, so a named key wins over
+        # whatever the map was copied from either way.
+        if group.metadata is not None:
+            args += [MAP_METADATA_FLAG, str(group.metadata)]
         args += _render_container_tags(group.tags)
         args += _render_sink_options(group, pass_)
         if group.chapters is not None:

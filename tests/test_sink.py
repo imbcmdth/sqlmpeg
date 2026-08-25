@@ -13,6 +13,7 @@ from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.sink import (
     CODEC_PARAMS_FLAGS,
     CSV_OPTIONS,
+    REPLACED_OPTIONS,
     SINK_OPTIONS,
     SinkOptionSpec,
     validate_csv_option,
@@ -45,13 +46,11 @@ _EXPECTED: dict[str, tuple[str, str]] = {
     "codec_params": ("video", "str"),
     "two_pass": ("container", "bool"),
     "movflags": ("container", "str"),
-    "metadata_from": ("container", "str"),
-    "strip_metadata": ("container", "bool"),
 }
 
 
-def test_table_has_exactly_twenty_six_entries() -> None:
-    assert len(SINK_OPTIONS) == 26
+def test_table_has_exactly_twenty_four_entries() -> None:
+    assert len(SINK_OPTIONS) == 24
     assert set(SINK_OPTIONS) == set(_EXPECTED)
 
 
@@ -150,11 +149,12 @@ def test_codec_params_flags_cover_x264_x265_svtav1() -> None:
     }
 
 
-def test_metadata_from_and_strip_metadata_share_the_map_metadata_flag() -> None:
-    assert SINK_OPTIONS["metadata_from"].flag == "-map_metadata"
-    assert SINK_OPTIONS["strip_metadata"].flag == "-map_metadata"
-    assert SINK_OPTIONS["strip_metadata"].value_template == "-1"
-    assert SINK_OPTIONS["strip_metadata"].type == "bool"
+def test_the_metadata_options_were_replaced_by_the_tags_column() -> None:
+    """Both are SELECT columns now; the rejection names what replaced each."""
+    assert "metadata_from" not in SINK_OPTIONS
+    assert "strip_metadata" not in SINK_OPTIONS
+    assert "f.tags AS tags" in REPLACED_OPTIONS["metadata_from"]
+    assert "STRUCT() AS tags" in REPLACED_OPTIONS["strip_metadata"]
 
 
 def test_subtitle_codec_scope_and_flag() -> None:
@@ -259,9 +259,11 @@ def test_validate_option_happy_max_size() -> None:
     assert validate_option("max_size", "10M") == "10M"
 
 
-def test_validate_option_happy_strip_metadata() -> None:
-    assert validate_option("strip_metadata", True) is True
-    assert validate_option("strip_metadata", False) is False
+def test_validate_option_rejects_a_replaced_option_by_name() -> None:
+    with pytest.raises(SqlmpegError) as excinfo:
+        validate_option("strip_metadata", True)
+    assert excinfo.value.code is ErrorCode.UNKNOWN_SINK_OPTION
+    assert "STRUCT() AS tags" in (excinfo.value.hint or "")
 
 
 def test_validate_option_unknown_raises() -> None:

@@ -249,19 +249,27 @@ _DIALECT_TAIL = """\
   `+ - * /` (Postgres typing -- int/int truncates, any float operand gives a
   float; dividing by a known zero is rejected), `CASE`, `||` (text only), and
   `::text` / `CAST(x AS text)` to spell a number for `||`. NULL propagates.
-  An aliased expression column is a metadata TAG on that row's tracks, the
-  alias being the key: `SELECT t, 'Audio (' || t.tags.language || ')' AS
-  title`. The keys are free-form EXCEPT the read-only fields of whatever the
+  Metadata is written by ONE column, named `tags`, holding a map.
+  `STRUCT(<value> AS <key>, ...)` is the map literal, and the column SETS
+  the keys it names, leaving every other key alone: `SELECT t,
+  STRUCT('Audio (' || t.tags.language || ')' AS title) AS tags`. A NULL
+  field clears exactly its key. `||` merges two maps with the right side
+  winning, so `f.tags || STRUCT('Cut' AS title) AS tags` copies an input's
+  own map and overrides one key; a bare `STRUCT() AS tags` over input rows
+  writes no globals at all. No other SELECT column writes metadata: an
+  aliased scalar at a media sink is a typed rejection naming this spelling.
+  The keys are free-form EXCEPT the read-only fields of whatever the
   column sits over -- a track row's `codec`, `index`, `width`, ..., or the
   container's `duration` -- which are probed facts and cannot be asserted:
-  `'h264' AS codec` is a typed rejection, not a tag called `codec`.
+  `STRUCT('h264' AS codec) AS tags` is a typed rejection, not a tag called
+  `codec`. `disposition` is reserved too, because
   `... AS disposition` is not a tag but the row's disposition FIELD:
   its value is ffmpeg's own flag spec (`'default'`, `'default+forced'`,
   `'0'` to clear), it says what the whole flag map is, and it needs a track
   row -- a container has no disposition. In a query with NO track rows the
-  same aliased column tags the CONTAINER instead (`SELECT f.video[1],
-  'Remastered' AS title`), and `NULL AS artist` clears that key in the
-  output. To set both scopes in one query,
+  `tags` column is the CONTAINER's map instead (`SELECT f.video[1],
+  STRUCT('Remastered' AS title, NULL AS artist) AS tags`). To set both
+  scopes in one query,
   tag the tracks inside a CTE and the container in the outer SELECT (the
   outer value wins on a shared key). Same grammar in a filter option
   over a row table, evaluated per row: `SELECT scale(t, t.width / 2,
@@ -273,9 +281,9 @@ _DIALECT_TAIL = """\
   an aggregate, a row-referencing expression must match a key). `GROUP BY` an
   input-level key is the one-file shape; `GROUP BY` a row column partitions
   rows into one output file per group -- it requires a fan-out `TO
-  (expression over the group keys)`, and group keys double as container tag
-  columns: `SELECT array_agg(a), a.tags.language AS title ... GROUP BY
-  a.tags.language) TO (a.tags.language || '.mka')`. `ORDER BY` inside
+  (expression over the group keys)`, and a `tags` column may read the group
+  keys: `SELECT array_agg(a), STRUCT(a.tags.language AS title) AS tags ...
+  GROUP BY a.tags.language) TO (a.tags.language || '.mka')`. `ORDER BY` inside
   `array_agg` is
   rejected; `ORDER BY` before the aggregate defines the order.
   `array_agg` is otherwise a whole-column-only aggregate, with ONE other
@@ -367,9 +375,10 @@ _DIALECT_TAIL = """\
   `input()`'s path, `COPY`'s destination, a stream position, and a few
   filters' required options (`subtitles`' `filename`, `drawtext`'s
   `text`/`textfile`, `frei0r`'s `filter_name`, ...).
-- A tag column written NULL CLEARS the tag, so `:'title' AS title` unset
-  clears; "keep unless told otherwise" is
-  `COALESCE(:'title', f.tags.title) AS title`.
+- A NULL field of a `tags` column CLEARS that key, so
+  `STRUCT(:'title' AS title) AS tags` unset clears it; "keep unless told
+  otherwise" is
+  `STRUCT(COALESCE(:'title', f.tags.title) AS title) AS tags`.
 - A `-v` for a name the text never references is a usage error.
 
 ### Chapters
@@ -384,12 +393,15 @@ _DIALECT_TAIL = """\
   selects nothing and an UNALIASED column of it in a media `COPY` is a typed
   rejection; the columns feed `WHERE`/`ORDER BY`, trim windows
   (`WHERE f.t BETWEEN c.start_t AND c.end_t`), fan-out destinations, and
-  tag columns, exactly like a track row's.
+  `tags` fields, exactly like a track row's.
 - To WRITE chapters, give the COPY's SELECT a column aliased `chapters`
   holding an array of `chapter` records: `SELECT f.video[1], f.audio[1],
-  ARRAY[ROW('Intro', 0, 60)::chapter, ROW('Act One', 60, 300)::chapter] AS
+  ARRAY[STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)::chapter,
+  STRUCT('Act One' AS title, 60 AS start_t, 300 AS end_t)::chapter] AS
   chapters FROM input('film.mkv') f`. A record names the writable fields
-  positionally, in declaration order -- `ROW(title, start_t, end_t)` -- and
+  by name, order-free -- `STRUCT(<v> AS title, <v> AS start_t, <v> AS
+  end_t)`, a missing field NULL; the positional `ROW(title, start_t,
+  end_t)::chapter` also works -- and
   its values take the compile-time value grammar (literals, `-v` variables,
   `||`, arithmetic, `f.duration`). `title` may be `NULL`; `start_t` and
   `end_t` are numbers in seconds. Every chapter must end after it starts,
@@ -398,7 +410,8 @@ _DIALECT_TAIL = """\
 - The same column takes two other sources. `g.chapters AS chapters` copies
   another input's list wholesale, and `NULL AS chapters` writes none;
   omitting the column leaves ffmpeg's own passthrough alone.
-  `array_agg(ROW(m.title, m.start_t, m.end_t)::chapter) AS chapters` builds
+  `array_agg(STRUCT(m.title AS title, m.start_t AS start_t, m.end_t AS
+  end_t)::chapter) AS chapters` builds
   one from any row source -- chapter rows, track rows, or a `VALUES` CTE in
   `FROM` -- with the stream columns in the `GROUP BY`. The chapter list is a
   value of the FILE, so one COPY writes one of them.
@@ -430,12 +443,15 @@ _DIALECT_TAIL = """\
   parameter with no DEFAULT still takes NULL as written, unchanged -- that
   is the escape when a caller means NULL itself.
 - A VALUE-returning function is legal anywhere a value of its type is: a
-  SELECT column, `WHERE`, a tag column, a fan-out `TO`. A
+  SELECT column, `WHERE`, a `tags` field, a fan-out `TO`. A
   `<kind>_stream[]` return splats like a bare array column.
 - A `TABLE`-returning function is a `FROM` row source, aliased like a
   CTE: `FROM input('v.mp4') v, spoken('a.mka', 'eng') AS t` then `t.track`.
   It contributes its body rows, so cross joins, `WHERE`, grouping and the
   one-row rule all apply. Calling one in the SELECT list is a rejection.
+  Its body may also write a `tags` column, which tags the streams it
+  returns; that column is not declared in `RETURNS TABLE` (declaring one
+  called `tags` is a rejection) and is not readable off the alias.
 - The body is ONE `SELECT` with no `WITH`, no `GROUP BY`/`ORDER BY`/
   `LIMIT`, referencing only its parameters and its own `FROM` aliases. No
   `OR REPLACE`, no `IF NOT EXISTS`, no schema-qualified name, no `OUT`/
@@ -455,14 +471,18 @@ _DIALECT_TAIL = """\
   exactly like chapter rows.
 - To WRITE cues, put an array of `cue` records in a STREAM position -- it IS
   a WebVTT subtitle track, not a column: `SELECT f.video[1], f.audio[1],
-  ARRAY[ROW('Hello', 0, 2.5)::cue] FROM input('film.mkv') f`. A record names
-  the writable fields positionally, `ROW(text, start_t, end_t)`, the same
+  ARRAY[STRUCT('Hello' AS text, 0 AS start_t, 2.5 AS end_t)::cue] FROM
+  input('film.mkv') f`. A record names
+  the writable fields by name, `STRUCT(<v> AS text, <v> AS start_t, <v> AS
+  end_t)`, the same
   shape a chapter has. Every cue must end after it starts and the list must
   run in ascending order; unlike chapters, two cues MAY overlap.
 - Cues and chapters convert into each other by swapping the cast:
-  `array_agg(ROW(c.title, c.start_t, c.end_t)::cue)` over `unnest(f.chapters)
+  `array_agg(STRUCT(c.title AS text, c.start_t AS start_t, c.end_t AS
+  end_t)::cue)` over `unnest(f.chapters)
   c` writes a chapter list as a caption track, and
-  `array_agg(ROW(c.text, c.start_t, c.end_t)::chapter) AS chapters` over
+  `array_agg(STRUCT(c.text AS title, c.start_t AS start_t, c.end_t AS
+  end_t)::chapter) AS chapters` over
   `unnest(v.cues) c` imports a `.vtt` file as a chapter list.
 
 ### Attachments
@@ -474,10 +494,11 @@ _DIALECT_TAIL = """\
   exactly like chapter rows and take no per-type stream index.
 - To WRITE attachments, give the COPY's SELECT a column aliased
   `attachments` holding an array of `attachment` records: `SELECT
-  f.video[1], f.audio[1], ARRAY[ROW('font.ttf',
-  'application/x-truetype-font', 'fonts/font.ttf')::attachment] AS
-  attachments FROM input('film.mkv') f`. The record is
-  `ROW(filename, mimetype, path)`: `path` is the file to read and may not be
+  f.video[1], f.audio[1], ARRAY[STRUCT('font.ttf' AS filename,
+  'application/x-truetype-font' AS mimetype, 'fonts/font.ttf' AS
+  path)::attachment] AS
+  attachments FROM input('film.mkv') f`. The record names
+  `filename`, `mimetype` and `path`: `path` is the file to read and may not be
   `NULL`, while `filename` and `mimetype` are what the container records and
   may each be `NULL` to leave ffmpeg's own default. `path` is write-only --
   a container carries the bytes, not where they came from, so an attachment
@@ -834,7 +855,7 @@ path, and a quoted `TO 'path'` is unchanged -- every track still lands in
 that one file. `WITH (...)` applies to every file identically. Rejected:
 a computed segment holding `/`, `\\` or `..`; two rows naming one file; zero
 surviving rows; a NULL name; and, in this version, fan-out with `two_pass`,
-`metadata_from`, a `chapters` column, `FORMAT csv`, `UNION ALL`, or another
+a `chapters` column, `FORMAT csv`, `UNION ALL`, or another
 `COPY` in the same script.
 
 ### Options
@@ -891,8 +912,11 @@ These are typed errors, never a best-effort graph. Do not reach for them.
   over the stream.
 - A field read off a filter's OUTPUT (`scale(v, 640, -2).width`,
   `volume(a, 0.2).tags.language`): nothing probed it. Setting a read-only
-  field (`'h264' AS codec`, `3 AS index`, `12 AS duration`): it is a probed
-  fact, not an assertion. `SELECT *` over a track-row alias in a media
+  field (`STRUCT('h264' AS codec) AS tags`, `STRUCT(3 AS index) AS tags`):
+  it is a probed fact, not an assertion. An aliased scalar column that is
+  not `tags`/`chapters`/`attachments`/`disposition` at a media sink: a
+  SELECT column there is an output stream, and metadata is written by a
+  `tags` column. `SELECT *` over a track-row alias in a media
   query: a star expands FIELDS, and a SELECT column is an output stream.
 - A written chapter list that goes backwards: each chapter must end after it
   starts, and the rows must ascend without overlapping.
@@ -1063,8 +1087,9 @@ _EXAMPLES: tuple[tuple[str, str], ...] = (
         "Give film.mkv four evenly spaced chapter markers, ten seconds each.",
         "COPY (\n"
         "  SELECT f.video[1], f.audio[1],\n"
-        "         array_agg(ROW('Chapter ' || i.i::text, (i.i - 1) * 10, "
-        "i.i * 10)::chapter) AS chapters\n"
+        "         array_agg(STRUCT('Chapter ' || i.i::text AS title,\n"
+        "                          (i.i - 1) * 10 AS start_t,\n"
+        "                          i.i * 10 AS end_t)::chapter) AS chapters\n"
         "  FROM input('film.mkv') f, generate_series(1, 4) i\n"
         ") TO 'chaptered.mkv'",
     ),

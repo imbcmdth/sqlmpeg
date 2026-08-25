@@ -55,7 +55,7 @@ The row IS the stream: a bare `t` where a stream is expected selects it, filters
 
 ## Chapter rows - `unnest(f.chapters) c`
 
-The same shape as track rows, over the container's chapter list. A chapter is not a stream, so a bare `c` selects nothing and an unaliased column of it in a media query is a typed rejection; the columns feed trim windows (`WHERE f.t BETWEEN c.start_t AND c.end_t`), fan-out destinations, tag columns, and table/CSV output. Chapter rows cross join with track rows like any other pair of sources.
+The same shape as track rows, over the container's chapter list. A chapter is not a stream, so a bare `c` selects nothing and an unaliased column of it in a media query is a typed rejection; the columns feed trim windows (`WHERE f.t BETWEEN c.start_t AND c.end_t`), fan-out destinations, `tags` fields, and table/CSV output. Chapter rows cross join with track rows like any other pair of sources.
 
 | column | type | notes |
 | --- | --- | --- |
@@ -63,7 +63,7 @@ The same shape as track rows, over the container's chapter list. A chapter is no
 | `title` | text | |
 | `start_t`, `end_t` | number | seconds |
 
-Writing chapters is the mirror: an aliased `chapters` column holding `chapter` records IS the output's chapter list - a literal `ARRAY[ROW('Intro', 0, 60)::chapter, ...]`, another input's list copied whole (`g.chapters AS chapters`), or `array_agg(ROW(...)::chapter)` gathered over any row source. `NULL AS chapters` writes none; omitting the column leaves ffmpeg's own default alone. It compiles to one extra self-contained input carrying the list. Recipes [39-40](examples.md#39-list-a-files-chapters) and [63](examples.md#63-copy-or-rebuild-a-chapter-list).
+Writing chapters is the mirror: an aliased `chapters` column holding `chapter` records IS the output's chapter list - a literal `ARRAY[STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)::chapter, ...]`, another input's list copied whole (`g.chapters AS chapters`), or `array_agg(STRUCT(...)::chapter)` gathered over any row source. `NULL AS chapters` writes none; omitting the column leaves ffmpeg's own default alone. It compiles to one extra self-contained input carrying the list. Recipes [39-40](examples.md#39-list-a-files-chapters) and [63](examples.md#63-copy-or-rebuild-a-chapter-list).
 
 Written chapters are checked at compile time: `start_t` and `end_t` must be numbers (`title` may be `NULL`), each chapter must end after it starts, and the rows must run in ascending order without overlapping. Back-to-back is fine - one may end exactly where the next begins.
 
@@ -89,11 +89,13 @@ Files riding inside the container: subtitle fonts, cover art, scripts.
 | `filename` | text | as stored |
 | `mimetype` | text | as stored |
 
-Writing takes a third field, `path` - the file to read - which is **write-only**: it names a source at construction time and has nothing to report back, so reading `a.path` is a rejection. `ARRAY[ROW('font.ttf', 'application/x-truetype-font', :'font')::attachment] AS attachments` attaches one; `filename` and `mimetype` may be `NULL` to take ffmpeg's defaults, `path` may not. [Recipe 66](examples.md#66-attach-a-font-and-list-what-a-file-carries).
+Writing takes a third field, `path` - the file to read - which is **write-only**: it names a source at construction time and has nothing to report back, so reading `a.path` is a rejection. `ARRAY[STRUCT('font.ttf' AS filename, 'application/x-truetype-font' AS mimetype, :'font' AS path)::attachment] AS attachments` attaches one; `filename` and `mimetype` may be `NULL` to take ffmpeg's defaults, `path` may not. [Recipe 66](examples.md#66-attach-a-font-and-list-what-a-file-carries).
 
 ## CTE rows - `WITH x AS (...)`
 
-A CTE exposes whatever its body named with `AS`, and referencing it in FROM contributes its body's ROWS - a two-row CTE is a two-row source, and comma between sources is a cross join with real multiplicity, exactly as SQL says. Tag columns in the body ride on its streams (see Tags below). No other columns exist on a CTE alias; there is no natural naming from a bare `a`. Views referenced in FROM follow the same rules.
+A CTE exposes whatever its body named with `AS`, and referencing it in FROM contributes its body's ROWS - a two-row CTE is a two-row source, and comma between sources is a cross join with real multiplicity, exactly as SQL says. A `tags` column in the body rides on its streams (see Tags below).
+
+A body column that is a compile-time VALUE rather than a stream - a series value, a probed scalar, a row column, arithmetic over those - is a **value column** of the CTE's rows, readable wherever row columns are: `WHERE`, a fan-out `TO` expression, `GROUP BY`, a further CTE, and table/CSV output. `SELECT v AS frame, i.i AS n ...` gives the rows an `n` that names one file per row ([recipe 81](examples.md#81-grab-n-evenly-spaced-frames-one-file-each)). Selecting one as a column of a MEDIA query is a rejection: a SELECT column there is an output stream. A value the compiler cannot evaluate is a typed rejection naming the column. A `tags` column is not one of them either: it is spent on the body's own streams, so reading `<cte>.tags` is an unknown column. No other columns exist on a CTE alias; there is no natural naming from a bare `a`. Views referenced in FROM follow the same rules.
 
 ## Series rows - `generate_series(1, 5) i`
 
@@ -120,15 +122,19 @@ An outer join's gap side is a NULL row. Selecting it bare is a typed rejection; 
 
 ## Tags
 
-An aliased non-stream SELECT column is a metadata tag; the alias is the key (free-form; quoted identifiers for unusual keys), the value any compile-time expression, `NULL` clears the key. The scope is the row shape it sits over:
+Metadata is written by ONE column, named `tags`, holding a map. `STRUCT(<value> AS <key>, ...)` is the map literal: each field name is a key (free-form; quoted identifiers for unusual keys), each value any compile-time expression. A `tags` column **sets the keys it names** and leaves every other key alone; a `NULL` field clears exactly its key. No other SELECT column writes metadata - an aliased scalar anywhere else is a value column (see CTE rows above), and at a media sink it is a typed rejection naming this spelling.
 
-- **Over track rows**: tags that row's stream(s) - `-metadata:s:N`. `CASE WHEN t.tags.language IN ('en', 'english') THEN 'eng' ELSE t.tags.language END AS language` retags a library in one expression. Unselected tags pass through unchanged. Recipes [37-38](examples.md#37-retitle-tracks-from-their-own-metadata).
-- **Over input rows only** (no track rows in the branch): tags the container - `-metadata`. The input's own tags feed the expressions, so `CASE WHEN f.tags.title IS NULL THEN 'Untitled' ELSE f.tags.title END AS title` fills a missing title. [Recipe 52](examples.md#52-read-the-containers-tags-rewrite-them-with-case).
-- **Both in one query**: layer with a CTE - tag columns in the body are per-stream, in the outer SELECT container-level, and the outer SELECT gathers the CTE's rows (`array_agg` + `GROUP BY`, see Combining rows); the outer value wins on a shared key. [Recipe 53](examples.md#53-tag-the-tracks-and-the-container-in-one-query).
+`||` merges two maps, right side winning: `f.tags || STRUCT('Cut' AS title) AS tags` copies an input's own map and overrides one key of it. The scope is the row shape the column sits over:
 
-The reserved names are the read-only fields of whatever the column sits over - a track row's `codec`, `index`, `width`, ... or the container's `duration` and `t`. Those are probed facts, so `'h264' AS codec` is a typed rejection rather than a tag called `codec`; every other name is a free-form key. A writable field keeps its own meaning: `disposition` writes the flag map.
+- **Over track rows**: the keys land on that row's stream(s) - `-metadata:s:N`. `STRUCT(CASE WHEN t.tags.language IN ('en', 'english') THEN 'eng' ELSE t.tags.language END AS language) AS tags` retags a library in one expression. Keys the column does not name pass through unchanged. Recipes [37-38](examples.md#37-retitle-tracks-from-their-own-metadata).
+- **Over input rows only** (no track rows in the branch): the keys are the container's - `-metadata`. The input's own tags feed the expressions, so `STRUCT(CASE WHEN f.tags.title IS NULL THEN 'Untitled' ELSE f.tags.title END AS title) AS tags` fills a missing title. [Recipe 52](examples.md#52-read-the-containers-tags-rewrite-them-with-case).
+- **Both in one query**: layer with a CTE - a `tags` column in the body is per-stream, in the outer SELECT container-level, and the outer SELECT gathers the CTE's rows (`array_agg` + `GROUP BY`, see Combining rows); the outer value wins on a shared key. [Recipe 53](examples.md#53-tag-the-tracks-and-the-container-in-one-query).
 
-`disposition` is not a tag but the row's own field: its value is ffmpeg's disposition spec (`'default'`, `'forced'`, `'default+forced'`, `'0'` clears), it says what the whole flag map is, and it emits `-disposition:N` - [recipe 41](examples.md#41-flag-the-default-track). A container has no disposition, so it needs a track row. `metadata_from <alias>` copies an input's global tags, `strip_metadata true` drops them; a tag column overrides either for its key. The same columns in a table/CSV query print as plain data, which previews what a retag will write.
+At container level the map's own SOURCE is written too: `f.tags || STRUCT(...) AS tags` emits `-map_metadata` for that input, and a bare `STRUCT() AS tags` emits `-map_metadata -1`, writing no globals at all. Over track rows a map that names no key is a rejection - there is nothing to set. [Recipe 82](examples.md#82-keep-a-files-tags-and-change-one).
+
+The reserved keys are the read-only fields of whatever the column sits over - a track row's `codec`, `index`, `width`, ... or the container's `duration` and `t`. Those are probed facts, so `STRUCT('h264' AS codec) AS tags` is a typed rejection rather than a tag called `codec`; every other name is a free-form key. `disposition` is reserved too, because it is the row's own field rather than metadata.
+
+`disposition` is not a tag but the row's own field: its value is ffmpeg's disposition spec (`'default'`, `'forced'`, `'default+forced'`, `'0'` clears), it says what the whole flag map is, and it emits `-disposition:N` - [recipe 41](examples.md#41-flag-the-default-track). A container has no disposition, so it needs a track row. The same columns in a table/CSV query print as plain data, which previews what a retag will write.
 
 ## Combining rows
 
@@ -151,7 +157,7 @@ The row count is the RESOLVED count against the actual file: a `WHERE` that narr
 
 `array_agg` takes any per-row stream expression (`array_agg(volume(a, 0.5))`) and must be a whole SELECT column, or the sole argument of `VARIADIC` (`concat(VARIADIC array_agg(a))`, [examples.md#70](examples.md#70-join-however-many-tracks-a-file-has-with-concat)); row order is the aggregation order (`ORDER BY` before the aggregate reorders it; `ORDER BY` inside `array_agg` is rejected). Postgres's grouping rule is enforced: outside an aggregate, a row-varying expression must match a `GROUP BY` key. Group keys may be streams (`GROUP BY vid`, `GROUP BY f.video[1]`).
 
-`GROUP BY` a row column partitions the rows, one output file per group - this requires a fan-out `TO (expression over the group keys)` (N groups are N rows; rule 2). Group keys are group-constants, so they double as container tag columns. [Recipe 55](examples.md#55-one-file-per-language-all-its-tracks-inside) writes one file per language with all of that language's tracks inside, titled by its key; [recipe 57](examples.md#57-combine-tracks-selected-by-separate-ctes) gathers across CTE boundaries.
+`GROUP BY` a row column partitions the rows, one output file per group - this requires a fan-out `TO (expression over the group keys)` (N groups are N rows; rule 2). Group keys are group-constants, so a `tags` column may read them. [Recipe 55](examples.md#55-one-file-per-language-all-its-tracks-inside) writes one file per language with all of that language's tracks inside, titled by its key; [recipe 57](examples.md#57-combine-tracks-selected-by-separate-ctes) gathers across CTE boundaries.
 
 ## Inspecting
 

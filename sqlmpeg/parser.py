@@ -211,6 +211,7 @@ from sqlmpeg.types import (
     STREAM_ARRAY_COLUMNS,
     STREAM_TAG_COLUMNS,
     TAGS_COLUMN,
+    TIME_COLUMN,
     UNNEST_COLUMNS,
     is_array,
 )
@@ -569,6 +570,38 @@ def _ident_name(node: exp.Expr | None) -> str:
 
 
 # map paths
+
+
+def _reads_non_time_column(node: exp.Expr, alias: str) -> bool:
+    """True if `node` reads a column of `alias` other than its seek handle."""
+    for sub_node in node.walk():
+        if not isinstance(sub_node, exp.Column):
+            continue
+        table_node = sub_node.args.get("table")
+        if table_node is None or _ident_name(table_node) != alias:
+            continue
+        if _ident_name(sub_node.this) != TIME_COLUMN:
+            return True
+    return False
+
+
+def _reads_cte_column(node: exp.Expr, scope: dict[str, str]) -> bool:
+    """True if `node` reads a column off a CTE alias in scope."""
+    for sub_node in node.walk():
+        if not isinstance(sub_node, exp.Column):
+            continue
+        table_node = sub_node.args.get("table")
+        if table_node is not None and scope.get(_ident_name(table_node)) == "cte":
+            return True
+    return False
+
+
+def _projection_alias(projection: exp.Expr) -> str | None:
+    """The name a SELECT column was written ``AS``, folded, else None."""
+    if not isinstance(projection, exp.Alias):
+        return None
+    alias = projection.args.get("alias")
+    return _ident_name(alias) if isinstance(alias, exp.Expr) else None
 
 
 def map_path(column: str, key: str) -> str:
@@ -3095,6 +3128,8 @@ class _Resolver:
         kind = self._check_value_expr(node, scope, select)
         if kind == "text":
             return
+        if kind is None and _reads_cte_column(node, scope):
+            return
         name = null_variable(_unwrap_paren(node))
         if name is not None:
             line, col = _pos(node, select)
@@ -3119,14 +3154,37 @@ class _Resolver:
         """Type-check a SELECT column written as CASE or ``||``.
 
         Neither shape can ever be a stream, so this runs whatever the query is:
-        lower decides whether the column is a metadata TAG (a media query over
-        track rows) or a rejection, and a tag's value has to type-check either
-        way.
+        lower decides whether the column is a VALUE column (a CTE body) or a
+        rejection, and its value has to type-check either way.
+
+        The metadata map has its own grammar -- ``f.tags || STRUCT(...)`` merges
+        two MAPS, and a bare map is no value -- so a tags column is checked
+        FIELD by field instead.
         """
+        if _projection_alias(projection) == TAGS_COLUMN:
+            self._check_tags_fields(projection, scope, select)
+            return
         inner = projection.this if isinstance(projection, exp.Alias) else projection
         value = _unwrap_paren(inner) if isinstance(inner, exp.Expr) else None
         if is_value_expr(value):
             self._check_value_expr(value, scope, select)
+
+    def _check_tags_fields(
+        self, projection: exp.Expr, scope: dict[str, str], select: exp.Select
+    ) -> None:
+        """Type-check every field of a ``tags`` column's struct literals.
+
+        The fields are ordinary compile-time values; the map operands around
+        them are not, and lower reads those.
+        """
+        for node in projection.walk():
+            if not isinstance(node, exp.Struct):
+                continue
+            for entry in node.expressions:
+                if isinstance(entry, exp.PropertyEQ) and isinstance(
+                    entry.expression, exp.Expr
+                ):
+                    self._check_value_expr(entry.expression, scope, select)
 
     def _check_expression(
         self, node: exp.Expr, select: exp.Select, *, array_agg: exp.Expr | None = None
@@ -3525,7 +3583,7 @@ class _Resolver:
         self,
         node: exp.Expr | None,
         column: exp.Column,
-        column_type: str,
+        column_type: str | None,
         scope: dict[str, str],
         join: exp.Join,
     ) -> None:
@@ -3652,6 +3710,9 @@ class _Resolver:
                     "it twice, reference <name>.video[1] twice — reuse is automatic",
                 )
             scope[local] = "cte"
+            # A CTE contributes ROWS, so its alias keys a fan-out like any
+            # other row source.
+            self.row_aliases.add(local)
             return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -4817,7 +4878,15 @@ class _Resolver:
         validated), False when it belongs to the time-window path.
         """
         aliases = _referenced_aliases(conjunct)
-        rows = {alias for alias in aliases if scope.get(alias) == "row"}
+        # A CTE contributes rows too, and its value columns filter them the
+        # same way a track row's own columns do. Its `t` is the seek handle,
+        # not a value, so it stays on the time-window path.
+        rows = {
+            alias
+            for alias in aliases
+            if scope.get(alias) == "row"
+            or (scope.get(alias) == "cte" and _reads_non_time_column(conjunct, alias))
+        }
         if not rows:
             return False
         others = aliases - rows
@@ -4990,11 +5059,15 @@ class _Resolver:
 
     def _row_operand(
         self, column: exp.Column, scope: dict[str, str], where: exp.Expr
-    ) -> str:
+    ) -> str | None:
         """Check one value-expression column operand and return its type.
 
         A track-row column, or an input alias's ``duration`` / container tag;
         the row itself is a stream and is rejected as one.
+
+        A CTE's value column types OPEN (None): its type is whatever its body
+        computed, which only lowering has seen, so the checks here stay
+        permissive and lowering names an unknown column.
         """
         table_node = column.args.get("table")
         if table_node is None:
@@ -5006,6 +5079,8 @@ class _Resolver:
                 hint=_ROW_WHERE_HINT,
             )
         alias = _ident_name(table_node)
+        if scope.get(alias) == "cte":
+            return None
         if scope.get(alias) != "row":
             # `<input>.duration` is the one non-row column the value grammar
             # reads: a probed container scalar, so it types as a number here
@@ -5277,7 +5352,7 @@ class _Resolver:
             record = record_cast_type(node)
             if record is not None:
                 column = RECORD_COLUMNS[record]
-                literal = f"ARRAY[ROW(...)::{record}, ...]"
+                literal = f"ARRAY[STRUCT(...)::{record}, ...]"
                 # A cue array is written in a STREAM position: it IS the
                 # track, so there is no column to name it as.
                 gathered = (
@@ -5329,10 +5404,12 @@ class _Resolver:
         self,
         node: exp.Expr | None,
         column: exp.Column,
-        column_type: str,
+        column_type: str | None,
         where: exp.Expr,
     ) -> None:
         """A row predicate's other operand: a literal of the column's own type."""
+        if column_type is None:  # a CTE value column: only lowering knows its type
+            return
         alias = _ident_name(column.args.get("table"))
         name = _ident_name(column.this)
         self._check_literal_type(node, column_type, f"{alias}.{column_label(name)}", where)

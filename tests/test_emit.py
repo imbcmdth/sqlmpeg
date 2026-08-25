@@ -30,6 +30,7 @@ from sqlmpeg.emit import (
 from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.ir import (
     NO_CHAPTERS,
+    NO_METADATA,
     Attachment,
     Graph,
     Node,
@@ -71,6 +72,7 @@ def _sink(
     tags: dict[str, str | None] | None = None,
     window: tuple[float | None, float | None] | None = None,
     chapters: int | None = None,
+    metadata: int | None = None,
     attachments: list[Attachment] | None = None,
 ) -> SinkUnit:
     """A destination with no outputs yet -- `_graph` fills them in."""
@@ -81,6 +83,7 @@ def _sink(
         tags=dict(tags or {}),
         window=window,
         chapters=chapters,
+        metadata=metadata,
         attachments=list(attachments or []),
     )
 
@@ -112,6 +115,7 @@ def _graph(
                 tags=dict(sink.tags),
                 window=sink.window,
                 chapters=sink.chapters,
+                metadata=sink.metadata,
                 attachments=list(sink.attachments),
             )
         ]
@@ -1290,35 +1294,36 @@ def test_container_tag_with_a_null_value_renders_an_empty_assignment() -> None:
     assert args[args.index("-metadata") :] == ["-metadata", "artist=", "out.mp4"]
 
 
-def test_container_tags_render_before_the_sink_options() -> None:
-    sink = _sink(path="out.mp4", options={"metadata_from": 0}, tags={"title": "Cut"})
+def test_container_tags_render_after_the_metadata_source() -> None:
+    """ffmpeg applies -metadata after -map_metadata, so a named key wins."""
+    sink = _sink(path="out.mp4", metadata=0, tags={"title": "Cut"})
     g = _graph([], [_out("src:a:v:0")], sink=sink)
     args = build_ffmpeg_args(emit(g))
-    assert args[args.index("-metadata") :] == [
-        "-metadata",
-        "title=Cut",
+    assert args[args.index("-map_metadata") :] == [
         "-map_metadata",
         "0",
+        "-metadata",
+        "title=Cut",
         "out.mp4",
     ]
 
 
-def test_sink_metadata_from_renders_map_metadata_with_the_input_index() -> None:
-    sink = _sink(path="out.mp4", options={"metadata_from": 0})
+def test_a_copied_metadata_source_renders_its_input_index() -> None:
+    sink = _sink(path="out.mp4", metadata=0)
     g = _graph([], [_out("src:a:v:0")], sink=sink)
     args = build_ffmpeg_args(emit(g))
     assert args[args.index("-map_metadata") :] == ["-map_metadata", "0", "out.mp4"]
 
 
-def test_sink_strip_metadata_renders_map_metadata_negative_one() -> None:
-    sink = _sink(path="out.mp4", options={"strip_metadata": True})
+def test_no_metadata_source_renders_map_metadata_negative_one() -> None:
+    sink = _sink(path="out.mp4", metadata=NO_METADATA)
     g = _graph([], [_out("src:a:v:0")], sink=sink)
     args = build_ffmpeg_args(emit(g))
     assert args[args.index("-map_metadata") :] == ["-map_metadata", "-1", "out.mp4"]
 
 
-def test_sink_strip_metadata_false_emits_nothing() -> None:
-    sink = _sink(path="out.mp4", options={"strip_metadata": False})
+def test_an_unset_metadata_source_emits_nothing() -> None:
+    sink = _sink(path="out.mp4")
     g = _graph([], [_out("src:a:v:0")], sink=sink)
     args = build_ffmpeg_args(emit(g))
     assert "-map_metadata" not in args

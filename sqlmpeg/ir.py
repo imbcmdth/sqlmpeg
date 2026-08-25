@@ -57,6 +57,10 @@ _SRC_PREFIX = "src:"
 # spelling for it. Any other value is an input index the chapters come from.
 NO_CHAPTERS = -1
 
+# `SinkUnit.metadata` for a file that copies no global tags at all: ffmpeg's
+# own spelling for "no metadata source".
+NO_METADATA = -1
+
 
 def is_src(ref: FrameRef) -> bool:
     """True if `ref` points at a raw input stream rather than a Node."""
@@ -251,6 +255,10 @@ class SinkUnit:
     * ``tags`` are the file's CONTAINER tags, key -> value, rendered as
       ``-metadata key=value``. A None value CLEARS the key and still renders
       (``-metadata key=``): ffmpeg copies an input's globals by default.
+    * ``metadata`` is the ffmpeg INPUT index this file's global tags are
+      copied from, rendered as ``-map_metadata``. None means the query named
+      no source, so ffmpeg's own default stands; :data:`NO_METADATA` writes
+      none. ``tags`` layers over whichever of the three applies.
     * ``window`` is this FILE's own ``(start, end)`` trim in seconds, rendered
       as ``-ss``/``-to`` OUTPUT options ahead of the unit's maps. Either bound
       may be None. It re-encodes every stream it covers, so emit drops the
@@ -270,6 +278,7 @@ class SinkUnit:
     tags: dict[str, str | None] = field(default_factory=dict)
     window: tuple[float | None, float | None] | None = None
     chapters: int | None = None
+    metadata: int | None = None
     attachments: list[Attachment] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
@@ -286,6 +295,8 @@ class SinkUnit:
             d["window"] = [self.window[0], self.window[1]]
         if self.chapters is not None:
             d["chapters"] = self.chapters
+        if self.metadata is not None:
+            d["metadata"] = self.metadata
         if self.attachments:
             d["attachments"] = [one.to_dict() for one in self.attachments]
         return d
@@ -298,8 +309,10 @@ class SinkUnit:
         raw_tags = d.get("tags")
         raw_window = d.get("window")
         raw_chapters = d.get("chapters")
+        raw_metadata = d.get("metadata")
         raw_attachments = d.get("attachments")
         assert raw_chapters is None or isinstance(raw_chapters, int)
+        assert raw_metadata is None or isinstance(raw_metadata, int)
         assert raw_attachments is None or isinstance(raw_attachments, list)
         assert isinstance(raw_outputs, list)
         assert raw_path is None or isinstance(raw_path, str)
@@ -329,6 +342,7 @@ class SinkUnit:
             tags=tags,
             window=window,
             chapters=raw_chapters,
+            metadata=raw_metadata,
             attachments=[
                 Attachment.from_dict(one)
                 for one in (raw_attachments or [])

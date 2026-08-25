@@ -289,6 +289,7 @@ from sqlmpeg.errors import ErrorCode, SqlmpegError
 from sqlmpeg.inputs import validate_option as validate_input_option
 from sqlmpeg.ir import (
     NO_CHAPTERS,
+    NO_METADATA,
     Attachment,
     FrameRef,
     Graph,
@@ -311,7 +312,6 @@ from sqlmpeg.parser import (
     ROW_STREAM,
     RawRowJoin,
     RawSink,
-    RawSinkOption,
     RawSource,
     RawTrackRows,
     RawValuesTable,
@@ -382,6 +382,7 @@ from sqlmpeg.types import (
     STREAM_TAG_COLUMNS,
     TAGS_COLUMN,
     TIME_COLUMN,
+    Field,
     RowColumnType,
 )
 from sqlmpeg.vars import unset_error
@@ -478,6 +479,13 @@ _ROW_WINDOW_FILE_HINT = (
     "file with ffmpeg.concat(VARIADIC array_agg(<column>)), or give each row a "
     "file of its own with a TO expression, e.g. TO ('clip' || i.i::text || '.mp4')"
 )
+# The same two ways out, spelled for rows a CTE body produced: the value the
+# TO expression names has to be a column of that body.
+_CTE_ROW_FILE_HINT = (
+    "gather the rows into that one file with array_agg(...), or give each row a "
+    "file of its own with a TO expression over a value the CTE body selected, "
+    "e.g. SELECT ..., i.i AS n in the body and TO ('clip' || x.n::text || '.mp4')"
+)
 _ONE_FILE_PER_GROUP_HINT = (
     "one group is one file, so the destination has to name the group, e.g. "
     "TO (t.tags.language || '.mka'); group by a column every row agrees on to write "
@@ -487,25 +495,28 @@ _GROUPED_CTE_HINT = (
     "a CTE with several rows varies inside the group: wrap the column in "
     "array_agg(...), or add it to the GROUP BY to make it the group's key"
 )
-_CHAPTER_LITERAL = f"ROW(title, start_t, end_t)::{CHAPTER_TYPE}"
-_CHAPTER_EXAMPLE = f"ROW('Intro', 0, 60)::{CHAPTER_TYPE}"
+_CHAPTER_LITERAL = f"STRUCT(... AS title, ... AS start_t, ... AS end_t)::{CHAPTER_TYPE}"
+_CHAPTER_EXAMPLE = f"STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)::{CHAPTER_TYPE}"
 _CHAPTERS_COLUMN_HINT = (
     f"a {CHAPTERS_COLUMN} column is an array of chapter records, e.g. "
     f"ARRAY[{_CHAPTER_EXAMPLE}] AS {CHAPTERS_COLUMN}, or "
-    f"array_agg(ROW(c.title, c.start_t, c.end_t)::{CHAPTER_TYPE}) AS "
-    f"{CHAPTERS_COLUMN} over rows"
+    f"array_agg(STRUCT(c.title AS title, c.start_t AS start_t, c.end_t AS "
+    f"end_t)::{CHAPTER_TYPE}) AS {CHAPTERS_COLUMN} over rows"
 )
-_CUE_LITERAL = f"ROW(text, start_t, end_t)::{CUE_TYPE}"
-_CUE_EXAMPLE = f"ROW('Hello', 0, 2.5)::{CUE_TYPE}"
+_CUE_LITERAL = f"STRUCT(... AS text, ... AS start_t, ... AS end_t)::{CUE_TYPE}"
+_CUE_EXAMPLE = f"STRUCT('Hello' AS text, 0 AS start_t, 2.5 AS end_t)::{CUE_TYPE}"
 _CUE_ARRAY_HINT = (
     f"an array of cue records IS a WebVTT subtitle track, e.g. "
     f"ARRAY[{_CUE_EXAMPLE}], or "
-    f"array_agg(ROW(c.title, c.start_t, c.end_t)::{CUE_TYPE}) over chapter rows"
+    f"array_agg(STRUCT(c.title AS text, c.start_t AS start_t, c.end_t AS "
+    f"end_t)::{CUE_TYPE}) over chapter rows"
 )
-_ATTACHMENT_LITERAL = f"ROW(filename, mimetype, path)::{ATTACHMENT_TYPE}"
+_ATTACHMENT_LITERAL = (
+    f"STRUCT(... AS filename, ... AS mimetype, ... AS path)::{ATTACHMENT_TYPE}"
+)
 _ATTACHMENT_EXAMPLE = (
-    f"ROW('font.ttf', 'application/x-truetype-font', 'fonts/font.ttf')"
-    f"::{ATTACHMENT_TYPE}"
+    f"STRUCT('font.ttf' AS filename, 'application/x-truetype-font' AS mimetype, "
+    f"'fonts/font.ttf' AS path)::{ATTACHMENT_TYPE}"
 )
 _ATTACHMENTS_COLUMN_HINT = (
     f"an {ATTACHMENTS_COLUMN} column is an array of attachment records, e.g. "
@@ -513,8 +524,14 @@ _ATTACHMENTS_COLUMN_HINT = (
 )
 _WRITTEN_ROW_HINT = (
     "a written row carries values, never a stream: filter, group and aggregate "
-    "by its columns, e.g. array_agg(ROW(m.title, m.start_t, m.end_t)::chapter) "
-    "AS chapters"
+    "by its columns, e.g. array_agg(STRUCT(m.title AS title, m.start_t AS "
+    "start_t, m.end_t AS end_t)::chapter) AS chapters"
+)
+# Both record spellings: the named STRUCT form, and the positional ROW cast it
+# replaced, which stays valid.
+_RECORD_SPELLING_HINT = (
+    "record fields are named, e.g. STRUCT('Intro' AS title, 0 AS start_t, "
+    "60 AS end_t)::chapter; the positional ROW('Intro', 0, 60)::chapter also works"
 )
 _CAPTION_TRIM_HINT = (
     "trim the video/audio without selecting the subtitle/data columns, or select "
@@ -1282,18 +1299,6 @@ def _sink_value(node: exp.Expr) -> object:
     return _Unrepresentable(_sink_describe(node))
 
 
-def _bare_name(node: exp.Expr) -> str | None:
-    """`node` as a bare, unqualified identifier name, else None.
-
-    What ``metadata_from <alias>`` takes: an ``exp.Var`` (VERIFIED under
-    sqlglot 30.17 -- a sink option's bare-word value always parses as one),
-    never a quoted string or a qualified name.
-    """
-    if isinstance(node, exp.Var) and not node.args.get("table"):
-        return _fold(node)
-    return None
-
-
 # Characters ffmetadata's own escaping would need (`\`, `=`, `;`, `#`, a
 # newline) -- rejected outright rather than silently writing a file ffmpeg
 # cannot parse back.
@@ -1304,7 +1309,8 @@ def _record_args(node: exp.Expr) -> list[exp.Expr] | None:
     """The values a ``ROW(...)`` record constructor lists, else None.
 
     ``ROW(a, b, c)`` parses as a plain call and the bare ``(a, b, c)`` form as
-    a tuple; both are the same constructor, so both are read here.
+    a tuple; both are the same constructor, so both are read here. A named
+    ``STRUCT(...)`` is read by :func:`_struct_fields` instead.
     """
     inner = _unwrap(node.this) if isinstance(node.this, exp.Expr) else None
     if isinstance(inner, exp.Tuple):
@@ -1312,6 +1318,44 @@ def _record_args(node: exp.Expr) -> list[exp.Expr] | None:
     if isinstance(inner, exp.Anonymous) and str(inner.this).lower() == "row":
         return [item for item in inner.expressions if isinstance(item, exp.Expr)]
     return None
+
+
+def _struct_node(node: exp.Expr) -> exp.Struct | None:
+    """The ``STRUCT(...)`` a cast wraps, else None."""
+    inner = _unwrap(node.this) if isinstance(node.this, exp.Expr) else None
+    return inner if isinstance(inner, exp.Struct) else None
+
+
+def _struct_fields(node: exp.Struct) -> dict[str, exp.Expr]:
+    """One ``STRUCT(value AS name, ...)`` as its fields, by name.
+
+    Every field is named: a positional entry has no name to match against the
+    record's own, so it is rejected rather than silently taken in order.
+    """
+    fields: dict[str, exp.Expr] = {}
+    for entry in node.expressions:
+        if not isinstance(entry, exp.PropertyEQ):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"a STRUCT field is named, got {_describe(entry)}",
+                entry if isinstance(entry, exp.Expr) else node,
+                fallback=node,
+                hint="name every field with AS, e.g. STRUCT('Intro' AS title)",
+            )
+        name = _fold(entry.this)
+        value = entry.expression
+        if not isinstance(value, exp.Expr):
+            continue
+        if name in fields:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"STRUCT names the field '{name}' twice",
+                entry,
+                fallback=node,
+                hint="one value per field name",
+            )
+        fields[name] = value
+    return fields
 
 
 @dataclass(frozen=True)
@@ -1636,8 +1680,7 @@ def _check_sink_option_conflicts(
     """Reject two sink options that cannot both hold, once all are validated.
 
     ``faststart``/``movflags`` both set: -movflags either way, so one would
-    silently win over the other's spelling. ``strip_metadata``/
-    ``metadata_from`` both set: -map_metadata either way, same problem.
+    silently win over the other's spelling.
     ``codec_params`` with no matching ``video_codec``: its rendered flag (see
     ``sqlmpeg.sink.CODEC_PARAMS_FLAGS``) is derived FROM ``video_codec``, so
     it has nothing to derive from.
@@ -1650,15 +1693,6 @@ def _check_sink_option_conflicts(
             fallback=path_node,
             hint="use 'faststart true' for the common case, or 'movflags' "
             "directly for anything else -- not both",
-        )
-    if "strip_metadata" in options and "metadata_from" in options:
-        raise _error(
-            ErrorCode.SINK_OPTION_TYPE,
-            "'strip_metadata' and 'metadata_from' both set -map_metadata",
-            option_nodes["metadata_from"],
-            fallback=path_node,
-            hint="'metadata_from' copies an input's global tags through; "
-            "'strip_metadata' drops them -- not both",
         )
     if "codec_params" in options:
         codec = options.get("video_codec")
@@ -1845,6 +1879,9 @@ class _CteBinding:
     columns: tuple[_Column, ...]
     rows: int = 1
     relation: _RowRelation | None = None
+    # Scalar columns of the body, name -> one value per body row. Read back
+    # by position, the same way a stream column is.
+    values: dict[str, tuple[RowValue, ...]] = field(default_factory=dict)
 
 
 @dataclass
@@ -1914,9 +1951,9 @@ class _TrackRow:
 class _CteRow:
     """One row of a CTE source: which row of the body's row set it is.
 
-    A CTE row has no metadata columns of its own — the body named what it
-    named, and those columns are streams — so the position is all a result
-    tuple needs to read the row's value back out of each column's array.
+    The position is all a result tuple needs: it indexes both the stream
+    columns' arrays and the body's value columns, which is what makes
+    ``x.n`` read the value this very row computed.
     """
 
     position: int
@@ -2044,7 +2081,9 @@ def _track_of(row: _RowTuple, alias: str) -> _TrackRow | None:
     return entry if isinstance(entry, _TrackRow) else None
 
 
-def _cte_row_count(columns: Iterable[_Column]) -> int:
+def _cte_row_count(
+    columns: Iterable[_Column], values: dict[str, tuple[RowValue, ...]]
+) -> int:
     """How many rows a CTE body produced: the width of its row-set columns.
 
     A splat array column carries one stream per body row, so its length IS the
@@ -2056,6 +2095,7 @@ def _cte_row_count(columns: Iterable[_Column]) -> int:
         for column in columns
         if column.splat and column.value.is_array
     ]
+    widths += [len(one) for one in values.values()]
     return max(widths) if widths else 1
 
 
@@ -2406,6 +2446,11 @@ class _Lowerer:
         self.graph = Graph(input_paths=list(res.input_paths), sources=dict(res.sources))
         self.ctx = _NodeFactory(self.graph)
         self.cte_columns: dict[str, tuple[_Column, ...]] = {}
+        # The VALUE columns of each CTE body, name -> column -> one value per
+        # body row. Filled as each body lowers, read when its alias binds.
+        self.cte_values: dict[str, dict[str, tuple[RowValue, ...]]] = {}
+        # The value columns the query being lowered has collected so far.
+        self.branch_values: dict[str, tuple[RowValue, ...]] = {}
         # Inputs this pass minted itself (`sqlmpeg.empty_captions()`),
         # alias -> its INTERNAL input options. Merged into `Graph.input_options`
         # by `_lower_input_options`, which is the only writer of that field.
@@ -2428,6 +2473,10 @@ class _Lowerer:
         # its chapters come from, `ir.NO_CHAPTERS` for a written NULL, and None
         # while no `chapters` column has been read. Reset per COPY.
         self.chapters: int | None = None
+        # The global tags of the file being written: the ffmpeg input index
+        # they are copied from, `ir.NO_METADATA` for none, and None while no
+        # `tags` column has named a source. Reset per COPY.
+        self.metadata: int | None = None
         # The files the file being written carries, in written order. Empty
         # while no `attachments` column has been read. Reset per COPY.
         self.attachments: list[Attachment] = []
@@ -2496,9 +2545,12 @@ class _Lowerer:
         and walking them again would lower the first group twice.
         """
         for name, body in self.res.ctes.items():
+            self.branch_values = {}
             self.cte_columns[name] = tuple(
                 self._lower_query(union_branches(body), body, tags="rows")
             )
+            self.cte_values[name] = self.branch_values
+            self.branch_values = {}
             self._harvest_cte_tags(body)
             self._harvest_cte_dispositions(body)
         if self.res.sinks:
@@ -2514,6 +2566,7 @@ class _Lowerer:
                     ),
                     tags=dict(self.container_tags),
                     chapters=self.chapters,
+                    metadata=self.metadata,
                     attachments=list(self.attachments),
                 )
             ]
@@ -2606,11 +2659,6 @@ class _Lowerer:
         node to the value node to the path literal — which at least keeps
         every rejection on (or just above) the ``WITH`` block.
 
-        ``metadata_from`` is pulled out of the ordinary name/value loop and
-        resolved separately: its value is a bare identifier (an input alias),
-        never a literal, so ``SINK_OPTIONS``' str/int/bool/num machinery does
-        not apply to it.
-
         A ``TO (<expression>)`` reaching here is a fan-out sink exactly when it
         reads a row column -- any row source, ``unnest`` or ``VALUES`` or
         ``generate_series``; that decision is made FIRST, since it changes
@@ -2627,30 +2675,22 @@ class _Lowerer:
         self.sink_path = raw.path
         self.fanout_windows = {}
         self.chapters = None
+        self.metadata = None
         self.attachments = []
         columns = self._lower_query(list(raw.branches), raw.query, tags="sink")
         options: dict[str, object] = {}
         option_nodes: dict[str, exp.Expr] = {}
-        metadata_from_opt: RawSinkOption | None = None
         for option in raw.options:
             if isinstance(_unwrap(option.value), exp.Null):
                 # NULL is absence: the option is not written, the encoder's /
                 # muxer's own default applies, and the option table never
                 # sees the value.
                 continue
-            if option.name == "metadata_from":
-                metadata_from_opt = option
-                continue
             line, col = _pos(option.name_node, option.value, raw.path_node)
             options[option.name] = validate_sink_option(
                 option.name, _sink_value(option.value), line=line, col=col
             )
             option_nodes[option.name] = option.value
-        if metadata_from_opt is not None:
-            options["metadata_from"] = self._lower_metadata_from(
-                metadata_from_opt, raw.path_node
-            )
-            option_nodes["metadata_from"] = metadata_from_opt.value
         _check_sink_option_conflicts(options, option_nodes, raw.path_node)
         outputs = _outputs(columns, self._layered_tags(), self._layered_dispositions())
         if not outputs:
@@ -2676,6 +2716,7 @@ class _Lowerer:
             tags=dict(self.container_tags),
             window=self._fanout_window(),
             chapters=self.chapters,
+            metadata=self.metadata,
             attachments=list(self.attachments),
         )
 
@@ -2700,15 +2741,13 @@ class _Lowerer:
     def _check_fanout_options(self, options: dict[str, object], raw: RawSink) -> None:
         """The sink options a fan-out COPY does not take, v1.
 
-        ``two_pass`` already compiles to a command SEQUENCE of its own, and
-        ``metadata_from`` names one input per file; both are small matrices
-        left closed rather than guessed at.
+        ``two_pass`` already compiles to a command SEQUENCE of its own, a
+        matrix left closed rather than guessed at.
         """
         if self.fanout_expr is None:
             return
-        # `metadata_from` carries an input INDEX, so 0 is a set value; only
-        # `two_pass false` is a set option that asks for nothing.
-        for name in ("two_pass", "metadata_from"):
+        # Only `two_pass false` is a set option that asks for nothing.
+        for name in ("two_pass",):
             if name not in options or options[name] is False:
                 continue
             raise _error(
@@ -2815,7 +2854,8 @@ class _Lowerer:
                 projection,
                 fallback=select,
                 hint="build the chapter list in the outer SELECT, e.g. "
-                "array_agg(ROW(c.title, c.start_t, c.end_t)::chapter) AS chapters",
+                "array_agg(STRUCT(c.title AS title, c.start_t AS start_t, "
+                "c.end_t AS end_t)::chapter) AS chapters",
             )
         if self.fanout_expr is not None:
             raise _error(
@@ -2931,29 +2971,65 @@ class _Lowerer:
         """
         node = _unwrap(node)
         fields = RECORD_FIELDS[record]
-        written = _record_args(node) if record_cast_type(node) == record else None
-        if written is None:
+        matches = record_cast_type(node) == record
+        struct = _struct_node(node) if matches else None
+        if struct is not None:
+            cells = self._named_record_cells(struct, record, fields, select)
+        else:
+            written = _record_args(node) if matches else None
+            if written is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{article(record)} {record} is written as {literal}, got "
+                    f"{_describe(node)}",
+                    node,
+                    fallback=select,
+                    hint=hint,
+                )
+            if len(written) != len(fields):
+                named = ", ".join(field.name for field in fields)
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"{article(record)} {record} takes {len(fields)} values "
+                    f"({named}), got {len(written)}",
+                    node,
+                    fallback=select,
+                    hint=hint,
+                )
+            cells = dict(zip((field.name for field in fields), written, strict=True))
+        return {
+            name: (cell, self._eval_value(cell, env, row, select))
+            for name, cell in cells.items()
+        }
+
+    def _named_record_cells(
+        self,
+        struct: exp.Struct,
+        record: str,
+        fields: tuple[Field, ...],
+        select: exp.Select,
+    ) -> dict[str, exp.Expr]:
+        """One ``STRUCT(... AS name)`` matched to a record's declared fields.
+
+        Order-free: the field NAME picks the slot. A field the struct leaves
+        out is NULL, which the per-field checks then accept or reject exactly
+        as a written NULL is accepted or rejected.
+        """
+        written = _struct_fields(struct)
+        declared = {field.name for field in fields}
+        for name in written:
+            if name in declared:
+                continue
+            listed = ", ".join(field.name for field in fields)
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"{article(record)} {record} is written as {literal}, got "
-                f"{_describe(node)}",
-                node,
+                f"{article(record)} {record} has no field '{name}'",
+                written[name],
                 fallback=select,
-                hint=hint,
-            )
-        if len(written) != len(fields):
-            named = ", ".join(field.name for field in fields)
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"{article(record)} {record} takes {len(fields)} values "
-                f"({named}), got {len(written)}",
-                node,
-                fallback=select,
-                hint=hint,
+                hint=f"the fields a {record} takes are {listed}",
             )
         return {
-            field.name: (cell, self._eval_value(cell, env, row, select))
-            for field, cell in zip(fields, written, strict=True)
+            field.name: written.get(field.name, exp.Null()) for field in fields
         }
 
     def _chapter_record(
@@ -3107,22 +3183,6 @@ class _Lowerer:
             start_node=start_cell,
             end_node=end_cell,
         )
-
-    def _lower_metadata_from(self, option: RawSinkOption, path_node: exp.Expr) -> int:
-        """``metadata_from <alias>``: copy an existing input's own global tags."""
-        node = option.value
-        name = _bare_name(node)
-        index = self.graph.sources.get(name) if name is not None else None
-        if index is None:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"'metadata_from' names an input() alias, got {_sink_describe(node)}",
-                node,
-                fallback=path_node,
-                hint="metadata_from copies an input's global tags through, e.g. "
-                "metadata_from f for FROM input(:'source') f",
-            )
-        return index
 
     def _mint_chapters_input(self, uri: str) -> int:
         """Add one ffmetadata ``data:`` URI as an extra ``-i``; return its index.
@@ -3352,31 +3412,38 @@ class _Lowerer:
             if _projection_name(projection) == ATTACHMENTS_COLUMN:
                 self._collect_attachments(projection, env, select, scope=tags)
                 continue
-            # A tag column produces no stream, so it never becomes an output.
-            # With track rows the tag is per-stream, without them it is a
-            # container tag on the file being written -- which a CTE body
-            # ("rows" scope) has no way to name. A GROUPED branch has rows but
-            # no per-row scope: its scalars are group-constants, so they tag
-            # the group's container.
-            if _is_tag_column(projection, env):
-                self._check_settable_key(projection, env, select)
-                if _projection_name(projection) == DISPOSITION_COLUMN:
-                    self._collect_disposition(projection, env, select, scope=tags)
-                elif _has_track_rows(env) and not env.grouped:
-                    self._collect_tag(projection, env, select)
-                elif tags == "sink":
-                    self._collect_container_tag(projection, env, select)
-                else:
+            # The metadata map produces no stream, so it never becomes an
+            # output. With track rows its keys are per-stream, without them
+            # they are the container's -- which a CTE body ("rows" scope) has
+            # no way to name. A GROUPED branch has rows but no per-row scope,
+            # so its map is the group's container.
+            if _projection_name(projection) == TAGS_COLUMN:
+                self._collect_tags(projection, env, select, scope=tags)
+                continue
+            # The flag map is the stream's own field, not metadata: it says
+            # what the whole map is and emits -disposition.
+            if _projection_name(projection) == DISPOSITION_COLUMN and _is_value_column(
+                projection, env
+            ):
+                self._collect_disposition(projection, env, select, scope=tags)
+                continue
+            # Every other compile-time scalar is a VALUE column: a column of
+            # the rows a CTE body produces, readable downstream. A sink writes
+            # streams, so one there has nowhere to go.
+            if _is_value_column(projection, env):
+                if tags == "sink":
                     raise _error(
                         ErrorCode.UNSUPPORTED_SQL,
-                        f"tag column '{_projection_name(projection)}' in a CTE "
-                        "body has no track row to tag",
+                        f"'{_projection_name(projection)}' is a value, and a "
+                        "SELECT column of a media query is an output stream",
                         projection,
                         fallback=select,
-                        hint="a CTE tags the rows it selects, e.g. FROM "
-                        "input('f.mkv') f, unnest(f.audio) t; a container tag "
-                        "belongs in the outer SELECT",
+                        hint="metadata is written by a tags column, e.g. "
+                        f"STRUCT(... AS {_projection_name(projection)}) AS "
+                        f"{TAGS_COLUMN}; a value read by a TO expression or a "
+                        "WHERE needs no SELECT column at all",
                     )
+                self._collect_value_column(projection, env, select)
                 continue
             columns.append(
                 _Column(
@@ -3388,11 +3455,11 @@ class _Lowerer:
         if not columns:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                "every SELECT column is a metadata tag, so the query selects no "
+                "every SELECT column is metadata, so the query selects no "
                 "stream",
                 fallback=select,
-                hint="a tag rides on the file the query writes; select its "
-                "tracks too, e.g. SELECT t, ... AS title",
+                hint="metadata rides on the file the query writes; select its "
+                "tracks too, e.g. SELECT t, STRUCT('Main' AS title) AS tags",
             )
         if tags == "sink":
             self._check_one_row_per_file(select, env)
@@ -3422,9 +3489,12 @@ class _Lowerer:
         else:
             count = len(env.relation.tuples) if env.relation is not None else 1
             what = "row" if count == 1 else "rows"
-            hint = (
-                _ROW_WINDOW_FILE_HINT if self.row_window_seen else _ONE_FILE_PER_ROW_HINT
-            )
+            if any(isinstance(b, _CteBinding) for b in env.bindings.values()):
+                hint = _CTE_ROW_FILE_HINT
+            elif self.row_window_seen:
+                hint = _ROW_WINDOW_FILE_HINT
+            else:
+                hint = _ONE_FILE_PER_ROW_HINT
         if count <= 1:
             return
         destination = (
@@ -3636,51 +3706,173 @@ class _Lowerer:
             merged.setdefault(source_id, {}).update(overrides)
         return merged
 
-    def _collect_container_tag(
-        self, projection: exp.Expr, env: _Env, select: exp.Select
+    def _collect_tags(
+        self, projection: exp.Expr, env: _Env, select: exp.Select, *, scope: _TagScope
     ) -> None:
-        """One tag column in a branch with no per-row scope: a CONTAINER tag.
+        """``... AS tags``: the metadata keys this column sets.
 
-        The alias is the key, free-form, and the value is evaluated once. NULL
-        CLEARS the key rather than leaving it alone: ffmpeg copies an input's
-        global tags by default, so the clear has to be written out.
-
-        A GROUPED branch evaluates it over the group's first tuple: resolve's
-        grouping check proved the column is a GROUP BY key, so every tuple of
-        the group reads the same value and the first one stands for all.
+        A tags column MERGES: it sets the keys it names and leaves every other
+        key alone. Over track rows the keys land on that row's streams, over
+        input rows on the container. Naming an input's own ``tags`` map copies
+        that input's globals through, and an empty ``STRUCT()`` writes none.
         """
-        key = _projection_name(projection)
-        if key is None:  # defensive: `_is_tag_column` checked
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL, "malformed tag column", projection,
-                fallback=select,
-            )
-        value = self._eval_value(_unwrap(projection), env, _group_row(env), select)
-        text = None if value is None else _tag_text(value)
-        if key in self.container_tags and self.container_tags[key] != text:
+        node = _unwrap(projection)
+        spec = self._read_tags(node, env, select)
+        for key, value_node in spec.entries.items():
+            self._check_tag_key(key, value_node, env, select)
+        if _has_track_rows(env) and not env.grouped:
+            self._collect_stream_tags(spec, node, env, select)
+            return
+        if scope != "sink":
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"container tag '{key}' takes two different values",
+                f"a '{TAGS_COLUMN}' column in a CTE body has no track row to tag",
                 projection,
                 fallback=select,
-                hint="one value per key; a file has one set of container tags",
+                hint="a CTE tags the rows it selects, e.g. FROM "
+                "input('f.mkv') f, unnest(f.audio) t; the container's own tags "
+                "belong in the outer SELECT",
             )
-        self.container_tags[key] = text
+        self._collect_container_tags(spec, node, env, select)
 
-    def _check_settable_key(
-        self, projection: exp.Expr, env: _Env, select: exp.Select
+    def _collect_stream_tags(
+        self, spec: _Tags, node: exp.Expr, env: _Env, select: exp.Select
     ) -> None:
-        """A tag column's alias names a tag KEY, never a read-only field.
+        """One tags column over track rows: its keys, per result row, per track.
 
-        Construction by alias and a free-form tag key share one spelling, so
-        the record's own READ-ONLY field names are the reserved set: `'eng' AS
-        language` writes a tag entry, `'h264' AS codec` claims a probed fact
-        and is rejected. A writable field (`disposition`) keeps its meaning --
-        it is the assertion it looks like.
+        A stream keeps the tags it already carries, so there is nothing here
+        for an empty map to mean -- only keys to set.
         """
-        key = _projection_name(projection)
-        if key is None:
-            return
+        relation = env.relation
+        if relation is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, "malformed tags column", node, fallback=select
+            )
+        if spec.stripped or not spec.entries:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"this '{TAGS_COLUMN}' column sets no key",
+                node,
+                fallback=select,
+                hint="per-stream tags set the keys they name, and this map "
+                "names none, e.g. STRUCT('Main' AS title) AS tags",
+            )
+        for key, value_node in spec.entries.items():
+            for row in relation.tuples:
+                value = self._eval_value(value_node, env, row, select)
+                text = None if value is None else _tag_text(value)
+                for track in row.values():
+                    # A CTE row carries no track of its own: its streams were
+                    # tagged by the body that named them.
+                    if isinstance(track, _TrackRow):
+                        self._record_tag(track.stream.source, key, text, node, select)
+
+    def _collect_container_tags(
+        self, spec: _Tags, node: exp.Expr, env: _Env, select: exp.Select
+    ) -> None:
+        """One tags column over input rows: the file's own global tags.
+
+        ffmpeg copies the first input's globals by default, so naming a source
+        (or naming none) is what writes ``-map_metadata``; the keys layer over
+        whichever applies.
+        """
+        if spec.copy_alias is not None and spec.stripped:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"this '{TAGS_COLUMN}' column both copies and writes no tags",
+                node,
+                fallback=select,
+                hint="copy an input's globals with f.tags, or write none with "
+                "STRUCT() -- not both",
+            )
+        if spec.copy_alias is not None:
+            index = self.graph.sources.get(spec.copy_alias)
+            if index is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{spec.copy_alias}.{TAGS_COLUMN}' names no input()",
+                    node,
+                    fallback=select,
+                    hint="the copied map is an input alias's own, e.g. "
+                    "f.tags || STRUCT('Cut' AS title) AS tags",
+                )
+            self.metadata = index
+        elif spec.stripped:
+            self.metadata = NO_METADATA
+        for key, value_node in spec.entries.items():
+            value = self._eval_value(value_node, env, _group_row(env), select)
+            text = None if value is None else _tag_text(value)
+            if key in self.container_tags and self.container_tags[key] != text:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"container tag '{key}' takes two different values",
+                    value_node,
+                    fallback=select,
+                    hint="one value per key; a file has one set of container tags",
+                )
+            self.container_tags[key] = text
+
+    def _read_tags(self, node: exp.Expr, env: _Env, select: exp.Select) -> _Tags:
+        """One tags EXPRESSION, read: what it copies and which keys it sets.
+
+        ``a || b`` is the merge, left to right, so a key b names wins over the
+        same key in a. An operand is either a struct literal or an alias's own
+        ``tags`` map.
+        """
+        entries: dict[str, exp.Expr] = {}
+        copy_alias: str | None = None
+        stripped = False
+        for operand in _merge_operands(node):
+            if isinstance(operand, exp.Struct):
+                fields = _struct_fields(operand)
+                if not fields:
+                    stripped = True
+                entries.update(fields)
+                continue
+            alias = _tags_map_alias(operand)
+            if alias is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"a '{TAGS_COLUMN}' column is a map, got {_describe(operand)}",
+                    operand,
+                    fallback=select,
+                    hint="write the keys with STRUCT('Main' AS title) AS tags, "
+                    "or copy an input's own map with f.tags || STRUCT(...) AS tags",
+                )
+            binding = env.bindings.get(alias)
+            # A CTE exposes what its body named, and the metadata map is not
+            # one of those: it rode the body's streams and is already spent.
+            if isinstance(binding, _CteBinding):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"unknown column '{alias}.{TAGS_COLUMN}'",
+                    operand,
+                    fallback=select,
+                    hint=self._cte_columns_hint(binding),
+                )
+            # A row alias's map is what already rides through to the output,
+            # so copying it names nothing new; only an input's globals do.
+            if isinstance(binding, _InputBinding):
+                copy_alias = alias
+        return _Tags(entries=entries, copy_alias=copy_alias, stripped=stripped)
+
+    def _check_tag_key(
+        self, key: str, anchor: exp.Expr, env: _Env, select: exp.Select
+    ) -> None:
+        """A tags field names a tag KEY, never a probed field or the flag map.
+
+        The reserved set is the read-only field names of whatever the column
+        sits over: the file reports those, so a query cannot claim them.
+        """
+        if key == DISPOSITION_COLUMN:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{DISPOSITION_COLUMN}' is the stream's flag map, not a tag",
+                anchor,
+                fallback=select,
+                hint="write it as its own column, e.g. "
+                f"'{DISPOSITION_KEYS[0]}' AS {DISPOSITION_COLUMN}",
+            )
         if _has_track_rows(env) and not env.grouped:
             what = "track row"
             reserved = frozenset(
@@ -3698,37 +3890,33 @@ class _Lowerer:
             ErrorCode.UNSUPPORTED_SQL,
             f"'{key}' is a probed field of the {what}, not something a query "
             "can set",
-            projection,
+            anchor,
             fallback=select,
-            hint=f"the file reports {key}; a tag column's alias is a free-form "
-            "key, e.g. 'eng' AS language",
+            hint=f"the file reports {key}; a tags field is a free-form key, "
+            "e.g. STRUCT('eng' AS language) AS tags",
         )
 
-    def _collect_tag(
+    def _collect_value_column(
         self, projection: exp.Expr, env: _Env, select: exp.Select
     ) -> None:
-        """One tag column, evaluated once per result row.
+        """One VALUE column of a CTE body: its value, once per body row.
 
-        ROW-SCOPED: the value a result row computes is written onto every track
-        that row carries, so a row holding a video and an audio track tags both,
-        and a joined row can tag one side's track with the other side's column.
+        The rows are the branch's relation, so a body cross-joined against a
+        series carries one value per series row and a downstream fan-out reads
+        the one its pinned row computed.
         """
-        key = _projection_name(projection)
-        relation = env.relation
-        if key is None or relation is None:  # defensive: `_is_tag_column` checked
+        name = _projection_name(projection)
+        if name is None:  # defensive: `_is_value_column` checked
             raise _error(
-                ErrorCode.UNSUPPORTED_SQL, "malformed tag column", projection,
+                ErrorCode.UNSUPPORTED_SQL, "malformed value column", projection,
                 fallback=select,
             )
-        value_node = _unwrap(projection)
-        for row in relation.tuples:
-            value = self._eval_value(value_node, env, row, select)
-            text = None if value is None else _tag_text(value)
-            for track in row.values():
-                # A CTE row carries no track of its own: its streams were
-                # tagged by the body that named them.
-                if isinstance(track, _TrackRow):
-                    self._record_tag(track.stream.source, key, text, projection, select)
+        node = _unwrap(projection)
+        relation = env.relation
+        tuples = relation.tuples if relation is not None and relation.tuples else [{}]
+        self.branch_values[name] = tuple(
+            self._eval_value(node, env, row, select) for row in tuples
+        )
 
     def _collect_disposition(
         self, projection: exp.Expr, env: _Env, select: exp.Select, *, scope: _TagScope
@@ -4412,6 +4600,7 @@ class _Lowerer:
                 self._add_values_rows(local, values, env, select)
                 return
             columns = self.cte_columns.get(name)
+            body_values = self.cte_values.get(name, {})
             if columns is None:
                 raise _error(
                     ErrorCode.UNKNOWN_ALIAS,
@@ -4429,7 +4618,7 @@ class _Lowerer:
             local = name
             if isinstance(alias_node, exp.TableAlias) and alias_node.this is not None:
                 local = _fold(alias_node.this)
-            self._add_cte_rows(local, columns, env, select)
+            self._add_cte_rows(local, columns, body_values, env, select)
             return
         raise _error(
             ErrorCode.UNSUPPORTED_SQL,
@@ -4504,7 +4693,12 @@ class _Lowerer:
         self._join_rows(env.relation, local, rows, None, env, select)
 
     def _add_cte_rows(
-        self, local: str, columns: tuple[_Column, ...], env: _Env, select: exp.Select
+        self,
+        local: str,
+        columns: tuple[_Column, ...],
+        values: dict[str, tuple[RowValue, ...]],
+        env: _Env,
+        select: exp.Select,
     ) -> None:
         """Bind one CTE reference: its body's rows join the branch's relation.
 
@@ -4516,9 +4710,13 @@ class _Lowerer:
         """
         if env.relation is None:
             env.relation = _RowRelation()
-        rows = _cte_row_count(columns)
+        rows = _cte_row_count(columns, values)
         env.bindings[local] = _CteBinding(
-            name=local, columns=columns, rows=rows, relation=env.relation
+            name=local,
+            columns=columns,
+            rows=rows,
+            relation=env.relation,
+            values=values,
         )
         self._join_rows(
             env.relation,
@@ -4691,8 +4889,9 @@ class _Lowerer:
         subscript metadata assertions)``.
 
         A conjunct is a ROW predicate exactly when it mentions a track-row
-        alias, which is unambiguous: a row alias is an alias, and one name
-        cannot be two things. A subscript metadata accessor (``Dot`` over
+        alias, or a CTE's value column -- both are columns of the rows this
+        branch joins, and an alias is unambiguous: one name cannot be two
+        things. A subscript metadata accessor (``Dot`` over
         ``Bracket``) is told apart by SHAPE instead, since its alias
         is an ordinary input one -- checked first, so a conjunct never falls
         through to the row/time split. Resolve rejected every mixed case but
@@ -4721,6 +4920,7 @@ class _Lowerer:
                 alias
                 for alias in aliases
                 if isinstance(env.bindings.get(alias), _RowBinding)
+                or _reads_cte_value(alias, conjunct, env)
             }
             if not rows:
                 time_conjuncts.append(conjunct)
@@ -4808,7 +5008,7 @@ class _Lowerer:
         join would silently turn it into an inner one.
         """
         for conjunct in conjuncts:
-            relation = self._row_binding_of(conjunct, env, select).relation
+            relation = self._predicate_relation(conjunct, env, select)
             relation.tuples = [
                 row
                 for row in relation.tuples
@@ -4922,6 +5122,25 @@ class _Lowerer:
         # A broadcast column is one unit: every tuple reads the same stream.
         return column.value.streams[0]
 
+    def _predicate_relation(
+        self, conjunct: exp.Expr, env: _Env, select: exp.Select
+    ) -> _RowRelation:
+        """The relation one WHERE predicate filters.
+
+        A predicate over a CTE's value column filters the branch's own
+        relation -- the CTE's rows are already joined into it.
+        """
+        for sub in conjunct.walk():
+            if not isinstance(sub, exp.Column):
+                continue
+            table_node = sub.args.get("table")
+            if table_node is None:
+                continue
+            binding = env.bindings.get(_fold(table_node))
+            if isinstance(binding, _CteBinding) and binding.relation is not None:
+                return binding.relation
+        return self._row_binding_of(conjunct, env, select).relation
+
     def _row_binding_of(
         self, node: exp.Expr, env: _Env, select: exp.Select
     ) -> _RowBinding:
@@ -5011,6 +5230,32 @@ class _Lowerer:
             fallback=select,
         )
 
+    def _cte_value_of(
+        self,
+        binding: _CteBinding,
+        column: exp.Column,
+        rows: _RowTuple,
+        select: exp.Select,
+    ) -> RowValue:
+        """One ``<cte>.<value column>`` reference, read out of this result row.
+
+        The tuple holds the body row this result row came from, so the value
+        is the one THAT row computed.
+        """
+        name = _fold(column.this)
+        values = binding.values.get(name)
+        if values is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"unknown column '{binding.name}.{column.name}'",
+                column,
+                fallback=select,
+                hint=self._cte_columns_hint(binding),
+            )
+        entry = rows.get(binding.name)
+        position = entry.position if isinstance(entry, _CteRow) else 0
+        return values[position] if position < len(values) else None
+
     def _row_value_of(
         self,
         node: exp.Expr | None,
@@ -5045,6 +5290,8 @@ class _Lowerer:
             key = tag_key(name)
             if key is not None:
                 return self._input_tag(binding.alias, key, column, select)
+        if isinstance(binding, _CteBinding):
+            return self._cte_value_of(binding, column, rows, select)
         if not isinstance(binding, _RowBinding):  # defensive: resolve checked it
             raise _error(
                 ErrorCode.UNKNOWN_ALIAS,
@@ -5869,6 +6116,16 @@ class _Lowerer:
         cues = self._lower_cue_array(node, env, select)
         if cues is not None:
             return cues
+        if isinstance(node, exp.Struct):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a STRUCT is a record, not a stream",
+                node,
+                fallback=select,
+                hint=f"name it to write metadata, e.g. STRUCT('Main' AS title) "
+                f"AS {TAGS_COLUMN}, or cast it to a record type, e.g. "
+                f"{_CHAPTER_EXAMPLE}",
+            )
         if isinstance(node, exp.Bracket | exp.Column):
             alias, value = self._base_stream(node, env, select)
             return self._access(env, alias, value, node, select)
@@ -6917,6 +7174,18 @@ class _Lowerer:
     ) -> _Value:
         column = self._cte_column(binding, name)
         if column is None:
+            if name in binding.values:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{binding.name}.{name}' is a value, and a SELECT column "
+                    "of a media query is an output stream",
+                    anchor,
+                    fallback=select,
+                    hint="read it where values are read -- a TO expression, a "
+                    f"WHERE, a GROUP BY -- without selecting it; or write it as "
+                    f"metadata, e.g. STRUCT({binding.name}.{name} AS {name}) AS "
+                    f"{TAGS_COLUMN}",
+                )
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"unknown column '{binding.name}.{name}'",
@@ -6997,6 +7266,7 @@ class _Lowerer:
 
     def _cte_columns_hint(self, binding: _CteBinding) -> str:
         names = {column.name for column in binding.columns if column.name is not None}
+        names |= set(binding.values)
         if not names:
             return (
                 f"'{binding.name}' has no named columns; name them with AS "
@@ -8562,9 +8832,12 @@ class _Lowerer:
     def run_table(self) -> list[TableSink]:
         """One :class:`~sqlmpeg.table.TableSink` per COPY, or one bare-select."""
         for name, body in self.res.ctes.items():
+            self.branch_values = {}
             self.cte_columns[name] = tuple(
                 self._lower_query(union_branches(body), body, tags="rows")
             )
+            self.cte_values[name] = self.branch_values
+            self.branch_values = {}
             self._harvest_cte_tags(body)
             self._harvest_cte_dispositions(body)
         self.table_mode = True
@@ -8775,6 +9048,9 @@ class _Lowerer:
                 ):
                     return self._array_cell_broadcast(expr, env, select, cardinality)
                 elif isinstance(binding, _CteBinding):
+                    if _fold(expr.this) in binding.values:
+                        # A value column of the body prints as plain data.
+                        return self._value_cells(expr, env, select, cardinality)
                     column = self._cte_column(binding, _fold(expr.this))
                     # A splat column falls through to `_value_to_cells` below,
                     # which is where its per-row cardinality is already
@@ -9068,6 +9344,47 @@ def _disposition(
     return dispositions.get(id(stream.source))
 
 
+@dataclass(frozen=True)
+class _Tags:
+    """One ``tags`` column, read: which keys it sets and what it copies.
+
+    `entries` is key -> the expression that computes it, in merge order, so a
+    later operand of ``||`` has already overwritten an earlier one's key.
+    `copy_alias` is the input whose globals the column copies, and `stripped`
+    says an empty map was written -- the two things that decide
+    ``-map_metadata``.
+    """
+
+    entries: dict[str, exp.Expr]
+    copy_alias: str | None
+    stripped: bool
+
+
+def _merge_operands(node: exp.Expr) -> list[exp.Expr]:
+    """The operands of a ``||`` chain, left to right; a lone node is one."""
+    inner = _unwrap(node)
+    if not isinstance(inner, exp.DPipe):
+        return [inner]
+    left = inner.this
+    right = inner.expression
+    operands: list[exp.Expr] = []
+    if isinstance(left, exp.Expr):
+        operands += _merge_operands(left)
+    if isinstance(right, exp.Expr):
+        operands += _merge_operands(right)
+    return operands
+
+
+def _tags_map_alias(node: exp.Expr) -> str | None:
+    """The alias whose whole ``tags`` map `node` names, else None."""
+    if not isinstance(node, exp.Column):
+        return None
+    table_node = node.args.get("table")
+    if table_node is None:
+        return None
+    return _fold(table_node) if _fold(node.this) == TAGS_COLUMN else None
+
+
 def _tag_text(value: str | int | float | bool) -> str:
     """A tag value as the text ffmpeg receives; a boolean spells itself out."""
     if isinstance(value, bool):
@@ -9123,16 +9440,13 @@ def _group_row(env: _Env) -> _RowTuple:
     return relation.tuples[0]
 
 
-def _is_tag_column(projection: exp.Expr, env: _Env) -> bool:
-    """True for a SELECT column that sets a metadata TAG rather than a stream.
+def _is_value_column(projection: exp.Expr, env: _Env) -> bool:
+    """True for a SELECT column that is a compile-time VALUE, not a stream.
 
-    A tag column is aliased — the alias IS the tag key — and its value is a
+    A value column is aliased — the alias names it — and its value is a
     compile-time expression over the row: a literal, NULL, a row's metadata
     column, an input's ``duration`` or container tag, CASE, ``||``, arithmetic
     or ``::text``. Everything else is a stream expression and lowers as one.
-
-    The branch decides what it tags: one with track rows tags THOSE (per
-    stream), one without tags the CONTAINER.
     """
     if _projection_name(projection) is None:
         return False
@@ -9141,7 +9455,34 @@ def _is_tag_column(projection: exp.Expr, env: _Env) -> bool:
         return True
     if _is_input_value_column(value, env):
         return True
+    if _is_cte_value_column(value, env):
+        return True
     return _row_metadata_column(value, env) is not None
+
+
+def _reads_cte_value(alias: str, conjunct: exp.Expr, env: _Env) -> bool:
+    """True when `conjunct` reads a VALUE column off this CTE alias."""
+    binding = env.bindings.get(alias)
+    if not isinstance(binding, _CteBinding):
+        return False
+    return any(
+        isinstance(sub, exp.Column)
+        and sub.args.get("table") is not None
+        and _fold(sub.args["table"]) == alias
+        and _fold(sub.this) in binding.values
+        for sub in conjunct.walk()
+    )
+
+
+def _is_cte_value_column(node: exp.Expr, env: _Env) -> bool:
+    """True for a reference to a CTE's own VALUE column."""
+    if not isinstance(node, exp.Column):
+        return False
+    table_node = node.args.get("table")
+    if table_node is None:
+        return False
+    binding = env.bindings.get(_fold(table_node))
+    return isinstance(binding, _CteBinding) and _fold(node.this) in binding.values
 
 
 def _is_input_value_column(node: exp.Expr, env: _Env) -> bool:

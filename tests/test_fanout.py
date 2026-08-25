@@ -29,7 +29,7 @@ import pytest
 from sqlmpeg import cli, compiler
 from sqlmpeg.compiler import compile_commands, compile_sql
 from sqlmpeg.errors import ErrorCode, SqlmpegError
-from sqlmpeg.ir import SinkUnit, StreamType
+from sqlmpeg.ir import Graph, SinkUnit, StreamType
 from sqlmpeg.probe import ChapterMeta, ProbeResult, StreamMeta
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -89,6 +89,10 @@ def _rejects(sql: str) -> SqlmpegError:
 def _units(sql: str) -> list[SinkUnit]:
     """Every output FILE the compile writes, in order, across its commands."""
     return [unit for graph in compile_commands(sql) for unit in graph.sinks]
+
+
+def _graphs(sql: str) -> list[Graph]:
+    return compile_commands(sql)
 
 
 def _paths(sql: str) -> list[str | None]:
@@ -208,20 +212,67 @@ def test_the_chapter_split_is_unchanged_by_the_widening() -> None:
     assert _paths(_CHAPTER_SPLIT) == ["ch1.mkv", "ch2.mkv"]
 
 
-def test_a_table_function_value_column_cannot_name_a_fan_out_file() -> None:
-    """A table-returning function becomes a CTE, and a CTE's columns are
-    streams -- so naming files from one is the CTE-keyed fan-out gap, not
-    something the row widening reaches."""
-    sql = (
-        "CREATE FUNCTION shots(path text, count number) "
+def _frames_function(count: int, source: str = SRC) -> str:
+    """The `frames` pattern: N evenly-spaced stills, each named from its row."""
+    return (
+        "CREATE FUNCTION frames(path text, count number, track number) "
         "RETURNS TABLE(n number, frame video_stream) AS $$ "
         "SELECT i.i, v FROM input(path) f, unnest(f.video) v, "
         "generate_series(1, count) i "
-        "WHERE v.index = 1 AND f.t >= i.i - 1 AND f.t <= i.i $$ LANGUAGE sql; "
-        f"COPY (SELECT s.frame FROM shots('{SRC}', 3) s) "
-        "TO ('shot' || s.n::text || '.png')"
+        "WHERE v.index = track AND f.t >= f.duration * (i.i - 0.5) / count "
+        "$$ LANGUAGE sql; "
+        f"COPY (SELECT s.frame FROM frames('{source}', {count}, 1) s) "
+        "TO ('shot' || s.n::text || '.png') WITH (video_codec 'png', frames 1)"
     )
-    assert "unknown column 's.n'" in _rejects(sql).message
+
+
+def test_a_table_functions_value_column_names_one_file_per_row() -> None:
+    """A declared scalar column is a value column of the generated CTE's rows,
+    so the fan-out TO reads it exactly as it reads any other row column."""
+    units = _units(_frames_function(4))
+    assert [unit.path for unit in units] == [
+        "shot1.png",
+        "shot2.png",
+        "shot3.png",
+        "shot4.png",
+    ]
+
+
+def test_each_pinned_row_arrives_with_its_own_seek() -> None:
+    """The window binds inside the body, where the input binds, so each row
+    mints its own `-i` already seeked to its midpoint."""
+    graphs = _graphs(_frames_function(4))
+    trims = [
+        start
+        for graph in graphs
+        for (start, _end) in graph.input_trims.values()
+    ]
+    # SRC is 10s long: the midpoint of each of four equal shares.
+    assert trims == [1.25, 3.75, 6.25, 8.75]
+
+
+def test_a_fan_out_over_a_function_writes_one_file_per_row() -> None:
+    assert len(_units(_frames_function(3))) == 3
+
+
+def test_a_value_column_titles_each_file_of_a_fan_out() -> None:
+    """A pinned row is ONE row, so its own value is that file's tag."""
+    sql = (
+        "CREATE FUNCTION frames(path text, count number, track number) "
+        "RETURNS TABLE(n number, frame video_stream) AS $$ "
+        "SELECT i.i, v FROM input(path) f, unnest(f.video) v, "
+        "generate_series(1, count) i "
+        "WHERE v.index = track AND f.t >= f.duration * (i.i - 0.5) / count "
+        "$$ LANGUAGE sql; "
+        f"COPY (SELECT s.frame, STRUCT('shot ' || s.n::text AS title) AS tags "
+        f"FROM frames('{SRC}', 3, 1) s) "
+        "TO ('shot' || s.n::text || '.png') WITH (video_codec 'png', frames 1)"
+    )
+    assert [unit.tags["title"] for unit in _units(sql)] == [
+        "shot 1",
+        "shot 2",
+        "shot 3",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +406,7 @@ def test_a_filtered_stream_the_files_share_is_split_across_them() -> None:
 
 def test_a_row_tag_column_tags_only_its_own_file() -> None:
     sql = (
-        f"COPY (SELECT t, 'Audio (' || t.tags.language || ')' AS title "
+        f"COPY (SELECT t, STRUCT('Audio (' || t.tags.language || ')' AS title) AS tags "
         f"FROM input('{SRC}') f, unnest(f.audio) t) TO (t.tags.language || '.m4a')"
     )
     assert [unit.outputs[0].metadata["title"] for unit in _units(sql)] == [
@@ -374,7 +425,7 @@ def test_a_tagged_ctes_tags_reach_every_file() -> None:
     sql = (
         "COPY ("
         "  WITH capt AS ("
-        "    SELECT s AS track, 'Subs' AS title"
+        "    SELECT s AS track, STRUCT('Subs' AS title) AS tags"
         f"    FROM input('{SRC}') g, unnest(g.subtitle) s"
         "  )"
         f"  SELECT t, array_agg(capt.track) FROM input('{SRC}') f, "
@@ -460,12 +511,31 @@ def test_a_chapters_column_and_a_fan_out_to_are_rejected() -> None:
     assert "'chapters' and a fan-out TO cannot both be set" in _rejects(sql).message
 
 
-def test_metadata_from_and_a_fan_out_to_are_rejected() -> None:
+def test_a_tags_map_over_track_rows_reaches_every_file_of_a_fan_out() -> None:
+    """The map is a column now, so it rides the fan-out like any other. With
+    track rows in scope its keys are the STREAM's, not the container's."""
     sql = (
-        f"COPY (SELECT t FROM input('{SRC}') f, unnest(f.audio) t) "
-        "TO (t.tags.language || '.m4a') WITH (metadata_from f)"
+        f"COPY (SELECT t, STRUCT('Set' AS album) AS tags "
+        f"FROM input('{SRC}') f, unnest(f.audio) t) "
+        "TO (t.tags.language || '.m4a')"
     )
-    assert "'metadata_from' and a fan-out TO cannot both be set" in _rejects(sql).message
+    for unit in _units(sql):
+        assert unit.outputs[0].metadata["album"] == "Set"
+
+
+def test_a_copied_container_map_reaches_every_file_of_a_fan_out() -> None:
+    """Without track rows in the SELECT the map is the container's, and
+    naming an input's own is what writes -map_metadata for each file."""
+    sql = (
+        f"COPY (SELECT f.audio[1], f.tags || STRUCT('Set' AS album) AS tags "
+        f"FROM input('{SRC}') f, generate_series(1, 2) i) "
+        "TO ('o' || i.i::text || '.m4a')"
+    )
+    units = _units(sql)
+    assert [unit.path for unit in units] == ["o1.m4a", "o2.m4a"]
+    for unit in units:
+        assert unit.metadata == 0
+        assert unit.tags == {"album": "Set"}
 
 
 def test_a_csv_copy_takes_no_to_expression() -> None:
@@ -715,6 +785,34 @@ def _chapter_split_sql(options: str = "") -> str:
 
 
 @pytest.mark.exec
+def test_a_value_column_names_the_frames_it_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _fixtures: None
+) -> None:
+    """Recipe 81 executed: four stills, each named from its own row's value."""
+    monkeypatch.undo()  # the synthetic probe: this one reads the real file
+    monkeypatch.chdir(tmp_path)
+    source = (FIXTURES_DIR / "av2.mp4").as_posix()
+    sql = (
+        "COPY ("
+        "  WITH shots AS ("
+        "    SELECT v AS frame, i.i AS n"
+        f"    FROM input('{source}') f, unnest(f.video) v, generate_series(1, 4) i"
+        "    WHERE v.index = 1 AND f.t >= f.duration * (i.i - 0.5) / 4"
+        "  )"
+        "  SELECT shots.frame FROM shots"
+        ") TO ('shot' || shots.n::text || '.png') WITH (video_codec 'png', frames 1)"
+    )
+    assert cli.main(["run", sql, "-y"]) == 0
+    for index in range(1, 5):
+        written = tmp_path / f"shot{index}.png"
+        assert written.exists(), f"shot{index}.png was not written"
+        assert written.stat().st_size > 0
+    # Four DIFFERENT frames: the per-row seek really moved.
+    sizes = {(tmp_path / f"shot{i}.png").read_bytes() for i in range(1, 5)}
+    assert len(sizes) == 4
+
+
+@pytest.mark.exec
 def test_split_by_chapter_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
     _fixtures: None,
@@ -806,7 +904,8 @@ def _two_eng(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 _GROUPED = (
-    f"COPY (SELECT array_agg(t), t.tags.language AS title FROM input('{SRC}') f, "
+    f"COPY (SELECT array_agg(t), STRUCT(t.tags.language AS title) AS tags "
+    f"FROM input('{SRC}') f, "
     "unnest(f.audio) t GROUP BY t.tags.language) TO (t.tags.language || '.mka')"
 )
 
@@ -917,7 +1016,8 @@ def test_one_file_per_language_with_all_its_tracks_runs(
     monkeypatch.chdir(tmp_path)
     source = (FIXTURES_DIR / "av-2eng.mp4").as_posix()
     sql = (
-        f"COPY (SELECT array_agg(t), t.tags.language AS title FROM input('{source}') f, "
+        f"COPY (SELECT array_agg(t), STRUCT(t.tags.language AS title) AS tags "
+        f"FROM input('{source}') f, "
         "unnest(f.audio) t GROUP BY t.tags.language) TO (t.tags.language || '.mka')"
     )
     assert cli.main(["run", sql, "-y"]) == 0
