@@ -39,6 +39,17 @@ Rejected:
 
 On a CTE, open windows pass only the bounds they have (`trim=start=3` with no `end=`).
 
+## Row-bounded windows: one seek per row
+
+A bound may read a row column - `WHERE f.t BETWEEN c.start_t AND c.end_t`, `WHERE f.t >= i.i - 1` - which makes the window one seek per surviving row. Where those seeks go is the query's business, and there are two answers:
+
+- **A fan-out `TO (expression)`** gives each row a file of its own; the windows are per-FILE, described below.
+- **An aggregate** gathers the rows into one file. Each row then mints its own `-i` of the same path with its own `-ss`/`-to`, all in ONE graph, and the per-row streams flow into the aggregate: `ffmpeg.concat(VARIADIC array_agg(shots.frame))` over N series rows is N seeks of one file joined end to end. Two rows naming the same window share one `-i`. [Recipe 75](examples.md#75-gather-n-clips-from-one-file-into-one).
+
+Neither, and N windows reach a single destination: a `ROW_COUNT_MISMATCH` naming both ways out. The alias being windowed has to be an `input()` one - a CTE name is a filtergraph pad, with no `-i` to repeat.
+
+Each window is its own input, so its timestamps start at zero; nothing is re-based afterwards.
+
 ## Fan-out windows: one seek per output file
 
 A fan-out `TO (expression)` whose rows carry a window writes one file per row, and where it can, all of them in one ffmpeg command: each output takes its own `-ss <start> -to <end>` ahead of that output's `-map` list, so the input is read and decoded once no matter how many pieces come out. The cuts are frame-accurate.

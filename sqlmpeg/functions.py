@@ -935,8 +935,22 @@ def _call_name(node: object) -> str:
     return str(node.name).lower() if isinstance(node, exp.Anonymous) else ""
 
 
+def _series_aliases(body: exp.Expr) -> set[str]:
+    """The body's ``generate_series`` aliases, each of which names its own
+    one column as well as its table (``generate_series(1, 5) i`` -> ``i.i``)."""
+    found: set[str] = set()
+    for table in body.find_all(exp.Table):
+        alias = table.args.get("alias")
+        if not isinstance(table.this, exp.GenerateSeries):
+            continue
+        if isinstance(alias, exp.TableAlias) and isinstance(alias.this, exp.Identifier):
+            found.add(_ident_name(alias.this))
+    return found
+
+
 def _rename(body: exp.Expr, mapping: dict[str, str]) -> None:
     """Rewrite every alias the body binds, and every reference to one."""
+    series = _series_aliases(body)
     for node in body.walk():
         if isinstance(node, exp.TableAlias) and isinstance(node.this, exp.Identifier):
             replacement = mapping.get(_ident_name(node.this))
@@ -949,9 +963,17 @@ def _rename(body: exp.Expr, mapping: dict[str, str]) -> None:
             identifier = node.args.get(key)
             if not isinstance(identifier, exp.Identifier):
                 continue
-            replacement = mapping.get(_ident_name(identifier))
-            if replacement is not None:
-                identifier.set("this", replacement)
+            name = _ident_name(identifier)
+            replacement = mapping.get(name)
+            if replacement is None:
+                continue
+            identifier.set("this", replacement)
+            if key == "this" or name not in series:
+                continue
+            # A series alias names its column too, so `i.i` moves whole.
+            own = node.args.get("this")
+            if isinstance(own, exp.Identifier) and _ident_name(own) == name:
+                own.set("this", replacement)
 
 
 def _accessor(argument: exp.Expr, path: list[exp.Identifier]) -> exp.Expr:

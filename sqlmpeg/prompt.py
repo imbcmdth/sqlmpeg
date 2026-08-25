@@ -349,10 +349,9 @@ _DIALECT_TAIL = """\
   valid empty table.
 - The rows are streamless, ordinary compile-time rows: cross-join them
   against an input or another row source with a comma, filter them in
-  `WHERE`, gather them with `array_agg`, read `i.i` in a SELECT expression --
-  exactly the rules a `VALUES` row follows. What they do NOT yet do: key a
-  trim-bound window or a fan-out `TO (expression)` -- that reach is track-
-  and chapter-row-only today.
+  `WHERE`, gather them with `array_agg`, read `i.i` in a SELECT expression,
+  key a fan-out `TO (expression)`, bound a trim window -- exactly the rules a
+  `VALUES` row follows.
 
 ### Variables
 - `:'name'` (string literal), `:"name"` (identifier) and bare `:name` (raw
@@ -549,11 +548,19 @@ _DIALECT_TAIL = """\
   for one alias (two lower bounds, a BETWEEN plus an overlapping `>=`, ...) is
   rejected, same as writing `BETWEEN` twice.
 - No `OR`, no `NOT BETWEEN`, no strict `<`/`>` (seeks are time-based, and a
-  strict bound has no frame-level meaning -- use `>=`/`<=`), no `=`, and no
-  track-row column in a bound (a seek is a property of the input, not of a
-  row). A window with both bounds present where the start is
+  strict bound has no frame-level meaning -- use `>=`/`<=`), and no `=`. A
+  window with both bounds present where the start is
   not strictly before the end is a compile-time `UNSUPPORTED_SQL`, not an
   ffmpeg runtime error.
+- A bound MAY read a row column (`WHERE f.t BETWEEN c.start_t AND c.end_t`,
+  `WHERE f.t >= i.i - 1`), which is one window per row. Then the query has to
+  say where those rows go: a fan-out `TO (expression)` gives each one a file
+  of its own, or an aggregate gathers them and each row takes its own `-i` of
+  the same file with its own seek, all in one command
+  (`ffmpeg.concat(VARIADIC array_agg(<column>))`). Neither, and it is a
+  `ROW_COUNT_MISMATCH` naming both ways out. The alias being windowed has to
+  be an `input()` one: a CTE name is a filtergraph pad with no `-i` to
+  repeat.
 - On an `input()` alias, the window becomes an INPUT seek (`-ss <start>`
   and/or `-to <end>` immediately before that alias's own `-i`, whichever
   bounds are present), not a filter: it trims AND rebases to t=0 every stream
@@ -775,7 +782,8 @@ integer literal for an `int` option (`crf 20`), or `true`/`false` for a
 ### One file per row
 
 `TO (<expression>)` -- parenthesized, not quoted -- writes ONE file per
-surviving track row when the expression reads that row table's columns. Each
+surviving row when the expression reads a row table's columns, whichever row
+source that table is (`unnest`, `VALUES`, `generate_series`). Each
 file binds its own row: its streams, its tags, its `WHERE` window, its name.
 They all ride ONE ffmpeg command, so the inputs are read once. The exception
 is a fan-out that both trims and stream-copies everything it maps: ffmpeg

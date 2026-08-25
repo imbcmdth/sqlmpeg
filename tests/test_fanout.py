@@ -144,6 +144,87 @@ def test_a_row_reading_to_writes_one_file_per_row() -> None:
 
 
 # ---------------------------------------------------------------------------
+# any compile-time row keys a fan-out, not just unnest
+# ---------------------------------------------------------------------------
+
+
+_SERIES_SPLIT = (
+    f"COPY (SELECT f.video[1], f.audio[1] FROM input('{SRC}') f, "
+    "generate_series(1, 3) i WHERE f.t >= i.i - 1 AND f.t <= i.i) "
+    "TO ('clip' || i.i::text || '.mp4')"
+)
+
+
+def test_a_series_row_keys_a_fan_out_to() -> None:
+    """Three series rows, three files, each with the window its own row named."""
+    graphs = compile_commands(_SERIES_SPLIT)
+    assert [unit.path for graph in graphs for unit in graph.sinks] == [
+        "clip1.mp4",
+        "clip2.mp4",
+        "clip3.mp4",
+    ]
+    assert [graph.input_trims["f"] for graph in graphs] == [(0, 1), (1, 2), (2, 3)]
+
+
+def test_a_series_keyed_fan_out_mints_no_extra_input() -> None:
+    """A fan-out row's window is that COMMAND's seek of the shared `-i`, so
+    nothing is copied: one input per command, exactly as a chapter split has."""
+    for graph in compile_commands(_SERIES_SPLIT):
+        assert graph.input_paths == [SRC]
+        assert set(graph.sources) == {"f"}
+
+
+def test_a_values_row_keys_a_fan_out_to() -> None:
+    """A written row source keys one just the same."""
+    sql = (
+        "COPY (WITH m(name, at) AS (VALUES ('intro', 0), ('outro', 5)) "
+        f"SELECT f.video[1] FROM input('{SRC}') f, m "
+        "WHERE f.t >= m.at AND f.t <= m.at + 1) TO (m.name || '.mp4')"
+    )
+    assert _paths(sql) == ["intro.mp4", "outro.mp4"]
+
+
+def test_a_series_keyed_fan_out_is_still_alone_in_its_script() -> None:
+    """The one-COPY rule reads every row alias now, so a series-keyed TO is
+    caught by it exactly as an unnest-keyed one is."""
+    sql = (
+        f"COPY (SELECT f.audio[1] FROM input('{SRC}') f) TO 'first.m4a'; "
+        f"COPY (SELECT f2.video[1] FROM input('{SRC}') f2, generate_series(1, 2) i "
+        "WHERE f2.t >= i.i - 1 AND f2.t <= i.i) TO ('clip' || i.i::text || '.mp4')"
+    )
+    assert "cannot share a script with another COPY" in _rejects(sql).message
+
+
+def test_the_chapter_split_is_unchanged_by_the_widening() -> None:
+    """Regression: the unnest-keyed split still chains one command per file,
+    each seeking the single `-i` its own row bounds, and mints nothing."""
+    graphs = compile_commands(_CHAPTER_SPLIT)
+    assert len(graphs) == 2
+    assert [graph.input_paths for graph in graphs] == [[SRC], [SRC]]
+    assert [graph.input_trims for graph in graphs] == [
+        {"f": (0.0, 4.0)},
+        {"f": (4.0, 10.0)},
+    ]
+    assert _paths(_CHAPTER_SPLIT) == ["ch1.mkv", "ch2.mkv"]
+
+
+def test_a_table_function_value_column_cannot_name_a_fan_out_file() -> None:
+    """A table-returning function becomes a CTE, and a CTE's columns are
+    streams -- so naming files from one is the CTE-keyed fan-out gap, not
+    something the row widening reaches."""
+    sql = (
+        "CREATE FUNCTION shots(path text, count number) "
+        "RETURNS TABLE(n number, frame video_stream) AS $$ "
+        "SELECT i.i, v FROM input(path) f, unnest(f.video) v, "
+        "generate_series(1, count) i "
+        "WHERE v.index = 1 AND f.t >= i.i - 1 AND f.t <= i.i $$ LANGUAGE sql; "
+        f"COPY (SELECT s.frame FROM shots('{SRC}', 3) s) "
+        "TO ('shot' || s.n::text || '.png')"
+    )
+    assert "unknown column 's.n'" in _rejects(sql).message
+
+
+# ---------------------------------------------------------------------------
 # per-row binding: streams, tags, seek bounds, paths
 # ---------------------------------------------------------------------------
 
@@ -480,21 +561,27 @@ def test_a_numeric_to_expression_is_rejected() -> None:
     assert "a TO expression must be text, got number" in _rejects(sql).message
 
 
-def test_a_row_bounded_window_needs_a_fan_out_to() -> None:
+def test_a_row_bounded_window_into_one_file_names_both_ways_out() -> None:
+    """A constant TO gives the rows no destination of their own and the query
+    gathers nothing, so two windows meet one file: rejected, with the hint
+    naming the aggregate and the TO expression."""
     sql = (
         f"COPY (SELECT f.video[1] FROM input('{SRC}') f, unnest(f.chapters) c "
         "WHERE f.t BETWEEN c.start_t AND c.end_t) TO ('one.mkv')"
     )
     err = _rejects(sql)
-    assert "only under a fan-out TO" in err.message
+    assert err.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert "this query has 2 rows" in err.message
+    assert err.hint is not None
+    assert "array_agg" in err.hint and "TO expression" in err.hint
 
 
-def test_a_row_bounded_window_under_a_quoted_to_keeps_the_old_rejection() -> None:
+def test_a_row_bounded_window_under_a_quoted_to_is_the_same_rejection() -> None:
     sql = (
         f"COPY (SELECT f.video[1] FROM input('{SRC}') f, unnest(f.chapters) c "
         "WHERE f.t BETWEEN c.start_t AND c.end_t) TO 'one.mkv'"
     )
-    assert "cannot mix track-row columns" in _rejects(sql).message
+    assert _rejects(sql).code is ErrorCode.ROW_COUNT_MISMATCH
 
 
 # ---------------------------------------------------------------------------

@@ -1478,6 +1478,12 @@ class Resolved:
     Disjoint from ``ctes``: a VALUES CTE is never FROM-selectable, only usable
     as a sink option's value (``chapters <alias>``)."""
 
+    row_aliases: frozenset[str] = frozenset()
+    """Every alias bound as a ROW table anywhere in the script: an ``unnest``
+    table, a ``VALUES`` table read in FROM, a ``generate_series``. What decides
+    whether a ``TO`` expression fans out, and what a path expression may read.
+    ``track_rows`` is the ``unnest`` subset of it."""
+
     series: dict[str, tuple[int, ...]] = field(default_factory=dict)
     """``FROM generate_series(start, stop[, step]) alias`` records, keyed by
     alias, in FROM order across the whole script. Each value is the WHOLE
@@ -2326,6 +2332,9 @@ class _Resolver:
         # branches may each spell their own table `m`.
         self.values_rows: dict[str, RawValuesTable] = {}
         self.series: dict[str, tuple[int, ...]] = {}
+        # Every row alias the script binds, across branches: unnest tables,
+        # VALUES tables read in FROM, and series.
+        self.row_aliases: set[str] = set()
 
     # -- entry point ------------------------------------------------------
 
@@ -2435,13 +2444,14 @@ class _Resolver:
             track_rows=self.track_rows,
             values_ctes=self.values_ctes,
             series=self.series,
+            row_aliases=frozenset(self.row_aliases),
         )
 
     def _check_fanout_is_alone(self, sinks: list[RawSink]) -> None:
         """A fan-out COPY is the only statement of its script, v1."""
         if len(sinks) <= 1:
             return
-        row_aliases = set(self.track_rows)
+        row_aliases = set(self.row_aliases)
         for sink in sinks:
             if sink.path_expr is None or not references_row_alias(sink.path_expr, row_aliases):
                 continue
@@ -2944,7 +2954,7 @@ class _Resolver:
             self._check_columns(projection, scope, select, table_mode=table_mode)
             self._check_select_value(projection, scope, select)
         if isinstance(where, exp.Where):
-            self._check_where(where, scope, select, fanout=path_expr is not None)
+            self._check_where(where, scope, select)
         order = select.args.get("order")
         if isinstance(order, exp.Order):
             self._check_order(order, scope, select)
@@ -3618,6 +3628,7 @@ class _Resolver:
                     )
                 self.values_rows[local] = values
                 scope[local] = "row"
+                self.row_aliases.add(local)
                 return
             if name not in visible:
                 raise _error(
@@ -3774,6 +3785,7 @@ class _Resolver:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
             )
+        self.row_aliases.add(alias)
         self.track_rows[alias] = RawTrackRows(
             alias=alias, source=source, column=column, node=unnest
         )
@@ -4057,6 +4069,7 @@ class _Resolver:
             alias=alias, columns=(alias,), rows=(), node=series, types=("number",)
         )
         scope[alias] = "row"
+        self.row_aliases.add(alias)
 
     def _known_hint(self, names: set[str] | dict[str, str]) -> str:
         known = ", ".join(sorted(names))
@@ -4625,8 +4638,6 @@ class _Resolver:
         where: exp.Where,
         scope: dict[str, str],
         select: exp.Select,
-        *,
-        fanout: bool = False,
     ) -> None:
         conjuncts: list[exp.Expr] = []
         self._flatten_and(where.this, conjuncts, select)
@@ -4644,7 +4655,7 @@ class _Resolver:
         conjuncts = [
             conjunct
             for conjunct in conjuncts
-            if not self._check_row_conjunct(conjunct, scope, where, fanout=fanout)
+            if not self._check_row_conjunct(conjunct, scope, where)
             and not self._check_subscript_conjunct(conjunct, scope, where)
         ]
 
@@ -4703,7 +4714,7 @@ class _Resolver:
             for kind, bound in (("low", low), ("high", high)):
                 if bound is None:
                     continue
-                self._check_time_bound(bound, scope, where, fanout=fanout)
+                self._check_time_bound(bound, scope, where)
                 if kind in alias_bounds:
                     bound_name = "lower" if kind == "low" else "upper"
                     raise _error(
@@ -4743,8 +4754,6 @@ class _Resolver:
         bound: exp.Expr,
         scope: dict[str, str],
         where: exp.Where,
-        *,
-        fanout: bool = False,
     ) -> None:
         """One trim bound: a number of seconds, literal or computed.
 
@@ -4752,14 +4761,16 @@ class _Resolver:
         time lower reads it -- but which number may be arithmetic over probed
         scalars (``f.duration - 0.5``), so the value grammar types it here.
 
-        Under a fan-out ``TO`` a bare row column (``c.start_t``) is a bound
-        too: each command binds its own row, so the window is that row's.
+        A bare row column (``c.start_t``) is a bound too: it is one number per
+        row, and lower decides what a per-row window means -- one file each
+        under a fan-out ``TO``, or one ``-i`` each when the rows are gathered.
         """
         if isinstance(bound, exp.Literal) and not bound.is_string:
             return
         if (
-            (is_value_expr(bound) or _is_input_duration(bound, scope))
-            or (fanout and _is_row_column(bound, scope))
+            is_value_expr(bound)
+            or _is_input_duration(bound, scope)
+            or _is_row_column(bound, scope)
         ) and (self._check_value_expr(bound, scope, where) == "number"):
             return
         raise _error(
@@ -4777,8 +4788,6 @@ class _Resolver:
         conjunct: exp.Expr,
         scope: dict[str, str],
         where: exp.Where,
-        *,
-        fanout: bool = False,
     ) -> bool:
         """Shape-check `conjunct` if it is a ROW predicate; say whether it was one.
 
@@ -4792,10 +4801,12 @@ class _Resolver:
         the ffmpeg command line, one in this compiler), and quietly cutting the
         expression in half is the kind of approximation guardrail #3 bans.
 
-        A fan-out ``TO`` reopens exactly one mixed shape: a time window on a
-        non-row alias whose BOUNDS are row columns (``WHERE f.t BETWEEN
-        c.start_t AND c.end_t``). Both halves then run in one world -- the
-        command being built for that row -- so there is nothing to cut in half.
+        Exactly one mixed shape is admitted: a time window on a non-row alias
+        whose BOUNDS are row columns (``WHERE f.t BETWEEN c.start_t AND
+        c.end_t``). Both halves then run in one world -- the window each row
+        names -- so there is nothing to cut in half. Lower decides what that
+        means: one command per row under a fan-out ``TO``, one ``-i`` per row
+        when the rows are gathered.
 
         Returns True when the conjunct was a row predicate (and is now
         validated), False when it belongs to the time-window path.
@@ -4806,7 +4817,7 @@ class _Resolver:
             return False
         others = aliases - rows
         if others:
-            if fanout and _is_row_bounded_window(conjunct, scope):
+            if _is_row_bounded_window(conjunct, scope):
                 return False
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,

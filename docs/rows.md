@@ -101,7 +101,7 @@ A count rather than a file: one row per integer in the range, computed at compil
 
 `start`, `stop`, and `step` must be integer literals by the time this pass runs, which is after `-v` substitution - `generate_series(1, :count)` is fine, a column reference or any other computed expression is a typed rejection, because that is what keeps the row count (`stop - start` over `step`, inclusive) known before anything runs. A `0` step is rejected, and so is a range that would produce no rows (descending bounds under the default ascending step, or the reverse under a negative one): a series that silently produces nothing is a mistake worth naming, not a valid empty table.
 
-The rows are streamless - no track, no `-i` - and join, filter, and gather exactly like a `VALUES` row: cross join them against an input or another row source with a comma, narrow them in `WHERE`, `array_agg` them, read `i.i` in a SELECT expression. What they do not yet do is key a trim-bound window or a fan-out `TO (expression)` - both reach only track and chapter rows today, `known_gaps.md` records it, and it is the reason a series alone has limited pull until that widens.
+The rows are streamless - no track, no `-i` - and behave exactly like a `VALUES` row: cross join them against an input or another row source with a comma, narrow them in `WHERE`, `array_agg` them, read `i.i` in a SELECT expression, key a fan-out `TO (expression)`, bound a trim window ([trimming.md](trimming.md#row-bounded-windows-one-seek-per-row)). [Recipes 74-75](examples.md#74-cut-a-file-into-n-clips-one-file-each) drive N files and one gathered file from the same count.
 
 ## Joins
 

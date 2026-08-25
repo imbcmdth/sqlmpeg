@@ -470,6 +470,11 @@ _ONE_FILE_PER_ROW_HINT = (
     "the column they share when they share one; or give each row a file of its "
     "own with a TO expression, e.g. TO (t.tags.language || '.mka')"
 )
+_ROW_WINDOW_FILE_HINT = (
+    "a row-bounded window is one seek per row: gather the rows into that one "
+    "file with ffmpeg.concat(VARIADIC array_agg(<column>)), or give each row a "
+    "file of its own with a TO expression, e.g. TO ('clip' || i.i::text || '.mp4')"
+)
 _ONE_FILE_PER_GROUP_HINT = (
     "one group is one file, so the destination has to name the group, e.g. "
     "TO (t.tags.language || '.mka'); group by a column every row agrees on to write "
@@ -2325,6 +2330,12 @@ class _Env:
     # partition the relation. An input-level or constant key has the same value
     # for every tuple and leaves one group.
     group_keys: tuple[exp.Expr, ...] = ()
+    # Input alias -> the `-i` each ROW of `relation` seeks, in row order. Set
+    # only for a window whose bounds read a row column with no fan-out TO: the
+    # rows stay in one graph, so each takes its own copy of the input with its
+    # own `-ss`/`-to`, and every stream column of the alias reads one stream
+    # per row.
+    row_inputs: dict[str, list[str]] = field(default_factory=dict)
 
 
 # ExpandCtx
@@ -2435,6 +2446,14 @@ class _Lowerer:
         # which names no destination at all.
         self.sink_anchor: exp.Expr | None = None
         self.sink_path: str | None = None
+        # A per-row `-i` this pass minted for a row-bounded window: the minted
+        # alias -> the input alias it copies. Path, probe and options are that
+        # alias's; only the window differs.
+        self.row_input_source: dict[str, str] = {}
+        # True once any branch minted one, so the one-row-per-file rejection
+        # can name the two ways a windowed row set reaches a destination --
+        # including when the windows are in a CTE body.
+        self.row_window_seen = False
         # True for the whole duration of `run_table()`; `run()` never sets it.
         # Table mode changes exactly one thing about the stream machinery it
         # otherwise reuses verbatim: an outer join's NULL row is an empty cell
@@ -2575,13 +2594,14 @@ class _Lowerer:
         not apply to it.
 
         A ``TO (<expression>)`` reaching here is a fan-out sink exactly when it
-        reads a track-row column; that decision is made FIRST, since it changes
+        reads a row column -- any row source, ``unnest`` or ``VALUES`` or
+        ``generate_series``; that decision is made FIRST, since it changes
         how the wrapped query lowers (one pinned row, per-row seek bounds).
         """
         self.fanout_expr = (
             raw.path_expr
             if raw.path_expr is not None
-            and references_row_alias(raw.path_expr, set(self.res.track_rows))
+            and references_row_alias(raw.path_expr, set(self.res.row_aliases))
             else None
         )
         self.fanout_seen = self.fanout_seen or self.fanout_expr is not None
@@ -2708,7 +2728,7 @@ class _Lowerer:
                 hint="unnest the rows in the COPY's own FROM, e.g. FROM "
                 "input(:'src') f, unnest(f.audio) t",
             )
-        for segment in _computed_segments(expression, set(self.res.track_rows)):
+        for segment in _computed_segments(expression, set(self.res.row_aliases)):
             self._check_path_segment(segment, env, raw, anchor)
         value = self._eval_value(expression, env, self.fanout_row, anchor)
         if value is None:
@@ -3124,6 +3144,12 @@ class _Lowerer:
                 )
             if options:
                 result[alias] = options
+        # A per-row `-i` repeats its origin's options: same file, same demuxer,
+        # only the seek differs.
+        for minted, origin in self.row_input_source.items():
+            origin_options = result.get(origin)
+            if origin_options:
+                result[minted] = dict(origin_options)
         # Compiler-minted inputs last: their options are INTERNAL (`-f webvtt`
         # for an `empty_captions` data: URI), already validated by construction,
         # and their aliases cannot collide with a user one.
@@ -3267,18 +3293,21 @@ class _Lowerer:
         # conjunct is a compile-time ASSERTION (nothing to filter -- the SELECT
         # list already names the exact stream the subscript picked); a time
         # window is a seek on an input. Resolve already rejected a conjunct
-        # mixing any two, so the split is total -- except for the one mix a
-        # fan-out TO admits, a time window bounded by row columns.
+        # mixing any two, so the split is total -- except for the one admitted
+        # mix, a time window bounded by row columns.
         time_conjuncts, row_conjuncts, assertion_conjuncts = self._split_where(select, env)
         fanout = self.fanout_expr is not None
-        # Under fan-out the trims wait for the pin: a bound may name that row.
-        if not fanout:
+        # A bound naming a row column is one window per row, so it -- like a
+        # fan-out's, which waits for the pin -- is read off the relation the
+        # WHERE and the ORDER BY leave behind.
+        per_row = any(self._is_row_window(conjunct, env) for conjunct in time_conjuncts)
+        if not fanout and not per_row:
             self._collect_trims(select, env, time_conjuncts)
         self._filter_rows(row_conjuncts, env, select)
         self._check_assertions(assertion_conjuncts, select)
         self._order_rows(select, env)
         self._pin_fanout_row(env, select)
-        if fanout:
+        if fanout or per_row:
             self._collect_trims(select, env, time_conjuncts)
 
         projections = select.expressions
@@ -3375,7 +3404,9 @@ class _Lowerer:
         else:
             count = len(env.relation.tuples) if env.relation is not None else 1
             what = "row" if count == 1 else "rows"
-            hint = _ONE_FILE_PER_ROW_HINT
+            hint = (
+                _ROW_WINDOW_FILE_HINT if self.row_window_seen else _ONE_FILE_PER_ROW_HINT
+            )
         if count <= 1:
             return
         destination = (
@@ -3494,10 +3525,11 @@ class _Lowerer:
         recorded.
 
         A column is a row set exactly when it READS one: a row alias's stream
-        column, a call over one, or another CTE's row-set column (which it
-        inherits). A bare input/source array (``f.audio``) and anything
-        broadcast over one is a single row carrying an array VALUE, and an
-        ``array_agg`` is one unit by definition.
+        column, a call over one, another CTE's row-set column (which it
+        inherits), or an input alias a row-bounded window gave one ``-i`` per
+        row. A bare input/source array (``f.audio``) and anything broadcast
+        over one is a single row carrying an array VALUE, and an ``array_agg``
+        is one unit by definition.
         """
         expr = _unwrap(projection)
         if isinstance(expr, exp.ArrayAgg):
@@ -3515,6 +3547,8 @@ class _Lowerer:
                 continue
             binding = env.bindings.get(_fold(table_node))
             if isinstance(binding, _RowBinding):
+                return True
+            if isinstance(binding, _InputBinding) and _fold(table_node) in env.row_inputs:
                 return True
             if isinstance(binding, _CteBinding):
                 column = self._cte_column(binding, _fold(sub.this))
@@ -3900,13 +3934,22 @@ class _Lowerer:
                 anchor,
                 select,
             )
+        row_inputs = env.row_inputs.get(alias)
         return [
             _Column(
                 name=None,
                 value=self._access(
                     env,
                     alias,
-                    _scalar(self._source_stream(alias, meta.type, meta.index)),
+                    _scalar(self._source_stream(alias, meta.type, meta.index))
+                    if row_inputs is None
+                    else _array(
+                        meta.type,
+                        [
+                            self._source_stream(source, meta.type, meta.index)
+                            for source in row_inputs
+                        ],
+                    ),
                     anchor,
                     select,
                 ),
@@ -4033,21 +4076,34 @@ class _Lowerer:
 
         The same cell a bare ``f.audio`` / ``f.chapters`` prints on its own: an
         array column is a value inside the input's single row, not a row set.
+        Unless a row-bounded window gave the alias an ``-i`` per row, in which
+        case each row prints the streams IT reads -- the same thing
+        ``SELECT f.audio`` prints for that row.
         """
         if column in RECORD_ARRAY_COLUMNS:
             return self._record_cells(alias, column, anchor, select, cardinality)
         result = self._star_probe(alias, anchor, select)
         stream_type = _ARRAY_COLUMNS[column]
-        streams = [
-            self._source_stream(alias, stream_type, meta.index)
-            for meta in result.by_type(stream_type)
-        ]
-        if streams:
-            streams = list(
-                self._access(env, alias, _array(stream_type, streams), anchor, select).streams
+        indices = [meta.index for meta in result.by_type(stream_type)]
+
+        def cell_of(source: str) -> CellValue:
+            streams = [
+                self._source_stream(source, stream_type, index) for index in indices
+            ]
+            if streams:
+                streams = list(
+                    self._access(
+                        env, alias, _array(stream_type, streams), anchor, select
+                    ).streams
+                )
+            return ArrayCell(
+                elements=tuple(self._stream_to_cell(stream) for stream in streams)
             )
-        cell = ArrayCell(elements=tuple(self._stream_to_cell(stream) for stream in streams))
-        return [cell] * cardinality
+
+        row_inputs = env.row_inputs.get(alias)
+        if row_inputs is not None and len(row_inputs) == cardinality:
+            return [cell_of(source) for source in row_inputs]
+        return [cell_of(alias)] * cardinality
 
     # -- FROM -------------------------------------------------------------
 
@@ -4621,8 +4677,9 @@ class _Lowerer:
         cannot be two things. A subscript metadata accessor (``Dot`` over
         ``Bracket``) is told apart by SHAPE instead, since its alias
         is an ordinary input one -- checked first, so a conjunct never falls
-        through to the row/time split. Resolve rejected every mixed case, so
-        nothing here has to decide what a half-and-half conjunct would mean.
+        through to the row/time split. Resolve rejected every mixed case but
+        one -- a time window whose bounds are row columns, which is a window
+        per row and lands in the time half.
         """
         where = select.args.get("where")
         if not isinstance(where, exp.Where):
@@ -4651,18 +4708,10 @@ class _Lowerer:
                 time_conjuncts.append(conjunct)
                 continue
             if aliases - rows and len(rows) == 1 and self._is_row_window(conjunct, env):
-                # A time window whose BOUNDS are row columns: one seek per row,
-                # so it needs the row a fan-out TO pins.
-                if self.fanout_expr is None:
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        "a trim bound may reference track-row columns only under "
-                        "a fan-out TO",
-                        conjunct,
-                        fallback=where,
-                        hint="write TO ('ch' || c.index::text || '.mkv') to get "
-                        "one command per row, each with its own window",
-                    )
+                # A time window whose BOUNDS are row columns: one seek per row.
+                # A fan-out TO gives each row a file; without one the rows stay
+                # in this graph and each seeks its own `-i` of the same file.
+                self._check_row_window_seeks_a_file(conjunct, where, env)
                 time_conjuncts.append(conjunct)
                 continue
             if aliases - rows or len(rows) > 1:  # defensive: resolve rejected both
@@ -4675,6 +4724,45 @@ class _Lowerer:
                 )
             row_conjuncts.append(conjunct)
         return time_conjuncts, row_conjuncts, assertion_conjuncts
+
+    def _check_row_window_seeks_a_file(
+        self, conjunct: exp.Expr, where: exp.Where, env: _Env
+    ) -> None:
+        """A row-bounded window with no fan-out ``TO`` needs an ``-i`` per row,
+        so the alias it windows has to own one.
+
+        A CTE name is a filtergraph pad, not a file: its window is a
+        ``trim``/``atrim`` pair on one stream, and there is nothing to mint one
+        of per row.
+        """
+        if self.fanout_expr is not None:
+            return
+        parsed = _time_bounds(conjunct)
+        table_node = parsed[0].args.get("table") if parsed is not None else None
+        alias = _fold(table_node) if table_node is not None else ""
+        if not isinstance(env.bindings.get(alias), _CteBinding):
+            return
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"'{alias}' is a filtergraph stream, so a trim bound reading a row "
+            "column has no input to seek per row",
+            conjunct,
+            fallback=where,
+            hint=f"window the input() alias '{alias}' was built from, or write "
+            "TO ('clip' || i.i::text || '.mp4') for one command per row",
+        )
+
+    def _reads_row_alias(self, node: exp.Expr, env: _Env) -> bool:
+        """True when `node` reads a column of any row table of this branch."""
+        for sub in node.walk():
+            if not isinstance(sub, exp.Column):
+                continue
+            table_node = sub.args.get("table")
+            if table_node is not None and isinstance(
+                env.bindings.get(_fold(table_node)), _RowBinding
+            ):
+                return True
+        return False
 
     def _is_row_window(self, conjunct: exp.Expr, env: _Env) -> bool:
         """True for a time window on a non-row alias bounded by row columns."""
@@ -5447,7 +5535,9 @@ class _Lowerer:
         where = select.args.get("where")
         if not isinstance(where, exp.Where) or not conjuncts:
             return
-        windows: dict[str, tuple[int | float | None, int | float | None]] = {}
+        # alias -> its (lower, upper) bound EXPRESSIONS; the numbers come
+        # after, once it is known how many rows each one is evaluated against.
+        bounds: dict[str, tuple[exp.Expr | None, exp.Expr | None]] = {}
         for conjunct in conjuncts:
             parsed = _time_bounds(conjunct)
             if parsed is None:
@@ -5507,23 +5597,23 @@ class _Lowerer:
                     fallback=where,
                     hint=_SOURCE_DURATION_HINT,
                 )
-            start, end = windows.get(alias, (None, None))
-            if low is not None:
-                start = self._time_bound(low, env, select)
-            if high is not None:
-                end = self._time_bound(high, env, select)
-            windows[alias] = (start, end)
+            low_node, high_node = bounds.get(alias, (None, None))
+            bounds[alias] = (
+                low if low is not None else low_node,
+                high if high is not None else high_node,
+            )
 
-        for alias, window in windows.items():
-            start, end = window
-            if start is not None and end is not None and start >= end:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"empty time window for alias '{alias}': start ({start}) "
-                    f"is not before end ({end})",
-                    fallback=select,
-                    hint="the start bound must be strictly before the end bound",
-                )
+        for alias, (low_node, high_node) in bounds.items():
+            per_row = self._is_per_row_window(alias, low_node, high_node, env)
+            rows = (
+                env.relation.tuples
+                if per_row and env.relation is not None
+                else [self.fanout_row]
+            )
+            windows = [
+                self._window_of(alias, low_node, high_node, env, row, select)
+                for row in rows
+            ]
             if isinstance(env.bindings[alias], _InputBinding):
                 if any(
                     opt.name == "seek_end"
@@ -5537,17 +5627,99 @@ class _Lowerer:
                         hint=f"drop seek_end from {alias}'s input(), or drop "
                         f"the WHERE window on '{alias}'",
                     )
-                if self.fanout_sinks and self.fanout_expr is not None:
+                if per_row:
+                    # Every row seeks its own copy of the file, all in this one
+                    # graph, so the alias reads one stream per row from here on.
+                    env.row_inputs[alias] = [
+                        self._row_input(alias, window) for window in windows
+                    ]
+                    self.row_window_seen = True
+                elif self.fanout_sinks and self.fanout_expr is not None:
                     # A fan-out row's window belongs to the FILE that row
                     # writes, not to the `-i` every one of them reads.
-                    self.fanout_windows[alias] = window
+                    self.fanout_windows[alias] = windows[0]
                 else:
-                    self.graph.input_trims[alias] = window
+                    self.graph.input_trims[alias] = windows[0]
             else:
-                env.trims[alias] = window
+                env.trims[alias] = windows[0]
+
+    def _is_per_row_window(
+        self,
+        alias: str,
+        low: exp.Expr | None,
+        high: exp.Expr | None,
+        env: _Env,
+    ) -> bool:
+        """True when this window is one seek PER ROW inside a single graph.
+
+        A bound that reads a row column names a different number for every
+        row. Under a fan-out ``TO`` that is one command per row and the pinned
+        row answers for all of them; without one the rows share this graph, so
+        each needs an ``-i`` of its own -- which only an input alias has.
+        """
+        if self.fanout_expr is not None or env.relation is None:
+            return False
+        if not isinstance(env.bindings.get(alias), _InputBinding):
+            return False
+        return any(
+            node is not None and self._reads_row_alias(node, env)
+            for node in (low, high)
+        )
+
+    def _window_of(
+        self,
+        alias: str,
+        low: exp.Expr | None,
+        high: exp.Expr | None,
+        env: _Env,
+        rows: _RowTuple,
+        select: exp.Select,
+    ) -> tuple[int | float | None, int | float | None]:
+        """One alias's window as `rows` reads it, start strictly before end."""
+        start = self._time_bound(low, env, select, rows) if low is not None else None
+        end = self._time_bound(high, env, select, rows) if high is not None else None
+        if start is not None and end is not None and start >= end:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"empty time window for alias '{alias}': start ({start}) "
+                f"is not before end ({end})",
+                fallback=select,
+                hint="the start bound must be strictly before the end bound",
+            )
+        return start, end
+
+    def _row_input(
+        self, alias: str, window: tuple[int | float | None, int | float | None]
+    ) -> str:
+        """The ``-i`` one row's window seeks: `alias` itself for the first
+        window, a copy of it for each further one.
+
+        One input per DISTINCT window, so two rows naming the same one share a
+        slot (and the split pass shares its decode). The copy's alias carries a
+        ``#``, which no unquoted identifier may, because nothing resolves it --
+        it exists so the graph's alias-keyed input tables can hold the slot.
+        """
+        recorded = self.graph.input_trims.get(alias)
+        if recorded is None or recorded == window:
+            self.graph.input_trims[alias] = window
+            return alias
+        for minted, origin in self.row_input_source.items():
+            if origin == alias and self.graph.input_trims.get(minted) == window:
+                return minted
+        index = len(self.graph.input_paths)
+        minted = f"{alias}#{index + 1}"
+        self.graph.input_paths.append(self.graph.input_paths[self.graph.sources[alias]])
+        self.graph.sources[minted] = index
+        self.graph.input_trims[minted] = window
+        self.row_input_source[minted] = alias
+        return minted
 
     def _time_bound(
-        self, bound: exp.Expr, env: _Env, select: exp.Select
+        self,
+        bound: exp.Expr,
+        env: _Env,
+        select: exp.Select,
+        rows: _RowTuple | None = None,
     ) -> int | float:
         """One trim bound in seconds: a literal, or the value grammar's answer.
 
@@ -5556,10 +5728,13 @@ class _Lowerer:
         probed — is already a rejection naming that field
         (:meth:`_input_duration`), so the raise below is the defensive floor.
 
-        A fan-out command evaluates the bound against ITS pinned row, which is
-        what makes ``WHERE f.t BETWEEN c.start_t AND c.end_t`` a per-row seek.
+        `rows` is the result row the bound reads its row columns off, which is
+        what makes ``WHERE f.t BETWEEN c.start_t AND c.end_t`` a per-row seek:
+        the pinned row under a fan-out ``TO``, each surviving row without one.
         """
-        value = self._eval_value(bound, env, self.fanout_row, select)
+        value = self._eval_value(
+            bound, env, self.fanout_row if rows is None else rows, select
+        )
         if isinstance(value, int | float):
             return value
         raise _error(
@@ -5896,14 +6071,16 @@ class _Lowerer:
                 hint=self._known_hint(),
             )
         if isinstance(binding, _InputBinding):
-            return alias, self._input_value(alias, name, index, anchor, select)
+            return alias, self._input_value(alias, name, index, env, anchor, select)
         if isinstance(binding, _SourceBinding):
             return alias, self._source_value(binding, name, index, anchor, select)
         if isinstance(binding, _RowBinding):
             # Under the INPUT alias, not the row one: a row table has no window
             # of its own, and every rule about the streams (`-i`, `-ss`, the
             # caption-seek rejection) is a property of the file they came from.
-            return binding.source, self._row_value(binding, name, index, anchor, select)
+            return binding.source, self._row_value(
+                binding, name, index, env, anchor, select
+            )
         return alias, self._cte_value(binding, name, index, anchor, select)
 
     def _row_value(
@@ -5911,6 +6088,7 @@ class _Lowerer:
         binding: _RowBinding,
         name: str,
         index: int | None,
+        env: _Env,
         anchor: exp.Expr,
         select: exp.Select,
     ) -> _Value:
@@ -5976,10 +6154,14 @@ class _Lowerer:
                 hint="an empty row set would select no streams; widen the WHERE, "
                 "or check that the file has the tracks you expect",
             )
-        streams = [
-            self._row_stream(binding, row, position, anchor, select)
-            for position, row in enumerate(binding.rows)
-        ]
+        streams = self._per_row_seeks(
+            binding,
+            [
+                self._row_stream(binding, row, position, anchor, select)
+                for position, row in enumerate(binding.rows)
+            ],
+            env,
+        )
         if index is None:
             return _array(binding.type, streams)
         if not 1 <= index <= len(streams):
@@ -5993,6 +6175,31 @@ class _Lowerer:
                 hint=_SUBSCRIPT_HINT,
             )
         return _scalar(streams[index - 1])
+
+    def _per_row_seeks(
+        self, binding: _RowBinding, streams: list[_Stream], env: _Env
+    ) -> list[_Stream]:
+        """Re-point a row table's tracks at the ``-i`` each row seeks.
+
+        A row-bounded window on the input the tracks came from gives every
+        result row a copy of the file with its own ``-ss``/``-to``, and a row's
+        track belongs to the copy that row seeks: the same stream of the same
+        file, read through a different input slot.
+        """
+        row_inputs = env.row_inputs.get(binding.source)
+        if row_inputs is None:
+            return streams
+        reseeked: list[_Stream] = []
+        for position, stream in enumerate(streams):
+            if position >= len(row_inputs) or not is_src(stream.ref):
+                reseeked.append(stream)
+                continue
+            _, stream_type, index = src_parts(stream.ref)
+            marker = _TYPE_MARKERS[stream_type]
+            reseeked.append(
+                replace(stream, ref=f"src:{row_inputs[position]}:{marker}:{index}")
+            )
+        return reseeked
 
     def _row_stream(
         self,
@@ -6444,9 +6651,17 @@ class _Lowerer:
         alias: str,
         name: str,
         index: int | None,
+        env: _Env,
         anchor: exp.Expr,
         select: exp.Select,
     ) -> _Value:
+        """One column of an input alias.
+
+        A row-bounded window makes the alias a ROW SET: it holds one ``-i``
+        per surviving row (``_Env.row_inputs``), so every stream column reads
+        one stream per row, in row order, and a subscript names that stream in
+        each of them rather than a single one.
+        """
         if name == TIME_COLUMN:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
@@ -6518,17 +6733,28 @@ class _Lowerer:
                 f"values {alias}.t, {alias}.{INPUT_DURATION_COLUMN} and its "
                 f"container tags ({alias}.{TAGS_COLUMN}.title, ...)",
             )
+        row_inputs = env.row_inputs.get(alias)
         if index is None:
-            return self._enumerate(alias, array_type, anchor, select)
+            return self._enumerate(alias, array_type, anchor, select, row_inputs)
         stream_type: StreamType = array_type
         zero_based = index - 1
 
         self._check_bounds(alias, stream_type, zero_based, anchor, select)
-        stream = self._source_stream(alias, stream_type, zero_based)
         self._reject_codecless(
-            stream.source, f"'{alias}.{stream_type}[{zero_based + 1}]'", anchor, select
+            self._stream_meta(alias, stream_type, zero_based),
+            f"'{alias}.{stream_type}[{zero_based + 1}]'",
+            anchor,
+            select,
         )
-        return _scalar(stream)
+        if row_inputs is None:
+            return _scalar(self._source_stream(alias, stream_type, zero_based))
+        return _array(
+            stream_type,
+            [
+                self._source_stream(source, stream_type, zero_based)
+                for source in row_inputs
+            ],
+        )
 
     def _source_stream(self, alias: str, stream_type: StreamType, index: int) -> _Stream:
         """One raw input stream, tagged with its probed metadata when there is any."""
@@ -6542,7 +6768,7 @@ class _Lowerer:
     def _stream_meta(
         self, alias: str, stream_type: StreamType, index: int
     ) -> StreamMeta | None:
-        result = self.probes.get(alias)
+        result = self.probes.get(self.row_input_source.get(alias, alias))
         if result is None:
             return None
         streams = result.by_type(stream_type)
@@ -6585,7 +6811,12 @@ class _Lowerer:
         )
 
     def _enumerate(
-        self, alias: str, stream_type: StreamType, anchor: exp.Expr, select: exp.Select
+        self,
+        alias: str,
+        stream_type: StreamType,
+        anchor: exp.Expr,
+        select: exp.Select,
+        row_inputs: list[str] | None = None,
     ) -> _Value:
         """The whole array of `alias`'s `stream_type` streams, in file order.
 
@@ -6593,6 +6824,9 @@ class _Lowerer:
         property of the file, so an input that could not be probed fails here
         -- the streams of a file that cannot be read cannot be enumerated, a
         natural error rather than a policy one.
+
+        `row_inputs` is the per-row ``-i`` list of a row-bounded window: the
+        array then runs row by row, the file's own tracks inside each.
         """
         result = self.probes.get(alias)
         if result is None:
@@ -6623,12 +6857,22 @@ class _Lowerer:
                 "select * to take whatever it holds",
             )
             return _array(stream_type, [])
-        streams = [self._source_stream(alias, stream_type, k) for k in range(count)]
-        for k, stream in enumerate(streams):
+        for k in range(count):
             self._reject_codecless(
-                stream.source, f"'{alias}.{stream_type}[{k + 1}]'", anchor, select
+                self._stream_meta(alias, stream_type, k),
+                f"'{alias}.{stream_type}[{k + 1}]'",
+                anchor,
+                select,
             )
-        return _array(stream_type, streams)
+        sources = [alias] if row_inputs is None else row_inputs
+        return _array(
+            stream_type,
+            [
+                self._source_stream(source, stream_type, k)
+                for source in sources
+                for k in range(count)
+            ],
+        )
 
     def _warn(
         self,
@@ -8296,10 +8540,14 @@ class _Lowerer:
         env.group_keys = _partition_keys(select, env)
         self._check_grouped_cte_columns(select, env)
         time_conjuncts, row_conjuncts, assertion_conjuncts = self._split_where(select, env)
-        self._collect_trims(select, env, time_conjuncts)
+        per_row = any(self._is_row_window(conjunct, env) for conjunct in time_conjuncts)
+        if not per_row:
+            self._collect_trims(select, env, time_conjuncts)
         self._filter_rows(row_conjuncts, env, select)
         self._check_assertions(assertion_conjuncts, select)
         self._order_rows(select, env)
+        if per_row:
+            self._collect_trims(select, env, time_conjuncts)
 
         projections = select.expressions
         if not projections:

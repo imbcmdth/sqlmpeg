@@ -2770,10 +2770,12 @@ def test_a_text_trim_bound_is_still_rejected() -> None:
     assert "time bounds must be numeric literals" in err.message
 
 
-def test_a_trim_bound_cannot_read_a_track_row_column() -> None:
-    err = _reject(f"SELECT t {_ROWS} WHERE f.t <= t.channels")
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "cannot mix track-row columns" in err.message
+def test_a_trim_bound_may_read_a_track_row_column() -> None:
+    """One window per row is a shape resolve admits and lower decides: one
+    file each under a fan-out TO, one `-i` each when the rows are gathered.
+    A conjunct that mixes the two worlds any OTHER way is still rejected
+    (`test_a_conjunct_may_not_mix_a_row_column_with_another_alias`)."""
+    _resolve(f"SELECT t {_ROWS} WHERE f.t <= t.channels")
 
 
 def test_a_row_column_the_schema_never_had_is_still_unknown() -> None:

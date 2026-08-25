@@ -436,7 +436,9 @@ metadata - never a runtime ffmpeg predicate. NULL follows SQL:
 `WHERE alias.t BETWEEN a AND b` (either bound alone also works) is the
 trim window - it compiles to seeks, not filters
 ([trimming.md](trimming.md)). Bounds take the value grammar, including
-`f.duration` and chapter columns.
+`f.duration` and any row column. A bound reading a row column is one
+window per row, and the query says where those rows go: a fan-out
+`TO (expression)` gives each a file, an aggregate gathers them into one.
 
 ## Grouping and combining
 

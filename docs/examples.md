@@ -1733,4 +1733,50 @@ $ sqlmpeg -f query.sql
 (4 rows)
 ```
 
-Two audio tracks times two passes is four rows, in the left side's order - the whole point of a compile-time row model: what a fan-out or a gather will do is inspectable before it writes anything. Actually driving N different files or N different filter passes from a series needs it to key a fan-out or bound a trim window, which - like combining an unknown number of streams into one filter call without writing each one out by hand - is not wired up yet; until then, a series pulls its weight as a parameterized count to gather over (recipe 70) and as a row to join, filter, and preview.
+Two audio tracks times two passes is four rows, in the left side's order - the whole point of a compile-time row model: what a fan-out or a gather will do is inspectable before it writes anything. The next two recipes put those rows to work: a series row can key a fan-out `TO`, and it can bound a trim window.
+
+## 74. Cut a file into N clips, one file each
+
+Any compile-time row may key a fan-out `TO`, not just an `unnest` - so a series turns "how many clips" into a parameter. Each row binds its own window, and its own filename:
+
+```sql
+COPY (
+  SELECT f.video[1], f.audio[1]
+  FROM input(:'source') f, generate_series(1, :count) i
+  WHERE f.t >= (i.i - 1) * :len AND f.t <= i.i * :len
+) TO ('clip' || i.i::text || '.mp4')
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mp4 -v count=3 -v len=5
+ffmpeg -ss 0 -to 5 -i film.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy clip1.mp4 && \
+  ffmpeg -ss 5 -to 10 -i film.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy clip2.mp4 && \
+  ffmpeg -ss 10 -to 15 -i film.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy clip3.mp4
+```
+
+Raise `:count` and the same query writes more files; nothing else moves. Every bound is still a compile-time number, so the seeks are decided before ffmpeg starts.
+
+## 75. Gather N clips from one file into one
+
+Drop the `TO` expression and the same windows mean something else: the rows have no destination of their own, so they have to be combined. Each row takes its own `-i` of the file with its own seek, and `VARIADIC array_agg` spreads the lot into one `concat` - a contact sheet of a long file, sampled at even intervals:
+
+```pgsql
+COPY (
+  WITH shots AS (
+    SELECT f.video AS frame
+    FROM input('tests/fixtures/av.mp4') f, generate_series(1, 3) i
+    WHERE f.t >= (i.i - 1) * 2 AND f.t <= (i.i - 1) * 2 + 1
+  )
+  SELECT ffmpeg.concat(VARIADIC array_agg(shots.frame))
+  FROM shots
+) TO 'sampled.mp4'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -ss 0 -to 1 -i tests/fixtures/av.mp4 -ss 2 -to 3 -i tests/fixtures/av.mp4 -ss 4 \
+  -to 5 -i tests/fixtures/av.mp4 -filter_complex \
+  '[0:v:0][1:v:0][2:v:0]concat=n=3:v=1:a=0[out0]' -map '[out0]' sampled.mp4
+```
+
+A row-bounded window needs one of the two: a `TO` expression to give each row a file, or an aggregate to gather the rows into one. Neither, and the query is a multi-row query into a single destination - the compile error names both ways out.

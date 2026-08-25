@@ -1146,6 +1146,172 @@ def test_the_seek_covers_the_whole_input_selected_or_not() -> None:
 
 
 # ---------------------------------------------------------------------------
+# row-bounded windows with no fan-out TO: one -i per row, gathered
+# ---------------------------------------------------------------------------
+
+
+def _windowed_probe(layout: str = "a", duration: float = 12.0) -> ProbeResult:
+    """`layout`'s tracks, plus a container duration for `f.duration` to read."""
+    return ProbeResult(streams=_layout_probe(layout).streams, duration=duration)
+
+
+def _gathered(bounds: str, count: int = 3) -> str:
+    """One clip per series row, gathered into a single mix."""
+    return (
+        "COPY (WITH shots AS ("
+        f"SELECT f.audio AS clip FROM input('x.mp4') f, generate_series(1, {count}) i "
+        f"WHERE {bounds}) "
+        "SELECT amix(VARIADIC array_agg(shots.clip)) FROM shots) TO 'o.mka'"
+    )
+
+
+def test_a_series_bounded_window_gives_every_row_its_own_input() -> None:
+    """Three rows, three windows, three `-i` of the same file in one graph --
+    and the streams reaching the aggregate come one from each."""
+    g = _lower(
+        _gathered("f.t >= (i.i - 1) * 2 AND f.t <= (i.i - 1) * 2 + 1"),
+        {"f": _windowed_probe()},
+    )
+    assert g.input_paths == ["x.mp4"] * 3
+    assert list(g.input_trims.values()) == [(0, 1), (2, 3), (4, 5)]
+    assert _filters(g) == ["amix"]
+    assert len(set(g.nodes["n1"].inputs)) == 3
+
+
+def test_two_rows_naming_the_same_window_share_one_input() -> None:
+    """One `-i` per distinct window, not per row: a repeated window is the same
+    seek of the same file, so the split pass shares its decode."""
+    g = _lower(
+        _gathered("f.t >= 0 AND f.t <= i.i * 0 + 1"), {"f": _windowed_probe()}
+    )
+    assert g.input_paths == ["x.mp4"]
+    assert g.input_trims == {"f": (0, 1)}
+
+
+def test_a_row_bounded_window_reads_the_input_probe_through_every_copy() -> None:
+    """The copies are the same file, so `f.duration` and the track layout
+    answer for all of them -- only the seek differs."""
+    g = _lower(
+        _gathered("f.t >= f.duration - i.i AND f.t <= f.duration"),
+        {"f": _windowed_probe(duration=10.0)},
+    )
+    assert list(g.input_trims.values()) == [(9.0, 10.0), (8.0, 10.0), (7.0, 10.0)]
+
+
+def _shots_by_series(count: int, length: int) -> str:
+    """The gathered form: one series row per shot, each bounding its own seek."""
+    spacing = f"(f.duration - {length}) * (i.i - 1) / ({count} - 1)"
+    return _gathered(f"f.t >= {spacing} AND f.t <= {spacing} + {length}", count)
+
+
+def _shots_by_hand(count: int, length: int) -> str:
+    """The same thing written out: one input() per shot, one literal window
+    each, and the gather spelled as a positional argument list -- which has to
+    say its own count, since only VARIADIC writes one from the array."""
+    froms = ", ".join(f"input('x.mp4') f{k}" for k in range(count))
+    args = ", ".join(f"f{k}.audio[1]" for k in range(count)) + f", inputs => {count}"
+    where = " AND ".join(
+        f"f{k}.t >= (f{k}.duration - {length}) * {k / (count - 1)} "
+        f"AND f{k}.t <= (f{k}.duration - {length}) * {k / (count - 1)} + {length}"
+        for k in range(count)
+    )
+    return f"COPY (SELECT amix({args}) FROM {froms} WHERE {where}) TO 'o.mka'"
+
+
+def test_the_gathered_form_compiles_to_the_hand_written_one_byte_for_byte() -> None:
+    """The decisive one: five series rows bounding five seeks of one file
+    produce the very argv five hand-copied inputs do -- same `-i` list in the
+    same order, same windows, same filtergraph."""
+    probes: dict[str, ProbeResult | None] = {"f": _windowed_probe()}
+    probes.update({f"f{k}": _windowed_probe() for k in range(5)})
+    gathered = insert_splits(_lower(_shots_by_series(5, 2), probes))
+    by_hand = insert_splits(_lower(_shots_by_hand(5, 2), probes))
+    assert build_ffmpeg_args(emit(gathered), "o.mka") == build_ffmpeg_args(
+        emit(by_hand), "o.mka"
+    )
+    assert list(gathered.input_trims.values()) == [
+        (0.0, 2.0),
+        (2.5, 4.5),
+        (5.0, 7.0),
+        (7.5, 9.5),
+        (10.0, 12.0),
+    ]
+
+
+def test_row_bounded_windows_reaching_one_file_name_both_ways_out() -> None:
+    """Nothing gathers the rows and nothing fans them out, so three windows
+    meet one destination: rejected, with the aggregate and the TO expression
+    both named."""
+    err = _reject_lower(
+        "COPY (SELECT f.audio FROM input('x.mp4') f, generate_series(1, 3) i "
+        "WHERE f.t >= i.i - 1 AND f.t <= i.i) TO 'o.mka'",
+        {"f": _windowed_probe()},
+    )
+    assert err.code is ErrorCode.ROW_COUNT_MISMATCH
+    assert "this query has 3 rows" in err.message
+    assert err.hint is not None
+    assert "array_agg" in err.hint and "TO expression" in err.hint
+
+
+def test_a_cte_column_cannot_carry_a_row_bounded_window() -> None:
+    """A CTE name is a filtergraph pad: there is no `-i` to mint one of per
+    row, so the window has to name the input the streams came from."""
+    err = _reject_lower(
+        "COPY (WITH c AS (SELECT f.audio[1] AS v FROM input('x.mp4') f) "
+        "SELECT c.v FROM c, generate_series(1, 2) i "
+        "WHERE c.t >= i.i - 1 AND c.t <= i.i) TO 'o.mka'",
+        {"f": _windowed_probe()},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "has no input to seek per row" in err.message
+
+
+_MOTION_THUMBNAIL = """
+COPY (
+  WITH shots AS (
+    SELECT ffmpeg.concat(VARIADIC f.video) AS frame
+    FROM input('{src}') f, generate_series(1, {count}) i
+    WHERE f.t >= (f.duration - {length}) * (i.i - 1) / ({count} - 1)
+      AND f.t <= (f.duration - {length}) * (i.i - 1) / ({count} - 1) + {length}
+  ),
+  small AS (SELECT fps(scale(shots.frame, 480, -2), 5) AS frame FROM shots)
+  SELECT paletteuse(small.frame, palettegen(small.frame))
+  FROM small
+) TO 'out.gif'
+"""
+
+
+def _motion_thumbnail_by_hand(src: str, count: int, length: int) -> str:
+    branches = " UNION ALL ".join(
+        f"SELECT v{k} AS frame FROM input('{src}') f{k}, unnest(f{k}.video) v{k} "
+        f"WHERE v{k}.index = 1 "
+        f"AND f{k}.t >= (f{k}.duration - {length}) * {k / (count - 1)} "
+        f"AND f{k}.t <= (f{k}.duration - {length}) * {k / (count - 1)} + {length}"
+        for k in range(count)
+    )
+    return (
+        f"COPY (WITH shots AS ({branches}), "
+        "small AS (SELECT fps(scale(shots.frame, 480, -2), 5) AS frame FROM shots) "
+        "SELECT paletteuse(small.frame, palettegen(small.frame)) FROM small"
+        ") TO 'out.gif'"
+    )
+
+
+@pytest.mark.exec
+def test_the_motion_thumbnail_gather_matches_its_hand_written_form() -> None:
+    """The same identity over the real thing: `concat` has a variable pad count
+    and only a live ffmpeg reports its options, so the shape the registry
+    program is written in is checked here rather than against the snapshot."""
+    src = (FIXTURES_DIR / "av.mp4").as_posix()
+    gathered = compile_sql(_MOTION_THUMBNAIL.format(src=src, count=5, length=1))
+    by_hand = compile_sql(_motion_thumbnail_by_hand(src, 5, 1))
+    assert build_ffmpeg_args(emit(gathered), "out.gif") == build_ffmpeg_args(
+        emit(by_hand), "out.gif"
+    )
+    assert len(gathered.input_paths) == 5
+
+
+# ---------------------------------------------------------------------------
 # open-ended input windows: >= / <=, either operand order, merging
 # ---------------------------------------------------------------------------
 

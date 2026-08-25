@@ -48,13 +48,10 @@ output is plain ffmpeg, so the two mix freely in a script.
   builds its filename from row metadata columns, and a CTE's columns
   are streams - so a `GROUP BY` over a CTE column with more than one
   group has no way to name its files yet. Group inside the CTE's body
-  (where metadata columns exist) instead.
-- **A `VALUES` or `generate_series` row cannot key a fan-out or bound a
-  trim window.** Both reach track and chapter rows only today, so
-  `TO (expression)` and a `WHERE f.t` bound built from `m.start_t` or
-  `i.i` are typed rejections rather than the one-file-per-row split a
-  track row gets. The rows still join, filter, and gather like any
-  other row - only fanning out and windowing on them is closed.
+  (where metadata columns exist) instead. A table-returning function is
+  a CTE by the time lowering sees it, so a `RETURNS TABLE(n number,
+  ...)` column cannot name files either; fan out in the caller's own
+  FROM, over a row source it binds itself.
 - **Filter outputs carry no facts.** Metadata columns describe probed
   input streams only; a filter's output is a stream with no readable
   `channel_layout`, `width`, `codec` and so on, even where ffmpeg
