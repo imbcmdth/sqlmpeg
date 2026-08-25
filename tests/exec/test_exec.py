@@ -2335,6 +2335,27 @@ def test_a_duration_trim_bound_shortens_the_output(tmp_path: Path) -> None:
     assert _ffprobe_duration(out_path) < source_duration
 
 
+def test_concatenated_trims_produce_the_correct_combined_duration(tmp_path: Path) -> None:
+    """Recipe 77: `trim` leaves the source's own timestamps behind, so two
+    trims concatenated without a PTS reset would leave a gap the length of
+    the second clip's own start offset -- silently wrong, no error. The
+    compiler inserts the reset itself; this is the one thing a compile-only
+    check cannot see: the joined file's duration is the SUM of the two
+    windows (1s + 1s), not longer."""
+    _require_fixture(_TESTSRC)
+    out_path = tmp_path / "joined.mp4"
+    source = _sql_path(_TESTSRC)
+    query = (
+        f"SELECT ffmpeg.trim(a.video[1], starti => 0, endi => 1) FROM input('{source}') a "
+        "UNION ALL "
+        f"SELECT ffmpeg.trim(b.video[1], starti => 2, endi => 3) FROM input('{source}') b"
+    )
+
+    _compile_and_run(query, out_path)
+
+    assert _ffprobe_duration(out_path) == pytest.approx(2.0, abs=_DURATION_SLACK)
+
+
 # ---------------------------------------------------------------------------
 # the MCP run tool
 # ---------------------------------------------------------------------------

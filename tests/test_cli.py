@@ -350,6 +350,22 @@ def test_explain_round_trips_graph(capsys: pytest.CaptureFixture[str]) -> None:
     assert graph.to_dict() == data
 
 
+def test_explain_shows_the_inserted_pts_reset_node(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`explain` dumps the compiled IR, so the `setpts` this compiler
+    inserts after an unreset `ffmpeg.trim` call shows up in it, exactly as
+    an inserted `split` node would."""
+    query = "SELECT ffmpeg.trim(a.video[1], starti => 1) FROM input('x.mp4') a"
+    code = cli.main(["explain", query])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert [node["filter"] for node in payload["nodes"]] == ["trim", "setpts"]
+    reset_node = payload["nodes"][1]
+    assert reset_node["args"] == {"expr": "PTS-STARTPTS"}
+    assert reset_node["inputs"] == ["n1"]
+
+
 def test_explain_bad_query(capsys: pytest.CaptureFixture[str]) -> None:
     code = cli.main(["explain", BAD_QUERY])
     captured = capsys.readouterr()

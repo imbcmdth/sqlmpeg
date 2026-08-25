@@ -1780,3 +1780,47 @@ ffmpeg -ss 0 -to 1 -i tests/fixtures/av.mp4 -ss 2 -to 3 -i tests/fixtures/av.mp4
 ```
 
 A row-bounded window needs one of the two: a `TO` expression to give each row a file, or an aggregate to gather the rows into one. Neither, and the query is a multi-row query into a single destination - the compile error names both ways out.
+
+## 76. Trim a filter call to a computed window
+
+`WHERE <alias>.t` isn't the only way to bound a clip - `ffmpeg.trim`/`ffmpeg.atrim`'s own `starti`/`endi`/`durationi` options take a number of seconds too, and that number may be a compile-time expression over `<alias>.duration`, not just a literal: half the file to its own end, without knowing the file's length up front.
+
+```pgsql
+COPY (
+  SELECT ffmpeg.trim(a.video[1], starti => a.duration / 4, endi => a.duration)
+  FROM input('tests/fixtures/testsrc.mp4') a
+) TO 'second_part.mp4'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -filter_complex \
+  '[0:v:0]trim=starti=1.0:endi=4.0,setpts=PTS-STARTPTS[out0]' -map '[out0]' \
+  second_part.mp4
+```
+
+`trim` preserves the source's own timestamps, so the compiler adds `setpts=PTS-STARTPTS` right after it - the query never wrote that filter. See recipe 77 for why that matters.
+
+## 77. Concatenate two windows of the same file
+
+A `trim`/`atrim` call leaves the source's timestamps alone - each clip still carries whatever PTS it had in the original file. Concatenated as-is, the second clip's own offset would show up as a gap. sqlmpeg resets it for you, once per trim, right before whatever consumes it:
+
+```pgsql
+COPY (
+  SELECT ffmpeg.trim(a.video[1], starti => 0, endi => 1)
+  FROM input('tests/fixtures/testsrc.mp4') a
+  UNION ALL
+  SELECT ffmpeg.trim(b.video[1], starti => 2, endi => 3)
+  FROM input('tests/fixtures/testsrc.mp4') b
+) TO 'joined.mp4'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/testsrc.mp4 -filter_complex \
+  '[0:v:0]trim=starti=0:endi=1[n1];[0:v:0]trim=starti=2:endi=3[n2];'\
+'[n1]setpts=PTS-STARTPTS[n1_pts];[n2]setpts=PTS-STARTPTS[n2_pts];'\
+'[n1_pts][n2_pts]concat=n=2:v=1:a=0[out0]' -map '[out0]' joined.mp4
+```
+
+Two `setpts` nodes, `n1_pts` and `n2_pts` - one per trim, neither written by the query - each rebasing its own clip to start at zero before `concat` joins them end to end. Writing your own `setpts`/`asetpts` right after a trim (or calling `sqlmpeg.speed`, which expands to one) takes over timing for that stream, and the compiler leaves it alone rather than stacking a second reset on top.

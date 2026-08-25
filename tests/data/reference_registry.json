@@ -4332,7 +4332,7 @@
       },
       "preroll": {
         "name": "preroll",
-        "type": "str",
+        "type": "duration",
         "doc": "preroll duration in seconds",
         "minimum": null,
         "maximum": null,
@@ -4342,7 +4342,7 @@
       },
       "buffer": {
         "name": "buffer",
-        "type": "str",
+        "type": "duration",
         "doc": "buffer duration in seconds",
         "minimum": null,
         "maximum": null,
@@ -5149,7 +5149,7 @@
       },
       "start_time": {
         "name": "start_time",
-        "type": "str",
+        "type": "duration",
         "doc": "set time to start fading",
         "minimum": null,
         "maximum": null,
@@ -5159,7 +5159,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set fade duration",
         "minimum": null,
         "maximum": null,
@@ -5991,7 +5991,7 @@
       },
       "time": {
         "name": "time",
-        "type": "str",
+        "type": "duration",
         "doc": "set the loop start time",
         "minimum": null,
         "maximum": null,
@@ -6100,7 +6100,7 @@
       },
       "patch": {
         "name": "patch",
-        "type": "str",
+        "type": "duration",
         "doc": "set patch duration",
         "minimum": null,
         "maximum": null,
@@ -6110,7 +6110,7 @@
       },
       "research": {
         "name": "research",
-        "type": "str",
+        "type": "duration",
         "doc": "set research duration",
         "minimum": null,
         "maximum": null,
@@ -6321,7 +6321,7 @@
       },
       "pad_dur": {
         "name": "pad_dur",
-        "type": "str",
+        "type": "duration",
         "doc": "set duration of silence to add",
         "minimum": null,
         "maximum": null,
@@ -6331,7 +6331,7 @@
       },
       "whole_dur": {
         "name": "whole_dur",
-        "type": "str",
+        "type": "duration",
         "doc": "set minimum target duration in the audio stream",
         "minimum": null,
         "maximum": null,
@@ -6665,7 +6665,7 @@
     "arealtime": {
       "limit": {
         "name": "limit",
-        "type": "str",
+        "type": "duration",
         "doc": "sleep time limit",
         "minimum": null,
         "maximum": null,
@@ -7406,7 +7406,7 @@
     "atrim": {
       "starti": {
         "name": "starti",
-        "type": "str",
+        "type": "duration",
         "doc": "Timestamp of the first frame that should be passed",
         "minimum": null,
         "maximum": null,
@@ -7416,7 +7416,7 @@
       },
       "endi": {
         "name": "endi",
-        "type": "str",
+        "type": "duration",
         "doc": "Timestamp of the first frame that should be dropped again",
         "minimum": null,
         "maximum": null,
@@ -7446,7 +7446,7 @@
       },
       "durationi": {
         "name": "durationi",
-        "type": "str",
+        "type": "duration",
         "doc": "Maximum duration of the output",
         "minimum": null,
         "maximum": null,
@@ -10229,7 +10229,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set minimum duration in seconds",
         "minimum": null,
         "maximum": null,
@@ -10261,7 +10261,7 @@
       },
       "start_duration": {
         "name": "start_duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set start duration of non-silence part",
         "minimum": null,
         "maximum": null,
@@ -10281,7 +10281,7 @@
       },
       "start_silence": {
         "name": "start_silence",
-        "type": "str",
+        "type": "duration",
         "doc": "set start duration of silence part to keep",
         "minimum": null,
         "maximum": null,
@@ -10314,7 +10314,7 @@
       },
       "stop_duration": {
         "name": "stop_duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set stop duration of silence part",
         "minimum": null,
         "maximum": null,
@@ -10334,7 +10334,7 @@
       },
       "stop_silence": {
         "name": "stop_silence",
-        "type": "str",
+        "type": "duration",
         "doc": "set stop duration of silence part to keep",
         "minimum": null,
         "maximum": null,
@@ -10374,7 +10374,7 @@
       },
       "window": {
         "name": "window",
-        "type": "str",
+        "type": "duration",
         "doc": "set duration of window for silence detection",
         "minimum": null,
         "maximum": null,
@@ -12055,7 +12055,7 @@
       },
       "queue": {
         "name": "queue",
-        "type": "str",
+        "type": "duration",
         "doc": "Audio queue size",
         "minimum": null,
         "maximum": null,
@@ -12135,7 +12135,7 @@
       },
       "vad_min_speech_duration": {
         "name": "vad_min_speech_duration",
-        "type": "str",
+        "type": "duration",
         "doc": "Minimum speech duration for VAD",
         "minimum": null,
         "maximum": null,
@@ -12145,7 +12145,7 @@
       },
       "vad_min_silence_duration": {
         "name": "vad_min_silence_duration",
-        "type": "str",
+        "type": "duration",
         "doc": "Minimum silence duration for VAD",
         "minimum": null,
         "maximum": null,
@@ -16039,7 +16039,7 @@
       },
       "preroll": {
         "name": "preroll",
-        "type": "str",
+        "type": "duration",
         "doc": "preroll duration in seconds",
         "minimum": null,
         "maximum": null,
@@ -16049,7 +16049,7 @@
       },
       "buffer": {
         "name": "buffer",
-        "type": "str",
+        "type": "duration",
         "doc": "buffer duration in seconds",
         "minimum": null,
         "maximum": null,
@@ -18483,7 +18483,7 @@
       },
       "start_time": {
         "name": "start_time",
-        "type": "str",
+        "type": "duration",
         "doc": "Number of seconds of the beginning of the effect.",
         "minimum": null,
         "maximum": null,
@@ -18493,7 +18493,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "Duration of the effect in seconds.",
         "minimum": null,
         "maximum": null,
@@ -19167,7 +19167,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set minimum duration in seconds",
         "minimum": null,
         "maximum": null,
@@ -20883,7 +20883,7 @@
       },
       "time": {
         "name": "time",
-        "type": "str",
+        "type": "duration",
         "doc": "set the loop start time",
         "minimum": null,
         "maximum": null,
@@ -24528,7 +24528,7 @@
     "realtime": {
       "limit": {
         "name": "limit",
-        "type": "str",
+        "type": "duration",
         "doc": "sleep time limit",
         "minimum": null,
         "maximum": null,
@@ -28604,7 +28604,7 @@
       },
       "start_duration": {
         "name": "start_duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set the duration to delay input",
         "minimum": null,
         "maximum": null,
@@ -28614,7 +28614,7 @@
       },
       "stop_duration": {
         "name": "stop_duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set the duration to pad input",
         "minimum": null,
         "maximum": null,
@@ -28797,7 +28797,7 @@
     "trim": {
       "starti": {
         "name": "starti",
-        "type": "str",
+        "type": "duration",
         "doc": "Timestamp of the first frame that should be passed",
         "minimum": null,
         "maximum": null,
@@ -28807,7 +28807,7 @@
       },
       "endi": {
         "name": "endi",
-        "type": "str",
+        "type": "duration",
         "doc": "Timestamp of the first frame that should be dropped again",
         "minimum": null,
         "maximum": null,
@@ -28837,7 +28837,7 @@
       },
       "durationi": {
         "name": "durationi",
-        "type": "str",
+        "type": "duration",
         "doc": "Maximum duration of the output",
         "minimum": null,
         "maximum": null,
@@ -31003,7 +31003,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set cross fade duration",
         "minimum": null,
         "maximum": null,
@@ -31013,7 +31013,7 @@
       },
       "offset": {
         "name": "offset",
-        "type": "str",
+        "type": "duration",
         "doc": "set cross fade start relative to first input stream",
         "minimum": null,
         "maximum": null,
@@ -31076,7 +31076,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set cross fade duration",
         "minimum": null,
         "maximum": null,
@@ -31086,7 +31086,7 @@
       },
       "offset": {
         "name": "offset",
-        "type": "str",
+        "type": "duration",
         "doc": "set cross fade start relative to first input stream",
         "minimum": null,
         "maximum": null,
@@ -31126,7 +31126,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set cross fade duration",
         "minimum": null,
         "maximum": null,
@@ -31136,7 +31136,7 @@
       },
       "offset": {
         "name": "offset",
-        "type": "str",
+        "type": "duration",
         "doc": "set cross fade start relative to first input stream",
         "minimum": null,
         "maximum": null,
@@ -34154,7 +34154,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set audio duration",
         "minimum": null,
         "maximum": null,
@@ -34473,7 +34473,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set duration",
         "minimum": null,
         "maximum": null,
@@ -34562,7 +34562,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set the audio duration",
         "minimum": null,
         "maximum": null,
@@ -34845,7 +34845,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set the audio duration",
         "minimum": null,
         "maximum": null,
@@ -34877,7 +34877,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -34909,7 +34909,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -35109,7 +35109,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -35161,7 +35161,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -35220,7 +35220,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -35285,7 +35285,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -35842,7 +35842,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -35900,7 +35900,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -36196,7 +36196,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -36260,7 +36260,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -36464,7 +36464,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -36506,7 +36506,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -36644,7 +36644,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -36751,7 +36751,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -36793,7 +36793,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -36835,7 +36835,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -36887,7 +36887,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -36939,7 +36939,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -36981,7 +36981,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set video duration",
         "minimum": null,
         "maximum": null,
@@ -37538,7 +37538,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set cross fade duration",
         "minimum": null,
         "maximum": null,
@@ -37790,7 +37790,7 @@
       },
       "duration": {
         "name": "duration",
-        "type": "str",
+        "type": "duration",
         "doc": "set audio duration",
         "minimum": null,
         "maximum": null,
@@ -37811,5 +37811,5 @@
     }
   },
   "snapshot_of": "ffmpeg version 9.0.1-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers",
-  "generated": "2026-08-21"
+  "generated": "2026-08-24"
 }

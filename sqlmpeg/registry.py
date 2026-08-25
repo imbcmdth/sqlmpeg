@@ -146,7 +146,7 @@ from sqlmpeg.ir import StreamType
 
 _TIMEOUT_SECONDS = 10.0
 
-FilterOptionType = Literal["num", "str", "bool"]
+FilterOptionType = Literal["num", "str", "bool", "duration"]
 
 
 @dataclass(frozen=True)
@@ -277,7 +277,7 @@ _TYPE_MAP: dict[str, FilterOptionType] = {
     "boolean": "bool",
     "string": "str",
     "color": "str",
-    "duration": "str",
+    "duration": "duration",
     "image_size": "str",
     "video_rate": "str",
     "flags": "str",
@@ -462,6 +462,8 @@ def _require_option_type(v: object) -> FilterOptionType:
         return "str"
     if v == "bool":
         return "bool"
+    if v == "duration":
+        return "duration"
     raise ValueError(f"bad option type {v!r}")
 
 

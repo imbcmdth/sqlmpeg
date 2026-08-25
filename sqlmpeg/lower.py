@@ -7936,12 +7936,32 @@ class _Lowerer:
         element came from and REPLACED BY THE LITERAL it computes to, so a
         per-row option and a written one bind through the same
         :meth:`_bind_options` and are validated by the same option table.
+        A bare column bound to a ``duration``-typed option counts too --
+        ``ffmpeg.trim(f, starti => f.duration)`` -- because that option takes
+        a number of seconds and a probed/row scalar IS one; a bare column
+        elsewhere stays untouched, since it may be a stream.
 
         A call with no computed option binds exactly once and hands the same
         dict to every element -- which is every call that existed before
         arithmetic did.
         """
-        if not any(is_value_expr(arg) for arg in self._option_args(call, extras)):
+        order = list(options)
+
+        def positional_target(index: int) -> FilterOption | None:
+            return options[order[index]] if index < len(order) else None
+
+        def countable(arg: exp.Expr, option: FilterOption | None) -> bool:
+            if is_value_expr(arg):
+                return True
+            return option is not None and option.type == "duration" and _is_row_scalar(arg, env)
+
+        extras_countable = [
+            countable(arg, positional_target(i)) for i, arg in enumerate(extras)
+        ]
+        named_countable = [
+            countable(arg.value, options.get(arg.name)) for arg in call.named
+        ]
+        if not any(extras_countable) and not any(named_countable):
             args = self._bind_options(
                 filter_name, call, node, select, env,
                 options=options, extras=extras, timeline=timeline,
@@ -7958,25 +7978,26 @@ class _Lowerer:
                     replace(
                         call,
                         named=[
-                            _NamedArg(arg.name, self._computed_arg(arg.value, env, row, select))
-                            for arg in call.named
+                            _NamedArg(
+                                arg.name,
+                                self._computed_arg(arg.value, env, row, select, evaluate=eval_it),
+                            )
+                            for arg, eval_it in zip(call.named, named_countable, strict=True)
                         ],
                     ),
                     node,
                     select,
                     env,
                     options=options,
-                    extras=[self._computed_arg(arg, env, row, select) for arg in extras],
+                    extras=[
+                        self._computed_arg(arg, env, row, select, evaluate=eval_it)
+                        for arg, eval_it in zip(extras, extras_countable, strict=True)
+                    ],
                     timeline=timeline,
                 )
             return cache[element]
 
         return bound
-
-    @staticmethod
-    def _option_args(call: _Call, extras: list[exp.Expr]) -> list[exp.Expr]:
-        """Every value node this call binds to an option, positional and named."""
-        return [*extras, *(arg.value for arg in call.named)]
 
     def _computed_arg(
         self,
@@ -7984,9 +8005,11 @@ class _Lowerer:
         env: _Env,
         row: _RowTuple,
         select: exp.Select,
+        *,
+        evaluate: bool,
     ) -> exp.Expr:
         """One option argument as `row` makes it; anything else, untouched."""
-        if not is_value_expr(node):
+        if not evaluate:
             return node
         return _literal_node(self._eval_value(node, env, row, select), node)
 
@@ -9094,6 +9117,17 @@ def _row_metadata_column(node: exp.Expr, env: _Env) -> str | None:
         return None
     name = _fold(node.this)
     return None if name == ROW_STREAM else name
+
+
+def _is_row_scalar(node: exp.Expr, env: _Env) -> bool:
+    """True for a bare column that is a compile-time VALUE, never a stream --
+    an input's probed duration/tag, or a row table's metadata field.
+
+    Lets a ``duration``-typed filter option accept ``starti => f.duration``
+    the way it already accepts arithmetic over one (`_option_binder`).
+    """
+    inner = _unwrap(node)
+    return _is_input_value_column(inner, env) or _row_metadata_column(inner, env) is not None
 
 
 def _flatten(columns: list[_Column]) -> list[_Column]:

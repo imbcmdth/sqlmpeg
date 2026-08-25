@@ -1,11 +1,14 @@
 """The compiler pipeline: SQL text in, IR :class:`~sqlmpeg.ir.Graph` out.
 
-``compile_sql`` chains the first three passes plus the split pass::
+``compile_sql`` chains the first three passes plus the PTS-reset and split
+passes::
 
-    parse -> resolve -> probe -> lower -> insert_splits
+    parse -> resolve -> probe -> lower -> insert_pts_resets -> insert_splits
 
 The returned graph is split-complete — every pad has exactly one consumer,
 which is what :func:`sqlmpeg.emit.emit` expects.
+:func:`sqlmpeg.pts.insert_pts_resets` runs first so the split pass sees the
+final topology, including any reset node it added.
 
 Probing happens between resolve and lower: every
 distinct input path is probed exactly once, results re-keyed by ALIAS for
@@ -46,6 +49,7 @@ from .parser import Resolved, parse, resolve
 from .probe import ProbeResult
 from .probe import probe as probe_path
 from .project import PackageSet
+from .pts import insert_pts_resets
 from .split import insert_splits
 from .table import TableSink
 from .warnings import OnWarning
@@ -112,7 +116,7 @@ def compile_commands(
         res = resolve(parse(text, unset), packages=packages, on_warning=on_warning, owner=owner)
         probes = _probe_inputs(res)
         graphs = lower_commands(res, probes, registry=registry_module.load(), on_warning=on_warning)
-        return [insert_splits(graph) for graph in graphs]
+        return [insert_splits(insert_pts_resets(graph)) for graph in graphs]
     except SqlmpegError:
         raise
     except RecursionError as err:

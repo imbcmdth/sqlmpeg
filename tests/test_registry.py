@@ -698,8 +698,8 @@ def test_xfade_enum_constants_and_name_valued_default(monkeypatch: pytest.Monkey
     assert transition.constants[-1] == "revealdown"
     assert "fade" in transition.constants
 
-    assert opts["duration"].type == "str"  # <duration>
-    assert opts["offset"].type == "str"
+    assert opts["duration"].type == "duration"  # <duration>
+    assert opts["offset"].type == "duration"  # <duration>
     assert opts["expr"].type == "str"  # <string>
 
 
@@ -1105,7 +1105,7 @@ def test_binary_and_dictionary_types_marked_unusable(monkeypatch: pytest.MonkeyP
         ("boolean", "bool"),
         ("string", "str"),
         ("color", "str"),
-        ("duration", "str"),
+        ("duration", "duration"),
         ("image_size", "str"),
         ("video_rate", "str"),
         ("flags", "str"),
