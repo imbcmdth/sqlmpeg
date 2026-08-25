@@ -568,7 +568,7 @@ def test_the_wrong_argument_count_names_the_qualified_signature(tmp_path: Path) 
         "COPY (SELECT me.edits.quieter(f.audio[1]) FROM input('film.mkv') f) TO 'out.mkv'",
         _packages(tmp_path),
         ErrorCode.UDF_ARG_TYPE,
-        "me.edits.quieter() got 1 argument, but it declares 2",
+        "me.edits.quieter() got 1 argument, but its parameter 'factor' has no DEFAULT",
     )
     assert error.hint == "me.edits.quieter(track audio_stream, factor number) RETURNS audio_stream"
 
@@ -2048,8 +2048,8 @@ def test_list_as_json_carries_the_signatures_and_the_variables(
         {
             "name": "quieter",
             "params": [
-                {"name": "track", "type": "audio_stream"},
-                {"name": "factor", "type": "number"},
+                {"name": "track", "type": "audio_stream", "default": None},
+                {"name": "factor", "type": "number", "default": None},
             ],
             "returns": "audio_stream",
             "file": "src/tracks.sql",

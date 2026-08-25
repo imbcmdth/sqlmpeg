@@ -13,7 +13,7 @@ A query is ONE statement, or a script:
 ```
 query   := select | copy
 script  := (function ;)* (CREATE VIEW name AS select ;)* (copy ;)* copy?
-function := CREATE FUNCTION name(param type, ...) RETURNS rtype
+function := CREATE FUNCTION name(param type [DEFAULT literal], ...) RETURNS rtype
             AS $$ select $$ LANGUAGE sql
 rtype   := text | number | boolean | <kind>_stream | chapter | cue
          | attachment | any of those with [] | TABLE(col type, ...)
@@ -35,8 +35,11 @@ dest    := 'path' | STDOUT | ( value-expression )
   it is the query you could have typed by hand. It must be defined
   before it is used and before the first `COPY`, every definition must
   be called, and a value-returning one is legal anywhere a value of its
-  type is while a `TABLE`-returning one is a `FROM` row source only.
-  Recipes [67-68](examples.md#67-write-a-function-and-reuse-it).
+  type is while a `TABLE`-returning one is a `FROM` row source only. A
+  parameter may declare `DEFAULT literal`; calls are positional, so an
+  omitted trailing argument takes it. Recipes
+  [67-68](examples.md#67-write-a-function-and-reuse-it),
+  [79](examples.md#79-give-a-parameter-a-default).
 - Trailing `;` allowed; `--` and `/* */` comments allowed. Unquoted
   identifiers fold to lowercase. View, CTE, and alias names share one
   flat namespace across the whole script.
@@ -502,6 +505,16 @@ metadata):
 
 Everything else falls through to ffmpeg's own error at run time.
 
+**A function parameter's `DEFAULT` reads NULL as absence too — a
+deviation from Postgres.** In Postgres, NULL is a value and only an
+omitted argument triggers a `DEFAULT`; here, an explicit NULL argument to
+a defaulted parameter takes the `DEFAULT` the same way omitting it does,
+because NULL is absence everywhere else in the dialect and calls are
+otherwise positional, so a caller who always writes the argument (an
+unset variable, say) has no other way to omit it. A parameter with no
+`DEFAULT` still takes a written NULL unchanged — that stays the way to
+mean NULL itself.
+
 One place absence is not "leave alone": writing a tag column with NULL
 clears the tag, so `:'title' AS title` unset clears the title. A
 program that means "keep unless told otherwise" writes
@@ -551,7 +564,9 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   count is variable on the OUTPUT side too).
 - **Functions**: `OR REPLACE`, `IF NOT EXISTS`, a schema-qualified
   name, any property but `RETURNS`/`LANGUAGE`, a language other than
-  `sql`, parameter defaults or `OUT`/`VARIADIC`, overloading, recursion,
+  `sql`, `OUT`/`INOUT`/`VARIADIC`/`COLLATE` on a parameter, `DEFAULT
+  NULL` (an unwritten argument already means NULL), a parameter without
+  a `DEFAULT` written after one that has one, overloading, recursion,
   a body with its own `WITH` or `GROUP BY`/`ORDER BY`/`LIMIT`, a body
   referencing anything but its parameters and its own `FROM` aliases, a
   definition in the query's own text that nothing calls, and a

@@ -1848,4 +1848,27 @@ ffmpeg -ss 0 -to 1 -i tests/fixtures/av.mp4 -ss 1 -to 2 -i tests/fixtures/av.mp4
   '[0:v:0][1:v:0][2:v:0][3:v:0]xstack=grid=2x2:inputs=4[out0]' -map '[out0]' grid.mp4
 ```
 
+## 79. Give a parameter a default
+
+A signature parameter may declare `DEFAULT <literal>`: a trailing argument left out of the call takes it, same as Postgres. One deviation from Postgres - NULL takes the default too, not the literal NULL, because NULL is absence everywhere else in the dialect (an unset variable substitutes to it) and a caller writing `label(:'prefix')` needs an unset `:prefix` to mean "not given" here as well:
+
+```sql
+CREATE FUNCTION label(prefix text DEFAULT 'clip') RETURNS text AS $$
+  SELECT prefix
+$$ LANGUAGE sql;
+
+COPY (
+  SELECT f.video[1], f.audio[1], label() AS title
+  FROM input(:'source') f
+) TO :'dest'
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mp4 -v dest=out.mp4
+ffmpeg -i film.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata title=clip \
+  out.mp4
+```
+
+A parameter with no `DEFAULT` still passes NULL through unchanged - that stays the way to write NULL itself, since a parameter that always defaults it away can never receive it.
+
 `inputs` is written for you, same as `hstack`/`vstack`/`amix` - it is `xstack`'s own first option, so a positional argument right after the streams binds to it, not to `grid`; `grid` needs `=>` to reach past it.

@@ -1098,7 +1098,12 @@ def _listing_json(listed: list[_Listed]) -> str:
                 {
                     "name": signature.name,
                     "params": [
-                        {"name": param.name, "type": param.type} for param in signature.params
+                        {
+                            "name": param.name,
+                            "type": param.type,
+                            "default": param.written_default,
+                        }
+                        for param in signature.params
                     ],
                     "returns": signature.returns,
                     "file": _relative(signature.export, entry.package.root),

@@ -200,10 +200,21 @@ _EXPANSION_BUDGET = 200
 
 @dataclass(frozen=True)
 class Parameter:
-    """One position of a signature: a name and a declared type."""
+    """One position of a signature: a name, a declared type, and an optional default.
+
+    `default` is the literal a ``DEFAULT`` constraint declared, or None with
+    no such constraint -- only a parameter carries one; a ``RETURNS TABLE``
+    column never does.
+    """
 
     name: str
     type: str
+    default: exp.Expr | None = None
+
+    @property
+    def written_default(self) -> str | None:
+        """The DEFAULT literal as written, or None with no default."""
+        return None if self.default is None else _written(self.default)
 
 
 @dataclass
@@ -263,7 +274,7 @@ class _Function:
 
     @property
     def signature(self) -> str:
-        written = ", ".join(f"{p.name} {p.type}" for p in self.params)
+        written = ", ".join(_written_param(p) for p in self.params)
         return f"{self.qualified}({written}) RETURNS {self.returns}"
 
 
@@ -330,6 +341,13 @@ def _written(node: exp.Expr | None) -> str:
         return node.sql(dialect="postgres")
     except Exception:  # a node sqlglot cannot render is still a rejection
         return node.__class__.__name__.upper()
+
+
+def _written_param(param: Parameter) -> str:
+    """One signature position as written: ``name type``, or with its DEFAULT."""
+    if param.written_default is None:
+        return f"{param.name} {param.type}"
+    return f"{param.name} {param.type} DEFAULT {param.written_default}"
 
 
 def _listed(columns: tuple[Parameter, ...] | None) -> str:
@@ -568,13 +586,16 @@ class _Declared:
     shape: str
     plain: str
     once: str
+    allow_default: bool = False
 
 
 _PARAMETER = _Declared(
     noun="parameter",
     shape=_FUNCTION_HINT,
-    plain="a parameter is a name and a type: no defaults, no OUT, no VARIADIC",
+    plain="a parameter is a name, a type, and an optional DEFAULT: no OUT, "
+    "no INOUT, no VARIADIC, no COLLATE",
     once="one name, one position",
+    allow_default=True,
 )
 _TABLE_COLUMN = _Declared(
     noun="RETURNS TABLE column",
@@ -584,11 +605,45 @@ _TABLE_COLUMN = _Declared(
 )
 
 
+def _default_constraint(node: exp.ColumnDef) -> exp.Expr | None:
+    """The literal a lone ``DEFAULT`` constraint declares, or None with none such."""
+    constraints = node.args.get("constraints") or []
+    if len(constraints) != 1:
+        return None
+    only = constraints[0]
+    inner = only.args.get("kind") if isinstance(only, exp.ColumnConstraint) else None
+    return inner.this if isinstance(inner, exp.DefaultColumnConstraint) else None
+
+
+def _checked_default(
+    default: exp.Expr, declared_type: str, name: str, written: str, anchor: exp.Expr
+) -> exp.Expr:
+    """The DEFAULT literal, rejected if it is NULL or does not match the parameter's type."""
+    if isinstance(default, exp.Null):
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{name}' declares the parameter '{written}' with DEFAULT NULL",
+            anchor,
+            hint="omitting the argument already gives NULL; drop the DEFAULT",
+        )
+    kind = _argument_kind(default)
+    if kind is None or kind != _declared_kind(declared_type):
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"function '{name}' declares the parameter '{written}' with a "
+            f"DEFAULT that is not {declared_type}",
+            anchor,
+            hint="a DEFAULT is a literal of the parameter's own type",
+        )
+    return default
+
+
 def _column_defs(
     nodes: Sequence[exp.Expr], name: str, anchor: exp.Expr, create: exp.Create, kind: _Declared
 ) -> tuple[Parameter, ...]:
     """One ``<name> <type>`` list -- a signature's, or a ``RETURNS TABLE``'s."""
     declared: list[Parameter] = []
+    seen_default = False
     for node in nodes:
         if not isinstance(node, exp.ColumnDef) or not isinstance(node.this, exp.Identifier):
             raise _error(
@@ -599,9 +654,11 @@ def _column_defs(
                 hint=kind.shape,
             )
         written = _ident_name(node.this)
-        # DEFAULT, OUT/INOUT, VARIADIC and COLLATE all land here.
+        # OUT/INOUT, VARIADIC and COLLATE all land here; DEFAULT lands here too
+        # unless `kind` allows it.
         constraints = node.args.get("constraints")
-        if constraints:
+        default = _default_constraint(node) if kind.allow_default else None
+        if constraints and default is None:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 f"function '{name}' writes the {kind.noun} '{written}' with "
@@ -618,7 +675,20 @@ def _column_defs(
                 fallback=create,
                 hint=kind.once,
             )
-        declared.append(Parameter(written, _checked_type(node.args.get("kind"), name, anchor)))
+        declared_type = _checked_type(node.args.get("kind"), name, anchor)
+        if default is not None:
+            default = _checked_default(default, declared_type, name, written, anchor)
+            seen_default = True
+        elif seen_default:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"function '{name}' declares the {kind.noun} '{written}' with no "
+                "DEFAULT after one that has one",
+                anchor,
+                fallback=create,
+                hint="every parameter after the first DEFAULT must have one too",
+            )
+        declared.append(Parameter(written, declared_type, default))
     return tuple(declared)
 
 
@@ -850,7 +920,7 @@ class Signature:
     @property
     def written(self) -> str:
         """The call form with its parameters: ``fn(track audio_stream)``."""
-        return f"{self.name}({', '.join(f'{p.name} {p.type}' for p in self.params)})"
+        return f"{self.name}({', '.join(_written_param(p) for p in self.params)})"
 
 
 def package_signatures(package: Package) -> tuple[Signature, ...]:
@@ -1139,6 +1209,13 @@ def _argument_kind(node: exp.Expr) -> str | None:
 def _declared_kind(declared: str) -> str:
     """What an argument of the declared type has to look like."""
     return "stream" if TYPES[element_type(declared)].kind != "scalar" else declared
+
+
+def _is_null(node: exp.Expr) -> bool:
+    """True for a written NULL, through any wrapping parens."""
+    if isinstance(node, exp.Paren) and isinstance(node.this, exp.Expr):
+        return _is_null(node.this)
+    return isinstance(node, exp.Null)
 
 
 # -- the pass --------------------------------------------------------------
@@ -1654,6 +1731,25 @@ class _Expander:
         self._check_arguments(function, call, arguments)
         return arguments
 
+    def _bound(self, function: _Function, arguments: list[exp.Expr]) -> list[exp.Expr]:
+        """`arguments`, in signature order, with a default filled in for each
+        parameter the caller left NULL or unwritten.
+
+        NULL is absence throughout the dialect -- an unset variable
+        substitutes to it -- so a NULL argument to a defaulted parameter
+        takes the default the same way omitting it does; a caller who means
+        NULL itself has no defaulted parameter to pass it to.
+        """
+        bound = list(arguments)
+        for index, param in enumerate(function.params):
+            if index < len(bound):
+                if param.default is not None and _is_null(bound[index]):
+                    bound[index] = copy.deepcopy(param.default)
+                continue
+            assert param.default is not None  # _check_arguments already enforced this
+            bound.append(copy.deepcopy(param.default))
+        return bound
+
     def _instance(
         self, site: _CallSite, arguments: list[exp.Expr]
     ) -> tuple[exp.Select, int]:
@@ -1665,7 +1761,8 @@ class _Expander:
         self.expansions.append(_Expansion(function.qualified, line, col))
         _rename(body, self._fresh_aliases(function, index))
         self._stamp(body, index)
-        _substitute(body, {p.name: a for p, a in zip(function.params, arguments)})
+        bound = self._bound(function, arguments)
+        _substitute(body, {p.name: a for p, a in zip(function.params, bound)})
         return body, index
 
     def _expand_call(
@@ -1765,13 +1862,29 @@ class _Expander:
     def _check_arguments(
         self, function: _Function, call: exp.Anonymous, arguments: list[exp.Expr]
     ) -> None:
-        """Arity and what each argument's shape says, against the signature."""
-        if len(arguments) != len(function.params):
-            plural = "" if len(arguments) == 1 else "s"
+        """Arity and what each argument's shape says, against the signature.
+
+        Fewer arguments than parameters is legal exactly when every parameter
+        left unwritten has a DEFAULT -- omission is trailing-only, so a call
+        can never leave a gap earlier than its shortest written prefix.
+        """
+        plural = "" if len(arguments) == 1 else "s"
+        if len(arguments) > len(function.params):
             raise _error(
                 ErrorCode.UDF_ARG_TYPE,
                 f"{function.qualified}() got {len(arguments)} argument{plural}, but it "
                 f"declares {len(function.params)}",
+                call,
+                hint=function.signature,
+            )
+        unfilled = next(
+            (p for p in function.params[len(arguments) :] if p.default is None), None
+        )
+        if unfilled is not None:
+            raise _error(
+                ErrorCode.UDF_ARG_TYPE,
+                f"{function.qualified}() got {len(arguments)} argument{plural}, but its "
+                f"parameter '{unfilled.name}' has no DEFAULT",
                 call,
                 hint=function.signature,
             )

@@ -428,7 +428,7 @@ def test_a_parameter_needs_a_name() -> None:
 
 @pytest.mark.parametrize(
     "written",
-    ["a text DEFAULT 'x'", "OUT a text", "VARIADIC a text[]", "a text COLLATE c"],
+    ["OUT a text", "INOUT a text", "VARIADIC a text[]", "a text COLLATE c"],
 )
 def test_a_parameter_is_a_name_and_a_type(written: str) -> None:
     sql = (
@@ -446,6 +446,79 @@ def test_a_parameter_name_is_declared_once() -> None:
         "SELECT m('x', 'y') AS m"
     )
     _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "'a' twice")
+
+
+# ---------------------------------------------------------------------------
+# DEFAULT parameters
+# ---------------------------------------------------------------------------
+
+
+GREET = (
+    "CREATE FUNCTION greet(name text, punctuation text DEFAULT '!') RETURNS text AS $$\n"
+    "  SELECT name || punctuation\n"
+    "$$ LANGUAGE sql;\n"
+)
+
+
+def test_an_omitted_trailing_argument_takes_the_default() -> None:
+    sql = GREET + "SELECT greet('hi') AS g FROM input('a.mka') f"
+    assert _rows(sql) == [["hi!"]]
+
+
+def test_a_null_argument_to_a_defaulted_parameter_takes_the_default() -> None:
+    """The one deviation from Postgres: NULL is absence throughout the dialect
+    -- an unset variable substitutes to it -- so it falls through to the
+    DEFAULT the same way omitting the argument does."""
+    sql = GREET + "SELECT greet('hi', NULL) AS g FROM input('a.mka') f"
+    assert _rows(sql) == [["hi!"]]
+
+
+def test_null_to_a_parameter_with_no_default_still_passes_through() -> None:
+    """Only a DEFAULT changes what NULL means; without one it drops as ever."""
+    sql = QUIETER + (
+        "COPY (SELECT f.video[1], quieter(f.audio[1], NULL) FROM input('film.mkv') f) "
+        "TO 'out.mkv'"
+    )
+    assert "[0:a:0]volume[out1]" in " ".join(_argv(sql))
+
+
+def test_too_few_arguments_names_the_parameter_with_no_default() -> None:
+    sql = QUIETER + "COPY (SELECT quieter(f.audio[1]) FROM input('a.mka') f) TO 'o.mka'"
+    error = _rejects(sql, ErrorCode.UDF_ARG_TYPE, "parameter 'factor' has no DEFAULT")
+    assert error.hint is not None and "quieter(track audio_stream, factor number)" in error.hint
+
+
+def test_a_default_on_a_non_trailing_parameter_works_once_every_later_one_has_one() -> None:
+    sql = (
+        "CREATE FUNCTION labeled(a text, b text DEFAULT 'y', c text DEFAULT 'z') "
+        "RETURNS text AS $$\n"
+        "  SELECT a || b || c\n"
+        "$$ LANGUAGE sql;\n"
+        "SELECT labeled('x') AS g FROM input('a.mka') f"
+    )
+    assert _rows(sql) == [["xyz"]]
+
+
+def test_a_parameter_without_a_default_after_one_with_one_is_rejected() -> None:
+    sql = (
+        "CREATE FUNCTION bad(a text DEFAULT 'x', b text) RETURNS text AS $$\n"
+        "  SELECT a || b\n"
+        "$$ LANGUAGE sql;\n"
+        "SELECT bad('p', 'q') AS g FROM input('a.mka') f"
+    )
+    _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "no DEFAULT after one that has one")
+
+
+def test_default_null_is_rejected() -> None:
+    """NULL already means omit; a literal DEFAULT NULL would only restate that."""
+    sql = (
+        "CREATE FUNCTION m(a text DEFAULT NULL) RETURNS text AS $$\n"
+        "  SELECT a\n"
+        "$$ LANGUAGE sql;\n"
+        "SELECT m() AS m FROM input('a.mka') f"
+    )
+    error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "DEFAULT NULL")
+    assert error.hint is not None and "drop the DEFAULT" in error.hint
 
 
 # ---------------------------------------------------------------------------

@@ -408,15 +408,27 @@ _DIALECT_TAIL = """\
   wrote, and a column written with two types is rejected.
 
 ### Functions
-- `CREATE FUNCTION <name>(<param> <type>, ...) RETURNS <type> AS $$ <one
-  SELECT> $$ LANGUAGE sql;` defines a reusable expression, expanded at
-  compile time -- it is the query you could have typed by hand. Define it
-  before it is used and before the first `COPY`; every definition must be
-  called (an uncalled one is a rejection).
+- `CREATE FUNCTION <name>(<param> <type> [DEFAULT <literal>], ...) RETURNS
+  <type> AS $$ <one SELECT> $$ LANGUAGE sql;` defines a reusable
+  expression, expanded at compile time -- it is the query you could have
+  typed by hand. Define it before it is used and before the first `COPY`;
+  every definition must be called (an uncalled one is a rejection).
 - Parameter and `RETURNS` types are the dialect's own: `text`, `number`,
   `boolean`, `video_stream`/`audio_stream`/`subtitle_stream`/`data_stream`,
   `chapter`, `cue`, `attachment`, any of those with `[]`, or
   `TABLE(<col> <type>, ...)`.
+- A parameter may declare `DEFAULT <literal>` -- a number, string, or
+  boolean matching its own type; `DEFAULT NULL` is a rejection, since
+  omitting the argument already means NULL. Every parameter written after
+  the first one with a DEFAULT must have one too. Calls are positional, so
+  omitting a trailing argument takes its DEFAULT; a call short of a
+  parameter with none is the arity rejection, naming it. **Deviation from
+  Postgres**: an explicit NULL argument to a defaulted parameter takes the
+  DEFAULT too, not the literal NULL -- NULL is absence everywhere else in
+  the dialect (an unset variable substitutes to it), so a wrapper that
+  always writes `:width` needs NULL to mean "not given" here as well. A
+  parameter with no DEFAULT still takes NULL as written, unchanged -- that
+  is the escape when a caller means NULL itself.
 - A VALUE-returning function is legal anywhere a value of its type is: a
   SELECT column, `WHERE`, a tag column, a fan-out `TO`. A
   `<kind>_stream[]` return splats like a bare array column.
@@ -426,8 +438,9 @@ _DIALECT_TAIL = """\
   one-row rule all apply. Calling one in the SELECT list is a rejection.
 - The body is ONE `SELECT` with no `WITH`, no `GROUP BY`/`ORDER BY`/
   `LIMIT`, referencing only its parameters and its own `FROM` aliases. No
-  `OR REPLACE`, no `IF NOT EXISTS`, no schema-qualified name, no
-  overloading, no recursion, no language but `sql`.
+  `OR REPLACE`, no `IF NOT EXISTS`, no schema-qualified name, no `OUT`/
+  `INOUT`/`VARIADIC`/`COLLATE` on a parameter, no overloading, no
+  recursion, no language but `sql`.
 
 ### Cues
 - `cues` is a second record array of the input alias, the cues of a WebVTT
