@@ -45,14 +45,33 @@ One repo so the compiler and the host evolve against one test suite
 it. wasm0r's repo keeps the module SDK and the frei0r host; what
 moves here is the pipe host — the thing the compiler spawns.
 
-## Build tool: maturin
+## Build tool: maturin — challenged and kept
 
-`maturin` with `bindings = "bin"` builds a wheel whose payload is a
-compiled executable on the user's PATH-equivalent (the wheel's
-scripts directory) — no PyO3, no extension module, no Python code in
-the sidecar package at all. It is the established tool for exactly
-this shape, and `maturin-action` on GitHub Actions handles the
-platform matrix including manylinux containers.
+The maintainer's challenge (2026-08-25): this is not a Python
+extension, just a native binary — is maturin necessary, and is a bare
+binary on PyPI even allowed?
+
+**Allowed, and mainstream.** `uv` — the tool this project runs every
+command through — is a pure Rust binary shipped as PyPI wheels with no
+Python code in the package. So is `ruff`. Both use maturin's
+`bindings = "bin"` mode, which exists precisely for this shape: no
+PyO3, no extension module, a compiled executable in the wheel's
+scripts directory.
+
+**Not necessary, but earning its keep.** The alternative is a
+hatchling/setuptools custom build hook running cargo — and then this
+repo owns the genuinely fiddly parts maturin does for free:
+
+- honest platform tags, including the manylinux compliance audit
+  (glibc symbol versions, linked libraries) — a hand-rolled hook can
+  ship a wheel pip installs on systems where the binary then fails;
+- scripts-directory placement, which is exactly where the
+  `binaries.py` discovery chain looks;
+- the CI matrix, via `maturin-action`'s manylinux containers and
+  cross-compilation.
+
+maturin is kept for the audit-and-tags work, not for any Python
+machinery.
 
 Target matrix, in order of user population:
 
