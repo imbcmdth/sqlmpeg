@@ -25,11 +25,15 @@ a client shows when it asks.
 
 from __future__ import annotations
 
+import functools
+from collections.abc import Callable
 from typing import Any
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from .. import __version__
+from ..errors import SqlmpegError
 from ..execute import DEFAULT_TIMEOUT
 from . import tools
 
@@ -226,6 +230,25 @@ def run(
     return tools.run_query(query, vars, timeout, overwrite, project)
 
 
+def _surfaced(tool: Callable[..., Any]) -> Callable[..., Any]:
+    """The typed message crosses the SDK boundary.
+
+    The SDK masks an arbitrary exception's text in the client-visible error
+    ("Error executing tool ..."); a rejection's line-anchored message IS this
+    server's contract -- the repair loop reads it -- so it is re-raised as the
+    SDK's own ToolError, whose text survives.
+    """
+
+    @functools.wraps(tool)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return tool(*args, **kwargs)
+        except SqlmpegError as err:
+            raise ToolError(str(err)) from err
+
+    return wrapped
+
+
 def build_server(*, allow_unsafe: bool = False) -> MCPServer[Any]:
     """The configured server; `allow_unsafe` adds the tools that write: ``run`` and ``install``."""
     # log_level configures the root logger, and at INFO sqlglot narrates every
@@ -233,15 +256,11 @@ def build_server(*, allow_unsafe: bool = False) -> MCPServer[Any]:
     server: MCPServer[Any] = MCPServer(
         "sqlmpeg", version=__version__, instructions=_INSTRUCTIONS, log_level="WARNING"
     )
-    server.add_tool(compile)
-    server.add_tool(validate)
-    server.add_tool(explain)
-    server.add_tool(inspect)
-    server.add_tool(filters)
-    server.add_tool(search)
+    for tool in (compile, validate, explain, inspect, filters, search):
+        server.add_tool(_surfaced(tool))
     if allow_unsafe:
-        server.add_tool(run)
-        server.add_tool(install)
+        server.add_tool(_surfaced(run))
+        server.add_tool(_surfaced(install))
 
     @server.resource(
         DIALECT_URI,
