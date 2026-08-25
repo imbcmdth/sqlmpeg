@@ -170,14 +170,16 @@ tail. `(i - 0.5) / count` centres each frame in its own slice and never
 touches either end. That difference is why these are two functions and
 not one with a flag.
 
-*Learned 2026-08-24, from the seek-rows wave: packaging this as a
-function does not work yet. A `RETURNS TABLE` call becomes a generated
-CTE, and a row-bounded window cannot seek through a CTE — there is no
-input at that level to seek per row — so the fan-out spelling AND the
-gathered spelling are both blocked behind the documented CTE gap. The
-PATTERN works inline (the cookbook's gather recipe proves it); `frames`
-the function waits on CTEs carrying compile-time value columns, which
-is its own feature. `grid` over inline rows is unaffected.*
+*Verified 2026-08-25, after the full wave batch landed: the gathered
+spelling WORKS through a table function, end to end — `frames(path,
+count, track)` returning stream rows, consumed by `grid(array_agg(...),
+'2x2')`, compiles to four midpoint seeks feeding one `xstack` and the
+output plays. One rule: the function's rows may carry only STREAM
+columns. A `number` column beside the stream still lowers as a metadata
+tag ("tag 'n' takes two different values on the same track"), so the
+fan-out spelling — `TO (:'prefix' || s.n || '.png')`, which needs that
+column — still waits on CTEs carrying compile-time value columns.
+Declare `count` with `DEFAULT` now that signatures have them.*
 
 **`grid(streams, shape)`** — the piece that shows what composition is
 for:
