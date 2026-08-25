@@ -11,6 +11,12 @@ proper (wasm0r's repo) and of the `LANGUAGE wasm` surface (plan 106):
 it is about giving the compiler the ability to produce DAGs that live
 both inside ffmpeg (filtergraphs) and outside it (processes and pipes).
 
+The project is cross-platform, and the platforms genuinely differ
+here. Most use will be POSIX — Linux, macOS, and WSL on Windows —
+with native Windows (PowerShell) the remaining column. Transport is
+therefore a per-platform decision behind one interface, and every
+finding below is tagged with the platform it was measured on.
+
 ## The design in one paragraph
 
 Lowering does not change. It keeps producing one logical graph; a node
@@ -69,15 +75,22 @@ compile time. Predictable cost over runtime buffering, the same trade
 trims-are-seeks already makes. Fan-in at an ffmpeg node stays allowed:
 ffmpeg schedules its own inputs.
 
+The mirror rule was measured, not assumed (see the findings): **every
+producer in a stage starts concurrently.** Feeding a fan-in
+sequentially deadlocked exactly as pipe-buffer arithmetic predicts —
+the consumer blocks opening its second input while the first producer
+blocks on a full buffer the consumer is not draining.
+
 ## Execution: groups that live and die together
 
 `execute.py` grows one concept: a **stage** is the set of processes
-wired by stream edges, started together and watched together. If any
-member exits nonzero, the group is torn down and the failure names the
-member and carries its stderr — diagnosability is the requirement,
-since "the pipeline died" is useless across four processes. Stages
-connected by file edges run in sequence, exactly as command lists do
-today. Per-stage timeout, same knob as today's per-command one.
+wired by stream edges, started together — all of them, concurrently,
+per the rule above — and watched together. If any member exits
+nonzero, the group is torn down and the failure names the member and
+carries its stderr — diagnosability is the requirement, since "the
+pipeline died" is useless across four processes. Stages connected by
+file edges run in sequence, exactly as command lists do today.
+Per-stage timeout, same knob as today's per-command one.
 
 ## What `compile` prints
 
@@ -92,25 +105,52 @@ described, honestly marked as run-only, and `run` is the supported
 path. This mirrors the existing posture: the printed command is a
 courtesy, execution is the contract.
 
-## The one open question: fan-in transport on Windows
+## Transport: findings first, decision after
 
-stdin gives each process exactly one anonymous pipe. A mux ffmpeg
-needing two piped inputs needs a second channel, and the options are
-genuinely platform-ugly:
+### Findings, 2026-08-24, native Windows (ffmpeg 9.0.1, Python 3.14)
 
-- extra-fd inheritance (`pipe:3`) — fragile on Windows through the C
-  runtime; may be fine, may not.
-- named pipes — ffmpeg has no native Windows named-pipe protocol
-  handler.
-- TCP loopback — `tcp://127.0.0.1:PORT?listen` is a real ffmpeg
-  protocol on every platform, at the cost of a port rendezvous the
-  runner must manage.
+Measured with real ffmpeg on both ends; the middle process where used
+was ffmpeg itself (`-f rawvideo -i pipe:0 -vf negate -f rawvideo
+pipe:1`), so nothing here depends on wasm existing.
 
-**Wave 1 is empirics, nothing else**: prove each candidate on this
-machine with plain ffmpeg-to-ffmpeg pipes, measure the fuss, pick one
-for fan-in and keep plain stdio for the linear case. No IR work starts
-until the transport answer exists, because the edge representation
-depends on whether an edge is a pipe or a rendezvous.
+| candidate | verdict |
+| --- | --- |
+| stdio anonymous pipes, linear chain | **works**, frame-exact, two- and three-stage |
+| extra inherited fds (`pipe:3`) | **dead** — the fd never reaches the native CRT; Python's `pass_fds` is POSIX-only regardless |
+| named pipes as input paths (`\\.\pipe\...`) | **works**, including two-way fan-in; created via ~40 lines of ctypes, no dependencies |
+| TCP loopback (`tcp://127.0.0.1:PORT?listen`) | **works**, including two-way fan-in, sub-second end to end |
+
+Three behaviors that shape the runner, whatever the transport:
+
+- **ffmpeg opens its inputs sequentially.** The second `?listen` port
+  is not listening until the first input has connected. A producer
+  therefore cannot know when its consumer is ready; producers must
+  either retry (TCP) or block politely on open (named pipes do this by
+  nature). This is the strongest argument for pipes over TCP: the
+  rendezvous problem disappears instead of being managed.
+- **Sequential feeding deadlocks.** Confirmed live, not theorized.
+- **Raw demuxers log a benign error at pipe-close EOF** ("Error during
+  demuxing: Invalid argument") while exiting 0 with every frame
+  delivered. The runner must judge members by exit code, never by
+  stderr content.
+
+### Pending: the POSIX column
+
+Linux/macOS/WSL: `mkfifo` + ffmpeg reading the FIFO path is the
+expected twin of the named-pipe result, and `pass_fds` reopens the
+extra-fd option there. Verify before wave 2 fixes the edge
+representation; WSL on the development machine is the nearest POSIX at
+hand (its VM refused to boot during the first attempt — retry, else
+CI's Linux runner does it).
+
+### The decision this points at
+
+stdio for linear chains everywhere. Named pipes for fan-in — `mkfifo`
+on POSIX, `CreateNamedPipe` via ctypes on native Windows — one
+interface, two creation calls, no ports, no retries, and ffmpeg sees
+an ordinary path on every platform. TCP stays a proven fallback if a
+platform's pipes hit a wall. Final confirmation waits on the POSIX
+column.
 
 ## Rows, and the line that keeps the language honest
 
@@ -126,11 +166,8 @@ into a second pass; they are not a relation the same compile can scan.
 ## Testable with zero wasm
 
 The chassis needs no sidecar to prove itself. ffmpeg plays the middle
-process perfectly well:
-
-    ffmpeg -f rawvideo -s ... -i pipe:0 -vf negate -f rawvideo pipe:1
-
-so the partition, the plumbing, the group supervision, and the
+process perfectly well (the findings above were produced exactly this
+way), so the partition, the plumbing, the group supervision, and the
 fail-together teardown all get exec-tier tests with ffmpeg-only nodes
 — including the deliberate-failure case (a middle process that exits
 nonzero mid-stream) proving the teardown and the named-member report.
@@ -139,14 +176,15 @@ module model and this machinery at the same time.
 
 ## Waves
 
-1. **Transport empirics.** The three fan-in candidates, on Windows,
-   with plain ffmpeg on both ends. A short findings note in this plan,
-   then the decision.
+1. **Transport empirics.** Native Windows column: done, findings
+   above. POSIX column: pending — `mkfifo` fan-in and `pass_fds` on
+   WSL or CI Linux, then the transport decision is final.
 2. **The IR and the partition pass.** Process-plan types beside
    `Graph`, the contraction pass, external nodes reachable through a
    test-only hook — no language surface. Unit-tested on shape alone.
-3. **Execution.** Stages in `execute.py`: spawn, wire, watch, tear
-   down, report. The ffmpeg-only exec tests above.
+3. **Execution.** Stages in `execute.py`: spawn concurrently, wire,
+   watch, tear down, report by member. The ffmpeg-only exec tests
+   above.
 4. **Printing.** The pipeline form for chains, the honest run-only
    form for DAGs, `known_gaps.md` updated.
 
