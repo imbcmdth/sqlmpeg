@@ -84,8 +84,8 @@ A row source that is a count rather than a file:
   a rejection. That is what keeps it countable: the row count is
   `stop - start + 1`, known before anything runs.
 - An optional third argument is the step, same rule.
-- The alias names both the relation and its one column, as in Postgres:
-  `generate_series(1, 5) i` gives `i`.
+- The alias names both the relation and its one column, and the
+  column reads back qualified: `generate_series(1, 5) i` gives `i.i`.
 - A descending or empty range is a rejection rather than zero rows: a
   query that produces nothing is a mistake worth naming.
 
@@ -193,8 +193,8 @@ ordinary type error downstream.
       WITH shots AS (
         SELECT f.video AS frame
         FROM input(:'source') f, generate_series(1, :count) i
-        WHERE f.t >= (f.duration - :len) * (i - 1) / (:count - 1)
-          AND f.t <= (f.duration - :len) * (i - 1) / (:count - 1) + :len
+        WHERE f.t >= (f.duration - :len) * (i.i - 1) / (:count - 1)
+          AND f.t <= (f.duration - :len) * (i.i - 1) / (:count - 1) + :len
       ),
       small AS (
         SELECT fps(scale(ffmpeg.concat(VARIADIC array_agg(shots.frame)),
@@ -205,7 +205,7 @@ ordinary type error downstream.
       FROM small
     ) TO :'dest'
 
-`(i - 1) / (:count - 1)` runs 0 to 1 across whatever count is passed —
+`(i.i - 1) / (:count - 1)` runs 0 to 1 across whatever count is passed —
 the `shot` function's fraction, generalised — so the head and tail clips
 still fall out of the same arithmetic and five hand-written branches
 become one.

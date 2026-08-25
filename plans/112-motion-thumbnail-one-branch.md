@@ -4,6 +4,10 @@ Maintainer, 2026-08-24. The last step of plan 108. Needs waves A and B
 landed; independent of 111. Lives in the registry repo
 (`D:\projects\sqlmpeg-registry`), not in sqlmpeg.
 
+*Overlaps plan 113 part B, which culls and reshapes the same
+registry: do the two together, once the compiler waves are in and
+the registry's final shape is settled.*
+
 `want/images`' motion thumbnail is five hand-copied branches, one per
 clip, because the count could not come from a parameter. With a series
 bounding a seek and `VARIADIC` gathering the result, it becomes one:
@@ -12,8 +16,8 @@ bounding a seek and `VARIADIC` gathering the result, it becomes one:
       WITH shots AS (
         SELECT f.video AS frame
         FROM input(:'source') f, generate_series(1, :count) i
-        WHERE f.t >= (f.duration - :len) * (i - 1) / (:count - 1)
-          AND f.t <= (f.duration - :len) * (i - 1) / (:count - 1) + :len
+        WHERE f.t >= (f.duration - :len) * (i.i - 1) / (:count - 1)
+          AND f.t <= (f.duration - :len) * (i.i - 1) / (:count - 1) + :len
       ),
       small AS (
         SELECT fps(scale(ffmpeg.concat(VARIADIC array_agg(shots.frame)),
@@ -24,7 +28,7 @@ bounding a seek and `VARIADIC` gathering the result, it becomes one:
       FROM small
     ) TO :'dest'
 
-`(i - 1) / (:count - 1)` runs 0 to 1 across whatever count is passed, so
+`(i.i - 1) / (:count - 1)` runs 0 to 1 across whatever count is passed, so
 the head and tail clips fall out of the same arithmetic that produces
 the middle ones.
 

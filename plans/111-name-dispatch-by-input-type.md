@@ -44,8 +44,8 @@ Do not let output types influence the rule.
   knowingly, one at a time; a test that stops failing for an unexamined
   reason is a regression in disguise.
 - **Broadcast still applies.** A bare array in an argument position
-  means one node per element, and dispatch happens per element, so an
-  array of mixed kinds resolves per stream.
+  means one node per element; the element type picks the variant
+  once for the whole array, since a stream array is homogeneous.
 - The dialect prompt should describe the rule, since a model writing
   `fade` over audio now gets working output rather than an error.
 

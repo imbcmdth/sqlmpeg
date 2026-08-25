@@ -114,6 +114,11 @@ ordinary SQL. `retitle` is the demo that needs it.
 
 ## Part 2 — Defaults in signatures
 
+*Status 2026-08-24: scheduled. This part was deferred until a
+library package needed signature defaults; the registry's planned
+library functions are that consumer. It lands after plans 109, 110
+and 113 part A.*
+
 ### 2.1 `DEFAULT` in `CREATE FUNCTION`
 
     CREATE FUNCTION resize(source text, width number DEFAULT 1280)
@@ -395,7 +400,7 @@ Each wave lands green, with its recipes in `docs/examples.md` first.
 | wave | what | depends on |
 | --- | --- | --- |
 | A | 1.1–1.4: unset → NULL, the drop at every binding site, required errors naming the variable, the reversed `-v` check, the curated list | — |
-| B | Part 2: `DEFAULT` in signatures, the NULL-takes-default deviation, `list` showing defaults | A; **deferred** — nothing else needs it |
+| B | Part 2: `DEFAULT` in signatures, the NULL-takes-default deviation, `list` showing defaults | A; scheduled 2026-08-24 — the registry's library functions need it |
 | C | 3.1–3.2: the manifest, the lockfile v2, `--as` deleted, reserved first segment | — |
 | D | 3.3–3.4: three-segment and alias resolution | C |
 | E | Part 4: the culls, the optional sweep, the grouping; `list` deriving required-ness | A |
@@ -405,7 +410,7 @@ A and C are independent and can run in parallel, as are B and D.
 Everything stays on the `packages` branch; `main` remains at 0.26.0
 until the set is in.
 
-**B is deferred.** It only matters for a package that EXPORTS functions,
+**B was deferred, and is now scheduled (2026-08-24).** It only matters for a package that EXPORTS functions,
 and after the sweep none of the eight does — they are programs. A
 library author has `COALESCE` in the body meanwhile, which works today;
 B moves the default into the signature so `list` and the package page

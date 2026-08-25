@@ -28,12 +28,18 @@ The change:
 
 - **`FilterOptionType` grows a `"duration"` member** (`registry.py:149`)
   and `_TYPE_MAP` stops flattening it.
-- **A duration option accepts either.** A string still works —
-  `'00:01:30'` and `'90'` are both legal ffmpeg durations and queries
-  may already pass them. A number, or any compile-time-countable
-  numeric expression, is now equally legal and is written as seconds
-  through the spelling rule the seek times already share
-  (`lower.py:5081`), so `90` and `-ss 90` agree to the digit.
+- **A duration option accepts a computed value.** The validator at
+  `lower.py:9117` already passes plain strings AND plain numbers
+  through (check this empirically before starting — a literal
+  `starti => 90` may work today). What is refused is a COMPUTED
+  expression: a column reference, arithmetic over one, a
+  substituted variable inside arithmetic. The lift is exactly
+  that: a compile-time-countable numeric expression is evaluated
+  the way seek bounds already are (the evaluated-bound path near
+  `lower.py:1410`) and written as seconds through the spelling
+  rule the seek times share (`lower.py:5081`), so `starti =>
+  f.duration / 2` and `-ss` agree to the digit. Strings keep
+  working unchanged.
 - **Not countable is still a rejection**, with the same shape as every
   other: name the option, the filter and what was written.
 
@@ -57,6 +63,9 @@ output, which is the kind of thing a compiler exists to prevent.
 
 - **After every `trim`/`atrim` whose result is used, insert a PTS
   reset**, unless that path already carries one the author wrote.
+  "Wrote" includes a macro expansion: a `setpts` that
+  `sqlmpeg.speed` put on the path counts, because calling it IS
+  taking control of timing.
 - **The compiler picks the variant from the stream's type** — `setpts`
   for video, `asetpts` for audio. This is a type check it can already
   make on a node it is inserting itself, and it needs nothing from

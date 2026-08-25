@@ -29,8 +29,9 @@ other N-to-one shapes, `mix` and `xstack` among them, that the table
 does not carry.
 
 ffmpeg 9.0.1 reports **34** filters with dynamic inputs. Nine are
-reachable. The other twenty-five are excluded by curation, not by any
-property they have — and `VARIADIC` removed the reason for the
+reachable through the table, ten counting `concat`'s own path. The
+other twenty-four are excluded by curation, not by any property they
+have — and `VARIADIC` removed the reason for the
 curation, because the pad count now comes from the array.
 
 ## What derives, and what does not
@@ -81,7 +82,9 @@ which is the principle the rest of the registry already runs on.
   regression test.
 - The count/`inputs` disagreement rejection keeps naming both numbers.
 - The snapshot changes, since these filters enter it. Regenerate with
-  `scripts/gen_snapshot.py`; never hand-edit it.
+  `scripts/gen_snapshot.py`; never hand-edit it. If carrying the
+  n-input marking means the snapshot schema gains a field, bump its
+  `format_version` with it.
 
 ---
 
@@ -150,10 +153,10 @@ lowers to `-loop 1`.
 **`frames(path, count, track)` returning rows of `(n, frame)`** — n
 full frames, evenly spaced.
 
-    SELECT i, v
+    SELECT i.i, v
     FROM input(path) f, unnest(f.video) v, generate_series(1, count) i
     WHERE v.index = track
-      AND f.t >= f.duration * (i - 0.5) / count
+      AND f.t >= f.duration * (i.i - 0.5) / count
 
 No window and no resize: a bare `f.t >=` is a seek to a point, and the
 caller's `frames 1` takes one frame from there. A count of 1 is a
