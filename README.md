@@ -14,6 +14,8 @@ Look, ffmpeg is a marvel - one that I've used for over a decade - but I still ne
 
  This project connects the two so you can bring your preexisting knowledge and create **declarative**, **composable**, and **generalizable** ffmpeg formulae.
 
+ The dialect is deliberately two-tongued: the query surface is Postgres - `COPY`, dollar-quoted functions, psql variables - while the data model is BigQuery's structs and arrays, because a media file *is* an array of structured things. If you speak either, you already speak most of it.
+
 ## Install
 
 Python 3.10+.

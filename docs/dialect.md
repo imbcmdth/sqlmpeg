@@ -1,10 +1,24 @@
 # The sqlmpeg dialect
 
-Postgres syntax, compiled - never executed by a database. Guardrail:
-every query must parse as valid Postgres; sqlmpeg then accepts the
-subset below and rejects the rest with typed, line-anchored errors
-([errors.md](errors.md)). This page is the language's formal surface:
-what exists, and - just as binding - what does not.
+SQL, compiled - never executed by a database. The dialect is one
+grammar drawn from two sources, split by a rule rather than by taste:
+**the statement and call surface is Postgres's** - `COPY ... TO`,
+`$$`-quoted functions, `:'var'` substitution, `name => value` binding,
+`VARIADIC`, `DEFAULT`, `::` casts - and **the value and row model is
+BigQuery's** - `STRUCT` literals, arrays of structs, `* EXCEPT` /
+`* REPLACE`, `ARRAY(select)` with `SELECT AS STRUCT` - because a media
+file is an array of structured things and BigQuery is the SQL built
+around that shape. Each borrowed spelling is noted where it appears.
+
+The second rule is as binding as the first: **one way to say a thing**,
+unless a second way carries a benefit of its own. When a borrowing
+covered an older spelling, the older spelling was removed, and a
+future feature lands under the same test.
+
+sqlmpeg accepts the surface below and rejects the rest with typed,
+line-anchored errors ([errors.md](errors.md)). This page is the
+language's formal shape: what exists, and - just as binding - what
+does not.
 
 ## Statements
 
@@ -442,6 +456,10 @@ disposition flag, `t.disposition.forced`, over a closed key set. A bare
 in a `tags` column.
 
 ## Values and predicates
+
+The borrowings below are instances of the split named at the top of
+this page: value-model spellings come from BigQuery, and each is
+recorded here at its point of use.
 
 `STRUCT(value AS name, ...)` is a **deviation**: Postgres has no such
 literal, and the spelling is borrowed (BigQuery's). It is the dialect's
