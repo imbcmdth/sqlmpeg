@@ -49,19 +49,7 @@ half the culled registry programs become one line. sqlglot parses
 both forms under its BigQuery reader, so the borrowing is cheap the
 way STRUCT was.
 
-### 2. `WITH OFFSET` on unnest
-
-    FROM unnest(f.video) v WITH OFFSET i
-
-BigQuery's spelling for "the element and its position". Every row
-source gets an ordinal for free — which overlaps the value-column
-work: `frames(...) s WITH OFFSET n` would have named the fan-out
-files without the function declaring `n` at all. Complements value
-columns rather than replacing them (a computed value is more than an
-ordinal), but for the common "number my rows" case it is the shorter
-truth.
-
-### 3. `ARRAY(SELECT ...)` — the missing converse
+### 2. `ARRAY(SELECT ...)` — the missing converse
 
 `unnest` turns an array into rows; nothing turns rows back into an
 array except `array_agg` + `GROUP BY` ceremony. BigQuery's `ARRAY(
@@ -74,8 +62,15 @@ reads as exactly what it does. `SELECT AS STRUCT` belongs to the same
 family and matters once functions return multi-column rows that want
 gathering whole.
 
-### 4. Considered and NOT recommended
+### 3. Considered and NOT recommended
 
+- **`WITH OFFSET` on unnest.** An earlier draft recommended it; the
+  one-way rule cuts it. Rows in this language already self-describe:
+  track rows carry `.index` from probe, a series row IS its number
+  (`i.i`), a VALUES-shaped struct row declares whatever it needs, and
+  a function row carries declared value columns. Every "number my
+  rows" case has a spelling; `WITH OFFSET` would be a second one.
+  Revisit only if a row source with no self-description appears.
 - **`arr[OFFSET(0)]` / `arr[ORDINAL(1)]` indexing.** BigQuery makes
   the base explicit, which fits the house ethos — but `f.video[1]` is
   in every doc, recipe, published program and user query, probe order
@@ -125,9 +120,48 @@ load-bearing here and has NO BigQuery equivalent to migrate to:
 
 The last row is worth savoring: BigQuery's replacement for VALUES is
 the struct duality itself. Once `ARRAY(...)`/struct literals are in,
-`unnest(ARRAY[STRUCT(...), STRUCT(...)])` works here too, and VALUES
-becomes a convenience rather than a necessity — both spellings, one
-model.
+`unnest(ARRAY[STRUCT(...), STRUCT(...)])` works here too — which is
+not a reason to keep both spellings. It is a reason to remove one.
+
+## What adoption removes
+
+The standing rule: **one way to say a thing, unless the second way
+carries a benefit of its own.** A spelling that merely rhymes pays
+rent or leaves. Every adoption below therefore lists its deletions,
+and the precedent is already set: adopting the struct map deleted
+`metadata_from`, `strip_metadata`, and the whole implicit-tag
+convention in one release.
+
+- **`VALUES` goes** once `unnest(ARRAY[STRUCT(...), ...])` lands.
+  Both of its uses are covered — a FROM row table, and the list a
+  `chapters` option consumes — and the struct spelling is named where
+  VALUES is positional (`(VALUES (1920, 20)) AS r(w, q)` says less
+  than `STRUCT(1920 AS w, 20 AS q)` at every reading). No distinct
+  benefit; removed.
+- **`ROW(...)::chapter` / `::cue` / `::attachment` goes.** The STRUCT
+  spelling shipped beside it as "the taught one", which was the
+  deprecation-window thinking this project does not need pre-1.0.
+  Positional record literals are exactly the rhyme this rule exists
+  to delete. Small follow-up wave; the census of sites exists.
+- **`GENERATE_ARRAY` is never adopted.** `generate_series` is the one
+  way to say "a counted row source", it is already a FROM item rather
+  than an array needing an unnest, and adopting BigQuery's spelling
+  would CREATE a rhyme where none exists. The one-way rule cuts both
+  directions: it prunes adoptions, not only incumbents.
+- **`CAST(x AS t)` versus `::`** — sqlglot parses both, so `CAST()`
+  may pass through unchecked today. Census whether it does; if so,
+  either reject it with a hint naming `::` or accept it silently
+  forever, but decide rather than drift. `::` is the documented
+  spelling either way.
+- **Kept, with the benefit named: `array_agg` beside
+  `ARRAY(SELECT ...)`.** Not a rhyme — different jobs. `array_agg` is
+  an aggregate and partitions under `GROUP BY` (one array per group,
+  which the per-language fan-outs need); `ARRAY(subquery)` is an
+  expression that gathers a whole subquery where an aggregate cannot
+  stand. BigQuery itself keeps both for the same reason.
+- **Kept: `unnest` beside subscripting.** `f.video[1]` picks one
+  element; `unnest(f.video) v` makes rows. Different results, not two
+  spellings of one thing.
 
 ## The recommendation: a hybrid with a stated rule
 
@@ -211,11 +245,13 @@ Three seams, each with a rule:
 ## If adopted, the order
 
 1. `* EXCEPT` / `* REPLACE` — highest value, self-contained.
-2. `WITH OFFSET` — pairs with the value-column work just landed.
-3. `ARRAY(SELECT ...)` and `SELECT AS STRUCT` — completes the
+2. `ARRAY(SELECT ...)` and `SELECT AS STRUCT`, with
+   `unnest(ARRAY[STRUCT(...)])` as a FROM item — completes the
    duality.
-4. Docs pass stating the rule where the dialect is described, so
-   future feature questions get answered by the rule instead of by
-   taste each time.
+3. The removal wave: `VALUES` and the positional `ROW::record`
+   literals go, and the `CAST()` census lands its decision.
+4. Docs pass stating the two rules — the dialect split AND the
+   one-way rule — where the dialect is described, so future feature
+   questions get answered by the rules instead of by taste each time.
 
 Each as its own small plan with recipes first, as usual.
