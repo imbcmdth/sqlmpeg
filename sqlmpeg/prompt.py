@@ -175,6 +175,21 @@ _DIALECT_TAIL = """\
   columns instead, with no probe needed. Over a track-row alias in a media
   query it is a typed rejection: a star over rows expands their FIELDS, and
   a SELECT column is an output stream -- write the bare alias.
+- `* EXCEPT(name, ...)` and `* REPLACE(expr AS name, ...)` (BigQuery's
+  spellings, borrowed like `STRUCT`) narrow or override the SAME expansion,
+  media queries only. A name is the KIND (`video`/`audio`/`subtitle`/
+  `data`) for an `input()`/generated-source star -- the expansion carries no
+  per-stream name of its own, so `EXCEPT`/`REPLACE` aim at every stream of
+  that kind at once -- or the column name a CTE gave with `AS` for a CTE
+  star. `EXCEPT` drops the matching columns; `REPLACE` keeps the expansion's
+  order and puts `expr` in the matching slot(s) instead -- `expr` is
+  checked exactly like any other SELECT expression, and does NOT have to
+  keep the slot's original kind (an ordinary aliased column has that same
+  freedom). A name may appear in EXCEPT or REPLACE at most once combined;
+  one absent from this file (a kind with no streams) is a no-op, same as a
+  bare `*` silently skipping it; one that never appears in the star's
+  vocabulary at all is a typed rejection naming what it holds. Empty
+  parentheses (`EXCEPT()`) are a typed rejection too.
 - Joining an external subtitle file needs no special syntax: add it as
   another `input()` alias and select its `<alias>.subtitle[1]` alongside the
   rest of the columns. Set `subtitle_codec` (see Output options) to transcode

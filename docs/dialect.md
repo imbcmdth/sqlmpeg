@@ -411,6 +411,17 @@ Each column is one of:
   excluded, read them by name), which a table query prints and a media
   query rejects. Over a CTE, the stream columns its body named.
 
+  `* EXCEPT(name, ...)` drops the named columns from the expansion;
+  `* REPLACE(expr AS name, ...)` keeps the expansion's order but
+  produces `name`'s slot from `expr` instead - a media query only. A
+  name is a kind (`video`/`audio`/`subtitle`/`data`) over an input or a
+  generated source, or the column name a CTE gave it. A name may
+  appear in EXCEPT or REPLACE at most once, and a name absent from
+  this file (a kind with no streams) is a no-op, exactly like a bare
+  `*` skipping it. `REPLACE`'s `expr` does not have to keep the slot's
+  original kind - the same freedom an ordinary aliased SELECT column
+  already has.
+
 Subscripts are positive integer literals, 1-based.
 `(f.audio[1]).codec`-style accessors reach row columns without
 unnest; in WHERE they are assertions. A tag is read by path,
@@ -427,6 +438,11 @@ one way to write a map or a record by field name — the `tags` column
 takes a map, and a `::chapter` / `::cue` / `::attachment` cast turns one
 into that record. Postgres's own positional `ROW(...)::chapter` stays
 valid.
+
+`* EXCEPT(...)` / `* REPLACE(...)` are borrowed the same way (BigQuery's
+splat modifiers); `EXCEPT` is otherwise a Postgres set operator, but the
+parenthesized form only ever appears after a bare `*`, where set
+subtraction has no meaning.
 
 
 One compile-time value grammar serves predicates, `tags` fields, value

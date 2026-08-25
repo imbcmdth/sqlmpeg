@@ -1947,3 +1947,40 @@ ffmpeg -i tests/fixtures/tagged.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy \
 
 A `NULL` field clears exactly its key. `STRUCT() AS tags` on its own writes no globals at all, which is how a file ships without the tags it was built from.
 
+## 83. Re-encode one track and carry the rest
+
+`* REPLACE(<expr> AS <name>)` keeps the star's whole expansion, in order, with one slot's stream swapped for a computed one - the everyday shape of "change one thing, keep everything else" without writing every column out:
+
+```pgsql
+COPY (
+  SELECT * REPLACE(scale(a.video[1], 1280, -2) AS video)
+  FROM input('tests/fixtures/avs.mkv') a
+) TO 'film.mp4' WITH (subtitle_codec 'mov_text')
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/avs.mkv -filter_complex \
+  '[0:v:0]scale=width=1280:height=-2[out0]' -map '[out0]' -map 0:a:0 -c:1 copy -map \
+  0:s:0 -metadata:s:2 language=eng -c:2 mov_text film.mp4
+```
+
+`video` names the slot `*` would otherwise fill with `a.video[1]` untouched; audio and the subtitle track pass through exactly as `SELECT *` alone would leave them.
+
+## 84. Drop a kind
+
+`* EXCEPT(<name>, ...)` keeps everything `*` would select except the named kind - here, every subtitle stream, without listing the video and audio columns by hand:
+
+```pgsql
+COPY (
+  SELECT * EXCEPT(subtitle) FROM input('tests/fixtures/avs.mkv') a
+) TO 'film.mp4'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/avs.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy film.mp4
+```
+
+No subtitle stream, no `mov_text` transcode: dropping the track drops the reason recipe 2 needed one.
+

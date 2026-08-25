@@ -2337,6 +2337,112 @@ def test_star_output_is_still_stream_copied_end_to_end() -> None:
 
 
 # ---------------------------------------------------------------------------
+# SELECT * EXCEPT(...) / REPLACE(...)
+# ---------------------------------------------------------------------------
+
+
+def test_star_except_drops_the_named_kind() -> None:
+    g = _lower(
+        "SELECT * EXCEPT(subtitle) FROM input('x.mkv') a", {"a": _layout_probe("vasd")}
+    )
+    assert _outputs(g) == [
+        ("src:a:v:0", "video", None),
+        ("src:a:a:0", "audio", None),
+        ("src:a:d:0", "data", None),
+    ]
+
+
+def test_star_except_drops_every_stream_of_a_repeated_kind() -> None:
+    g = _lower(
+        "SELECT * EXCEPT(audio) FROM input('x.mkv') a", {"a": _layout_probe("vaa")}
+    )
+    assert _outputs(g) == [("src:a:v:0", "video", None)]
+
+
+def test_star_replace_substitutes_in_place_and_keeps_order() -> None:
+    g = _lower(
+        "SELECT * REPLACE(scale(a.video[1], 640, -2) AS video) "
+        "FROM input('x.mkv') a",
+        {"a": _layout_probe("vas")},
+    )
+    assert _filters(g) == ["scale"]
+    assert [o.type for o in g.outputs] == ["video", "audio", "subtitle"]
+
+
+def test_star_replace_argv_is_byte_identical_to_the_longhand_columns() -> None:
+    """The whole point: `* REPLACE(...)` is shorthand, not a different
+    compile path -- its argv must match writing every column out."""
+    replaced_sql = (
+        "SELECT * REPLACE(scale(a.video[1], 640, -2) AS video) "
+        "FROM input('x.mkv') a"
+    )
+    longhand_sql = (
+        "SELECT scale(a.video[1], 640, -2), a.audio[1], a.subtitle[1] "
+        "FROM input('x.mkv') a"
+    )
+    probes = {"a": _layout_probe("vas")}
+    replaced = emit(insert_splits(_lower(replaced_sql, probes)))
+    longhand = emit(insert_splits(_lower(longhand_sql, probes)))
+    assert build_ffmpeg_args(replaced, "out.mkv") == build_ffmpeg_args(longhand, "out.mkv")
+
+
+def test_star_replace_composes_with_a_sink_and_its_with_options() -> None:
+    """A `* REPLACE` result is an ordinary column list downstream: it feeds a
+    sink, WITH options included, exactly like writing the columns out."""
+    g = compile_sql(
+        "COPY (SELECT * REPLACE(scale(a.video[1], 640, -2) AS video) "
+        "FROM input('tests/fixtures/avs.mkv') a) "
+        "TO 'out.mp4' WITH (video_codec 'libx264', crf 20, subtitle_codec 'mov_text')"
+    )
+    args = build_ffmpeg_args(emit(g))
+    assert "libx264" in args
+    assert "mov_text" in args
+    assert "20" in args
+
+
+def test_star_except_on_a_file_lacking_that_kind_is_a_no_op() -> None:
+    """Excepting a kind the file never had behaves exactly like the bare
+    `SELECT *` a reader would otherwise have written."""
+    probes = {"a": _layout_probe("va")}
+    excepted = _outputs(
+        _lower("SELECT * EXCEPT(subtitle) FROM input('x.mkv') a", probes)
+    )
+    bare = _outputs(_lower("SELECT * FROM input('x.mkv') a", probes))
+    assert excepted == bare
+
+
+def test_star_except_unknown_name_lists_what_the_star_holds() -> None:
+    err = _reject_lower(
+        "SELECT * EXCEPT(nope) FROM input('x.mkv') a", {"a": _layout_probe("va")}
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'nope'" in err.message
+    assert err.hint is not None
+    assert "audio" in err.hint and "video" in err.hint
+
+
+def test_star_replace_unknown_name_lists_what_the_star_holds() -> None:
+    err = _reject_lower(
+        "SELECT * REPLACE(a.video[1] AS nope) FROM input('x.mkv') a",
+        {"a": _layout_probe("va")},
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "'nope'" in err.message
+
+
+def test_star_replace_may_change_the_slot_kind() -> None:
+    """No new rule invented: an ordinary aliased SELECT column already lets
+    its name and its stream's real kind disagree, and REPLACE is the same
+    substitution -- the position keeps the name, the value carries whatever
+    kind the expression actually produces."""
+    g = _lower(
+        "SELECT * REPLACE(a.audio[1] AS video) FROM input('x.mkv') a",
+        {"a": _layout_probe("va")},
+    )
+    assert [o.type for o in g.outputs] == ["audio", "audio"]
+
+
+# ---------------------------------------------------------------------------
 # compile_sql: probing policy
 # ---------------------------------------------------------------------------
 

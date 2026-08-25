@@ -335,7 +335,10 @@ from sqlmpeg.parser import (
     record_cast_type,
     record_unnest_hint,
     references_row_alias,
+    star_except_entries,
+    star_node,
     star_qualifier,
+    star_replace_entries,
     subscript_index,
     subscript_metadata_shape,
     tag_key,
@@ -3522,10 +3525,16 @@ class _Lowerer:
             return
         key_texts = {key.sql() for key in group_keys(select)}
         for projection in select.expressions:
-            if isinstance(projection, exp.Expr) and star_qualifier(projection) is None:
+            if not isinstance(projection, exp.Expr):
+                continue
+            star = star_node(projection)
+            if star is None:
                 self._check_grouped_cte_expr(
                     _projection_expr(projection), env, select, key_texts
                 )
+            else:
+                for _, _, expr in star_replace_entries(star):
+                    self._check_grouped_cte_expr(expr, env, select, key_texts)
 
     def _check_grouped_cte_expr(
         self, node: exp.Expr, env: _Env, select: exp.Select, key_texts: set[str]
@@ -4070,22 +4079,80 @@ class _Lowerer:
         of the file, captions included), for a CTE it is the filter trim
         `_access` splices — which is also where a trimmed CTE caption column is
         rejected.
+
+        EXCEPT/REPLACE (borrowed from BigQuery) narrow or override the result
+        by IDENTITY: an input or generated-source stream's identity is its
+        kind (``video``/``audio``/``subtitle``/``data`` -- passthrough columns
+        carry no name of their own, so a kind is all EXCEPT/REPLACE has to
+        aim at, and both drop or replace EVERY stream of a repeated kind), a
+        CTE column's is the name its body gave it with ``AS``. A REPLACE
+        expression lowers once PER MATCHING SLOT, same as writing it out that
+        many times by hand -- two streams of one kind sharing a REPLACE are
+        two independent nodes, split downstream like any other reused source.
         """
+        star = star_node(anchor)
+        except_entries = star_except_entries(star) if star is not None else []
+        replace_entries = star_replace_entries(star) if star is not None else []
+        except_names = {name for name, _ in except_entries}
+        replace_map = {name: expr for name, _, expr in replace_entries}
+        # The star's VOCABULARY, not just what this file happens to hold: an
+        # input's four kinds are always nameable, a video-less file included --
+        # EXCEPT(subtitle) on one with none is a no-op, exactly like a bare
+        # `*` already silently skips a kind with nothing in it.
+        vocabulary: set[str] = set()
         columns: list[_Column] = []
+
+        def slot(identity: str, build: Callable[[], _Column]) -> None:
+            if identity in except_names:
+                return
+            if identity in replace_map:
+                columns.append(
+                    _Column(name=None, value=self._lower_expr(replace_map[identity], env, select))
+                )
+                return
+            columns.append(build())
+
+        def input_thunk(alias: str, meta: StreamMeta) -> Callable[[], _Column]:
+            return lambda: self._star_input_column(alias, meta, anchor, env, select)
+
+        def source_thunk(binding: _SourceBinding) -> Callable[[], _Column]:
+            return lambda: _Column(name=None, value=_scalar(self._source_stream_of(binding)))
+
+        def cte_thunk(column: _Column) -> Callable[[], _Column]:
+            return lambda: column
+
         for binding in self._star_bindings(qualifier, anchor, env, select):
             if isinstance(binding, _RowBinding):
                 raise _row_star_error(binding, anchor, select)
             if isinstance(binding, _InputBinding):
-                columns += self._star_input(binding.alias, anchor, env, select)
+                vocabulary |= set(_STREAM_STAR_COLUMNS)
+                for kind, meta in self._star_input(binding.alias, anchor, env, select):
+                    slot(kind, input_thunk(binding.alias, meta))
             elif isinstance(binding, _SourceBinding):
                 # A source has exactly one stream, so its star is that one
                 # column -- statically, like everything else about it.
-                columns.append(
-                    _Column(name=None, value=_scalar(self._source_stream_of(binding)))
-                )
+                vocabulary.add(binding.output)
+                slot(binding.output, source_thunk(binding))
             else:
-                columns += self._star_cte(binding, anchor, env, select)
+                for name, column in self._star_cte(binding, anchor, env, select):
+                    vocabulary.add(name)
+                    slot(name, cte_thunk(column))
+
+        for name, item_anchor in except_entries + [(n, a) for n, a, _ in replace_entries]:
+            if name not in vocabulary:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"'{name}' is not a column '*' expands to here",
+                    item_anchor,
+                    fallback=select,
+                    hint=self._star_holdings_hint(vocabulary),
+                )
         return columns
+
+    def _star_holdings_hint(self, vocabulary: set[str]) -> str:
+        if not vocabulary:
+            return "'*' expands to nothing here"
+        return f"'*' holds: {', '.join(sorted(vocabulary))}"
 
     def _star_probe(self, alias: str, anchor: exp.Expr, select: exp.Select) -> ProbeResult:
         """The probe a star over an input alias needs, or INPUT_NOT_FOUND.
@@ -4109,13 +4176,18 @@ class _Lowerer:
 
     def _star_input(
         self, alias: str, anchor: exp.Expr, env: _Env, select: exp.Select
-    ) -> list[_Column]:
+    ) -> list[tuple[str, StreamMeta]]:
         """Every stream of one input alias: the stream arrays, in v/a/s/d order.
 
         The container's array columns are what a star stands for, and a media
         SELECT column is an output stream, so the four stream arrays expand and
         `chapters` does not -- a chapter is not a stream, and ffmpeg's own
         default already carries an input's chapters through a remux.
+
+        Returns ``(kind, probed metadata)`` pairs rather than built columns:
+        building one is split out to :meth:`_star_input_column` so a stream
+        EXCEPT drops, or REPLACE overrides, never reaches the codecless check
+        or the WHERE-window access at all.
         """
         result = self._star_probe(alias, anchor, select)
         path = self.res.input_paths[self.graph.sources[alias]]
@@ -4133,50 +4205,61 @@ class _Lowerer:
                 fallback=select,
                 hint="an empty expansion would select nothing; drop the star",
             )
-        for meta in streams:
-            self._reject_codecless(
-                meta,
-                f"'{alias}.*' includes '{alias}.{meta.type}[{meta.index + 1}]', which",
+        return [(meta.type, meta) for meta in streams]
+
+    def _star_input_column(
+        self,
+        alias: str,
+        meta: StreamMeta,
+        anchor: exp.Expr,
+        env: _Env,
+        select: exp.Select,
+    ) -> _Column:
+        """One passthrough column of one input alias's star expansion."""
+        self._reject_codecless(
+            meta,
+            f"'{alias}.*' includes '{alias}.{meta.type}[{meta.index + 1}]', which",
+            anchor,
+            select,
+        )
+        row_inputs = env.row_inputs.get(alias)
+        return _Column(
+            name=None,
+            value=self._access(
+                env,
+                alias,
+                _scalar(self._source_stream(alias, meta.type, meta.index))
+                if row_inputs is None
+                else _array(
+                    meta.type,
+                    [
+                        self._source_stream(source, meta.type, meta.index)
+                        for source in row_inputs
+                    ],
+                ),
                 anchor,
                 select,
-            )
-        row_inputs = env.row_inputs.get(alias)
-        return [
-            _Column(
-                name=None,
-                value=self._access(
-                    env,
-                    alias,
-                    _scalar(self._source_stream(alias, meta.type, meta.index))
-                    if row_inputs is None
-                    else _array(
-                        meta.type,
-                        [
-                            self._source_stream(source, meta.type, meta.index)
-                            for source in row_inputs
-                        ],
-                    ),
-                    anchor,
-                    select,
-                ),
-            )
-            for meta in streams
-        ]
+            ),
+        )
 
     def _star_cte(
         self, binding: _CteBinding, anchor: exp.Expr, env: _Env, select: exp.Select
-    ) -> list[_Column]:
+    ) -> list[tuple[str, _Column]]:
         """A CTE's columns, in order, arrays splatted. No probe is involved.
 
         A CTE's shape was fixed when its body lowered, so this is static — the
         same information `<cte>.<name>` already reads. Column names are kept:
-        the star selects the columns the CTE named, not anonymous streams.
+        the star selects the columns the CTE named, not anonymous streams --
+        and are the identity EXCEPT/REPLACE match here.
         """
         return [
-            _Column(
-                name=column.name,
-                value=self._access(
-                    env, binding.name, _scalar(stream), anchor, select
+            (
+                column.name or "",
+                _Column(
+                    name=column.name,
+                    value=self._access(
+                        env, binding.name, _scalar(stream), anchor, select
+                    ),
                 ),
             )
             for column in binding.columns
@@ -4202,6 +4285,19 @@ class _Lowerer:
             )
         return [binding]
 
+    def _check_star_table_mode(self, anchor: exp.Expr, select: exp.Select) -> None:
+        """EXCEPT/REPLACE narrow a MEDIA star's stream expansion; a table
+        query's star prints record fields instead, which they do not reach."""
+        star = star_node(anchor)
+        if star is not None and (star.args.get("except_") or star.args.get("replace")):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "EXCEPT/REPLACE are not supported on a table query's '*'",
+                anchor,
+                fallback=select,
+                hint="write the columns out, or drop the modifier",
+            )
+
     def _star_names(
         self, qualifier: str, anchor: exp.Expr, env: _Env, select: exp.Select
     ) -> list[str]:
@@ -4212,6 +4308,7 @@ class _Lowerer:
         one array column its output type fills. `_star_cells` walks the very
         same lists in the same order.
         """
+        self._check_star_table_mode(anchor, select)
         names: list[str] = []
         for binding in self._star_bindings(qualifier, anchor, env, select):
             if isinstance(binding, _RowBinding):

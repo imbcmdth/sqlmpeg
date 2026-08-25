@@ -257,7 +257,10 @@ __all__ = [
     "null_variable",
     "parse",
     "resolve",
+    "star_except_entries",
+    "star_node",
     "star_qualifier",
+    "star_replace_entries",
     "subscript_index",
     "subscript_metadata_shape",
     "tag_key",
@@ -386,6 +389,12 @@ _STAR_HINT = (
     "a star is a whole SELECT column: write `SELECT *` or `SELECT <alias>.*`; "
     "it cannot be aliased, subscripted, or passed to a function"
 )
+_STAR_MODIFIER_HINT = "'*' takes EXCEPT(<name>, ...) and REPLACE(<expr> AS <name>, ...) only"
+_STAR_EXCEPT_ITEM_HINT = (
+    "EXCEPT names are bare and unqualified: EXCEPT(subtitle), not EXCEPT(f.subtitle)"
+)
+_STAR_REPLACE_ITEM_HINT = "each REPLACE entry needs a name: REPLACE(<expr> AS <name>)"
+_STAR_DUPLICATE_HINT = "a column is named in EXCEPT or REPLACE at most once"
 _SINK_HINT = "the only sink form is COPY (<query>) TO '<path>' WITH (<options>)"
 _SCRIPT_HINT = (
     "a script is CREATE VIEW ... ; statements followed by one or more "
@@ -1005,6 +1014,52 @@ def star_qualifier(node: exp.Expr) -> str | None:
         table = node.args.get("table")
         return _ident_name(table) if isinstance(table, exp.Expr) else ""
     return None
+
+
+def star_node(projection: exp.Expr) -> exp.Star | None:
+    """The ``exp.Star`` a star projection carries, whichever of the two shapes
+    :func:`star_qualifier` recognizes; None for anything else.
+
+    Where ``star_qualifier`` answers WHICH alias a star covers, this answers
+    what the star itself says: its EXCEPT/REPLACE modifiers, borrowed from
+    BigQuery (``sqlglot`` parses both under plain ``read="postgres"`` already,
+    empty parenthesized lists included — ``EXCEPT()`` gives ``except_=[]``,
+    kept apart from a bare ``*``'s ``except_=None``).
+    """
+    if isinstance(projection, exp.Star):
+        return projection
+    if isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star):
+        return projection.this
+    return None
+
+
+def star_except_entries(star: exp.Star) -> list[tuple[str, exp.Expr]]:
+    """``(folded name, anchor node)`` per EXCEPT entry of a validated star.
+
+    Assumes :meth:`_Resolver._check_star_modifiers` already rejected any other
+    shape, so every entry really is a bare, unqualified column reference.
+    """
+    items = star.args.get("except_") or []
+    return [
+        (_ident_name(item.this), item) for item in items if isinstance(item, exp.Column)
+    ]
+
+
+def star_replace_entries(star: exp.Star) -> list[tuple[str, exp.Expr, exp.Expr]]:
+    """``(folded name, anchor node, inner expression)`` per REPLACE entry.
+
+    Assumes :meth:`_Resolver._check_star_modifiers` already rejected any other
+    shape, so every entry really is ``<expr> AS <name>``.
+    """
+    items = star.args.get("replace") or []
+    out: list[tuple[str, exp.Expr, exp.Expr]] = []
+    for item in items:
+        if not isinstance(item, exp.Alias):
+            continue
+        alias = item.args.get("alias")
+        name = _ident_name(alias) if isinstance(alias, exp.Expr) else ""
+        out.append((name, item, item.this))
+    return out
 
 
 # named arguments
@@ -2970,12 +3025,21 @@ class _Resolver:
         for projection in projections:
             # A star projection carries nothing but the star and its qualifier,
             # so there is no expression to check inside it -- and running the
-            # generic walk would hit the star rejection it is exempt from.
-            if star_qualifier(projection) is None:
+            # generic walk would hit the star rejection it is exempt from. Its
+            # EXCEPT/REPLACE modifiers are the exception: REPLACE's expressions
+            # are ordinary SELECT expressions and are checked as such.
+            star = star_node(projection)
+            if star is None:
                 self._check_expression(
                     projection,
                     select,
                     array_agg=_projection_expr(projection) if aggregating else None,
+                )
+                continue
+            self._check_star_modifiers(star, projection, select)
+            for _, _, expr in star_replace_entries(star):
+                self._check_expression(
+                    expr, select, array_agg=_projection_expr(expr) if aggregating else None
                 )
 
         where = select.args.get("where")
@@ -2984,8 +3048,15 @@ class _Resolver:
 
         scope = self._collect_scope(select, visible)
         for projection in projections:
-            self._check_columns(projection, scope, select, table_mode=table_mode)
-            self._check_select_value(projection, scope, select)
+            star = star_node(projection)
+            if star is None:
+                self._check_columns(projection, scope, select, table_mode=table_mode)
+                self._check_select_value(projection, scope, select)
+                continue
+            self._check_star_qualifier(projection, scope, select)
+            for _, _, expr in star_replace_entries(star):
+                self._check_columns(expr, scope, select, table_mode=table_mode)
+                self._check_select_value(expr, scope, select)
         if isinstance(where, exp.Where):
             self._check_where(where, scope, select)
         order = select.args.get("order")
@@ -2995,6 +3066,107 @@ class _Resolver:
             self._check_path_expr(path_expr, scope, select)
         if is_grouped(select):
             self._check_grouping(select, scope, path_expr, table_mode=table_mode)
+
+    def _check_star_qualifier(
+        self, projection: exp.Expr, scope: dict[str, str], select: exp.Select
+    ) -> None:
+        """``<alias>.*``'s alias must be in scope; a bare ``*`` names none to check."""
+        if not isinstance(projection, exp.Column):
+            return
+        table_node = projection.args.get("table")
+        if table_node is None:
+            return
+        name = _ident_name(table_node)
+        if scope.get(name) is None:
+            raise _error(
+                ErrorCode.UNKNOWN_ALIAS,
+                f"unknown alias '{name}'",
+                table_node,
+                fallback=select,
+                hint=self._known_hint(scope),
+            )
+
+    def _check_star_modifiers(
+        self, star: exp.Star, projection: exp.Expr, select: exp.Select
+    ) -> None:
+        """Shape-check a star's EXCEPT/REPLACE, and reject any other star modifier.
+
+        Existence -- whether a name is really among what the star expands to
+        -- needs the probe, so it stays lower's business, same split as
+        everything else a star can name. This only checks what the SQL text
+        alone can: a name is named at most once, and every name is well-formed
+        (an EXCEPT entry is a bare column, a REPLACE entry is ``<expr> AS
+        <name>``), never empty.
+        """
+        if star.args.get("rename") is not None or star.args.get("ilike") is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "'*' takes only EXCEPT and REPLACE",
+                projection,
+                fallback=select,
+                hint=_STAR_MODIFIER_HINT,
+            )
+        seen: dict[str, exp.Expr] = {}
+        except_items = star.args.get("except_")
+        if except_items is not None:
+            if not except_items:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "EXCEPT() names no columns",
+                    projection,
+                    fallback=select,
+                    hint="name at least one column to drop, e.g. * EXCEPT(subtitle)",
+                )
+            for item in except_items:
+                if (
+                    not isinstance(item, exp.Column)
+                    or not isinstance(item.this, exp.Identifier)
+                    or item.args.get("table") is not None
+                    or item.args.get("db") is not None
+                ):
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        "EXCEPT takes bare column names",
+                        item,
+                        fallback=select,
+                        hint=_STAR_EXCEPT_ITEM_HINT,
+                    )
+                self._record_star_name(_ident_name(item.this), item, seen, select)
+        replace_items = star.args.get("replace")
+        if replace_items is not None:
+            if not replace_items:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "REPLACE() names no columns",
+                    projection,
+                    fallback=select,
+                    hint="name at least one column to replace, e.g. "
+                    "* REPLACE(scale(f.video[1], 1280, -2) AS video)",
+                )
+            for item in replace_items:
+                alias = item.args.get("alias") if isinstance(item, exp.Alias) else None
+                if not isinstance(item, exp.Alias) or not isinstance(alias, exp.Identifier):
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        "REPLACE entries need a name",
+                        item,
+                        fallback=select,
+                        hint=_STAR_REPLACE_ITEM_HINT,
+                    )
+                self._record_star_name(_ident_name(alias), item, seen, select)
+
+    def _record_star_name(
+        self, name: str, node: exp.Expr, seen: dict[str, exp.Expr], select: exp.Select
+    ) -> None:
+        if name in seen:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"duplicate name '{name}' in EXCEPT/REPLACE",
+                node,
+                fallback=select,
+                hint=_STAR_DUPLICATE_HINT,
+            )
+        seen[name] = node
 
     def _check_aggregate_context(self, select: exp.Select, where: str | None) -> None:
         """Aggregation belongs to a query's own SELECT, never a CTE body.
@@ -3072,6 +3244,11 @@ class _Resolver:
                     fallback=select,
                     hint=_GROUP_STREAM_HINT,
                 )
+            else:
+                star = star_node(projection)
+                if star is not None:
+                    for _, _, expr in star_replace_entries(star):
+                        self._check_grouped_expr(expr, scope, select, key_texts)
         if path_expr is not None:
             self._check_grouped_expr(path_expr, scope, select, key_texts)
         row_keys = [key for key in keys if _references_row(key, scope)]

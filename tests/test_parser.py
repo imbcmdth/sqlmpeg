@@ -487,6 +487,90 @@ def test_count_star_over_track_rows_is_still_an_aggregate_rejection() -> None:
 
 
 # ---------------------------------------------------------------------------
+# resolve — SELECT * EXCEPT(...) / REPLACE(...)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * EXCEPT(subtitle) FROM input('x') a",
+        "SELECT * EXCEPT(subtitle, data) FROM input('x') a",
+        "SELECT a.* EXCEPT(subtitle) FROM input('x') a",
+        "SELECT * REPLACE(scale(a.video[1], 1280, -2) AS video) FROM input('x') a",
+        "SELECT * REPLACE(a.video[1] AS video, a.audio[1] AS audio) FROM input('x') a",
+        "SELECT * EXCEPT(subtitle) REPLACE(a.video[1] AS video) FROM input('x') a",
+    ],
+)
+def test_star_except_and_replace_are_accepted(sql: str) -> None:
+    resolve(parse(sql))
+
+
+def test_star_except_empty_is_rejected() -> None:
+    err = _reject("SELECT * EXCEPT() FROM input('x') a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "no columns" in err.message
+
+
+def test_star_replace_empty_is_rejected() -> None:
+    err = _reject("SELECT * REPLACE() FROM input('x') a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "no columns" in err.message
+
+
+def test_star_except_duplicate_name_is_rejected() -> None:
+    err = _reject("SELECT * EXCEPT(subtitle, subtitle) FROM input('x') a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "duplicate name 'subtitle'" in err.message
+
+
+def test_star_except_and_replace_sharing_a_name_is_rejected() -> None:
+    """A column named at most once across EXCEPT and REPLACE together."""
+    err = _reject(
+        "SELECT * EXCEPT(video) REPLACE(a.video[1] AS video) FROM input('x') a"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "duplicate name 'video'" in err.message
+
+
+def test_star_except_qualified_name_is_rejected() -> None:
+    err = _reject("SELECT * EXCEPT(a.subtitle) FROM input('x') a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "bare column names" in err.message
+
+
+def test_star_replace_without_as_is_rejected() -> None:
+    err = _reject("SELECT * REPLACE(a.video[1]) FROM input('x') a")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "need a name" in err.message
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * RENAME(video AS v) FROM input('x') a",
+        "SELECT * ILIKE 'v%' FROM input('x') a",
+    ],
+)
+def test_star_rename_and_ilike_are_rejected(sql: str) -> None:
+    err = _reject(sql)
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "EXCEPT and REPLACE" in err.message
+
+
+def test_star_replace_expression_is_checked_like_any_projection() -> None:
+    """A REPLACE expression is an ordinary SELECT expression: no free pass
+    from the generic checks a bare star is exempt from."""
+    err = _reject("SELECT * REPLACE(count(*) AS video) FROM input('x') a")
+    assert err.code is ErrorCode.NO_STREAMING_EQUIVALENT
+
+
+def test_star_replace_unknown_column_is_still_checked() -> None:
+    err = _reject("SELECT * REPLACE(z.video[1] AS video) FROM input('x') a")
+    assert err.code is ErrorCode.UNKNOWN_ALIAS
+
+
+# ---------------------------------------------------------------------------
 # resolve — subtitle / data pseudo-columns
 # ---------------------------------------------------------------------------
 
