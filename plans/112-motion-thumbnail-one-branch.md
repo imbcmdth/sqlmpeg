@@ -14,19 +14,25 @@ bounding a seek and `VARIADIC` gathering the result, it becomes one:
 
     COPY (
       WITH shots AS (
-        SELECT f.video AS frame
+        SELECT ffmpeg.concat(VARIADIC f.video) AS frame
         FROM input(:'source') f, generate_series(1, :count) i
         WHERE f.t >= (f.duration - :len) * (i.i - 1) / (:count - 1)
           AND f.t <= (f.duration - :len) * (i.i - 1) / (:count - 1) + :len
       ),
       small AS (
-        SELECT fps(scale(ffmpeg.concat(VARIADIC array_agg(shots.frame)),
-                         :width, -2), :fps) AS frame
+        SELECT fps(scale(shots.frame, :width, -2), :fps) AS frame
         FROM shots
       )
       SELECT paletteuse(small.frame, palettegen(small.frame))
       FROM small
     ) TO :'dest'
+
+Two shapes an earlier sketch used do not resolve, by pre-existing
+rules the seek-rows wave confirmed: `array_agg` may not live in a CTE
+body, and a `VARIADIC` call may not nest inside another call. The form
+above — the gather in its own CTE, spreading the per-row array
+directly — is the one the compiler's byte-identity test pins
+(`tests/test_lower.py::test_the_motion_thumbnail_gather_matches_its_hand_written_form`).
 
 `(i.i - 1) / (:count - 1)` runs 0 to 1 across whatever count is passed, so
 the head and tail clips fall out of the same arithmetic that produces

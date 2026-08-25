@@ -170,6 +170,15 @@ tail. `(i - 0.5) / count` centres each frame in its own slice and never
 touches either end. That difference is why these are two functions and
 not one with a flag.
 
+*Learned 2026-08-24, from the seek-rows wave: packaging this as a
+function does not work yet. A `RETURNS TABLE` call becomes a generated
+CTE, and a row-bounded window cannot seek through a CTE — there is no
+input at that level to seek per row — so the fan-out spelling AND the
+gathered spelling are both blocked behind the documented CTE gap. The
+PATTERN works inline (the cookbook's gather recipe proves it); `frames`
+the function waits on CTEs carrying compile-time value columns, which
+is its own feature. `grid` over inline rows is unaffected.*
+
 **`grid(streams, shape)`** — the piece that shows what composition is
 for:
 
