@@ -509,16 +509,20 @@ def test_a_parameter_without_a_default_after_one_with_one_is_rejected() -> None:
     _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "no DEFAULT after one that has one")
 
 
-def test_default_null_is_rejected() -> None:
-    """NULL already means omit; a literal DEFAULT NULL would only restate that."""
+def test_default_null_makes_the_parameter_omissible() -> None:
+    """DEFAULT NULL is the spelling for an optional knob: omitting the
+    argument is legal and gives NULL, which drops wherever the body uses it
+    as an option. Without the DEFAULT, omission is an arity error, so the
+    two spellings are not redundant."""
     sql = (
-        "CREATE FUNCTION m(a text DEFAULT NULL) RETURNS text AS $$\n"
-        "  SELECT a\n"
+        "CREATE FUNCTION quieter(track audio_stream, factor number DEFAULT NULL) "
+        "RETURNS audio_stream AS $$\n"
+        "  SELECT volume(track, factor)\n"
         "$$ LANGUAGE sql;\n"
-        "SELECT m() AS m FROM input('a.mka') f"
+        "COPY (SELECT f.video[1], quieter(f.audio[1]) FROM input('film.mkv') f) "
+        "TO 'out.mkv'"
     )
-    error = _rejects(sql, ErrorCode.UNSUPPORTED_SQL, "DEFAULT NULL")
-    assert error.hint is not None and "drop the DEFAULT" in error.hint
+    assert "[0:a:0]volume[out1]" in " ".join(_argv(sql))
 
 
 # ---------------------------------------------------------------------------

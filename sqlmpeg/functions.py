@@ -618,14 +618,16 @@ def _default_constraint(node: exp.ColumnDef) -> exp.Expr | None:
 def _checked_default(
     default: exp.Expr, declared_type: str, name: str, written: str, anchor: exp.Expr
 ) -> exp.Expr:
-    """The DEFAULT literal, rejected if it is NULL or does not match the parameter's type."""
+    """The DEFAULT literal, rejected if it does not match the parameter's type.
+
+    ``DEFAULT NULL`` is legal and matches every type: it is the spelling for
+    an optional parameter that is simply absent when omitted -- the NULL flows
+    down and drops wherever the body uses it, like any other NULL. Without a
+    DEFAULT, omission is an arity error, so the two spellings are not
+    redundant.
+    """
     if isinstance(default, exp.Null):
-        raise _error(
-            ErrorCode.UNSUPPORTED_SQL,
-            f"function '{name}' declares the parameter '{written}' with DEFAULT NULL",
-            anchor,
-            hint="omitting the argument already gives NULL; drop the DEFAULT",
-        )
+        return default
     kind = _argument_kind(default)
     if kind is None or kind != _declared_kind(declared_type):
         raise _error(
