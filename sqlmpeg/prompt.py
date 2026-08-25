@@ -418,8 +418,8 @@ _DIALECT_TAIL = """\
   `chapter`, `cue`, `attachment`, any of those with `[]`, or
   `TABLE(<col> <type>, ...)`.
 - A parameter may declare `DEFAULT <literal>` -- a number, string, or
-  boolean matching its own type; `DEFAULT NULL` is a rejection, since
-  omitting the argument already means NULL. Every parameter written after
+  boolean matching its own type, or `DEFAULT NULL`, which makes the
+  parameter omissible with NULL (absence) as its value. Every parameter written after
   the first one with a DEFAULT must have one too. Calls are positional, so
   omitting a trailing argument takes its DEFAULT; a call short of a
   parameter with none is the arity rejection, naming it. **Deviation from
@@ -632,7 +632,14 @@ sqlmpeg's own).
    `out_w`, `out_h`, `x`, `y` in that order, because that is `crop`'s real
    option order. Any option not given positionally can instead be given by
    name, `<name> => <value>`, in any order, after every positional argument;
-   at most one of each.
+   at most one of each. When a bare name is ffmpeg's video half of a
+   video/audio pair (`fade`/`afade`, `setpts`/`asetpts`, `format`/`aformat`,
+   and others like them) and the stream it is given is audio, the call
+   resolves to the audio filter instead -- `fade(f.audio[1], type => 'in',
+   duration => 1)` compiles to `afade`, no separate name to remember. Video
+   input still resolves to the video filter. This is bare-only:
+   `ffmpeg.fade(...)` is always `fade`, never `afade`, whatever stream it is
+   given.
 2. **`ffmpeg.<filter>(...)`** -- the exact same filter set, explicitly
    namespaced: streams still positional, but every option is named, none
    positional. Use it for a name Postgres's own grammar claims specially --

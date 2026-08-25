@@ -7094,7 +7094,8 @@ class _Lowerer:
                 if call.namespaced
                 else self._unknown_function_hint(name),
             )
-        return self._lower_dynamic_call(node, name, dynamic, call, env, select)
+        target_name, target = self._dispatch_audio(name, dynamic, call, env, select)
+        return self._lower_dynamic_call(node, target_name, target, call, env, select)
 
     def _lower_variadic_call(
         self, node: exp.Expr, name: str, call: _Call, env: _Env, select: exp.Select
@@ -7311,6 +7312,38 @@ class _Lowerer:
         )
 
     # -- the ordinary case: any filter the installed ffmpeg reports --------
+
+    def _dispatch_audio(
+        self,
+        name: str,
+        dynamic: DynamicFilter,
+        call: _Call,
+        env: _Env,
+        select: exp.Select,
+    ) -> tuple[str, DynamicFilter]:
+        """A bare video-only name dispatches to its audio twin over audio input.
+
+        ``ffmpeg.<name>(...)`` is untouched -- only a bare call dispatches.
+        Eligibility comes straight from the registry, not a curated list:
+        ``name`` takes video-only input, ``a<name>`` exists and takes
+        audio-only input. That excludes a pair that only shares a stem, like
+        ``interleave``/``ainterleave`` or ``mix``/``amix`` (both N-input, so
+        neither has a fixed pad type to compare).
+        """
+        if call.namespaced or self.registry is None:
+            return name, dynamic
+        if dynamic.n_input or not dynamic.inputs or any(k != "video" for k in dynamic.inputs):
+            return name, dynamic
+        twin_name = "a" + name
+        twin = self.registry.get(twin_name)
+        if twin is None or twin.n_input or not twin.inputs:
+            return name, dynamic
+        if any(k != "audio" for k in twin.inputs):
+            return name, dynamic
+        kinds = self._stream_kinds(call, env, select, len(dynamic.inputs))
+        if kinds[:1] == ["audio"]:
+            return twin_name, twin
+        return name, dynamic
 
     def _lower_dynamic_call(
         self,
@@ -8510,7 +8543,8 @@ class _Lowerer:
                     if call.namespaced
                     else self._unknown_function_hint(name),
                 )
-            return dynamic.output
+            _, target = self._dispatch_audio(name, dynamic, call, env, select)
+            return target.output
         return _UNSUPPORTED_KIND
 
     # -- table/csv queries --

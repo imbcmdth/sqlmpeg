@@ -1872,3 +1872,22 @@ ffmpeg -i film.mp4 -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy -metadata title=cli
 A parameter with no `DEFAULT` still passes NULL through unchanged - that stays the way to write NULL itself, since a parameter that always defaults it away can never receive it.
 
 `inputs` is written for you, same as `hstack`/`vstack`/`amix` - it is `xstack`'s own first option, so a positional argument right after the streams binds to it, not to `grid`; `grid` needs `=>` to reach past it.
+
+## 80. Fade in, video or audio, with one name
+
+`fade` is ffmpeg's video filter; `afade` does the same for audio. Write `fade` once and call it on both a video track and an audio track - sqlmpeg reads each argument's type and resolves the call itself, no need to spell `afade` separately:
+
+```pgsql
+COPY (
+  SELECT fade(f.video[1], type => 'in', duration => 1),
+         fade(f.audio[1], type => 'in', duration => 1)
+  FROM input(:'source') f
+) TO :'dest'
+```
+
+```
+$ sqlmpeg compile -f query.sql -v source=film.mp4 -v dest=faded.mp4
+ffmpeg -i film.mp4 -filter_complex \
+  '[0:v:0]fade=type=in:duration=1[out0];[0:a:0]afade=type=in:duration=1[out1]' -map \
+  '[out0]' -map '[out1]' faded.mp4
+```

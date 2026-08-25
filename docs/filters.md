@@ -39,7 +39,7 @@ SELECT ffmpeg.trim(a.video[1], start => 1, end => 4),
 FROM input('a.mp4') a, input('b.mp4') b
 ```
 
-Eleven bare names need it (measured against ffmpeg 7.1 / sqlglot 30.17): `copy`, `corr`, `format`, `median`, `normalize`, `null`, `overlay`, `pad`, `random`, `reverse`, `trim`. Whether a collision errors or mangles depends on arity; when in doubt, or in generated code, use the namespace.
+Twelve bare names need it (measured against ffmpeg 9.0.1 / sqlglot 30.17): `copy`, `corr`, `format`, `join`, `median`, `normalize`, `null`, `overlay`, `pad`, `random`, `reverse`, `trim`. Whether a collision errors or mangles depends on arity; when in doubt, or in generated code, use the namespace.
 
 `ffmpeg` is reserved: an alias, CTE, or view by that name is `UNSUPPORTED_SQL`.
 

@@ -3426,6 +3426,80 @@ def test_a_stdlib_call_nests_inside_a_dynamic_call(_registry: Registry) -> None:
     assert g.nodes["n2"].inputs == ["n1"]
 
 
+# -- a bare name dispatches to its audio twin over audio input --------------
+#
+# `fade`/`afade` is a clean pair in the real registry: `fade` takes video
+# only, `afade` takes audio only. `mix`/`amix` and `interleave`/`ainterleave`
+# only share a stem -- both sides are N-input, with no fixed pad type -- so
+# they stay out of dispatch entirely.
+
+
+def test_bare_name_stays_the_video_filter_over_video_input() -> None:
+    g = _lower("SELECT fade(a.video[1], type => 'in', duration => 1) FROM input('x.mp4') a")
+    assert _filters(g) == ["fade"]
+
+
+def test_bare_name_dispatches_to_its_audio_twin_over_audio_input() -> None:
+    g = _lower("SELECT fade(a.audio[1], type => 'in', duration => 1) FROM input('x.mp4') a")
+    assert _filters(g) == ["afade"]
+
+
+def test_dispatched_call_compiles_byte_identical_to_writing_the_audio_filter() -> None:
+    bare = compile_sql(
+        "SELECT fade(a.audio[1], type => 'in', duration => 1) FROM input('x.mp4') a"
+    )
+    explicit = compile_sql(
+        "SELECT afade(a.audio[1], type => 'in', duration => 1) FROM input('x.mp4') a"
+    )
+    assert build_ffmpeg_args(emit(bare), "out.mp4") == build_ffmpeg_args(
+        emit(explicit), "out.mp4"
+    )
+
+
+def test_the_namespaced_spelling_never_dispatches() -> None:
+    """`ffmpeg.fade(...)` is `fade` and nothing else -- an audio input is
+    exactly the type error it was before dispatch existed."""
+    err = _reject("SELECT ffmpeg.fade(a.audio[1]) FROM input('x.mp4') a")
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "it takes video as its stream input, got (audio)" in err.message
+
+
+def test_broadcast_over_an_audio_array_dispatches_once_for_the_whole_array() -> None:
+    g = _lower(
+        "SELECT fade(a.audio, type => 'in', duration => 1) FROM input('x.mp4') a",
+        {"a": _probe_result(audios=2)},
+    )
+    assert _filters(g) == ["afade", "afade"]
+
+
+def test_a_video_only_name_with_no_audio_twin_still_rejects_audio() -> None:
+    """`crop` has no `acrop` -- the rejection is exactly what it was before."""
+    err = _reject("SELECT crop(a.audio[1], 100, 100, 0, 0) FROM input('x.mp4') a")
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "it takes video as its stream input, got (audio)" in err.message
+
+
+def test_option_validation_follows_the_dispatched_target() -> None:
+    """`color` is one of `fade`'s own options; `afade` has none such -- the
+    dispatched call's error names the filter it actually resolved to."""
+    err = _reject(
+        "SELECT fade(a.audio[1], type => 'in', color => 'black') FROM input('x.mp4') a"
+    )
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
+    assert "filter 'afade' has no option 'color'" in err.message
+
+
+def test_an_n_input_pair_is_not_touched_by_audio_dispatch() -> None:
+    """`mix` is N-input with a fixed VIDEO pad type; a bare call over audio
+    streams is rejected by the ordinary N-input rule, never quietly switched
+    to `amix`."""
+    err = _reject(
+        "SELECT mix(a.audio[1], b.audio[1]) FROM input('x.mp4') a, input('y.mp4') b"
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "its stream inputs are all video" in err.message
+
+
 # -- named option validation (both tiers, same two codes) -------------------
 
 
@@ -5921,10 +5995,12 @@ _CENSUS_ARG_FORMS = (
     "a.video[1], x => 1",
 )
 
-# Measured against ffmpeg 7.1 (464 in-scope filters) and sqlglot 30.17.
+# Measured against ffmpeg 9.0.1 (512 in-scope filters) and sqlglot 30.17.
+# `join` entered when n-input filters joined the in-scope set.
 _KNOWN_COLLISIONS = frozenset(
     {
         "copy",
+        "join",
         "corr",
         "format",
         "median",
@@ -6007,11 +6083,14 @@ def test_every_collided_filter_compiles_through_the_namespace(
     for name in collided:
         dynamic = registry.get(name)
         assert dynamic is not None
-        aliases = "abcd"[: len(dynamic.inputs)]
-        assert len(aliases) == len(dynamic.inputs), name
+        # An n-input filter reports no fixed pads; two of its own kind is a
+        # legal call (the count option defaults to 2).
+        kinds = list(dynamic.inputs) or [dynamic.output, dynamic.output]
+        aliases = "abcd"[: len(kinds)]
+        assert len(aliases) == len(kinds), name
         pads = ", ".join(
             f"{alias}.video[1]" if kind == "video" else f"{alias}.audio[1]"
-            for alias, kind in zip(aliases, dynamic.inputs)
+            for alias, kind in zip(aliases, kinds)
         )
         sources = ", ".join(
             f"input('{files[i % len(files)]}') {alias}"
