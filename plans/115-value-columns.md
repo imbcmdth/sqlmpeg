@@ -1,18 +1,81 @@
-# 115 — A row may carry a value
+# 115 — Tags become explicit, and every other column becomes a value
 
-Maintainer, 2026-08-25. The missing piece for the standalone `frames`
-function, and the closure of a documented gap.
+Maintainer, 2026-08-25, rewritten after the census and the design
+conversation. Supersedes the first draft's tag-relocation rule.
 
-## The gap, precisely
+Pre-1.0, so this breaks cleanly in one release: **the implicit
+aliased-scalar-tag convention is removed and the explicit form arrives
+in the same change.** No deprecation window, no dual meaning, no
+release where a scalar column means two things.
 
-A SELECT column in a media query is one of exactly two things: a
-**stream** (it goes in the graph) or a **tag** (a scalar stamped onto
-the output as metadata). There is no third thing — *a plain per-row
-value traveling with the row*. Every row column readable today in
-`WHERE` and `TO` expressions (`v.index`, `c.start_t`, `i.i`) comes from
-the row SOURCE — probe, series, VALUES — never from a SELECT list.
+## The two rules, complete
 
-So a table function cannot say which row is which:
+1. **Metadata is written by a column named `tags`, holding a struct
+   expression.** Everything else in a SELECT list that is not a stream
+   (or one of the existing special columns — `chapters`,
+   `disposition`, `attachments`) is a **value column**: plain data
+   traveling with the row, never metadata.
+
+2. **`STRUCT(expr AS key, ...)` is the struct literal.** Borrowed from
+   BigQuery, documented as a deviation like the dialect's others, and
+   already parsed by the current parser (verified: `exp.Struct` with
+   `PropertyEQ` fields, and `f.tags || STRUCT(...)` as `DPipe`).
+
+The write surface:
+
+    SELECT *, STRUCT('roo' AS title, :'artist' AS artist) AS tags ...
+    SELECT *, f.tags || STRUCT('roo' AS title) AS tags ...      -- copy, override
+    SELECT *, f.tags || STRUCT(NULL AS title) AS tags ...       -- NULL clears a key
+    SELECT t, t.tags || STRUCT('eng' AS language) AS tags
+    FROM input(:'source') f, unnest(f.audio) t WHERE t.index = 1
+
+Scoping is today's rule, respelled: over input rows the `tags` column
+is the container's map; over track rows it is that stream's; in a CTE
+body it rides the body's streams (which is how recipe 53's layering
+survives — respelled, not killed). `||` merges right-side-wins; a NULL
+field clears its key (the absence rule — no delete operator). All of
+it evaluates at compile time to `-metadata` flags, as today.
+
+Read and write are finally the same shape: `f.tags.title` in,
+`STRUCT(... AS title)` out.
+
+## What is removed
+
+- An aliased scalar column is no longer a tag, anywhere. At a media
+  sink, a scalar column that is not `tags` (or another special column)
+  is a typed rejection whose hint shows the `STRUCT(...) AS tags`
+  spelling. In a table query, scalars keep printing as data.
+- The census (in the transcript of the standing agent, harness at the
+  session scratchpad's `cen.py`) maps every current tag behavior — the
+  A-set is the respell list, and the "tag takes two different values"
+  error family disappears entirely.
+
+## Value columns — what the removal buys
+
+With tags explicit, a scalar column has exactly one meaning, so CTE
+and table-function rows can finally carry values:
+
+- A CTE alias exposes its scalar columns beside its streams (today it
+  exposes streams only — verified, there is NO existing outer-read
+  behavior to preserve). Readable wherever row columns read today:
+  `WHERE`, a fan-out `TO` expression, `GROUP BY`, another CTE, table
+  output.
+- A table function's `RETURNS TABLE(n number, ...)` declaration is
+  ENFORCED — the census found declared types are currently decorative
+  — and its declared scalar columns are value columns.
+- Every value is compile-time evaluated by the row evaluator that
+  already computes predicates and seek bounds. Nothing new is known
+  only at run time; a column that is not compile-time evaluable is a
+  typed rejection naming it.
+- A fan-out `TO` reading a CTE/function value column pins one row per
+  command, the machinery every other row-keyed fan-out uses; per-row
+  windows are bound inside the body where the input binds, so a pinned
+  row arrives with its input already seeked. `docs/known_gaps.md`'s
+  "CTE-keyed group cannot fan out" entry closes; the
+  `ROW_COUNT_MISMATCH` hint that names an unreachable body alias
+  becomes true or is reworded.
+
+## The acceptance test
 
     CREATE FUNCTION frames(path text, count number, track number)
     RETURNS TABLE(n number, frame video_stream) AS $$
@@ -21,80 +84,55 @@ So a table function cannot say which row is which:
       WHERE v.index = track AND f.t >= f.duration * (i.i - 0.5) / count
     $$ LANGUAGE sql;
 
-`i.i` is filed under "tag", four rows select the same track with four
-values, and the compile dies with "tag 'n' takes two different values
-on the same track". Drop `n` and the GATHERED spelling works today,
-verified end to end — but the standalone spelling, one file per frame,
-needs to READ `n`:
-
-    COPY (SELECT s.n, s.frame FROM frames(:'source', :count, 1) s)
+    COPY (SELECT s.frame FROM frames(:'source', :count, 1) s)
     TO (:'prefix' || s.n::text || '.png') WITH (video_codec 'png', frames 1)
 
-and the function's rows cannot carry it. Without that, a `frames`
-function is only a composition ingredient; the point of it standing
-alone is exactly per-frame files.
+`:count` commands, each seeking its midpoint, each writing its own
+file named from `s.n`. Second acceptance: per-file titles under a
+fan-out — `STRUCT('shot ' || s.n::text AS title) AS tags`. Third: the
+gathered spelling keeps compiling unchanged (its tests exist).
 
-## The feature
+## STRUCT beyond tags
 
-**A CTE — including the generated one a table function becomes — may
-carry compile-time value columns beside its stream columns.**
+Chapters and cues gain the named-field spelling beside the positional
+one — `STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)` is
+accepted wherever `ROW('Intro', 0, 60)::chapter` is. The `ROW::cast`
+form stays valid; STRUCT is the taught one. **Every recipe and doc
+example using `ROW(...)::chapter` / `::cue` is rewritten to STRUCT**,
+and the tag recipes (52, 53, 55, retitle-shaped ones) are respelled to
+the `tags` column.
 
-- A scalar SELECT column in a CTE body whose value is compile-time
-  evaluable per row (a series value, a VALUES cell, a probed scalar, a
-  row column, arithmetic over those) becomes a **value column** of the
-  CTE's rows: readable downstream wherever row columns are readable
-  today — `WHERE`, a fan-out `TO` expression, another CTE.
-- Everything stays countable: a value column is evaluated at compile
-  time, per row, by the evaluator that already computes row predicates
-  and seek bounds. Nothing about this touches run time.
-- **A value column selected at a SINK becomes a tag there.** That is
-  the disambiguation rule, and it is not new behavior so much as
-  today's behavior relocated: the tag decision moves from the CTE body
-  (where it collides across rows) to the sink (where a fan-out has
-  pinned ONE row, so each file gets its own row's value). Single-row
-  queries behave exactly as today; the multi-row collision error stops
-  firing where no sink-level collision exists. Per-file titles from a
-  fan-out fall out for free.
+## Consequential retirements, same change
 
-## The second half: a fan-out may key on these rows
+`metadata_from <alias>` is `f.tags AS tags`; `strip_metadata true` is
+`STRUCT() AS tags`. Both sink options are removed; their rejections
+name the replacement spelling. The language gets smaller.
 
-The documented gap "a CTE-keyed group cannot fan out" is exactly the
-missing consumer. A fan-out `TO` whose expression reads a CTE value
-column (`s.n`) pins one CTE row per command, the same pinning every
-other row-keyed fan-out already does. The seek machinery needs nothing:
-per-row windows are bound inside the body where the input binds
-(proven working through table functions in the gathered form), so the
-pinned row arrives with its input already seeked.
+## Ripples to carry, not forget
 
-`known_gaps.md`'s CTE entry narrows or closes accordingly — rewrite it
-to whatever is true when this lands.
+- `sqlmpeg/prompt.py`: the tag section shrinks to the one rule; STRUCT
+  documented; an LLM never learns the dead spelling.
+- `docs/rows.md` Tags section, `docs/dialect.md`'s tag-column grammar
+  and the value grammar, `docs/errors.md` if error codes change.
+- The registry's programs (`want/*`) use `AS title` and must be
+  respelled when registry work resumes — noted here so the release
+  that ships this is followed promptly by the registry update.
+- Two-pass (`loudnorm2`), `explain`, and MCP surfaces should need
+  nothing, but verify tags still flow through `SinkUnit.tags`.
 
-## Empirics FIRST, semantics preserved
+## Order
 
-Before designing anything, census what a scalar CTE column DOES today:
-every shape of `WITH x AS (SELECT <stream>, <scalar> AS t ...) SELECT
-x.<stream>, x.t ...` that currently compiles, and what it produces.
-Whatever compiles today must compile to the same argv after — the tag
-relocation must be invisible for every single-row case. Any shape where
-that cannot hold is a STOP: report it before proceeding, do not choose
-silently.
+1. STRUCT literal as a value expression + the `tags` column, with the
+   implicit convention removed and every test/recipe/doc respelled in
+   the same motion (the census's A-set is the checklist).
+2. Value columns: CTE and table-function rows, enforcement of declared
+   types, reads in WHERE/TO/GROUP BY/table output, the fan-out
+   pinning. The frames acceptance.
+3. Chapters/cues STRUCT spelling + recipe rewrites; the two sink
+   option retirements.
 
-## Acceptance
-
-1. The standalone `frames` query above: `:count` files, names from
-   `s.n`, each a one-frame png seeked to its midpoint. THE test.
-2. The gathered spelling keeps working unchanged (its test exists).
-3. A fan-out writing per-file titles from a value column.
-4. A value column that is NOT compile-time evaluable is a typed
-   rejection naming the column.
-5. Every existing tag recipe compiles to identical argv.
-
-## Recipes first
-
-Two into `docs/examples.md` before implementation: the standalone
-frames pattern (inline, not the function — the cookbook teaches the
-dialect), and per-file titles from a fan-out. Pins generated by the
-compiler, never hand-typed.
+One agent may carry all three in sequence; the boundary between them
+is where a review could land if it must.
 
 ## House rules
 
@@ -103,4 +141,5 @@ compiler, never hand-typed.
 - Never cite a plan or RFC number in code, comments, docstrings or
   error messages.
 - Short factual WHAT comments only.
+- Recipes and pins generated by running the compiler, never hand-typed.
 - Run the targeted tests, not the whole suite. Report concisely.
