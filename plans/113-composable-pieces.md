@@ -170,16 +170,14 @@ tail. `(i - 0.5) / count` centres each frame in its own slice and never
 touches either end. That difference is why these are two functions and
 not one with a flag.
 
-*Verified 2026-08-25, after the full wave batch landed: the gathered
-spelling WORKS through a table function, end to end — `frames(path,
-count, track)` returning stream rows, consumed by `grid(array_agg(...),
-'2x2')`, compiles to four midpoint seeks feeding one `xstack` and the
-output plays. One rule: the function's rows may carry only STREAM
-columns. A `number` column beside the stream still lowers as a metadata
-tag ("tag 'n' takes two different values on the same track"), so the
-fan-out spelling — `TO (:'prefix' || s.n || '.png')`, which needs that
-column — still waits on CTEs carrying compile-time value columns.
-Declare `count` with `DEFAULT` now that signatures have them.*
+*Updated 2026-08-25, after value columns landed: BOTH spellings work
+now. The gathered form was verified end to end earlier the same day
+(four midpoint seeks into one `xstack`, output plays), and the
+standalone form is the compiler's own acceptance test — `frames(path,
+count, track)` returning `(n, frame)` rows, `TO (:'prefix' ||
+s.n::text || '.png')`, one file per frame. Ship `frames` complete with
+its `n` column, and declare `count` with `DEFAULT` now that signatures
+have them.*
 
 **`grid(streams, shape)`** — the piece that shows what composition is
 for:
@@ -202,6 +200,30 @@ Note `tile` is already callable and makes contact sheets from a single
 stream — cheaper for that one case, but it cannot do the four-camera
 case, so it cannot be the shared function. For a long file nine seeks
 beat decoding the whole thing anyway.
+
+## B4. Language fallout to fold into the same pass
+
+The tag and dialect work that landed after this plan was written
+changes three things here, none large:
+
+- **`retitle` respells — and becomes its own best advertisement.** It
+  is the ONLY registry program using the removed aliased-scalar tag
+  spelling (verified by grep; no program uses `VALUES`, `ROW(...)`
+  record literals, `metadata_from`, or `strip_metadata`). Its body
+  collapses to the copy-and-override idiom:
+
+      SELECT *, f.tags || STRUCT(:'title' AS title, :'artist' AS artist) AS tags
+      FROM input(:'source') f
+
+  with unset variables clearing nothing (NULL merges as absence).
+- **A `* REPLACE` pass over the kept programs**, once that lands:
+  every keep-everything-change-one-thing program (`watermark`, `pip`,
+  the one-track transforms that survived the cull) shortens to
+  `SELECT * REPLACE(<expr> AS video)`. Do it in the same pass as the
+  cull so each program is touched once.
+- **`frames` and `grid` ship as tested**, per the updated note above —
+  including per-frame file output, which was the standalone function's
+  whole point.
 
 ## What is still blocked
 
