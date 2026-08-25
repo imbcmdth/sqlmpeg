@@ -21,7 +21,7 @@ select  := [WITH cte (, cte)*] SELECT columns FROM from [WHERE pred]
            [GROUP BY exprs] [ORDER BY exprs]
            (UNION ALL select)*
 copy    := COPY ( select ) TO dest [WITH ( option value (, ...)* )]
-cte     := name AS ( select )  |  name (col, ...) AS ( VALUES ... )
+cte     := name AS ( select )
 dest    := 'path' | STDOUT | ( value-expression )
 ```
 
@@ -360,9 +360,9 @@ Every FROM item is a compile-time table; the column model per shape is
 | `input('path', name => value, ...) alias` | 1 | alias mandatory; path is a literal, never computed; trailing named options are ffmpeg's per-input flags |
 | `ffmpeg.<source>(name => value, ...) alias` | 1 | generated stream (testsrc2, sine, color, anullsrc, ...), no `-i`; options named-only |
 | `unnest(alias.<array>) alias` | one per element | the four stream arrays, or `chapters` / `cues` / `attachments`, of an input declared earlier in the same FROM |
-| `unnest(ARRAY[STRUCT(v AS c, ...), ...]) alias` | one per array element | a written row table, the STRUCT spelling of `(VALUES (...)) AS t(c)`; columns are the STRUCT field names, every element declaring the same set |
+| `unnest(ARRAY[STRUCT(v AS c, ...), ...]) alias` | one per array element | a written row table; columns are the STRUCT field names, every element declaring the same set |
 | `generate_series(start, stop[, step]) alias` | `stop - start` over `step`, inclusive | alias mandatory, names both the row table and its one column (`i.i`); bounds and step are integer literals after substitution |
-| `cte_or_view_name [alias]` | its body's rows | a multi-row body is a multi-row source; a `VALUES` list is one too |
+| `cte_or_view_name [alias]` | its body's rows | a multi-row body is a multi-row source |
 | `function_name(args) alias` | its body's rows | a table-returning function, expanded at compile time |
 
 Comma between items is a cross join with real multiplicity.
@@ -447,8 +447,7 @@ in a `tags` column.
 literal, and the spelling is borrowed (BigQuery's). It is the dialect's
 one way to write a map or a record by field name — the `tags` column
 takes a map, and a `::chapter` / `::cue` / `::attachment` cast turns one
-into that record. Postgres's own positional `ROW(...)::chapter` stays
-valid.
+into that record.
 
 `* EXCEPT(...)` / `* REPLACE(...)` are borrowed the same way (BigQuery's
 splat modifiers); `EXCEPT` is otherwise a Postgres set operator, but the
@@ -471,7 +470,7 @@ destinations:
 value := literal | NULL | row-column | input-scalar
        | value || value            -- text only
        | value (+|-|*|/) value     -- Postgres typing; int/int truncates
-       | value ::text | CAST(value AS text)
+       | value ::text
        | CASE WHEN pred THEN value [ELSE value] END
        | COALESCE(value, ...)      -- first argument a value, never a stream;
                                    -- arguments agree on one type
@@ -481,8 +480,12 @@ value := literal | NULL | row-column | input-scalar
        | map || map                          -- merge, right side wins
        | ARRAY[STRUCT(...)::chapter, ...]    -- record arrays: chapter,
        | ARRAY[STRUCT(...)::cue, ...]        -- cue, attachment
-                                             -- ROW(...)::chapter also works
 ```
+
+`::text` is the spelling; `CAST(value AS text)` compiles too, but only
+because sqlglot 30.17 parses it to the identical node with no marker
+telling the two apart, so it is an undocumented synonym rather than a
+second supported spelling.
 
 Predicates: `= != < <= > >= BETWEEN IS [NOT] NULL [NOT] IN (literals)`,
 combined with `AND OR NOT`. A boolean value is a predicate on its own

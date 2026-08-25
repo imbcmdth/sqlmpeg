@@ -186,7 +186,7 @@ import difflib
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 import sqlglot
 from sqlglot import TokenType, exp
@@ -485,6 +485,33 @@ def _record_not_stream_hint(alias: str, record: str) -> str:
     )
 
 
+def _row_table_hint(alias: str, columns: list[str], tuples: list[exp.Expr]) -> str:
+    """The struct spelling of a written row table, in this query's own names.
+
+    A row's cells render verbatim when they line up with the column list
+    (an ordinary ``VALUES`` row always does); otherwise the fields are named
+    with a placeholder value, which is still the query's own column names.
+    """
+    rows_sql: list[str] = []
+    if columns:
+        for tup in tuples:
+            cells = tup.expressions if isinstance(tup, exp.Tuple) else None
+            if cells is None or len(cells) != len(columns):
+                rows_sql = []
+                break
+            fields = ", ".join(
+                f"{cell.sql(dialect='postgres')} AS {column}"
+                for cell, column in zip(cells, columns, strict=True)
+            )
+            rows_sql.append(f"STRUCT({fields})")
+    if rows_sql:
+        return f"a row table is written unnest(ARRAY[{', '.join(rows_sql)}]) {alias}"
+    if columns:
+        fields = ", ".join(f"... AS {column}" for column in columns)
+        return f"a row table is written unnest(ARRAY[STRUCT({fields}), ...]) {alias}"
+    return f"a row table is written unnest(ARRAY[STRUCT(...), ...]) {alias}"
+
+
 _GROUP_FANOUT_HINT = (
     "one group is one file, so the destination has to name the group, "
     "e.g. TO (t.tags.language || '.mka')"
@@ -754,9 +781,9 @@ def is_value_expr(node: exp.Expr | None) -> bool:
 def record_cast_type(node: exp.Expr | None) -> str | None:
     """The declared record type ``<x>::<name>`` casts to, else None.
 
-    ``ROW('Intro', 0, 60)::chapter`` parses as a cast to a USERDEFINED type
-    whose name sits in the DataType's ``kind``; only the names
-    :data:`RECORD_FIELDS` declares are records.
+    ``STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)::chapter`` parses
+    as a cast to a USERDEFINED type whose name sits in the DataType's
+    ``kind``; only the names :data:`RECORD_FIELDS` declares are records.
     """
     if not isinstance(node, exp.Cast):
         return None
@@ -1478,14 +1505,13 @@ class RawTrackRows:
 
 @dataclass(frozen=True)
 class RawValuesTable:
-    """``WITH <alias>(<columns>) AS (VALUES (...), ...)`` -- a literal row table.
+    """``unnest(ARRAY[STRUCT(...), ...]) alias`` -- a literal row table.
 
     A ROW SOURCE like an ``unnest`` table, joined into the branch's relation
     the same way, except that its rows are written out rather than probed.
-    `columns` is the alias's column list, in written order; `rows` is one tuple
-    of value expressions per VALUES row (literals for a ``WITH ... AS
-    (VALUES ...)`` table, the compile-time value grammar for a struct row
-    table), each the same length as `columns`; `types` is the type each
+    `columns` is the alias's column list, in written order; `rows` is one
+    tuple of value expressions per row, taking the compile-time value
+    grammar, each the same length as `columns`; `types` is the type each
     column settled on, parallel to `columns` -- ``text``, ``number`` or
     ``boolean``, with an all-NULL column reading as ``text`` the way Postgres
     types one.
@@ -1563,22 +1589,17 @@ class Resolved:
     input alias named in ``RawTrackRows.source`` — and shares the one flat
     namespace views, CTEs and aliases live in."""
 
-    values_ctes: dict[str, RawValuesTable] = field(default_factory=dict)
-    """``WITH <alias>(<cols>) AS (VALUES ...)`` records, keyed by alias.
-    Disjoint from ``ctes``: a VALUES CTE is never FROM-selectable, only usable
-    as a sink option's value (``chapters <alias>``)."""
-
     struct_rows: dict[str, RawValuesTable] = field(default_factory=dict)
     """``unnest(ARRAY[STRUCT(...), ...]) alias`` records, keyed by the row
-    alias, in FROM order across the whole script -- the struct spelling of a
-    ``VALUES`` table read in FROM. Disjoint from ``track_rows``: a struct row
-    table carries no stream, only written value columns."""
+    alias, in FROM order across the whole script -- a written row table.
+    Disjoint from ``track_rows``: a struct row table carries no stream, only
+    written value columns."""
 
     row_aliases: frozenset[str] = frozenset()
     """Every alias bound as a ROW table anywhere in the script: an ``unnest``
-    table, a ``VALUES`` table read in FROM, a ``generate_series``. What decides
-    whether a ``TO`` expression fans out, and what a path expression may read.
-    ``track_rows`` is the ``unnest`` subset of it."""
+    table, a struct row table read in FROM, a ``generate_series``. What
+    decides whether a ``TO`` expression fans out, and what a path expression
+    may read. ``track_rows`` is the ``unnest`` subset of it."""
 
     series: dict[str, tuple[int, ...]] = field(default_factory=dict)
     """``FROM generate_series(start, stop[, step]) alias`` records, keyed by
@@ -2524,14 +2545,13 @@ class _Resolver:
         self.source_filters: dict[str, RawSource] = {}
         self.track_rows: dict[str, RawTrackRows] = {}
         self.struct_rows: dict[str, RawValuesTable] = {}
-        self.values_ctes: dict[str, RawValuesTable] = {}
-        # The VALUES tables THIS branch's FROM clause binds, by the local name
-        # it read them under. Branch-local, so `_collect_scope` clears it: two
-        # branches may each spell their own table `m`.
+        # The struct row tables THIS branch's FROM clause binds, by the local
+        # name it read them under. Branch-local, so `_collect_scope` clears
+        # it: two branches may each spell their own table `m`.
         self.values_rows: dict[str, RawValuesTable] = {}
         self.series: dict[str, tuple[int, ...]] = {}
         # Every row alias the script binds, across branches: unnest tables,
-        # VALUES tables read in FROM, and series.
+        # struct row tables read in FROM, and series.
         self.row_aliases: set[str] = set()
 
     # -- entry point ------------------------------------------------------
@@ -2641,7 +2661,6 @@ class _Resolver:
             source_filters=self.source_filters,
             track_rows=self.track_rows,
             struct_rows=self.struct_rows,
-            values_ctes=self.values_ctes,
             series=self.series,
             row_aliases=frozenset(self.row_aliases),
         )
@@ -2706,7 +2725,7 @@ class _Resolver:
         # UNION ALL branch aggregates like any other: it is one concat segment,
         # and a segment with several rows has to gather them the same way.
         no_aggregate = context
-        visible = set(self.ctes) | set(self.values_ctes)
+        visible = set(self.ctes)
         for branch in branches:
             self._validate_select(
                 branch,
@@ -2902,13 +2921,12 @@ class _Resolver:
 
             # A column list is CTE syntax stock Postgres uses for two things:
             # naming a VALUES CTE's columns (there is nothing else to name
-            # them from), or renaming an ordinary SELECT's. Only the first is
-            # supported -- sqlglot's own shape tells them apart, since a
-            # `(VALUES ...)` body always parses as `Select(expressions=[Star],
-            # from_=From(this=Values(...)))`.
+            # them from), or renaming an ordinary SELECT's. Neither is
+            # supported: a VALUES CTE is rejected outright, and a SELECT's
+            # columns are named with AS inside the SELECT instead.
             if alias.args.get("columns"):
                 self._reserve(name, alias.this)
-                self._add_values_cte(name, alias, cte)
+                self._reject_column_list_cte(name, alias, cte)
                 continue
 
             self._reserve(name, alias.this)
@@ -2930,142 +2948,50 @@ class _Resolver:
                     hint="hoist the CTE to the top-level WITH",
                 )
             # A CTE only sees the CTEs defined before it (no forward refs).
-            visible = set(self.ctes) | set(self.values_ctes)
+            visible = set(self.ctes)
             for branch in union_branches(body):
                 self._validate_select(branch, visible, no_aggregate="a CTE body")
             self.ctes[name] = body
 
-    def _add_values_cte(self, name: str, alias: exp.TableAlias, cte: exp.CTE) -> None:
-        """``WITH <name>(<cols>) AS (VALUES ...)`` -- a compile-time row table.
+    def _reject_column_list_cte(
+        self, name: str, alias: exp.TableAlias, cte: exp.CTE
+    ) -> NoReturn:
+        """``WITH <name>(<cols>) AS (...)`` -- no column list is supported.
 
-        Shape only: sqlglot always wraps a parenthesized ``VALUES`` in
-        ``Select(expressions=[Star()], from_=From(this=Values(...)))``, so
-        that exact shape is what tells a real VALUES CTE apart from a column-
-        renamed SELECT (which is not supported: ``AS`` inside the SELECT is
-        the one way to name a SELECT CTE's columns).
+        The one thing a CTE column list was ever for is naming a VALUES row
+        table's columns, and VALUES is not supported; sqlglot's own shape
+        tells a real VALUES body apart from a column-renamed SELECT
+        (``Select(expressions=[Star()], from_=From(this=Values(...)))``),
+        so when it matches, the hint spells out the STRUCT replacement with
+        this query's own names and values.
         """
-        columns_list = alias.args.get("columns") or []
-        column_names = [_ident_name(c) for c in columns_list]
-        if len(set(column_names)) != len(column_names):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"duplicate column name in '{name}({', '.join(column_names)})'",
-                alias,
-                hint="every VALUES column needs its own name",
-            )
-        reserved = [column for column in column_names if column in MAP_COLUMNS]
-        if reserved:
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"'{name}.{reserved[0]}' takes a name a row's maps already use",
-                alias,
-                hint=f"{_listed_columns(MAP_COLUMNS)} name the maps a track row "
-                "carries; pick another column name",
-            )
-
+        column_names = [_ident_name(c) for c in (alias.args.get("columns") or [])]
         body = _unwrap(cte.this)
-        if not isinstance(body, exp.Select):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"CTE '{name}' has a column list, so it must be VALUES (...)",
-                cte.this,
-                fallback=cte,
-                hint="name a SELECT CTE's columns with AS inside the SELECT instead",
-            )
-        _check_query_args(body, frozenset({"expressions", "from_"}), f"VALUES CTE '{name}'")
-        exprs = body.expressions
-        from_ = body.args.get("from_")
-        if len(exprs) != 1 or not isinstance(exprs[0], exp.Star) or not isinstance(
-            from_, exp.From
+        tuples: list[exp.Expr] = []
+        if (
+            isinstance(body, exp.Select)
+            and len(body.expressions) == 1
+            and isinstance(body.expressions[0], exp.Star)
+            and isinstance(body.args.get("from_"), exp.From)
         ):
+            values = body.args["from_"].this
+            if isinstance(values, exp.Values):
+                tuples = list(values.expressions)
+        if tuples:
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
-                f"CTE '{name}' has a column list, so it must be VALUES (...)",
+                "a VALUES row table is not supported",
                 cte.this,
                 fallback=cte,
-                hint="name a SELECT CTE's columns with AS inside the SELECT instead",
+                hint=_row_table_hint(name, column_names, tuples),
             )
-        values = from_.this
-        if not isinstance(values, exp.Values):
-            raise _error(
-                ErrorCode.UNSUPPORTED_SQL,
-                f"CTE '{name}' has a column list, so it must be VALUES (...)",
-                cte.this,
-                fallback=cte,
-                hint="name a SELECT CTE's columns with AS inside the SELECT instead",
-            )
-        _check_query_args(from_, frozenset({"this"}), f"VALUES CTE '{name}' FROM")
-        _check_query_args(values, frozenset({"expressions", "alias"}), "VALUES")
-
-        rows: list[tuple[exp.Literal | exp.Null, ...]] = []
-        for tup in values.expressions:
-            if not isinstance(tup, exp.Tuple):
-                raise _error(ErrorCode.UNSUPPORTED_SQL, "malformed VALUES row", tup, fallback=cte)
-            cells = tup.expressions
-            if len(cells) != len(column_names):
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"VALUES row has {len(cells)} values, but "
-                    f"'{name}({', '.join(column_names)})' names {len(column_names)}",
-                    tup,
-                    fallback=cte,
-                )
-            checked: list[exp.Literal | exp.Null] = []
-            for cell in cells:
-                unwrapped = _unwrap(cell) if isinstance(cell, exp.Expr) else cell
-                if not isinstance(unwrapped, exp.Literal | exp.Null):
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        "a VALUES cell must be a literal",
-                        cell if isinstance(cell, exp.Expr) else tup,
-                        fallback=cte,
-                        hint="VALUES rows are compile-time literals: numbers, "
-                        "quoted strings, or NULL -- no expressions",
-                    )
-                checked.append(unwrapped)
-            rows.append(tuple(checked))
-
-        self.values_ctes[name] = RawValuesTable(
-            alias=name,
-            columns=tuple(column_names),
-            rows=tuple(rows),
-            node=cte,
-            types=self._values_types(name, tuple(column_names), tuple(rows), cte),
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            f"CTE '{name}' has a column list, which is not supported",
+            alias,
+            fallback=cte,
+            hint="name a SELECT CTE's columns with AS inside the SELECT instead",
         )
-
-    def _values_types(
-        self,
-        name: str,
-        columns: tuple[str, ...],
-        rows: tuple[tuple[exp.Literal | exp.Null, ...], ...],
-        cte: exp.CTE,
-    ) -> tuple[str, ...]:
-        """One type per column, read off the literals; disagreement is rejected.
-
-        A column every row leaves NULL types as text, which is what Postgres
-        gives an untyped NULL column of a VALUES list.
-        """
-        types: list[str] = []
-        for position, column in enumerate(columns):
-            settled: str | None = None
-            for row in rows:
-                cell = row[position]
-                written = _literal_type(cell)
-                if written is None:
-                    continue
-                if settled is not None and written != settled:
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        f"column '{name}.{column}' holds both {settled} and "
-                        f"{written}",
-                        cell,
-                        fallback=cte,
-                        hint="every row of a VALUES column writes the same "
-                        "type; NULL fits any of them",
-                    )
-                settled = written
-            types.append(settled or "text")
-        return tuple(types)
 
     def _reserve(self, name: str, node: exp.Expr | None) -> None:
         if not name:
@@ -3092,7 +3018,6 @@ class _Resolver:
             or name in self.source_filters
             or name in self.track_rows
             or name in self.struct_rows
-            or name in self.values_ctes
             or name in self.series
         ):
             raise _error(
@@ -4080,7 +4005,29 @@ class _Resolver:
                 return
             self._add_track_rows(item, scope)
             return
+        if isinstance(item, exp.Values):
+            self._reject_values(item)
         self._add_table(item, scope, visible)
+
+    def _reject_values(self, values: exp.Values) -> NoReturn:
+        """``FROM (VALUES (...)) AS r(w, q)`` -- a written row table, but not
+        this dialect's spelling of one: ``unnest(ARRAY[STRUCT(...), ...])``
+        is. The hint spells it out with this query's own alias, columns and
+        values where the row shape lines up with the column list.
+        """
+        alias_node = values.args.get("alias")
+        alias = ""
+        columns: list[str] = []
+        if isinstance(alias_node, exp.TableAlias):
+            if alias_node.this is not None:
+                alias = _ident_name(alias_node.this)
+            columns = [_ident_name(c) for c in (alias_node.args.get("columns") or [])]
+        raise _error(
+            ErrorCode.UNSUPPORTED_SQL,
+            "a VALUES row table is not supported",
+            values,
+            hint=_row_table_hint(alias or "t", columns, list(values.expressions)),
+        )
 
     def _add_table(
         self, table: exp.Expr | None, scope: dict[str, str], visible: set[str]
@@ -4137,23 +4084,6 @@ class _Resolver:
             return
         if isinstance(inner, exp.Identifier):
             name = _ident_name(inner)
-            values = self.values_ctes.get(name)
-            if values is not None:
-                # A written row source: it binds like a track-row table, so
-                # every rule about rows -- the cross join, GROUP BY,
-                # array_agg -- applies to it unchanged.
-                local = self._local_alias(name, alias_node, table)
-                if local in scope:
-                    raise _error(
-                        ErrorCode.UNSUPPORTED_SQL,
-                        f"duplicate name '{local}'",
-                        alias_node if alias_node is not None else inner,
-                        fallback=table,
-                    )
-                self.values_rows[local] = values
-                scope[local] = "row"
-                self.row_aliases.add(local)
-                return
             if name not in visible:
                 raise _error(
                     ErrorCode.UNKNOWN_ALIAS,
@@ -4192,14 +4122,14 @@ class _Resolver:
         self, unnest: exp.Unnest, array: exp.Array, scope: dict[str, str]
     ) -> None:
         """``unnest(ARRAY[STRUCT(...), ...]) alias`` -- an inline written row
-        table, the STRUCT spelling of ``(VALUES (...)) AS t(c)``.
+        table, its columns the STRUCT field names.
 
         Every struct in the array names the same field set, order-free; a
         field's value takes the ordinary compile-time value grammar -- a
         literal, or an expression over one -- so a stream inside is rejected
         the same way any other value position rejects one. The rows join the
-        branch's relation through the same ``RawValuesTable``/``_RowBinding``
-        machinery a ``VALUES`` table's do.
+        branch's relation through the ``RawValuesTable``/``_RowBinding``
+        machinery every written row table shares.
         """
         _check_query_args(
             unnest, frozenset({"expressions", "alias", "offset"}), "unnest"
@@ -4307,9 +4237,8 @@ class _Resolver:
         """One type per column, from the compile-time value grammar.
 
         A stream-typed field is rejected here, by the same value grammar any
-        other value position uses (:meth:`_check_value_expr`); disagreement
-        across rows is rejected the way a VALUES column's is
-        (:meth:`_values_types`).
+        other value position uses (:meth:`_check_value_expr`); a column whose
+        rows disagree on type is rejected too.
         """
         types: list[str] = []
         for position, column in enumerate(columns):
@@ -4677,11 +4606,10 @@ class _Resolver:
         produce no rows, are rejected too: a series that silently produces
         nothing is a mistake worth naming, not a valid empty table.
 
-        The row VALUES are computed here rather than deferred to lower, the
-        same way a VALUES CTE's column types are (:meth:`_values_types`) --
+        The row values are computed here rather than deferred to lower --
         pure-literal arithmetic is resolve's business. `values_rows` gets a
         schema-only descriptor (empty ``rows``, since nothing after this reads
-        them) purely so the existing VALUES-row machinery -- WHERE, SELECT,
+        them) purely so the existing written-row machinery -- WHERE, SELECT,
         GROUP BY, array_agg over `scope[alias] == "row"` -- picks the column
         up for free; `series` on `Resolved` carries the actual sequence lower
         builds the rows from.
@@ -4911,7 +4839,7 @@ class _Resolver:
         values: RawValuesTable,
         select: exp.Expr,
     ) -> str:
-        """Whitelist one ``<VALUES alias>.<column>`` and return its type.
+        """Whitelist one ``<written row alias>.<column>`` and return its type.
 
         A written row carries no stream, so the alias standing on its own is a
         rejection rather than the stream a track row's alias names.

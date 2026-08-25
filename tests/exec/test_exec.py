@@ -1592,8 +1592,8 @@ def test_extractplanes_extracts_the_luma_plane_as_grey(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# chapters: read the array column off a real file; write from a VALUES CTE
-# and read that back with ffprobe
+# chapters: read the array column off a real file; write from a struct row
+# table and read that back with ffprobe
 # ---------------------------------------------------------------------------
 
 
@@ -1653,8 +1653,9 @@ def test_a_written_chapters_column_is_read_back_off_the_output(
     query = (
         "COPY (\n"
         f"  SELECT f.video[1], f.audio[1],\n"
-        "         ARRAY[ROW('Intro', 0, 1)::chapter,\n"
-        "               ROW('Credits', 1, 2)::chapter] AS chapters\n"
+        "         ARRAY[STRUCT('Intro' AS title, 0 AS start_t, 1 AS end_t)::chapter,\n"
+        "               STRUCT('Credits' AS title, 1 AS start_t, 2 AS end_t)::chapter] "
+        "AS chapters\n"
         f"  FROM input('{_sql_path(_AV)}') f\n"
         f") TO '{_sql_path(out_path)}';"
     )
@@ -1668,18 +1669,18 @@ def test_a_written_chapters_column_is_read_back_off_the_output(
 
 
 def test_a_gathered_chapters_column_writes_the_same_file(tmp_path: Path) -> None:
-    """`array_agg` over a VALUES row source is the relational spelling of the
+    """`array_agg` over a struct row source is the relational spelling of the
     same list, so the file it writes carries the same chapters."""
     _require_fixture(_AV)
     out_path = tmp_path / "gathered.mkv"
     query = (
         "COPY (\n"
-        "  WITH marks(start_t, end_t, title) AS (\n"
-        "    VALUES (0, 1, 'Intro'), (1, 2, 'Credits')\n"
-        "  )\n"
         f"  SELECT f.video[1], f.audio[1],\n"
-        "         array_agg(ROW(m.title, m.start_t, m.end_t)::chapter) AS chapters\n"
-        f"  FROM input('{_sql_path(_AV)}') f, marks m\n"
+        "         array_agg(STRUCT(m.title AS title, m.start_t AS start_t,\n"
+        "                          m.end_t AS end_t)::chapter) AS chapters\n"
+        f"  FROM input('{_sql_path(_AV)}') f,\n"
+        "       unnest(ARRAY[STRUCT(0 AS start_t, 1 AS end_t, 'Intro' AS title),\n"
+        "                    STRUCT(1 AS start_t, 2 AS end_t, 'Credits' AS title)]) m\n"
         "  GROUP BY f.video[1], f.audio[1]\n"
         f") TO '{_sql_path(out_path)}';"
     )

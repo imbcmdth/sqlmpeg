@@ -155,8 +155,8 @@ def test_a_table_returning_package_function_is_a_row_source(tmp_path: Path) -> N
 def test_a_package_function_reads_rows_as_a_table_query(tmp_path: Path) -> None:
     _project(tmp_path, files={"src/lang.sql": NORMALIZE})
     sinks = compile_table_sql(
-        "WITH said(raw) AS (VALUES ('english'), ('de'))\n"
-        "SELECT me.edits.normalize_lang(said.raw) AS language FROM said",
+        "SELECT me.edits.normalize_lang(said.raw) AS language "
+        "FROM unnest(ARRAY[STRUCT('english' AS raw), STRUCT('de' AS raw)]) said",
         packages=_packages(tmp_path),
     )
     assert sinks[0].result.rows == [["eng"], ["de"]]

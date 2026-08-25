@@ -1453,17 +1453,16 @@ ffmpeg -i tests/fixtures/av2.mp4 -i tests/fixtures/av-chapters.mkv -map 0:v:0 -c
   -map 0:a:0 -c:1 copy -metadata:s:1 language=eng -map_chapters 1 borrowed.mkv
 ```
 
-Gathering rows builds one instead. A `VALUES` list is just another row source, so this compiles to exactly the same command as [recipe 40](#40-write-chapters) - two spellings, one file:
+Gathering rows builds one instead. A written row table is just another row source, so this compiles to exactly the same command as [recipe 40](#40-write-chapters) - two spellings, one file:
 
 ```sql
 COPY (
-  WITH marks(start_t, end_t, title) AS (
-    VALUES (0, 60, 'Intro'), (60, 300, 'Act One')
-  )
   SELECT f.video[1], f.audio[1],
          array_agg(STRUCT(m.title AS title, m.start_t AS start_t,
                           m.end_t AS end_t)::chapter) AS chapters
-  FROM input(:'source') f, marks m
+  FROM input(:'source') f,
+       unnest(ARRAY[STRUCT(0 AS start_t, 60 AS end_t, 'Intro' AS title),
+                    STRUCT(60 AS start_t, 300 AS end_t, 'Act One' AS title)]) m
   GROUP BY f.video[1], f.audio[1]
 ) TO :'dest'
 ```
@@ -1700,7 +1699,7 @@ ffmpeg -i tests/fixtures/av2.mp4 -filter_complex '[0:a:0][0:a:1]amix=inputs=2[ou
 `inputs` still writes itself from the count, so `amix(VARIADIC xs, inputs => 3)` over a two-element array is a rejection naming both numbers, exactly as `amix(a, b, inputs => 3)` already was.
 ## 72. Write evenly-spaced chapters, however many you want
 
-`generate_series(start, stop[, step])` in `FROM` is a row source that is a count rather than a file - a `VALUES` table with its cells computed instead of written. The alias names both the table and its one column, so `generate_series(1, :count) i` reads back as `i.i`; gather it into a chapter list the same way any row source builds one, and the count becomes a parameter instead of a wall of copy-pasted `STRUCT(...)`s:
+`generate_series(start, stop[, step])` in `FROM` is a row source that is a count rather than a file - a struct row table with its cells computed instead of written. The alias names both the table and its one column, so `generate_series(1, :count) i` reads back as `i.i`; gather it into a chapter list the same way any row source builds one, and the count becomes a parameter instead of a wall of copy-pasted `STRUCT(...)`s:
 
 ```sql
 COPY (
@@ -1986,7 +1985,7 @@ No subtitle stream, no `mov_text` transcode: dropping the track drops the reason
 
 ## 85. Key an encode ladder from written rows
 
-`unnest(ARRAY[STRUCT(...), ...])` is the STRUCT spelling of `(VALUES (...)) AS t(c)`: an inline row table, its columns named by the STRUCT fields instead of a column list. Each row keys its own `TO` and its own `* REPLACE`, so an encode ladder is one row per rung rather than one query per rung:
+`unnest(ARRAY[STRUCT(...), ...])` is an inline row table, its columns named by the STRUCT fields instead of a column list. Each row keys its own `TO` and its own `* REPLACE`, so an encode ladder is one row per rung rather than one query per rung:
 
 ```pgsql
 COPY (

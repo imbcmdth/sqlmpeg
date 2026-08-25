@@ -178,11 +178,13 @@ def test_a_series_keyed_fan_out_mints_no_extra_input() -> None:
         assert set(graph.sources) == {"f"}
 
 
-def test_a_values_row_keys_a_fan_out_to() -> None:
+def test_a_struct_row_keys_a_fan_out_to() -> None:
     """A written row source keys one just the same."""
     sql = (
-        "COPY (WITH m(name, at) AS (VALUES ('intro', 0), ('outro', 5)) "
-        f"SELECT f.video[1] FROM input('{SRC}') f, m "
+        "COPY (SELECT f.video[1] "
+        f"FROM input('{SRC}') f, "
+        "unnest(ARRAY[STRUCT('intro' AS name, 0 AS at), "
+        "STRUCT('outro' AS name, 5 AS at)]) m "
         "WHERE f.t >= m.at AND f.t <= m.at + 1) TO (m.name || '.mp4')"
     )
     assert _paths(sql) == ["intro.mp4", "outro.mp4"]

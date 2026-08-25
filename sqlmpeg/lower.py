@@ -530,12 +530,6 @@ _WRITTEN_ROW_HINT = (
     "by its columns, e.g. array_agg(STRUCT(m.title AS title, m.start_t AS "
     "start_t, m.end_t AS end_t)::chapter) AS chapters"
 )
-# Both record spellings: the named STRUCT form, and the positional ROW cast it
-# replaced, which stays valid.
-_RECORD_SPELLING_HINT = (
-    "record fields are named, e.g. STRUCT('Intro' AS title, 0 AS start_t, "
-    "60 AS end_t)::chapter; the positional ROW('Intro', 0, 60)::chapter also works"
-)
 _CAPTION_TRIM_HINT = (
     "trim the video/audio without selecting the subtitle/data columns, or select "
     "them in a query without a WHERE time range; to caption a trimmed clip, join "
@@ -1308,21 +1302,6 @@ def _sink_value(node: exp.Expr) -> object:
 _UNSAFE_CHAPTER_TITLE = frozenset("\\=;#\n\r")
 
 
-def _record_args(node: exp.Expr) -> list[exp.Expr] | None:
-    """The values a ``ROW(...)`` record constructor lists, else None.
-
-    ``ROW(a, b, c)`` parses as a plain call and the bare ``(a, b, c)`` form as
-    a tuple; both are the same constructor, so both are read here. A named
-    ``STRUCT(...)`` is read by :func:`_struct_fields` instead.
-    """
-    inner = _unwrap(node.this) if isinstance(node.this, exp.Expr) else None
-    if isinstance(inner, exp.Tuple):
-        return [item for item in inner.expressions if isinstance(item, exp.Expr)]
-    if isinstance(inner, exp.Anonymous) and str(inner.this).lower() == "row":
-        return [item for item in inner.expressions if isinstance(item, exp.Expr)]
-    return None
-
-
 def _struct_node(node: exp.Expr) -> exp.Struct | None:
     """The ``STRUCT(...)`` a cast wraps, else None."""
     inner = _unwrap(node.this) if isinstance(node.this, exp.Expr) else None
@@ -1929,7 +1908,7 @@ class _SourceBinding:
 RowValue = str | int | float | bool | None
 
 # `_TrackRow.stream` for a row that carries no track -- a chapter row, or a
-# written VALUES row. Never a real stream (neither exposes a stream column at
+# written row. Never a real stream (neither exposes a stream column at
 # all), only a dataclass filler. Its ref deliberately fails `is_src()` (no
 # "src:" prefix) and is not a node id either, so anything that somehow did try
 # to render it fails fast with "unknown node" rather than silently wiring up
@@ -2006,8 +1985,9 @@ class _RowBinding:
     `source` is the INPUT alias the tracks belong to. Everything downstream
     (the ``-i``, its WHERE window, provenance) keys off THAT alias, not the row
     one: a row table takes no input slot of its own. `values` is set instead
-    for a WRITTEN row source (a VALUES CTE in FROM), whose rows come from the
-    query rather than from a probe; it has no input alias and no streams.
+    for a WRITTEN row source (a struct row table in FROM), whose rows come
+    from the query rather than from a probe; it has no input alias and no
+    streams.
     """
 
     alias: str
@@ -2663,8 +2643,8 @@ class _Lowerer:
         every rejection on (or just above) the ``WITH`` block.
 
         A ``TO (<expression>)`` reaching here is a fan-out sink exactly when it
-        reads a row column -- any row source, ``unnest`` or ``VALUES`` or
-        ``generate_series``; that decision is made FIRST, since it changes
+        reads a row column -- any row source, ``unnest``, a struct row table,
+        or ``generate_series``; that decision is made FIRST, since it changes
         how the wrapped query lowers (one pinned row, per-row seek bounds).
         """
         self.fanout_expr = (
@@ -2843,7 +2823,7 @@ class _Lowerer:
     ) -> None:
         """``... AS chapters``: the file's chapter list, from one of three sources.
 
-        A literal ``ARRAY[ROW(...)::chapter, ...]`` and an ``array_agg`` over
+        A literal ``ARRAY[STRUCT(...)::chapter, ...]`` and an ``array_agg`` over
         rows both become one self-contained ffmetadata ``data:`` input;
         ``<input>.chapters`` names that input's own list; NULL writes none.
         The value is the FILE's, not a row's, so it is read once per COPY and
@@ -2964,13 +2944,13 @@ class _Lowerer:
         row: _RowTuple,
         select: exp.Select,
     ) -> dict[str, tuple[exp.Expr, RowValue]]:
-        """One ``ROW(...)::<record>``, evaluated: each field's cell and value.
+        """One ``STRUCT(...)::<record>``, evaluated: each field's cell and value.
 
-        The positional signature is the declared one
-        (:data:`~sqlmpeg.types.RECORD_FIELDS`): a query supplies the writable
-        fields, in declaration order, and never a probed one like ``index``.
-        Each value takes the ordinary compile-time value grammar. The cell is
-        kept beside the value so a rejection anchors on what the query typed.
+        Fields are named (:data:`~sqlmpeg.types.RECORD_FIELDS` lists them
+        for the record); a query supplies the writable ones, by name, and
+        never a probed one like ``index``. Each value takes the ordinary
+        compile-time value grammar. The cell is kept beside the value so a
+        rejection anchors on what the query typed.
 
         A ``SELECT AS STRUCT`` gather's struct carries no cast -- there is
         nowhere in that spelling to write one -- so it is marked instead
@@ -2986,30 +2966,16 @@ class _Lowerer:
             "gathered_struct"
         ):
             struct = node
-        if struct is not None:
-            cells = self._named_record_cells(struct, record, fields, select)
-        else:
-            written = _record_args(node) if matches else None
-            if written is None:
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"{article(record)} {record} is written as {literal}, got "
-                    f"{_describe(node)}",
-                    node,
-                    fallback=select,
-                    hint=hint,
-                )
-            if len(written) != len(fields):
-                named = ", ".join(field.name for field in fields)
-                raise _error(
-                    ErrorCode.UNSUPPORTED_SQL,
-                    f"{article(record)} {record} takes {len(fields)} values "
-                    f"({named}), got {len(written)}",
-                    node,
-                    fallback=select,
-                    hint=hint,
-                )
-            cells = dict(zip((field.name for field in fields), written, strict=True))
+        if struct is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"{article(record)} {record} is written as {literal}, got "
+                f"{_describe(node)}",
+                node,
+                fallback=select,
+                hint=hint,
+            )
+        cells = self._named_record_cells(struct, record, fields, select)
         return {
             name: (cell, self._eval_value(cell, env, row, select))
             for name, cell in cells.items()
@@ -3048,7 +3014,7 @@ class _Lowerer:
     def _chapter_record(
         self, node: exp.Expr, env: _Env, row: _RowTuple, select: exp.Select
     ) -> _Chapter:
-        """One ``ROW(title, start_t, end_t)::chapter``, evaluated and checked."""
+        """One ``STRUCT(title, start_t, end_t)::chapter``, evaluated and checked."""
         cells = self._written_record(
             node, CHAPTER_TYPE, _CHAPTER_LITERAL, _CHAPTERS_COLUMN_HINT, env, row, select
         )
@@ -3158,7 +3124,7 @@ class _Lowerer:
     def _attachment_record(
         self, node: exp.Expr, env: _Env, row: _RowTuple, select: exp.Select
     ) -> Attachment:
-        """One ``ROW(filename, mimetype, path)::attachment``, evaluated."""
+        """One ``STRUCT(filename, mimetype, path)::attachment``, evaluated."""
         cells = self._written_record(
             node,
             ATTACHMENT_TYPE,
@@ -3180,7 +3146,7 @@ class _Lowerer:
     def _cue_record(
         self, node: exp.Expr, env: _Env, row: _RowTuple, select: exp.Select
     ) -> _Cue:
-        """One ``ROW(text, start_t, end_t)::cue``, evaluated and checked."""
+        """One ``STRUCT(text, start_t, end_t)::cue``, evaluated and checked."""
         cells = self._written_record(
             node, CUE_TYPE, _CUE_LITERAL, _CUE_ARRAY_HINT, env, row, select
         )
@@ -4710,13 +4676,6 @@ class _Lowerer:
             return
         if isinstance(inner, exp.Identifier):
             name = _fold(inner)
-            values = self.res.values_ctes.get(name)
-            if values is not None:
-                local = name
-                if isinstance(alias_node, exp.TableAlias) and alias_node.this is not None:
-                    local = _fold(alias_node.this)
-                self._add_values_rows(local, values, env, select)
-                return
             columns = self.cte_columns.get(name)
             body_values = self.cte_values.get(name, {})
             if columns is None:
@@ -4748,17 +4707,17 @@ class _Lowerer:
     def _add_values_rows(
         self, local: str, values: RawValuesTable, env: _Env, select: exp.Select
     ) -> None:
-        """Bind one VALUES table: its written rows join the branch's relation.
+        """Bind one written row table: its rows join the branch's relation.
 
         The same join :meth:`_add_track_rows` builds, with the rows read off
-        the query instead of a probe -- so a comma between a VALUES table and
-        anything else is the ordinary cross join, and ``array_agg`` over it
-        aggregates the same way. No stream and no ``-i``: the rows are values.
-        Each cell takes the ordinary compile-time value grammar
-        (:meth:`_eval_value`), evaluated once over the branch's representative
-        row -- a plain VALUES/``generate_series`` cell is always a literal, so
-        this is the identity for them; a struct row table's cell may be an
-        expression over one.
+        the query instead of a probe -- so a comma between a written row
+        table and anything else is the ordinary cross join, and
+        ``array_agg`` over it aggregates the same way. No stream and no
+        ``-i``: the rows are values. Each cell takes the ordinary
+        compile-time value grammar (:meth:`_eval_value`), evaluated once
+        over the branch's representative row -- a ``generate_series`` cell
+        is always a literal, so this is the identity for it; a struct row
+        table's cell may be an expression over one.
         """
         if env.relation is None:
             env.relation = _RowRelation()
@@ -4792,7 +4751,7 @@ class _Lowerer:
         select: exp.Select,
     ) -> None:
         """Bind one ``generate_series`` table: its computed rows join the
-        branch's relation exactly like a VALUES table's written ones.
+        branch's relation exactly like a struct row table's written ones.
 
         `values` is the whole computed sequence -- resolve already did the
         arithmetic and rejected a zero step or an empty/descending range,
@@ -6335,7 +6294,7 @@ class _Lowerer:
     def _lower_cue_array(
         self, node: exp.Expr, env: _Env, select: exp.Select
     ) -> _Value | None:
-        """``ARRAY[ROW(...)::cue, ...]`` / ``array_agg(ROW(...)::cue)`` as a track.
+        """``ARRAY[STRUCT(...)::cue, ...]`` / ``array_agg(STRUCT(...)::cue)`` as a track.
 
         None when the expression is not one, so every other stream expression
         falls through untouched. The cues become one self-contained WebVTT

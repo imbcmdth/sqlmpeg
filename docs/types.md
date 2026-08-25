@@ -39,8 +39,7 @@ Every field is one or the other, and the distinction is enforced:
   attachment's own fields. A `tags` map is written with a `tags` column
   (`STRUCT('eng' AS language) AS tags`, a `NULL` field clears); a
   record's fields are written by name in a literal,
-  `STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)::chapter`, or
-  positionally in the older `ROW('Intro', 0, 60)::chapter`.
+  `STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)::chapter`.
 - **Write-only** — one field, `attachment.path`: it names the file to
   attach when constructing a record and has nothing to report back, so
   reading it is a rejection.

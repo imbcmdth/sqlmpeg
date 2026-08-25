@@ -2531,7 +2531,7 @@ def test_never_raises_anything_but_sqlmpeg_error(sql: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# unnest(f.chapters) in FROM, and VALUES CTEs
+# unnest(f.chapters) in FROM, and written row tables
 # ---------------------------------------------------------------------------
 
 
@@ -2688,108 +2688,36 @@ def test_a_lone_chapter_record_still_names_the_chapters_column() -> None:
     )
 
 
-def test_values_cte_binds_a_row_table_not_a_normal_cte() -> None:
-    res = _resolve(
-        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro')) "
+def test_a_values_cte_is_rejected() -> None:
+    err = _reject(
+        "COPY (WITH marks(start_t, end_t, title) AS "
+        "(VALUES (0, 60, 'Intro'), (60, 300, 'Act One')) "
         f"{SINK_QUERY}) TO 'x.mkv'"
     )
-    assert list(res.values_ctes) == ["marks"]
-    table = res.values_ctes["marks"]
-    assert table.columns == ("start_t", "end_t", "title")
-    assert len(table.rows) == 1
-    assert "marks" not in res.ctes
-
-
-def test_values_cte_column_order_is_whatever_was_written() -> None:
-    res = _resolve(
-        "COPY (WITH marks(title, start_t, end_t) AS (VALUES ('Intro', 0, 60)) "
-        f"{SINK_QUERY}) TO 'x.mkv'"
-    )
-    assert res.values_ctes["marks"].columns == ("title", "start_t", "end_t")
-
-
-def test_values_cte_is_a_row_source_in_from() -> None:
-    _resolve(
-        "WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro')) "
-        "SELECT m.title FROM input('f.mkv') f, marks m"
-    )
-
-
-def test_values_cte_columns_take_the_type_their_literals_wrote() -> None:
-    res = _resolve(
-        "WITH marks(start_t, end_t, title) AS (VALUES (0, 60, NULL)) "
-        "SELECT m.title FROM input('f.mkv') f, marks m"
-    )
-    assert res.values_ctes["marks"].types == ("number", "number", "text")
-
-
-def test_a_values_column_of_two_types_is_rejected() -> None:
-    err = _reject(
-        "WITH marks(start_t, end_t, title) AS "
-        "(VALUES (0, 60, 'Intro'), ('x', 120, 'Act One')) "
-        "SELECT m.title FROM input('f.mkv') f, marks m"
-    )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "holds both number and text" in err.message
-
-
-def test_an_unknown_values_column_is_rejected() -> None:
-    err = _reject(
-        "WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro')) "
-        "SELECT m.nope FROM input('f.mkv') f, marks m"
+    assert "a VALUES row table is not supported" in err.message
+    assert err.hint == (
+        "a row table is written unnest(ARRAY[STRUCT(0 AS start_t, 60 AS "
+        "end_t, 'Intro' AS title), STRUCT(60 AS start_t, 300 AS end_t, "
+        "'Act One' AS title)]) marks"
     )
+
+
+def test_a_values_row_table_in_from_is_rejected() -> None:
+    err = _reject("SELECT r.w FROM (VALUES (1920, 20), (1280, 22)) AS r(w, q)")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "unknown column 'm.nope'" in err.message
-
-
-def test_a_values_column_may_not_take_a_map_columns_name() -> None:
-    err = _reject(
-        "WITH marks(tags, start_t) AS (VALUES ('a', 0)) "
-        "SELECT m.start_t FROM input('f.mkv') f, marks m"
+    assert "a VALUES row table is not supported" in err.message
+    assert err.hint == (
+        "a row table is written unnest(ARRAY[STRUCT(1920 AS w, 20 AS q), "
+        "STRUCT(1280 AS w, 22 AS q)]) r"
     )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "takes a name a row's maps already use" in err.message
-
-
-def test_a_values_row_is_not_a_stream() -> None:
-    err = _reject(
-        "WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro')) "
-        "SELECT m FROM input('f.mkv') f, marks m"
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
 def test_ordinary_cte_column_renaming_still_stays_rejected() -> None:
     err = _reject("WITH x(a, b) AS (SELECT 1, 2) SELECT * FROM x")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "must be VALUES" in err.message
-
-
-def test_values_cte_row_arity_must_match_its_column_list() -> None:
-    err = _reject(
-        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 60)) "
-        f"{SINK_QUERY}) TO 'x.mkv'"
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "VALUES row has 2 values" in err.message
-
-
-def test_values_cte_cell_must_be_a_literal() -> None:
-    err = _reject(
-        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 1 + 1, 'Intro')) "
-        f"{SINK_QUERY}) TO 'x.mkv'"
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "must be a literal" in err.message
-
-
-def test_values_cte_rejects_duplicate_column_names() -> None:
-    err = _reject(
-        "COPY (WITH marks(start_t, start_t, title) AS (VALUES (0, 60, 'Intro')) "
-        f"{SINK_QUERY}) TO 'x.mkv'"
-    )
-    assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "duplicate column name" in err.message
+    assert "column list, which is not supported" in err.message
+    assert err.hint == "name a SELECT CTE's columns with AS inside the SELECT instead"
 
 
 # ---------------------------------------------------------------------------

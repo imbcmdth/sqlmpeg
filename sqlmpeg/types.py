@@ -465,10 +465,10 @@ MAP_ELEMENTS: dict[str, str] = {
     if f.exposed and is_array(f.type) and resolve(f.type).kind == "map"
 }
 
-# The fields a record LITERAL names, positionally, per record type: the
-# writable ones, in declaration order. A read-only field is ffprobe's own
-# (`chapter.index` is the order the container already lists), so a query never
-# supplies it. A record type with nothing exposed yet has no entry at all.
+# The fields a record LITERAL names, per record type: the writable ones, in
+# declaration order. A read-only field is ffprobe's own (`chapter.index` is
+# the order the container already lists), so a query never supplies it. A
+# record type with nothing exposed yet has no entry at all.
 RECORD_FIELDS: dict[str, tuple[Field, ...]] = {
     declared.name: written
     for declared in _DECLARED

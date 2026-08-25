@@ -366,8 +366,8 @@ _DIALECT_TAIL = """\
 ### Series rows
 - `FROM generate_series(start, stop[, step]) alias` is a compile-time row
   table of integers, one row per value in the range -- a count rather than a
-  file, joined into the branch exactly like a `VALUES` row table (see CTEs
-  below). The alias is mandatory, like every other call-shaped FROM item
+  file, joined into the branch exactly like a struct row table (see below).
+  The alias is mandatory, like every other call-shaped FROM item
   (`input()`, `unnest()`, `ffmpeg.<source>()`), and it names both the row
   table and its one column: `generate_series(1, 5) i` reads its value back as
   `i.i`, not bare `i` -- there is no bare-column spelling, same rule as any
@@ -384,22 +384,21 @@ _DIALECT_TAIL = """\
 - The rows are streamless, ordinary compile-time rows: cross-join them
   against an input or another row source with a comma, filter them in
   `WHERE`, gather them with `array_agg`, read `i.i` in a SELECT expression,
-  key a fan-out `TO (expression)`, bound a trim window -- exactly the rules a
-  `VALUES` row follows.
+  key a fan-out `TO (expression)`, bound a trim window -- exactly the rules
+  any other written row follows.
 
 ### Struct row tables
-- `unnest(ARRAY[STRUCT(<v> AS <c>, ...), ...]) alias` is the STRUCT spelling
-  of `(VALUES (...)) AS t(c)` -- an inline written row table whose columns
-  are the STRUCT field names instead of a column list:
-  `unnest(ARRAY[STRUCT(1920 AS w, '1080p' AS name), STRUCT(1280 AS w, '720p'
-  AS name)]) r` gives rows readable as `r.w`, `r.name`. Every STRUCT in the
-  array must declare the same field set, order-free -- a mismatch names the
-  odd field. A field's value takes the compile-time value grammar (literals,
-  `-v` variables, `||`, arithmetic, `f.duration`); a stream inside is a
-  typed rejection, since these are value rows, same as any other. An empty
-  array is a typed rejection, same policy as an empty `generate_series`.
+- `unnest(ARRAY[STRUCT(<v> AS <c>, ...), ...]) alias` is an inline written
+  row table whose columns are the STRUCT field names instead of a column
+  list: `unnest(ARRAY[STRUCT(1920 AS w, '1080p' AS name), STRUCT(1280 AS w,
+  '720p' AS name)]) r` gives rows readable as `r.w`, `r.name`. Every STRUCT in
+  the array must declare the same field set, order-free -- a mismatch names
+  the odd field. A field's value takes the compile-time value grammar
+  (literals, `-v` variables, `||`, arithmetic, `f.duration`); a stream inside
+  is a typed rejection, since these are value rows, same as any other. An
+  empty array is a typed rejection, same policy as an empty `generate_series`.
   Otherwise it joins, filters, sorts, aggregates and keys a fan-out exactly
-  like a `VALUES` row does.
+  like any other written row does.
 
 ### Variables
 - `:'name'` (string literal), `:"name"` (identifier) and bare `:name` (raw
@@ -440,30 +439,24 @@ _DIALECT_TAIL = """\
   STRUCT('Act One' AS title, 60 AS start_t, 300 AS end_t)::chapter] AS
   chapters FROM input('film.mkv') f`. A record names the writable fields
   by name, order-free -- `STRUCT(<v> AS title, <v> AS start_t, <v> AS
-  end_t)`, a missing field NULL; the positional `ROW(title, start_t,
-  end_t)::chapter` also works -- and
-  its values take the compile-time value grammar (literals, `-v` variables,
-  `||`, arithmetic, `f.duration`). `title` may be `NULL`; `start_t` and
-  `end_t` are numbers in seconds. Every chapter must end after it starts,
-  and the list must run in ascending order without overlapping (back-to-back
-  is fine).
+  end_t)`, a missing field NULL -- and its values take the compile-time
+  value grammar (literals, `-v` variables, `||`, arithmetic, `f.duration`).
+  `title` may be `NULL`; `start_t` and `end_t` are numbers in seconds. Every
+  chapter must end after it starts, and the list must run in ascending order
+  without overlapping (back-to-back is fine).
 - The same column takes two other sources. `g.chapters AS chapters` copies
   another input's list wholesale, and `NULL AS chapters` writes none;
   omitting the column leaves ffmpeg's own passthrough alone.
   `array_agg(STRUCT(m.title AS title, m.start_t AS start_t, m.end_t AS
   end_t)::chapter) AS chapters` builds
-  one from any row source -- chapter rows, track rows, or a `VALUES` CTE in
-  `FROM` -- with the stream columns in the `GROUP BY`. The chapter list is a
-  value of the FILE, so one COPY writes one of them. `ARRAY(SELECT AS
+  one from any row source -- chapter rows, track rows, or a struct row table
+  in `FROM` -- with the stream columns in the `GROUP BY`. The chapter list is
+  a value of the FILE, so one COPY writes one of them. `ARRAY(SELECT AS
   STRUCT m.title, m.start_t, m.end_t FROM ...)` builds the same array
   without the `GROUP BY` ceremony -- the array-gather spelling of the same
   `array_agg(STRUCT(...)::chapter)`, for `chapters`, `attachments` and a
   cue array alike; `SELECT AS STRUCT` has nowhere to write the `::chapter`
   cast, so it is inferred from where the array lands.
-- A `VALUES` CTE is an ordinary row source: `WITH marks(start_t, end_t,
-  title) AS (VALUES (0, 60, 'Intro'), (60, 300, 'Act One')) ... FROM
-  input('film.mkv') f, marks m`. Its columns take the type their literals
-  wrote, and a column written with two types is rejected.
 
 ### Functions
 - `CREATE FUNCTION <name>(<param> <type> [DEFAULT <literal>], ...) RETURNS
@@ -879,8 +872,7 @@ integer literal for an `int` option (`crf 20`), or `true`/`false` for a
 
 `TO (<expression>)` -- parenthesized, not quoted -- writes ONE file per
 surviving row when the expression reads a row table's columns, whichever row
-source that table is (`unnest`, `VALUES`, `generate_series`, a struct row
-table). Each
+source that table is (`unnest`, `generate_series`, a struct row table). Each
 file binds its own row: its streams, its tags, its `WHERE` window, its name.
 They all ride ONE ffmpeg command, so the inputs are read once. The exception
 is a fan-out that both trims and stream-copies everything it maps: ffmpeg

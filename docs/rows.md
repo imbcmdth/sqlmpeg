@@ -99,15 +99,15 @@ A body column that is a compile-time VALUE rather than a stream - a series value
 
 ## Series rows - `generate_series(1, 5) i`
 
-A count rather than a file: one row per integer in the range, computed at compile time from `start`, `stop`, and an optional `step` - a `VALUES` row with its cells computed instead of written. The alias is mandatory, like every other call-shaped FROM item (`input()`, `unnest()`, `ffmpeg.<source>()`), and it names both the row table and its one column: `generate_series(1, 5) i` reads its value back as `i.i`, the same dot-qualified spelling a `VALUES` column takes - there is no bare `i` for the value, and no other column.
+A count rather than a file: one row per integer in the range, computed at compile time from `start`, `stop`, and an optional `step` - a struct row table with its cells computed instead of written. The alias is mandatory, like every other call-shaped FROM item (`input()`, `unnest()`, `ffmpeg.<source>()`), and it names both the row table and its one column: `generate_series(1, 5) i` reads its value back as `i.i`, the same dot-qualified spelling any row column takes - there is no bare `i` for the value, and no other column.
 
 `start`, `stop`, and `step` must be integer literals by the time this pass runs, which is after `-v` substitution - `generate_series(1, :count)` is fine, a column reference or any other computed expression is a typed rejection, because that is what keeps the row count (`stop - start` over `step`, inclusive) known before anything runs. A `0` step is rejected, and so is a range that would produce no rows (descending bounds under the default ascending step, or the reverse under a negative one): a series that silently produces nothing is a mistake worth naming, not a valid empty table.
 
-The rows are streamless - no track, no `-i` - and behave exactly like a `VALUES` row: cross join them against an input or another row source with a comma, narrow them in `WHERE`, `array_agg` them, read `i.i` in a SELECT expression, key a fan-out `TO (expression)`, bound a trim window ([trimming.md](trimming.md#row-bounded-windows-one-seek-per-row)). [Recipes 74-75](examples.md#74-cut-a-file-into-n-clips-one-file-each) drive N files and one gathered file from the same count.
+The rows are streamless - no track, no `-i` - and behave exactly like a struct row: cross join them against an input or another row source with a comma, narrow them in `WHERE`, `array_agg` them, read `i.i` in a SELECT expression, key a fan-out `TO (expression)`, bound a trim window ([trimming.md](trimming.md#row-bounded-windows-one-seek-per-row)). [Recipes 74-75](examples.md#74-cut-a-file-into-n-clips-one-file-each) drive N files and one gathered file from the same count.
 
 ## Struct row tables - `unnest(ARRAY[STRUCT(...), ...]) r`
 
-An inline written row table - the STRUCT spelling of `(VALUES (...)) AS t(c)`, its columns named by the STRUCT fields instead of a column list:
+An inline written row table, its columns named by the STRUCT fields instead of a column list:
 
 ```sql
 FROM input(:'source') f,
@@ -116,7 +116,7 @@ FROM input(:'source') f,
 
 gives rows readable as `r.w`, `r.name`. Every STRUCT in the array declares the same field set, order-free - a mismatch is a typed rejection naming the odd field. A field's value takes the same compile-time value grammar any other value position does: a literal, or an expression over one (arithmetic, `CASE`, `||`, `::text`, an earlier alias's probed scalar); a stream inside is a typed rejection, since these are value rows, never streams. An empty array is a typed rejection too - the same posture `generate_series`'s empty range takes, not a silently empty table.
 
-Otherwise it is a `VALUES` row in every way: cross join it with a comma, narrow it in `WHERE`, sort it, `array_agg` it, key a fan-out `TO (expression)` - [recipe 85](examples.md#85-key-an-encode-ladder-from-written-rows) keys an encode ladder off one, reading a rung's own width straight into a filter call's option. It joins `JOIN ... ON` with nothing, including itself: explicit JOIN stays reserved for `unnest` track rows.
+Otherwise it behaves like any other written row: cross join it with a comma, narrow it in `WHERE`, sort it, `array_agg` it, key a fan-out `TO (expression)` - [recipe 85](examples.md#85-key-an-encode-ladder-from-written-rows) keys an encode ladder off one, reading a rung's own width straight into a filter call's option. It joins `JOIN ... ON` with nothing, including itself: explicit JOIN stays reserved for `unnest` track rows.
 
 ## Joins
 

@@ -7213,7 +7213,8 @@ def test_chapter_rows_cross_join_track_rows() -> None:
 def test_a_chapters_column_mints_an_ffmetadata_input_and_sets_map_chapters() -> None:
     g = _lower(
         "COPY (SELECT f.video[1], f.audio[1], "
-        "ARRAY[ROW('Intro', 0, 60)::chapter, ROW('Act One', 60, 300)::chapter] "
+        "ARRAY[STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)::chapter, "
+        "STRUCT('Act One' AS title, 60 AS start_t, 300 AS end_t)::chapter] "
         "AS chapters FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert len(g.input_paths) == 2
@@ -7258,8 +7259,7 @@ def test_no_chapters_column_leaves_ffmpegs_own_default_alone() -> None:
 
 def test_the_chapters_sink_option_is_gone() -> None:
     err = _reject(
-        "COPY (WITH marks(start_t, end_t, title) AS (VALUES (0, 60, 'Intro')) "
-        "SELECT f.video[1] FROM input('film.mkv') f) "
+        "COPY (SELECT f.video[1] FROM input('film.mkv') f) "
         "TO 'out.mkv' WITH (chapters marks)"
     )
     assert err.code is ErrorCode.UNKNOWN_SINK_OPTION
@@ -7282,13 +7282,16 @@ def test_a_chapters_column_must_be_an_array_of_records() -> None:
     assert "takes an array of chapter records" in err.message
 
 
-def test_a_chapter_record_takes_the_declared_field_count() -> None:
+def test_a_positional_chapter_record_is_rejected() -> None:
     err = _reject(
-        "COPY (SELECT f.video[1], ARRAY[ROW('Intro', 0)::chapter] AS chapters "
+        "COPY (SELECT f.video[1], ARRAY[ROW('Intro', 0, 60)::chapter] AS chapters "
         "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
-    assert "a chapter takes 3 values (title, start_t, end_t), got 2" in err.message
+    assert (
+        "a chapter is written as STRUCT(... AS title, ... AS start_t, "
+        "... AS end_t)::chapter"
+    ) in err.message
 
 
 def test_a_chapters_element_must_be_a_chapter_record() -> None:
@@ -7306,7 +7309,7 @@ def test_a_chapters_element_must_be_a_chapter_record() -> None:
 def test_a_chapters_column_in_a_cte_body_is_rejected() -> None:
     err = _reject(
         "COPY (WITH gathered AS (SELECT f.video[1] AS v, "
-        "ARRAY[ROW('Intro', 0, 60)::chapter] AS chapters "
+        "ARRAY[STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)::chapter] AS chapters "
         "FROM input('film.mkv') f) "
         "SELECT gathered.v FROM gathered) TO 'out.mkv'"
     )
@@ -7317,7 +7320,7 @@ def test_a_chapters_column_in_a_cte_body_is_rejected() -> None:
 def test_a_chapter_records_values_take_the_value_grammar() -> None:
     g = _lower(
         "COPY (SELECT f.video[1], "
-        "ARRAY[ROW('Part ' || 'One', 0, 30 + 30)::chapter] AS chapters "
+        "ARRAY[STRUCT('Part ' || 'One' AS title, 0 AS start_t, 30 + 30 AS end_t)::chapter] AS chapters "
         "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     payload = base64.b64decode(g.input_paths[1].split(",", 1)[1]).decode()
@@ -7327,7 +7330,7 @@ def test_a_chapter_records_values_take_the_value_grammar() -> None:
 
 def test_a_chapter_records_bounds_may_read_an_inputs_duration() -> None:
     g = _lower(
-        "COPY (SELECT f.video[1], ARRAY[ROW('All', 0, f.duration)::chapter] "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT('All' AS title, 0 AS start_t, f.duration AS end_t)::chapter] "
         "AS chapters FROM input('film.mkv') f) TO 'out.mkv'",
         {"f": ProbeResult(streams=[_track("video", 0)], duration=12.5)},
     )
@@ -7342,15 +7345,18 @@ def test_array_agg_over_a_values_table_builds_the_same_document() -> None:
     """The two spellings of recipes 40 and 63: one file, one set of bytes."""
     literal = _lower(
         "COPY (SELECT f.video[1], "
-        "ARRAY[ROW('Intro', 0, 60)::chapter, ROW('Act One', 60, 300)::chapter] "
+        "ARRAY[STRUCT('Intro' AS title, 0 AS start_t, 60 AS end_t)::chapter, "
+        "STRUCT('Act One' AS title, 60 AS start_t, 300 AS end_t)::chapter] "
         "AS chapters FROM input('film.mkv') f) TO 'out.mkv'"
     )
     gathered = _lower(
-        "COPY (WITH marks(start_t, end_t, title) AS "
-        "(VALUES (0, 60, 'Intro'), (60, 300, 'Act One')) "
-        "SELECT f.video[1], "
-        "array_agg(ROW(m.title, m.start_t, m.end_t)::chapter) AS chapters "
-        "FROM input('film.mkv') f, marks m GROUP BY f.video[1]) TO 'out.mkv'"
+        "COPY (SELECT f.video[1], "
+        "array_agg(STRUCT(m.title AS title, m.start_t AS start_t, "
+        "m.end_t AS end_t)::chapter) AS chapters "
+        "FROM input('film.mkv') f, "
+        "unnest(ARRAY[STRUCT(0 AS start_t, 60 AS end_t, 'Intro' AS title), "
+        "STRUCT(60 AS start_t, 300 AS end_t, 'Act One' AS title)]) m "
+        "GROUP BY f.video[1]) TO 'out.mkv'"
     )
     assert gathered.input_paths == literal.input_paths
 
@@ -7358,7 +7364,7 @@ def test_array_agg_over_a_values_table_builds_the_same_document() -> None:
 def test_array_agg_over_chapter_rows_copies_a_list_relationally() -> None:
     g = _lower(
         "COPY (SELECT f.video[1], "
-        "array_agg(ROW(c.title, c.start_t, c.end_t)::chapter) AS chapters "
+        "array_agg(STRUCT(c.title AS title, c.start_t AS start_t, c.end_t AS end_t)::chapter) AS chapters "
         "FROM input('f.mkv') f, unnest(f.chapters) c GROUP BY f.video[1]) "
         "TO 'out.mkv'",
         _chapter_probes(*_TWO_CHAPTERS),
@@ -7398,7 +7404,7 @@ def test_a_chapters_column_groups_with_the_stream_columns() -> None:
     not each become a file of their own."""
     g = _lower(
         "COPY (SELECT f.video[1], f.audio[1], "
-        "array_agg(ROW(c.title, c.start_t, c.end_t)::chapter) AS chapters "
+        "array_agg(STRUCT(c.title AS title, c.start_t AS start_t, c.end_t AS end_t)::chapter) AS chapters "
         "FROM input('f.mkv') f, unnest(f.chapters) c "
         "GROUP BY f.video[1], f.audio[1]) TO 'out.mkv'",
         _chapter_probes(*_TWO_CHAPTERS),
@@ -7409,7 +7415,7 @@ def test_a_chapters_column_groups_with_the_stream_columns() -> None:
 
 def test_a_chapters_column_rejects_a_non_numeric_start_t() -> None:
     err = _reject(
-        "COPY (SELECT f.video[1], ARRAY[ROW('Intro', 'x', 60)::chapter] AS chapters "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT('Intro' AS title, 'x' AS start_t, 60 AS end_t)::chapter] AS chapters "
         "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -7418,7 +7424,7 @@ def test_a_chapters_column_rejects_a_non_numeric_start_t() -> None:
 
 def test_a_chapters_column_null_title_omits_the_title_line() -> None:
     g = _lower(
-        "COPY (SELECT f.video[1], ARRAY[ROW(NULL, 0, 60)::chapter] AS chapters "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT(NULL AS title, 0 AS start_t, 60 AS end_t)::chapter] AS chapters "
         "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     payload = base64.b64decode(g.input_paths[1].split(",", 1)[1]).decode()
@@ -7428,7 +7434,7 @@ def test_a_chapters_column_null_title_omits_the_title_line() -> None:
 
 def test_a_chapters_column_rejects_an_unescapable_title() -> None:
     err = _reject(
-        "COPY (SELECT f.video[1], ARRAY[ROW('a=b', 0, 60)::chapter] AS chapters "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT('a=b' AS title, 0 AS start_t, 60 AS end_t)::chapter] AS chapters "
         "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -7437,7 +7443,7 @@ def test_a_chapters_column_rejects_an_unescapable_title() -> None:
 
 def test_a_chapters_column_rejects_a_chapter_that_ends_before_it_starts() -> None:
     err = _reject(
-        "COPY (SELECT f.video[1], ARRAY[ROW('Intro', 60, 30)::chapter] AS chapters "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT('Intro' AS title, 60 AS start_t, 30 AS end_t)::chapter] AS chapters "
         "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -7446,7 +7452,7 @@ def test_a_chapters_column_rejects_a_chapter_that_ends_before_it_starts() -> Non
 
 def test_a_chapters_column_rejects_a_zero_length_chapter() -> None:
     err = _reject(
-        "COPY (SELECT f.video[1], ARRAY[ROW('Intro', 0, 0)::chapter] AS chapters "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT('Intro' AS title, 0 AS start_t, 0 AS end_t)::chapter] AS chapters "
         "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -7456,7 +7462,7 @@ def test_a_chapters_column_rejects_a_zero_length_chapter() -> None:
 def test_a_chapters_column_rejects_records_out_of_order() -> None:
     err = _reject(
         "COPY (SELECT f.video[1], "
-        "ARRAY[ROW('Two', 60, 120)::chapter, ROW('One', 0, 30)::chapter] AS chapters "
+        "ARRAY[STRUCT('Two' AS title, 60 AS start_t, 120 AS end_t)::chapter, STRUCT('One' AS title, 0 AS start_t, 30 AS end_t)::chapter] AS chapters "
         "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -7467,7 +7473,7 @@ def test_a_chapters_column_rejects_records_out_of_order() -> None:
 def test_a_chapters_column_rejects_overlapping_records() -> None:
     err = _reject(
         "COPY (SELECT f.video[1], "
-        "ARRAY[ROW('One', 0, 60)::chapter, ROW('Two', 30, 90)::chapter] AS chapters "
+        "ARRAY[STRUCT('One' AS title, 0 AS start_t, 60 AS end_t)::chapter, STRUCT('Two' AS title, 30 AS start_t, 90 AS end_t)::chapter] AS chapters "
         "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     assert err.code is ErrorCode.UNSUPPORTED_SQL
@@ -7478,7 +7484,7 @@ def test_a_chapters_column_accepts_back_to_back_records() -> None:
     """Touching is not overlapping: one ends exactly where the next begins."""
     g = _lower(
         "COPY (SELECT f.video[1], "
-        "ARRAY[ROW('One', 0, 60)::chapter, ROW('Two', 60, 120)::chapter] AS chapters "
+        "ARRAY[STRUCT('One' AS title, 0 AS start_t, 60 AS end_t)::chapter, STRUCT('Two' AS title, 60 AS start_t, 120 AS end_t)::chapter] AS chapters "
         "FROM input('film.mkv') f) TO 'out.mkv'"
     )
     payload = base64.b64decode(g.input_paths[1].split(",", 1)[1]).decode()
@@ -7620,7 +7626,7 @@ def test_a_cue_row_carries_no_stream_to_select() -> None:
 
 def test_a_cue_array_literal_mints_one_webvtt_input_and_maps_it() -> None:
     g = _lower(
-        "COPY (SELECT f.video[1], ARRAY[ROW('Hello', 0, 2.5)::cue] "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT('Hello' AS text, 0 AS start_t, 2.5 AS end_t)::cue] "
         "FROM input('f.mkv') f) TO 'out.mkv'",
         _cue_probes(),
     )
@@ -7635,7 +7641,7 @@ def test_a_cue_array_literal_mints_one_webvtt_input_and_maps_it() -> None:
 
 def test_a_cue_array_is_a_subtitle_stream_and_not_a_chapters_column() -> None:
     g = _lower(
-        "COPY (SELECT f.video[1], ARRAY[ROW('Hello', 0, 2.5)::cue] "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT('Hello' AS text, 0 AS start_t, 2.5 AS end_t)::cue] "
         "FROM input('f.mkv') f) TO 'out.mkv'",
         _cue_probes(),
     )
@@ -7646,7 +7652,7 @@ def test_a_cue_array_is_a_subtitle_stream_and_not_a_chapters_column() -> None:
 def test_array_agg_over_chapter_rows_writes_the_chapter_list_as_cues() -> None:
     g = _lower(
         "COPY (SELECT f.video[1], "
-        "array_agg(ROW(c.title, c.start_t, c.end_t)::cue) "
+        "array_agg(STRUCT(c.title AS text, c.start_t AS start_t, c.end_t AS end_t)::cue) "
         "FROM input('f.mkv') f, unnest(f.chapters) c GROUP BY f.video[1]) "
         "TO 'out.mkv'",
         {
@@ -7670,7 +7676,7 @@ def test_array_agg_over_cue_rows_writes_them_back_as_a_chapter_list() -> None:
     """The mirror: a .vtt file imported as chapters, milliseconds intact."""
     g = _lower(
         "COPY (SELECT f.video[1], "
-        "array_agg(ROW(c.text, c.start_t, c.end_t)::chapter) AS chapters "
+        "array_agg(STRUCT(c.text AS title, c.start_t AS start_t, c.end_t AS end_t)::chapter) AS chapters "
         + _FROM_VTT
         + " GROUP BY f.video[1]) TO 'out.mkv'",
         _cue_probes(),
@@ -7684,7 +7690,7 @@ def test_array_agg_over_cue_rows_writes_them_back_as_a_chapter_list() -> None:
 def test_a_cue_list_may_overlap_where_a_chapter_list_may_not() -> None:
     g = _lower(
         "COPY (SELECT f.video[1], "
-        "ARRAY[ROW('a', 0, 6)::cue, ROW('b', 1, 2)::cue] "
+        "ARRAY[STRUCT('a' AS text, 0 AS start_t, 6 AS end_t)::cue, STRUCT('b' AS text, 1 AS start_t, 2 AS end_t)::cue] "
         "FROM input('f.mkv') f) TO 'out.mkv'",
         _cue_probes(),
     )
@@ -7694,7 +7700,7 @@ def test_a_cue_list_may_overlap_where_a_chapter_list_may_not() -> None:
 def test_a_cue_list_that_goes_backwards_is_rejected() -> None:
     err = _reject_lower(
         "COPY (SELECT f.video[1], "
-        "ARRAY[ROW('a', 5, 6)::cue, ROW('b', 1, 2)::cue] "
+        "ARRAY[STRUCT('a' AS text, 5 AS start_t, 6 AS end_t)::cue, STRUCT('b' AS text, 1 AS start_t, 2 AS end_t)::cue] "
         "FROM input('f.mkv') f) TO 'out.mkv'",
         _cue_probes(),
     )
@@ -7704,7 +7710,7 @@ def test_a_cue_list_that_goes_backwards_is_rejected() -> None:
 
 def test_a_cue_that_ends_before_it_starts_is_rejected() -> None:
     err = _reject_lower(
-        "COPY (SELECT f.video[1], ARRAY[ROW('a', 2.5, 1)::cue] "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT('a' AS text, 2.5 AS start_t, 1 AS end_t)::cue] "
         "FROM input('f.mkv') f) TO 'out.mkv'",
         _cue_probes(),
     )
@@ -7712,19 +7718,22 @@ def test_a_cue_that_ends_before_it_starts_is_rejected() -> None:
     assert "cue 1 ends at 1, which is not after its start 2.5" in err.message
 
 
-def test_a_cue_record_takes_the_declared_field_count() -> None:
+def test_a_bare_tuple_cue_record_is_rejected() -> None:
     err = _reject_lower(
-        "COPY (SELECT f.video[1], ARRAY[ROW('a', 0)::cue] "
+        "COPY (SELECT f.video[1], ARRAY[('a', 0, 6)::cue] "
         "FROM input('f.mkv') f) TO 'out.mkv'",
         _cue_probes(),
     )
-    assert "a cue takes 3 values (text, start_t, end_t), got 2" in err.message
+    assert (
+        "a cue is written as STRUCT(... AS text, ... AS start_t, "
+        "... AS end_t)::cue"
+    ) in err.message
 
 
 def test_a_cues_text_may_not_be_null_or_empty() -> None:
     for written in ("NULL", "''"):
         err = _reject_lower(
-            f"COPY (SELECT f.video[1], ARRAY[ROW({written}, 0, 1)::cue] "
+            f"COPY (SELECT f.video[1], ARRAY[STRUCT({written} AS text, 0 AS start_t, 1 AS end_t)::cue] "
             "FROM input('f.mkv') f) TO 'out.mkv'",
             _cue_probes(),
         )
@@ -7734,7 +7743,7 @@ def test_a_cues_text_may_not_be_null_or_empty() -> None:
 
 def test_a_cues_text_may_not_hold_an_arrow_or_a_blank_line() -> None:
     err = _reject_lower(
-        "COPY (SELECT f.video[1], ARRAY[ROW('a --> b', 0, 1)::cue] "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT('a --> b' AS text, 0 AS start_t, 1 AS end_t)::cue] "
         "FROM input('f.mkv') f) TO 'out.mkv'",
         _cue_probes(),
     )
@@ -7744,7 +7753,7 @@ def test_a_cues_text_may_not_hold_an_arrow_or_a_blank_line() -> None:
 
 def test_a_cues_text_escapes_what_webvtt_reads_as_markup() -> None:
     g = _lower(
-        "COPY (SELECT f.video[1], ARRAY[ROW('Tom & <b>', 0, 1)::cue] "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT('Tom & <b>' AS text, 0 AS start_t, 1 AS end_t)::cue] "
         "FROM input('f.mkv') f) TO 'out.mkv'",
         _cue_probes(),
     )
@@ -7753,7 +7762,7 @@ def test_a_cues_text_escapes_what_webvtt_reads_as_markup() -> None:
 
 def test_a_cues_start_must_be_a_number() -> None:
     err = _reject_lower(
-        "COPY (SELECT f.video[1], ARRAY[ROW('a', 'x', 1)::cue] "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT('a' AS text, 'x' AS start_t, 1 AS end_t)::cue] "
         "FROM input('f.mkv') f) TO 'out.mkv'",
         _cue_probes(),
     )
@@ -7799,8 +7808,8 @@ def _attachment_probes(*attachments: AttachmentMeta) -> dict[str, ProbeResult | 
 
 
 _ATTACH = (
-    "ARRAY[ROW('font.ttf', 'application/x-truetype-font', "
-    "'fonts/font.ttf')::attachment] AS attachments"
+    "ARRAY[STRUCT('font.ttf' AS filename, 'application/x-truetype-font' AS mimetype, "
+    "'fonts/font.ttf' AS path)::attachment] AS attachments"
 )
 
 
@@ -7866,7 +7875,7 @@ def test_an_attachments_literal_writes_one_attach_per_record() -> None:
 def test_array_agg_over_attachment_rows_copies_a_list_across() -> None:
     g = _lower(
         "COPY (SELECT f.video[1], "
-        "array_agg(ROW(a.filename, a.mimetype, 'fonts/' || a.filename)::attachment) "
+        "array_agg(STRUCT(a.filename AS filename, a.mimetype AS mimetype, 'fonts/' || a.filename AS path)::attachment) "
         "AS attachments FROM input('f.mkv') f, unnest(f.attachments) a "
         "GROUP BY f.video[1]) TO 'out.mkv'",
         _attachment_probes(_FONT, _SCRIPT),
@@ -7890,7 +7899,7 @@ def test_an_attachments_filename_and_mimetype_may_be_null() -> None:
     """ffmpeg then names the attachment after the file and guesses the type."""
     g = _lower(
         "COPY (SELECT f.video[1], "
-        "ARRAY[ROW(NULL, NULL, 'fonts/font.ttf')::attachment] AS attachments "
+        "ARRAY[STRUCT(NULL AS filename, NULL AS mimetype, 'fonts/font.ttf' AS path)::attachment] AS attachments "
         "FROM input('f.mkv') f) TO 'out.mkv'",
         _attachment_probes(),
     )
@@ -7900,7 +7909,8 @@ def test_an_attachments_filename_and_mimetype_may_be_null() -> None:
 def test_an_attachment_without_a_path_is_rejected() -> None:
     for written in ("NULL", "''", "1"):
         err = _reject_lower(
-            f"COPY (SELECT f.video[1], ARRAY[ROW('a', 'text/plain', {written})"
+            "COPY (SELECT f.video[1], ARRAY[STRUCT('a' AS filename, "
+            f"'text/plain' AS mimetype, {written} AS path)"
             "::attachment] AS attachments FROM input('f.mkv') f) TO 'out.mkv'",
             _attachment_probes(),
         )
@@ -7910,7 +7920,7 @@ def test_an_attachment_without_a_path_is_rejected() -> None:
 
 def test_an_attachments_filename_must_be_text_or_null() -> None:
     err = _reject_lower(
-        "COPY (SELECT f.video[1], ARRAY[ROW(2, 'text/plain', 'x.txt')::attachment] "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT(2 AS filename, 'text/plain' AS mimetype, 'x.txt' AS path)::attachment] "
         "AS attachments FROM input('f.mkv') f) TO 'out.mkv'",
         _attachment_probes(),
     )
@@ -7918,14 +7928,16 @@ def test_an_attachments_filename_must_be_text_or_null() -> None:
     assert "'attachments.filename' must be a string or NULL" in err.message
 
 
-def test_an_attachment_record_takes_the_declared_field_count() -> None:
+def test_a_positional_attachment_record_is_rejected() -> None:
     err = _reject_lower(
-        "COPY (SELECT f.video[1], ARRAY[ROW('a', 'text/plain')::attachment] "
+        "COPY (SELECT f.video[1], "
+        "ARRAY[ROW('a', 'text/plain', 'x.txt')::attachment] "
         "AS attachments FROM input('f.mkv') f) TO 'out.mkv'",
         _attachment_probes(),
     )
     assert (
-        "an attachment takes 3 values (filename, mimetype, path), got 2" in err.message
+        "an attachment is written as STRUCT(... AS filename, ... AS mimetype, "
+        "... AS path)::attachment" in err.message
     )
 
 
@@ -7965,7 +7977,7 @@ def test_two_branches_may_not_write_two_attachment_lists() -> None:
     err = _reject_lower(
         f"COPY (SELECT f.video[1], {_ATTACH} FROM input('f.mkv') f "
         "UNION ALL SELECT g.video[1], "
-        "ARRAY[ROW('other.ttf', 'font/ttf', 'o.ttf')::attachment] AS attachments "
+        "ARRAY[STRUCT('other.ttf' AS filename, 'font/ttf' AS mimetype, 'o.ttf' AS path)::attachment] AS attachments "
         "FROM input('f.mkv') g) TO 'out.mkv'",
         {"f": _attachment_probes()["f"], "g": _attachment_probes()["f"]},
     )
@@ -7983,79 +7995,18 @@ def test_a_bare_chapter_column_tags_the_container_like_any_other_value() -> None
 
 
 # ---------------------------------------------------------------------------
-# a VALUES CTE as a row source
+# a VALUES CTE is rejected
 # ---------------------------------------------------------------------------
 
-_MARKS = (
-    "WITH marks(start_t, end_t, title) AS "
-    "(VALUES (0, 60, 'Intro'), (60, 300, 'Act One')) "
-)
 
-
-def test_a_values_table_prints_its_written_rows() -> None:
-    sinks = lower_table(
-        resolve(parse(_MARKS + "SELECT m.title, m.start_t FROM input('f.mkv') f, marks m")),
-        {"f": ProbeResult(streams=[_track("video", 0)])},
+def test_a_values_cte_as_a_row_source_is_rejected() -> None:
+    err = _reject(
+        "COPY (WITH marks(start_t, end_t, title) AS "
+        "(VALUES (0, 60, 'Intro'), (60, 300, 'Act One')) "
+        "SELECT m.title FROM input('f.mkv') f, marks m) TO 'o.mkv'"
     )
-    assert sinks[0].result.columns == ["title", "start_t"]
-    assert sinks[0].result.rows == [["Intro", 0], ["Act One", 60]]
-
-
-def test_a_values_table_star_is_its_written_columns() -> None:
-    sinks = lower_table(
-        resolve(parse(_MARKS + "SELECT m.* FROM input('f.mkv') f, marks m")),
-        {"f": ProbeResult(streams=[_track("video", 0)])},
-    )
-    assert sinks[0].result.columns == ["start_t", "end_t", "title"]
-
-
-def test_a_values_table_cross_joins_track_rows() -> None:
-    sinks = lower_table(
-        resolve(parse(
-            _MARKS + "SELECT t.index, m.title "
-            "FROM input('f.mkv') f, unnest(f.audio) t, marks m"
-        )),
-        {"f": ProbeResult(streams=[_track("audio", 0)])},
-    )
-    assert sinks[0].result.rows == [[1, "Intro"], [1, "Act One"]]
-
-
-def test_a_values_column_filters_and_sorts_like_any_row_column() -> None:
-    sinks = lower_table(
-        resolve(parse(
-            _MARKS + "SELECT m.title FROM input('f.mkv') f, marks m "
-            "WHERE m.start_t >= 60 ORDER BY m.title"
-        )),
-        {"f": ProbeResult(streams=[_track("video", 0)])},
-    )
-    assert sinks[0].result.rows == [["Act One"]]
-
-
-def test_a_tag_column_over_written_rows_tags_the_container() -> None:
-    """Rows with no track have nothing to tag per stream, so the file gets it."""
-    g = _lower(
-        "COPY (WITH marks(name) AS (VALUES ('Doc')) "
-        "SELECT f.video[1], STRUCT('T: ' || m.name AS title) AS tags "
-        "FROM input('f.mkv') f, marks m) TO 'o.mkv'",
-        {"f": ProbeResult(streams=[_track("video", 0)])},
-    )
-    assert g.sinks[0].tags == {"title": "T: Doc"}
-
-
-def test_a_bare_written_column_tags_the_container_like_any_other_value() -> None:
-    """Same for a written row: the field name is the key, the column the value."""
-    g = _lower(
-        "COPY (WITH marks(name) AS (VALUES ('Doc')) "
-        "SELECT f.video[1], STRUCT(m.name AS title) AS tags "
-        "FROM input('f.mkv') f, marks m) TO 'o.mkv'",
-        {"f": ProbeResult(streams=[_track("video", 0)])},
-    )
-    assert g.sinks[0].tags == {"title": "Doc"}
-
-
-def test_a_values_row_is_not_an_output_stream() -> None:
-    err = _reject("COPY (" + _MARKS + "SELECT m FROM input('f.mkv') f, marks m) TO 'o.mkv'")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "a VALUES row table is not supported" in err.message
 
 
 # ---------------------------------------------------------------------------
@@ -8065,6 +8016,11 @@ def test_a_values_row_is_not_an_output_stream() -> None:
 _RUNGS = (
     "unnest(ARRAY[STRUCT(1920 AS w, '1080p' AS name), "
     "STRUCT(1280 AS w, '720p' AS name)]) r"
+)
+
+_MARKS = (
+    "unnest(ARRAY[STRUCT(0 AS start_t, 60 AS end_t, 'Intro' AS title), "
+    "STRUCT(60 AS start_t, 300 AS end_t, 'Act One' AS title)]) m"
 )
 
 
@@ -8077,22 +8033,59 @@ def test_struct_row_table_prints_its_written_rows() -> None:
     assert sinks[0].result.rows == [["1080p", 1920], ["720p", 1280]]
 
 
-def test_struct_row_table_compiles_the_same_argv_as_a_values_cte() -> None:
-    """The STRUCT spelling of ``(VALUES (...)) AS t(c)`` -- same rows, same
-    argv, byte for byte, key fan-out and all."""
-    struct_q = (
-        "COPY (SELECT f.* REPLACE(scale(f.video[1], r.w, -2) AS video) "
-        f"FROM input('x.mp4') f, {_RUNGS}) TO (r.name || '.mp4')"
+def test_a_struct_row_table_star_is_its_written_columns() -> None:
+    sinks = lower_table(
+        resolve(parse(f"SELECT m.* FROM input('f.mkv') f, {_MARKS}")),
+        {"f": ProbeResult(streams=[_track("video", 0)])},
     )
-    values_q = (
-        "COPY (WITH r(w, name) AS (VALUES (1920, '1080p'), (1280, '720p')) "
-        "SELECT f.* REPLACE(scale(f.video[1], r.w, -2) AS video) "
-        "FROM input('x.mp4') f, r) TO (r.name || '.mp4')"
+    assert sinks[0].result.columns == ["start_t", "end_t", "title"]
+
+
+def test_a_struct_row_table_cross_joins_track_rows() -> None:
+    sinks = lower_table(
+        resolve(parse(
+            "SELECT t.index, m.title "
+            f"FROM input('f.mkv') f, unnest(f.audio) t, {_MARKS}"
+        )),
+        {"f": ProbeResult(streams=[_track("audio", 0)])},
     )
-    probes = {"f": _layout_probe("v")}
-    g1 = insert_splits(_lower(struct_q, probes))
-    g2 = insert_splits(_lower(values_q, probes))
-    assert build_ffmpeg_args(emit(g1), None) == build_ffmpeg_args(emit(g2), None)
+    assert sinks[0].result.rows == [[1, "Intro"], [1, "Act One"]]
+
+
+def test_a_struct_row_column_filters_and_sorts_like_any_row_column() -> None:
+    sinks = lower_table(
+        resolve(parse(
+            f"SELECT m.title FROM input('f.mkv') f, {_MARKS} "
+            "WHERE m.start_t >= 60 ORDER BY m.title"
+        )),
+        {"f": ProbeResult(streams=[_track("video", 0)])},
+    )
+    assert sinks[0].result.rows == [["Act One"]]
+
+
+def test_a_tag_column_over_struct_rows_tags_the_container() -> None:
+    """Rows with no track have nothing to tag per stream, so the file gets it."""
+    g = _lower(
+        "COPY (SELECT f.video[1], STRUCT('T: ' || m.name AS title) AS tags "
+        "FROM input('f.mkv') f, unnest(ARRAY[STRUCT('Doc' AS name)]) m) TO 'o.mkv'",
+        {"f": ProbeResult(streams=[_track("video", 0)])},
+    )
+    assert g.sinks[0].tags == {"title": "T: Doc"}
+
+
+def test_a_bare_struct_row_column_tags_the_container_like_any_other_value() -> None:
+    """Same for a written row: the field name is the key, the column the value."""
+    g = _lower(
+        "COPY (SELECT f.video[1], STRUCT(m.name AS title) AS tags "
+        "FROM input('f.mkv') f, unnest(ARRAY[STRUCT('Doc' AS name)]) m) TO 'o.mkv'",
+        {"f": ProbeResult(streams=[_track("video", 0)])},
+    )
+    assert g.sinks[0].tags == {"title": "Doc"}
+
+
+def test_a_struct_row_is_not_an_output_stream() -> None:
+    err = _reject(f"COPY (SELECT m FROM input('f.mkv') f, {_MARKS}) TO 'o.mkv'")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
 
 
 def test_struct_row_table_field_reads_as_a_scale_option() -> None:
@@ -8735,7 +8728,7 @@ def test_a_written_cue_track_muxes_and_reads_back(tmp_path: Path) -> None:
     out = tmp_path / "with-cues.mkv"
     query = (
         "COPY (SELECT f.video[1], "
-        "array_agg(ROW(c.title, c.start_t, c.end_t)::cue) "
+        "array_agg(STRUCT(c.title AS text, c.start_t AS start_t, c.end_t AS end_t)::cue) "
         f"FROM input('{(FIXTURES_DIR / 'av-chapters.mkv').as_posix()}') f, "
         "unnest(f.chapters) c GROUP BY f.video[1]) TO 'x.mkv'"
     )
@@ -8769,7 +8762,7 @@ def test_a_chapter_list_built_from_cues_keeps_its_fractional_bounds(
     out = tmp_path / "chaptered.mkv"
     query = (
         "COPY (SELECT f.video[1], "
-        "array_agg(ROW(c.text, c.start_t, c.end_t)::chapter) AS chapters "
+        "array_agg(STRUCT(c.text AS title, c.start_t AS start_t, c.end_t AS end_t)::chapter) AS chapters "
         f"FROM input('{(FIXTURES_DIR / 'av2.mp4').as_posix()}') f, "
         f"input('{(FIXTURES_DIR / 'subs.en.vtt').as_posix()}') v, "
         "unnest(v.cues) c GROUP BY f.video[1]) TO 'x.mkv'"
@@ -11165,7 +11158,7 @@ def test_a_chapter_list_may_leave_title_out() -> None:
     any nullable field follows at construction."""
     query = (
         "COPY (SELECT f.video[1], "
-        "ARRAY[ROW(NULL, 0, 30)::chapter, ROW(NULL, 30, 90)::chapter] AS chapters "
+        "ARRAY[STRUCT(NULL AS title, 0 AS start_t, 30 AS end_t)::chapter, STRUCT(NULL AS title, 30 AS start_t, 90 AS end_t)::chapter] AS chapters "
         "FROM input('x.mp4') f) TO 'o.mkv'"
     )
     graph = compile_sql(query)
@@ -11176,7 +11169,7 @@ def test_a_chapter_list_may_leave_title_out() -> None:
 
 def test_a_chapter_list_still_needs_its_span() -> None:
     query = (
-        "COPY (SELECT f.video[1], ARRAY[ROW('Intro', 0, NULL)::chapter] AS chapters "
+        "COPY (SELECT f.video[1], ARRAY[STRUCT('Intro' AS title, 0 AS start_t, NULL AS end_t)::chapter] AS chapters "
         "FROM input('x.mp4') f) TO 'o.mkv'"
     )
     with pytest.raises(SqlmpegError) as excinfo:
