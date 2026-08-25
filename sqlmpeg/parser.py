@@ -4725,7 +4725,7 @@ class _Resolver:
                         hint="each alias may set at most one lower and one "
                         "upper time bound",
                     )
-                alias_bounds[kind] = bound
+                alias_bounds[kind] = _unwrap_paren(bound)
 
         for alias, alias_bounds in bounds.items():
             low_literal = alias_bounds.get("low")
@@ -4764,7 +4764,12 @@ class _Resolver:
         A bare row column (``c.start_t``) is a bound too: it is one number per
         row, and lower decides what a per-row window means -- one file each
         under a fan-out ``TO``, or one ``-i`` each when the rows are gathered.
+
+        A parenthesized bound (``(f.duration - 0.5)``) is unwrapped first --
+        the parens carry no meaning the value grammar doesn't already, and
+        every shape check below needs the bare expression to recognize it.
         """
+        bound = _unwrap_paren(bound)
         if isinstance(bound, exp.Literal) and not bound.is_string:
             return
         if (

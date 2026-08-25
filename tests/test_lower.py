@@ -9774,6 +9774,20 @@ def test_a_bare_duration_is_a_trim_bound_of_its_own() -> None:
     assert _trim("f.t <= f.duration", _duration_probes(12.0)) == (None, 12.0)
 
 
+_PAREN_TRIM = (
+    "COPY (SELECT f.video[1] FROM input('a.mkv') f "
+    "WHERE f.t >= (5 - 1) AND f.t <= 10) TO 'out.mp4'"
+)
+_BARE_TRIM = (
+    "COPY (SELECT f.video[1] FROM input('a.mkv') f "
+    "WHERE f.t >= 5 - 1 AND f.t <= 10) TO 'out.mp4'"
+)
+
+
+def test_a_parenthesized_trim_bound_compiles_to_the_same_ir_as_the_bare_one() -> None:
+    assert compile_sql(_PAREN_TRIM).to_dict() == compile_sql(_BARE_TRIM).to_dict()
+
+
 def test_an_unprobed_duration_is_a_rejection_naming_the_field() -> None:
     with pytest.raises(SqlmpegError) as excinfo:
         _lower(

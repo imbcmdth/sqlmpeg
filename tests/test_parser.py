@@ -2764,6 +2764,14 @@ def test_a_bare_duration_is_a_legal_trim_bound() -> None:
     _resolve("SELECT f.video[1] FROM input('x.mp4') f WHERE f.t <= f.duration")
 
 
+def test_a_parenthesized_trim_bound_still_resolves() -> None:
+    """A stray paren around the arithmetic must not change the shape check."""
+    _resolve(
+        "SELECT f.video[1] FROM input('x.mp4') f "
+        "WHERE f.t >= (f.duration - 1) AND f.t <= f.duration"
+    )
+
+
 def test_a_text_trim_bound_is_still_rejected() -> None:
     err = _reject("SELECT f.video[1] FROM input('x.mp4') f WHERE f.t <= 'ten'")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
