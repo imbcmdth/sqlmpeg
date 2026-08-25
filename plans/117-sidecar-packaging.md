@@ -73,6 +73,21 @@ repo owns the genuinely fiddly parts maturin does for free:
 maturin is kept for the audit-and-tags work, not for any Python
 machinery.
 
+**`setuptools-rust`, also considered (maintainer, same day).** It has
+the right mode — `RustBin` ships plain executables, beside the
+`RustExtension` it is better known for — and the main package already
+uses setuptools. Two things decide against it. The shared-backend
+argument is smaller than it looks: the sidecar is its own package
+with its own pyproject either way, so nothing is reused but
+familiarity. And the lightweight comparison inverts over the whole
+stack: setuptools-rust builds the wheel but leaves the platform work
+to a `cibuildwheel` + `auditwheel`/`delocate` pairing — four tools
+where maturin is one containing the audit, the tags, and the CI
+action. The precedent splits the same way: Rust EXTENSIONS often use
+setuptools-rust (cryptography), pure binaries landed on maturin (uv,
+ruff). Kept as the named fallback if maturin ever grates; the
+scaffolding wave should not need to revisit this.
+
 Target matrix, in order of user population:
 
 | target | notes |
