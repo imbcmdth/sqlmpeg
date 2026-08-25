@@ -7,6 +7,11 @@ other freely — all of which fits this compiler better than it fits a
 row store. Should the dialect align with BigQuery long term? This
 document inventories both directions and recommends an answer.
 
+*Status 2026-08-25: adopted and landed, all four waves. `* EXCEPT` /
+`* REPLACE`; the duality (`ARRAY(select)`, `SELECT AS STRUCT`, struct
+row tables); the removals (`VALUES`, positional record literals, the
+CAST census); and the rules stated in dialect.md and the README.*
+
 ## The observation that organizes everything
 
 sqlmpeg is already two dialects wearing one syntax, split along a
