@@ -105,6 +105,19 @@ A count rather than a file: one row per integer in the range, computed at compil
 
 The rows are streamless - no track, no `-i` - and behave exactly like a `VALUES` row: cross join them against an input or another row source with a comma, narrow them in `WHERE`, `array_agg` them, read `i.i` in a SELECT expression, key a fan-out `TO (expression)`, bound a trim window ([trimming.md](trimming.md#row-bounded-windows-one-seek-per-row)). [Recipes 74-75](examples.md#74-cut-a-file-into-n-clips-one-file-each) drive N files and one gathered file from the same count.
 
+## Struct row tables - `unnest(ARRAY[STRUCT(...), ...]) r`
+
+An inline written row table - the STRUCT spelling of `(VALUES (...)) AS t(c)`, its columns named by the STRUCT fields instead of a column list:
+
+```sql
+FROM input(:'source') f,
+     unnest(ARRAY[STRUCT(1920 AS w, '1080p' AS name), STRUCT(1280 AS w, '720p' AS name)]) r
+```
+
+gives rows readable as `r.w`, `r.name`. Every STRUCT in the array declares the same field set, order-free - a mismatch is a typed rejection naming the odd field. A field's value takes the same compile-time value grammar any other value position does: a literal, or an expression over one (arithmetic, `CASE`, `||`, `::text`, an earlier alias's probed scalar); a stream inside is a typed rejection, since these are value rows, never streams. An empty array is a typed rejection too - the same posture `generate_series`'s empty range takes, not a silently empty table.
+
+Otherwise it is a `VALUES` row in every way: cross join it with a comma, narrow it in `WHERE`, sort it, `array_agg` it, key a fan-out `TO (expression)` - [recipe 85](examples.md#85-key-an-encode-ladder-from-written-rows) keys an encode ladder off one, reading a rung's own width straight into a filter call's option. It joins `JOIN ... ON` with nothing, including itself: explicit JOIN stays reserved for `unnest` track rows.
+
 ## Joins
 
 ```sql
@@ -158,6 +171,8 @@ The row count is the RESOLVED count against the actual file: a `WHERE` that narr
 `array_agg` takes any per-row stream expression (`array_agg(volume(a, 0.5))`) and must be a whole SELECT column, or the sole argument of `VARIADIC` (`concat(VARIADIC array_agg(a))`, [examples.md#70](examples.md#70-join-however-many-tracks-a-file-has-with-concat)); row order is the aggregation order (`ORDER BY` before the aggregate reorders it; `ORDER BY` inside `array_agg` is rejected). Postgres's grouping rule is enforced: outside an aggregate, a row-varying expression must match a `GROUP BY` key. Group keys may be streams (`GROUP BY vid`, `GROUP BY f.video[1]`).
 
 `GROUP BY` a row column partitions the rows, one output file per group - this requires a fan-out `TO (expression over the group keys)` (N groups are N rows; rule 2). Group keys are group-constants, so a `tags` column may read them. [Recipe 55](examples.md#55-one-file-per-language-all-its-tracks-inside) writes one file per language with all of that language's tracks inside, titled by its key; [recipe 57](examples.md#57-combine-tracks-selected-by-separate-ctes) gathers across CTE boundaries.
+
+`ARRAY(<select>)` is `array_agg`'s converse: an expression-position gather of a countable subquery, without the CTE + `array_agg` + `GROUP BY` ceremony - [recipe 86](examples.md#86-gather-clips-into-one-file-without-the-cte) is recipe 75's contact sheet written as one expression, byte for byte the same command. It stands wherever an `array_agg` result already does (a whole SELECT column, `VARIADIC`'s argument); a multi-column subquery needs `SELECT AS STRUCT <cols>` to gather an array of structs instead, feeding `chapters` / `attachments` / a cue array the way `array_agg(STRUCT(...)::<record>)` does by hand ([recipe 85](examples.md#85-key-an-encode-ladder-from-written-rows) uses the struct row table above the same way `array_agg` uses any other row source). `array_agg` itself is unchanged - it stays the aggregate a `GROUP BY` partitions; `ARRAY(...)` is the ungrouped, no-partition case, and the two overlapping there is expected, not a duplication to resolve.
 
 ## Inspecting
 

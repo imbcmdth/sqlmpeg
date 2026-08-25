@@ -1984,3 +1984,48 @@ ffmpeg -i tests/fixtures/avs.mkv -map 0:v:0 -c:0 copy -map 0:a:0 -c:1 copy film.
 
 No subtitle stream, no `mov_text` transcode: dropping the track drops the reason recipe 2 needed one.
 
+## 85. Key an encode ladder from written rows
+
+`unnest(ARRAY[STRUCT(...), ...])` is the STRUCT spelling of `(VALUES (...)) AS t(c)`: an inline row table, its columns named by the STRUCT fields instead of a column list. Each row keys its own `TO` and its own `* REPLACE`, so an encode ladder is one row per rung rather than one query per rung:
+
+```pgsql
+COPY (
+  SELECT f.* REPLACE(scale(f.video[1], r.w, -2) AS video)
+  FROM input('tests/fixtures/av.mp4') f,
+       unnest(ARRAY[STRUCT(1920 AS w, '1080p' AS name), STRUCT(1280 AS w, '720p' AS name)]) r
+) TO (r.name || '.mp4')
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -i tests/fixtures/av.mp4 -filter_complex \
+  '[0:v:0]split=2[src_f_v_0_split0][src_f_v_0_split1];'\
+'[src_f_v_0_split0]scale=width=1920:height=-2[out0];'\
+'[src_f_v_0_split1]scale=width=1280:height=-2[out2]' -map '[out0]' -map 0:a:0 -c:1 copy \
+  1080p.mp4 -map '[out2]' -map 0:a:0 -c:1 copy 720p.mp4
+```
+
+Add a rung by adding a row - nothing else about the query changes. A row's field is a compile-time value like any other: `r.w` reads as a number wherever one is wanted, the same as a track row's own metadata columns do.
+
+## 86. Gather clips into one file without the CTE
+
+`ARRAY(<select>)` is the converse of `unnest`: it gathers a countable subquery's rows into an array, in expression position, without a `WITH` and a `GROUP BY`-less `array_agg` to spell it. Recipe 75's contact sheet, written as one expression:
+
+```pgsql
+COPY (
+  SELECT ffmpeg.concat(VARIADIC ARRAY(
+    SELECT f.video FROM input('tests/fixtures/av.mp4') f, generate_series(1, 3) i
+    WHERE f.t >= (i.i - 1) * 2 AND f.t <= (i.i - 1) * 2 + 1
+  ))
+) TO 'sampled.mp4'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -ss 0 -to 1 -i tests/fixtures/av.mp4 -ss 2 -to 3 -i tests/fixtures/av.mp4 -ss 4 \
+  -to 5 -i tests/fixtures/av.mp4 -filter_complex \
+  '[0:v:0][1:v:0][2:v:0]concat=n=3:v=1:a=0[out0]' -map '[out0]' sampled.mp4
+```
+
+Byte for byte recipe 75's command: `ARRAY(...)` reads its subquery's own FROM as this branch's row source, the same one `WITH shots AS (...) ... FROM shots` gives `array_agg` by hand. A multi-column subquery needs `SELECT AS STRUCT` to gather a struct array instead - the same shape `array_agg(STRUCT(...)::chapter)` builds by hand, for a `chapters`/`attachments` column that has nowhere to write the cast.
+

@@ -303,6 +303,17 @@ _DIALECT_TAIL = """\
   rejected; `ORDER BY` before the aggregate defines the order.
   `array_agg` is otherwise a whole-column-only aggregate, with ONE other
   legal spot: the sole argument of `VARIADIC` (below).
+- `ARRAY(<select>)` is the expression-position converse of `unnest`: it
+  gathers a single-column SELECT's rows into an array without a `WITH` +
+  `array_agg` + `GROUP BY` -- `ffmpeg.concat(VARIADIC ARRAY(SELECT frame
+  FROM ...))` reads its subquery's own FROM as this branch's row source,
+  the same relation `array_agg` would aggregate by hand. The subquery must
+  be self-contained (its own `input()`/`unnest()`/`generate_series()`/struct
+  row table, no reference to a row source outside it) and this branch must
+  have no row source of its own already -- one gather per SELECT. A
+  multi-column subquery needs `SELECT AS STRUCT <cols>` to gather a struct
+  array instead (see Chapters below for feeding one to a `chapters`/
+  `attachments` column); more than one column without it is rejected.
 - `VARIADIC <array>` in a filter call spreads the array as the argument
   list -- as many pads as the array has elements, instead of the bare
   array's own meaning (broadcast, one node per element). It is how a
@@ -376,6 +387,20 @@ _DIALECT_TAIL = """\
   key a fan-out `TO (expression)`, bound a trim window -- exactly the rules a
   `VALUES` row follows.
 
+### Struct row tables
+- `unnest(ARRAY[STRUCT(<v> AS <c>, ...), ...]) alias` is the STRUCT spelling
+  of `(VALUES (...)) AS t(c)` -- an inline written row table whose columns
+  are the STRUCT field names instead of a column list:
+  `unnest(ARRAY[STRUCT(1920 AS w, '1080p' AS name), STRUCT(1280 AS w, '720p'
+  AS name)]) r` gives rows readable as `r.w`, `r.name`. Every STRUCT in the
+  array must declare the same field set, order-free -- a mismatch names the
+  odd field. A field's value takes the compile-time value grammar (literals,
+  `-v` variables, `||`, arithmetic, `f.duration`); a stream inside is a
+  typed rejection, since these are value rows, same as any other. An empty
+  array is a typed rejection, same policy as an empty `generate_series`.
+  Otherwise it joins, filters, sorts, aggregates and keys a fan-out exactly
+  like a `VALUES` row does.
+
 ### Variables
 - `:'name'` (string literal), `:"name"` (identifier) and bare `:name` (raw
   text) are psql-style references, filled at compile time by `-v name=value`
@@ -429,7 +454,12 @@ _DIALECT_TAIL = """\
   end_t)::chapter) AS chapters` builds
   one from any row source -- chapter rows, track rows, or a `VALUES` CTE in
   `FROM` -- with the stream columns in the `GROUP BY`. The chapter list is a
-  value of the FILE, so one COPY writes one of them.
+  value of the FILE, so one COPY writes one of them. `ARRAY(SELECT AS
+  STRUCT m.title, m.start_t, m.end_t FROM ...)` builds the same array
+  without the `GROUP BY` ceremony -- the array-gather spelling of the same
+  `array_agg(STRUCT(...)::chapter)`, for `chapters`, `attachments` and a
+  cue array alike; `SELECT AS STRUCT` has nowhere to write the `::chapter`
+  cast, so it is inferred from where the array lands.
 - A `VALUES` CTE is an ordinary row source: `WITH marks(start_t, end_t,
   title) AS (VALUES (0, 60, 'Intro'), (60, 300, 'Act One')) ... FROM
   input('film.mkv') f, marks m`. Its columns take the type their literals
@@ -849,7 +879,8 @@ integer literal for an `int` option (`crf 20`), or `true`/`false` for a
 
 `TO (<expression>)` -- parenthesized, not quoted -- writes ONE file per
 surviving row when the expression reads a row table's columns, whichever row
-source that table is (`unnest`, `VALUES`, `generate_series`). Each
+source that table is (`unnest`, `VALUES`, `generate_series`, a struct row
+table). Each
 file binds its own row: its streams, its tags, its `WHERE` window, its name.
 They all ride ONE ffmpeg command, so the inputs are read once. The exception
 is a fan-out that both trims and stream-copies everything it maps: ffmpeg

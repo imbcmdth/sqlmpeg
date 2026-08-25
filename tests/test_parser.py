@@ -2793,6 +2793,153 @@ def test_values_cte_rejects_duplicate_column_names() -> None:
 
 
 # ---------------------------------------------------------------------------
+# struct row tables: unnest(ARRAY[STRUCT(...), ...]) alias
+# ---------------------------------------------------------------------------
+
+
+def test_struct_row_table_binds_a_row_table_like_values_do() -> None:
+    res = _resolve(
+        "SELECT r.w FROM input('f.mkv') f, "
+        "unnest(ARRAY[STRUCT(1920 AS w, '1080p' AS name), "
+        "STRUCT(1280 AS w, '720p' AS name)]) r"
+    )
+    assert list(res.struct_rows) == ["r"]
+    table = res.struct_rows["r"]
+    assert table.columns == ("w", "name")
+    assert table.types == ("number", "text")
+    assert len(table.rows) == 2
+    assert "r" in res.row_aliases
+    assert "r" not in res.track_rows
+
+
+def test_struct_row_table_field_order_is_order_free_across_rows() -> None:
+    res = _resolve(
+        "SELECT r.w FROM input('f.mkv') f, "
+        "unnest(ARRAY[STRUCT(1920 AS w, '1080p' AS name), "
+        "STRUCT('720p' AS name, 1280 AS w)]) r"
+    )
+    assert res.struct_rows["r"].columns == ("w", "name")
+
+
+def test_struct_row_table_field_mismatch_is_rejected() -> None:
+    err = _reject(
+        "SELECT r.w FROM input('f.mkv') f, "
+        "unnest(ARRAY[STRUCT(1920 AS w, '1080p' AS name), STRUCT(1280 AS w)]) r"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "does not declare the same fields" in err.message
+    assert "'name'" in err.message
+
+
+def test_struct_row_table_empty_array_is_rejected() -> None:
+    err = _reject("SELECT f.video[1] FROM input('f.mkv') f, unnest(ARRAY[]) r")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "empty list of rows" in err.message
+
+
+def test_struct_row_table_field_rejects_a_stream() -> None:
+    err = _reject(
+        "SELECT r.v FROM input('f.mkv') f, unnest(ARRAY[STRUCT(f.video[1] AS v)]) r"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+def test_struct_row_table_field_takes_arithmetic_over_a_literal() -> None:
+    res = _resolve(
+        "SELECT r.w FROM input('f.mkv') f, unnest(ARRAY[STRUCT(1920 / 2 AS w)]) r"
+    )
+    assert res.struct_rows["r"].types == ("number",)
+
+
+def test_struct_row_table_field_may_not_take_a_map_columns_name() -> None:
+    err = _reject(
+        "SELECT r.w FROM input('f.mkv') f, unnest(ARRAY[STRUCT(1 AS w, 'x' AS tags)]) r"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "takes a name a row's maps already use" in err.message
+
+
+def test_struct_row_table_requires_an_alias() -> None:
+    err = _reject("SELECT 1 FROM input('f.mkv') f, unnest(ARRAY[STRUCT(1 AS w)])")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "requires an alias" in err.message
+
+
+def test_struct_row_table_is_not_joinable_with_explicit_join() -> None:
+    err = _reject(
+        "SELECT 1 FROM input('f.mkv') f, unnest(f.audio) t "
+        "JOIN unnest(ARRAY[STRUCT(1 AS w)]) r ON t.index = r.w"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "track-row tables only" in err.message
+
+
+# ---------------------------------------------------------------------------
+# ARRAY(SELECT ...) gathers
+# ---------------------------------------------------------------------------
+
+
+def test_array_gather_multi_column_without_struct_is_rejected() -> None:
+    err = _reject(
+        "SELECT ffmpeg.concat(VARIADIC ARRAY("
+        "SELECT f.video, f.audio FROM input('f.mkv') f))"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "single-column SELECT" in err.message
+
+
+def test_array_gather_needs_a_branch_with_no_row_source_of_its_own() -> None:
+    err = _reject(
+        "SELECT 1 FROM input('f.mkv') f, unnest(f.audio) t "
+        "WHERE t.index = ANY(ARRAY(SELECT i.i FROM generate_series(1, 2) i))"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "no row source of its own" in err.message
+
+
+def test_struct_gather_needs_a_name_for_each_field() -> None:
+    err = _reject(
+        "SELECT ffmpeg.concat(VARIADIC ARRAY("
+        "SELECT AS STRUCT c.title, c.start_t + 1 "
+        "FROM unnest(ARRAY[STRUCT('Intro' AS title, 0 AS start_t)]) c))"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "needs a name" in err.message
+
+
+def test_struct_gather_rejects_a_duplicate_field_name() -> None:
+    err = _reject(
+        "SELECT ffmpeg.concat(VARIADIC ARRAY("
+        "SELECT AS STRUCT c.title, c.start_t AS title "
+        "FROM unnest(ARRAY[STRUCT('Intro' AS title, 0 AS start_t)]) c))"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "names the field 'title' twice" in err.message
+
+
+def test_array_gather_subquery_may_not_carry_its_own_with() -> None:
+    err = _reject(
+        "SELECT ffmpeg.concat(VARIADIC ARRAY("
+        "WITH x AS (SELECT f.video FROM input('f.mkv') f) SELECT x.video FROM x))"
+    )
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "own WITH" in err.message
+
+
+def test_array_gather_subquery_requires_a_from_clause() -> None:
+    err = _reject("SELECT ffmpeg.concat(VARIADIC ARRAY(SELECT 1))")
+    assert err.code is ErrorCode.UNSUPPORTED_SQL
+    assert "FROM clause" in err.message
+
+
+def test_array_gather_uncountable_source_is_the_ordinary_rejection() -> None:
+    err = _reject(
+        "SELECT ffmpeg.concat(VARIADIC ARRAY(SELECT x.video FROM nope x))"
+    )
+    assert err.code is ErrorCode.UNKNOWN_ALIAS
+
+
+# ---------------------------------------------------------------------------
 # arithmetic, casts and <input>.duration in the compile-time value grammar
 # ---------------------------------------------------------------------------
 

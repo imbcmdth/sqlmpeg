@@ -424,8 +424,8 @@ _SERIES_RANGE_HINT = (
     "swap the bounds, or the step's sign, to make it ascend"
 )
 _FROM_ITEM_MESSAGE = (
-    "only input('path'), ffmpeg.<source>(...), generate_series(...), and CTE "
-    "or view names are allowed in FROM"
+    "only input('path'), unnest(...), ffmpeg.<source>(...), "
+    "generate_series(...), and CTE or view names are allowed in FROM"
 )
 _ROW_WHERE_HINT = (
     "a track-row predicate compares one row column against a literal: "
@@ -1483,15 +1483,17 @@ class RawValuesTable:
     A ROW SOURCE like an ``unnest`` table, joined into the branch's relation
     the same way, except that its rows are written out rather than probed.
     `columns` is the alias's column list, in written order; `rows` is one tuple
-    of literal expressions (or ``NULL``) per VALUES row, each the same length
-    as `columns`; `types` is the type each column settled on, parallel to
-    `columns` -- ``text`` or ``number``, taken from the literals themselves,
-    with an all-NULL column reading as ``text`` the way Postgres types one.
+    of value expressions per VALUES row (literals for a ``WITH ... AS
+    (VALUES ...)`` table, the compile-time value grammar for a struct row
+    table), each the same length as `columns`; `types` is the type each
+    column settled on, parallel to `columns` -- ``text``, ``number`` or
+    ``boolean``, with an all-NULL column reading as ``text`` the way Postgres
+    types one.
     """
 
     alias: str
     columns: tuple[str, ...]
-    rows: tuple[tuple[exp.Literal | exp.Null, ...], ...]
+    rows: tuple[tuple[exp.Expr, ...], ...]
     node: exp.Expr
     types: tuple[str, ...]
 
@@ -1565,6 +1567,12 @@ class Resolved:
     """``WITH <alias>(<cols>) AS (VALUES ...)`` records, keyed by alias.
     Disjoint from ``ctes``: a VALUES CTE is never FROM-selectable, only usable
     as a sink option's value (``chapters <alias>``)."""
+
+    struct_rows: dict[str, RawValuesTable] = field(default_factory=dict)
+    """``unnest(ARRAY[STRUCT(...), ...]) alias`` records, keyed by the row
+    alias, in FROM order across the whole script -- the struct spelling of a
+    ``VALUES`` table read in FROM. Disjoint from ``track_rows``: a struct row
+    table carries no stream, only written value columns."""
 
     row_aliases: frozenset[str] = frozenset()
     """Every alias bound as a ROW table anywhere in the script: an ``unnest``
@@ -1696,6 +1704,107 @@ def _referenced_aliases(node: exp.Expr) -> set[str]:
             if table_node is not None:
                 aliases.add(_ident_name(table_node))
     return aliases
+
+
+def _row_struct_array(unnest: exp.Unnest) -> exp.Array | None:
+    """The ``ARRAY[STRUCT(...), ...]`` a struct row table's unnest wraps.
+
+    None for an ordinary ``unnest(<column>)``. A ``unnest(ARRAY[...])`` whose
+    elements are not every one a ``STRUCT`` falls through to the ordinary
+    "bare array column" rejection instead -- there is no written-row shape to
+    name -- but an EMPTY array still counts, so its own rejection can say so.
+    """
+    if len(unnest.expressions) != 1:
+        return None
+    array = unnest.expressions[0]
+    if not isinstance(array, exp.Array):
+        return None
+    elements = array.expressions
+    if elements and not all(isinstance(element, exp.Struct) for element in elements):
+        return None
+    return array
+
+
+def _row_struct_fields(struct: exp.Struct) -> dict[str, exp.Expr]:
+    """One ``STRUCT(value AS name, ...)`` as its fields, by name, written order.
+
+    Every field is named: a positional entry has no name to match a later
+    row's fields against, so it is rejected rather than taken in order.
+    """
+    fields: dict[str, exp.Expr] = {}
+    for entry in struct.expressions:
+        if not isinstance(entry, exp.PropertyEQ):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"a STRUCT field is named, got {entry.__class__.__name__.lower()}",
+                entry if isinstance(entry, exp.Expr) else struct,
+                fallback=struct,
+                hint="name every field with AS, e.g. STRUCT(1920 AS w)",
+            )
+        name = _ident_name(entry.this)
+        value = entry.expression
+        if not isinstance(value, exp.Expr):
+            continue
+        if name in fields:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"STRUCT names the field '{name}' twice",
+                entry,
+                fallback=struct,
+                hint="one value per field name",
+            )
+        fields[name] = value
+    return fields
+
+
+def _array_gather_select(array: exp.Array) -> exp.Select | None:
+    """The subquery one ``ARRAY(SELECT ...)`` wraps, else None for a literal
+    array."""
+    elements = array.expressions
+    if len(elements) != 1:
+        return None
+    inner = elements[0]
+    return inner if isinstance(inner, exp.Select) else None
+
+
+def _find_array_gathers(node: exp.Expr) -> list[exp.Array]:
+    """Every ``ARRAY(SELECT ...)`` gather reachable from `node`, without
+    re-entering a match's own inner subquery.
+
+    Once hoisted, that subquery is validated (and, if it holds a gather of
+    its own, hoisted again) as the synthetic CTE body it becomes -- not as
+    part of THIS branch's own walk.
+    """
+    matches: list[exp.Array] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value, exp.Expr):
+            return
+        if isinstance(value, exp.Array) and _array_gather_select(value) is not None:
+            matches.append(value)
+            return
+        for child in value.args.values():
+            visit(child)
+
+    for child in node.args.values():
+        visit(child)
+    return matches
+
+
+def _projection_field_name(node: exp.Expr) -> str | None:
+    """The STRUCT field name one ``SELECT AS STRUCT`` column takes: its own
+    ``AS`` alias, else a bare column's natural name."""
+    if isinstance(node, exp.Alias):
+        alias = node.args.get("alias")
+        return _ident_name(alias) if isinstance(alias, exp.Expr) else None
+    inner = _unwrap(node) if isinstance(node, exp.Expr) else None
+    if isinstance(inner, exp.Column) and not isinstance(inner.this, exp.Star):
+        return _ident_name(inner.this)
+    return None
 
 
 def _describe_unnest_arg(node: object) -> str:
@@ -2414,6 +2523,7 @@ class _Resolver:
         self.input_options: dict[str, tuple[RawInputOption, ...]] = {}
         self.source_filters: dict[str, RawSource] = {}
         self.track_rows: dict[str, RawTrackRows] = {}
+        self.struct_rows: dict[str, RawValuesTable] = {}
         self.values_ctes: dict[str, RawValuesTable] = {}
         # The VALUES tables THIS branch's FROM clause binds, by the local name
         # it read them under. Branch-local, so `_collect_scope` clears it: two
@@ -2530,6 +2640,7 @@ class _Resolver:
             input_options=self.input_options,
             source_filters=self.source_filters,
             track_rows=self.track_rows,
+            struct_rows=self.struct_rows,
             values_ctes=self.values_ctes,
             series=self.series,
             row_aliases=frozenset(self.row_aliases),
@@ -2980,6 +3091,7 @@ class _Resolver:
             or name in self.sources
             or name in self.source_filters
             or name in self.track_rows
+            or name in self.struct_rows
             or name in self.values_ctes
             or name in self.series
         ):
@@ -3002,6 +3114,8 @@ class _Resolver:
         path_expr: exp.Expr | None = None,
         no_aggregate: str | None = None,
     ) -> None:
+        self._hoist_array_gathers(select, visible)
+
         # `ORDER BY` and `GROUP BY` are admitted for ROW-SOURCE queries and
         # nowhere else. The carve-out is decided from the FROM clause alone,
         # before any of it is validated, so a branch with no rows keeps the
@@ -3614,7 +3728,11 @@ class _Resolver:
                     fallback=join,
                     hint=_JOIN_HINT,
                 )
-        if not isinstance(join.this, exp.Unnest) or "row" not in scope.values():
+        if (
+            not isinstance(join.this, exp.Unnest)
+            or _row_struct_array(join.this) is not None
+            or "row" not in scope.values()
+        ):
             raise _error(
                 ErrorCode.UNSUPPORTED_SQL,
                 "explicit JOIN syntax is supported between unnest(...) track-row "
@@ -3784,11 +3902,182 @@ class _Resolver:
             return
         self._check_row_literal(node, column, column_type, join)
 
+    # -- ARRAY(SELECT ...) gathers -----------------------------------------
+
+    def _hoist_array_gathers(self, select: exp.Select, visible: set[str]) -> None:
+        """Rewrite this branch's ``ARRAY(SELECT ...)``, if it has one, into
+        ``array_agg(...)`` over the subquery's OWN row source, spliced
+        straight into this branch's FROM -- so the gather and a hand-written
+        ``array_agg(...) FROM ..., unnest(...) c`` compile to the identical
+        thing, because after this rewrite they ARE the identical thing.
+
+        ``array_agg`` reads the branch's OWN relation
+        (:meth:`_Lowerer._lower_array_agg`), so a branch with a row source of
+        its own already, or more than one gather, has no single relation to
+        splice one into and is rejected rather than silently cross-
+        multiplying two unrelated row counts together.
+        """
+        matches = _find_array_gathers(select)
+        if not matches:
+            return
+        if len(matches) > 1:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"a SELECT may gather at most one ARRAY(subquery), found "
+                f"{len(matches)}",
+                select,
+                hint="gather each into its own WITH ... AS (...) CTE, and "
+                "combine them there instead",
+            )
+        if _has_row_source(select, visible):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "ARRAY(subquery) needs a branch with no row source of its "
+                "own to read rows from",
+                select,
+                hint="pull the branch's own row source into a WITH ... AS "
+                "(...) CTE too, and array_agg over it instead",
+            )
+        self._splice_gather(select, matches[0])
+
+    def _splice_gather(self, select: exp.Select, array_node: exp.Array) -> None:
+        """One ``ARRAY(SELECT ...)`` node: splice its subquery's FROM/WHERE
+        into `select`'s own, and rewrite the node to ``array_agg(...)`` over
+        the original projection(s) -- now resolved against the spliced-in
+        row source, exactly as they would be written by hand.
+        """
+        subquery = array_node.expressions[0]
+        if not isinstance(subquery, exp.Select):  # defensive: caller matched this shape
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, "malformed ARRAY(...) gather", array_node
+            )
+        if subquery.args.get("with_") is not None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "a gathered subquery may not have its own WITH",
+                subquery.args["with_"],
+                fallback=array_node,
+                hint="hoist the CTE to the surrounding query's own WITH clause",
+            )
+        from_ = subquery.args.get("from_")
+        if not isinstance(from_, exp.From):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "ARRAY(...) subquery requires a FROM clause",
+                subquery,
+                fallback=array_node,
+                hint="add FROM input(...) or another row source the "
+                "compiler can count",
+            )
+        projections = subquery.expressions
+        if not projections:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "ARRAY(...) subquery selects no column",
+                subquery,
+                fallback=array_node,
+            )
+        if subquery.args.get("kind") == "STRUCT":
+            replacement = self._struct_gather_expr(subquery, projections)
+        elif len(projections) != 1:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "ARRAY(...) takes a single-column SELECT, got "
+                f"{len(projections)} columns",
+                subquery,
+                fallback=array_node,
+                hint="name every column and write SELECT AS STRUCT to "
+                "gather a struct array instead",
+            )
+        else:
+            replacement = exp.ArrayAgg(this=projections[0])
+
+        outer_from = select.args.get("from_")
+        items = [from_.this] if isinstance(from_.this, exp.Expr) else []
+        sub_joins = subquery.args.get("joins") or []
+        if outer_from is None:
+            if not items:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "ARRAY(...) subquery requires a FROM clause",
+                    subquery,
+                    fallback=array_node,
+                )
+            select.set("from_", exp.From(this=items[0]))
+            items = items[1:]
+        new_joins = [exp.Join(this=item) for item in items]
+        select.set(
+            "joins", [*(select.args.get("joins") or []), *new_joins, *sub_joins]
+        )
+        sub_where = subquery.args.get("where")
+        if isinstance(sub_where, exp.Where) and isinstance(sub_where.this, exp.Expr):
+            outer_where = select.args.get("where")
+            if isinstance(outer_where, exp.Where) and isinstance(outer_where.this, exp.Expr):
+                select.set(
+                    "where",
+                    exp.Where(this=exp.and_(outer_where.this, sub_where.this, copy=False)),
+                )
+            else:
+                select.set("where", sub_where)
+
+        array_node.replace(replacement)
+
+    def _struct_gather_expr(
+        self, subquery: exp.Select, projections: list[exp.Expr]
+    ) -> exp.ArrayAgg:
+        """``ARRAY(SELECT AS STRUCT <cols> FROM ...)``: the struct gather.
+
+        Each column's name -- an ``AS`` alias, else its natural one -- names
+        one field of the STRUCT the array_agg gathers, exactly the fields a
+        hand-written ``array_agg(STRUCT(c.title AS title, ...)::chapter)``
+        would name. Marked so a record consumer (chapters, attachments,
+        cues) accepts it the way it already accepts an explicitly cast one,
+        since ``SELECT AS STRUCT`` offers nowhere to write the cast.
+        """
+        fields: list[exp.Expr] = []
+        seen: set[str] = set()
+        for projection in projections:
+            if not isinstance(projection, exp.Expr):
+                continue
+            field_name = _projection_field_name(projection)
+            if field_name is None:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "a struct gather's column needs a name",
+                    projection,
+                    fallback=subquery,
+                    hint="name it with AS, e.g. SELECT AS STRUCT c.title AS "
+                    "title, ...",
+                )
+            if field_name in seen:
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"SELECT AS STRUCT names the field '{field_name}' twice",
+                    projection,
+                    fallback=subquery,
+                    hint="one column per field name",
+                )
+            seen.add(field_name)
+            value = projection.this if isinstance(projection, exp.Alias) else projection
+            if not isinstance(value, exp.Expr):
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL, "malformed SELECT column", subquery
+                )
+            fields.append(exp.PropertyEQ(this=exp.to_identifier(field_name), expression=value))
+        struct = exp.Struct(expressions=fields)
+        struct.meta["gathered_struct"] = True
+        return exp.ArrayAgg(this=struct)
+
     def _add_from_item(
         self, item: exp.Expr | None, scope: dict[str, str], visible: set[str]
     ) -> None:
-        """One FROM item: a track-row ``unnest``, or an ordinary table."""
+        """One FROM item: a track-row ``unnest``, a struct row table, or an
+        ordinary table."""
         if isinstance(item, exp.Unnest):
+            struct_array = _row_struct_array(item)
+            if struct_array is not None:
+                self._add_struct_rows(item, struct_array, scope)
+                return
             self._add_track_rows(item, scope)
             return
         self._add_table(item, scope, visible)
@@ -3896,6 +4185,152 @@ class _Resolver:
             _FROM_ITEM_MESSAGE,
             table,
         )
+
+    # -- FROM unnest(ARRAY[STRUCT(...), ...]) alias ------------
+
+    def _add_struct_rows(
+        self, unnest: exp.Unnest, array: exp.Array, scope: dict[str, str]
+    ) -> None:
+        """``unnest(ARRAY[STRUCT(...), ...]) alias`` -- an inline written row
+        table, the STRUCT spelling of ``(VALUES (...)) AS t(c)``.
+
+        Every struct in the array names the same field set, order-free; a
+        field's value takes the ordinary compile-time value grammar -- a
+        literal, or an expression over one -- so a stream inside is rejected
+        the same way any other value position rejects one. The rows join the
+        branch's relation through the same ``RawValuesTable``/``_RowBinding``
+        machinery a ``VALUES`` table's do.
+        """
+        _check_query_args(
+            unnest, frozenset({"expressions", "alias", "offset"}), "unnest"
+        )
+        if unnest.args.get("offset"):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "unnest ... WITH ORDINALITY is not supported",
+                unnest,
+                hint="every track row already carries its 1-based position as "
+                "<alias>.index",
+            )
+        alias_node = unnest.args.get("alias")
+        if not isinstance(alias_node, exp.TableAlias) or alias_node.this is None:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "unnest(ARRAY[STRUCT(...), ...]) requires an alias",
+                unnest,
+                hint="name the rows, e.g. unnest(ARRAY[STRUCT(1920 AS w)]) r",
+            )
+        if alias_node.args.get("columns"):
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                "table column aliases are not supported",
+                alias_node,
+                fallback=unnest,
+                hint="a struct row table's columns are its STRUCT field names",
+            )
+        alias = _ident_name(alias_node.this)
+        self._reserve(alias, alias_node.this)
+        if alias in scope:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, f"duplicate name '{alias}'", alias_node.this
+            )
+
+        elements = array.expressions
+        if not elements:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"unnest(ARRAY[...]) for '{alias}' is an empty list of rows",
+                array,
+                fallback=unnest,
+                hint="write at least one STRUCT(...), e.g. "
+                "unnest(ARRAY[STRUCT(1920 AS w)]) r",
+            )
+        first = elements[0]
+        if not isinstance(first, exp.Struct):  # defensive: _row_struct_array checked
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL, "malformed struct row", first, fallback=unnest
+            )
+        first_fields = _row_struct_fields(first)
+        reserved = [name for name in first_fields if name in MAP_COLUMNS]
+        if reserved:
+            raise _error(
+                ErrorCode.UNSUPPORTED_SQL,
+                f"'{alias}.{reserved[0]}' takes a name a row's maps already use",
+                first,
+                fallback=unnest,
+                hint=f"{_listed_columns(MAP_COLUMNS)} name the maps a track row "
+                "carries; pick another field name",
+            )
+        columns = tuple(first_fields)
+        rows: list[tuple[exp.Expr, ...]] = [tuple(first_fields[name] for name in columns)]
+        for position, element in enumerate(elements[1:], start=2):
+            if not isinstance(element, exp.Struct):  # defensive: checked above
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    "malformed struct row",
+                    element,
+                    fallback=unnest,
+                )
+            fields = _row_struct_fields(element)
+            missing = set(columns) - set(fields)
+            extra = set(fields) - set(columns)
+            if missing or extra:
+                odd = sorted(missing | extra)[0]
+                raise _error(
+                    ErrorCode.UNSUPPORTED_SQL,
+                    f"row {position}'s STRUCT does not declare the same fields "
+                    f"row 1's does ({_listed_columns(columns)}): '{odd}' "
+                    f"{'is missing' if odd in missing else 'is unexpected'}",
+                    element,
+                    fallback=unnest,
+                    hint="every STRUCT in the array names the same fields",
+                )
+            rows.append(tuple(fields[name] for name in columns))
+
+        types = self._struct_row_types(alias, columns, rows, scope, unnest)
+        self.row_aliases.add(alias)
+        table = RawValuesTable(
+            alias=alias, columns=columns, rows=tuple(rows), node=unnest, types=types
+        )
+        self.struct_rows[alias] = table
+        self.values_rows[alias] = table
+        scope[alias] = "row"
+
+    def _struct_row_types(
+        self,
+        alias: str,
+        columns: tuple[str, ...],
+        rows: list[tuple[exp.Expr, ...]],
+        scope: dict[str, str],
+        unnest: exp.Unnest,
+    ) -> tuple[str, ...]:
+        """One type per column, from the compile-time value grammar.
+
+        A stream-typed field is rejected here, by the same value grammar any
+        other value position uses (:meth:`_check_value_expr`); disagreement
+        across rows is rejected the way a VALUES column's is
+        (:meth:`_values_types`).
+        """
+        types: list[str] = []
+        for position, column in enumerate(columns):
+            settled: str | None = None
+            for row in rows:
+                written = self._check_value_expr(row[position], scope, unnest)
+                if written is None:
+                    continue
+                if settled is not None and written != settled:
+                    raise _error(
+                        ErrorCode.UNSUPPORTED_SQL,
+                        f"column '{alias}.{column}' holds both {settled} and "
+                        f"{written}",
+                        row[position],
+                        fallback=unnest,
+                        hint="every row of a column writes the same type; NULL "
+                        "fits any of them",
+                    )
+                settled = written
+            types.append(settled or "text")
+        return tuple(types)
 
     # -- FROM unnest(<input>.<type>) alias ------------
 

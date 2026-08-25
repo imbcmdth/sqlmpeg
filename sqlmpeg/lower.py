@@ -444,8 +444,8 @@ _STREAM_HINT = (
 )
 _SUBSCRIPT_HINT = "stream subscripts are 1-based: a.video[1] is the first video stream"
 _FROM_ITEM_MESSAGE = (
-    "only input('path'), ffmpeg.<source>(...), generate_series(...), and CTE "
-    "or view names are allowed in FROM"
+    "only input('path'), unnest(...), ffmpeg.<source>(...), "
+    "generate_series(...), and CTE or view names are allowed in FROM"
 )
 _ZIP_HINT = (
     "broadcast arrays zip elementwise, one output per element; "
@@ -2971,11 +2971,21 @@ class _Lowerer:
         fields, in declaration order, and never a probed one like ``index``.
         Each value takes the ordinary compile-time value grammar. The cell is
         kept beside the value so a rejection anchors on what the query typed.
+
+        A ``SELECT AS STRUCT`` gather's struct carries no cast -- there is
+        nowhere in that spelling to write one -- so it is marked instead
+        (``ARRAY(...)``'s own resolve-time rewrite) and accepted here on that
+        mark alone; an ordinary bare ``STRUCT(...)`` still needs its
+        ``::<record>`` cast exactly as before.
         """
         node = _unwrap(node)
         fields = RECORD_FIELDS[record]
         matches = record_cast_type(node) == record
         struct = _struct_node(node) if matches else None
+        if struct is None and isinstance(node, exp.Struct) and node.meta.get(
+            "gathered_struct"
+        ):
+            struct = node
         if struct is not None:
             cells = self._named_record_cells(struct, record, fields, select)
         else:
@@ -4422,7 +4432,18 @@ class _Lowerer:
             )
         for item, join in from_entries(select):
             if isinstance(item, exp.Unnest):
-                self._add_track_rows(item, join, env, select)
+                alias_node = item.args.get("alias")
+                alias = (
+                    _fold(alias_node.this)
+                    if isinstance(alias_node, exp.TableAlias)
+                    and alias_node.this is not None
+                    else ""
+                )
+                struct_values = self.res.struct_rows.get(alias)
+                if struct_values is not None:
+                    self._add_values_rows(alias, struct_values, env, select)
+                else:
+                    self._add_track_rows(item, join, env, select)
             else:
                 self._add_table(item, env, select)
         return env
@@ -4733,20 +4754,24 @@ class _Lowerer:
         the query instead of a probe -- so a comma between a VALUES table and
         anything else is the ordinary cross join, and ``array_agg`` over it
         aggregates the same way. No stream and no ``-i``: the rows are values.
+        Each cell takes the ordinary compile-time value grammar
+        (:meth:`_eval_value`), evaluated once over the branch's representative
+        row -- a plain VALUES/``generate_series`` cell is always a literal, so
+        this is the identity for them; a struct row table's cell may be an
+        expression over one.
         """
         if env.relation is None:
             env.relation = _RowRelation()
+        group_row = _group_row(env)
         rows = [
             _TrackRow(
                 stream=_STREAMLESS_ROW,
                 columns={
-                    name: None
-                    if isinstance(cell, exp.Null)
-                    else self._literal_of(cell, select)
-                    for name, cell in zip(values.columns, row, strict=True)
+                    name: self._eval_value(cell, env, group_row, select)
+                    for name, cell in zip(values.columns, entry, strict=True)
                 },
             )
-            for row in values.rows
+            for entry in values.rows
         ]
         env.bindings[local] = _RowBinding(
             alias=local,
@@ -8364,10 +8389,12 @@ class _Lowerer:
         element came from and REPLACED BY THE LITERAL it computes to, so a
         per-row option and a written one bind through the same
         :meth:`_bind_options` and are validated by the same option table.
-        A bare column bound to a ``duration``-typed option counts too --
-        ``ffmpeg.trim(f, starti => f.duration)`` -- because that option takes
-        a number of seconds and a probed/row scalar IS one; a bare column
-        elsewhere stays untouched, since it may be a stream.
+        A bare column bound to a non-boolean option counts too --
+        ``ffmpeg.trim(f, starti => f.duration)``, ``scale(f.video[1], r.w,
+        -2)`` -- because a probed/row scalar may be exactly what the option
+        wants (the option table still rejects it once evaluated if it is
+        not); a bare column bound to a boolean option, or to a stream
+        argument, stays untouched, since it may be a stream.
 
         A call with no computed option binds exactly once and hands the same
         dict to every element -- which is every call that existed before
@@ -8381,7 +8408,11 @@ class _Lowerer:
         def countable(arg: exp.Expr, option: FilterOption | None) -> bool:
             if is_value_expr(arg):
                 return True
-            return option is not None and option.type == "duration" and _is_row_scalar(arg, env)
+            return (
+                option is not None
+                and option.type != "bool"
+                and _is_row_scalar(arg, env)
+            )
 
         extras_countable = [
             countable(arg, positional_target(i)) for i, arg in enumerate(extras)

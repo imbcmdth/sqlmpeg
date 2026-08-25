@@ -1242,6 +1242,29 @@ def test_the_gathered_form_compiles_to_the_hand_written_one_byte_for_byte() -> N
     ]
 
 
+def _gathered_by_array(bounds: str, count: int = 3) -> str:
+    """The ``ARRAY(SELECT ...)`` form of :func:`_gathered` -- no CTE, no
+    ``array_agg`` written by hand."""
+    return (
+        "COPY (SELECT amix(VARIADIC ARRAY("
+        f"SELECT f.audio FROM input('x.mp4') f, generate_series(1, {count}) i "
+        f"WHERE {bounds}))) TO 'o.mka'"
+    )
+
+
+def test_array_gather_variadic_compiles_the_same_as_array_agg_over_a_cte() -> None:
+    """``ARRAY(SELECT ...)`` inside VARIADIC is sugar for a hidden row source
+    plus ``array_agg`` -- byte for byte the same argv as writing that CTE by
+    hand (the recipe 75 shape)."""
+    bounds = "f.t >= (i.i - 1) * 2 AND f.t <= (i.i - 1) * 2 + 1"
+    probes: dict[str, ProbeResult | None] = {"f": _windowed_probe()}
+    gathered = insert_splits(_lower(_gathered_by_array(bounds), probes))
+    by_hand = insert_splits(_lower(_gathered(bounds), probes))
+    assert build_ffmpeg_args(emit(gathered), "o.mka") == build_ffmpeg_args(
+        emit(by_hand), "o.mka"
+    )
+
+
 def test_row_bounded_windows_reaching_one_file_name_both_ways_out() -> None:
     """Nothing gathers the rows and nothing fans them out, so three windows
     meet one destination: rejected, with the aggregate and the TO expression
@@ -7345,6 +7368,31 @@ def test_array_agg_over_chapter_rows_copies_a_list_relationally() -> None:
     assert "title=Intro" in payload and "title=Credits" in payload
 
 
+def test_struct_gather_feeding_chapters_compiles_the_same_as_array_agg_struct() -> None:
+    """``ARRAY(SELECT AS STRUCT ...)`` feeding a ``chapters`` column is byte
+    for byte the hand-written ``array_agg(STRUCT(...)::chapter)`` spelling --
+    a new way to BUILD the array, the same semantics consuming it."""
+    gathered = (
+        "COPY (SELECT f.video[1], ARRAY(SELECT AS STRUCT c.title, c.start_t, "
+        "c.end_t FROM unnest(ARRAY[STRUCT('Intro' AS title, 0 AS start_t, "
+        "60 AS end_t), STRUCT('Credits' AS title, 60 AS start_t, "
+        "90 AS end_t)]) c) AS chapters FROM input('f.mkv') f) TO 'out.mkv'"
+    )
+    by_hand = (
+        "COPY (SELECT f.video[1], array_agg(STRUCT(c.title AS title, "
+        "c.start_t AS start_t, c.end_t AS end_t)::chapter) AS chapters "
+        "FROM input('f.mkv') f, unnest(ARRAY[STRUCT('Intro' AS title, "
+        "0 AS start_t, 60 AS end_t), STRUCT('Credits' AS title, "
+        "60 AS start_t, 90 AS end_t)]) c GROUP BY f.video[1]) TO 'out.mkv'"
+    )
+    g1 = _lower(gathered, {})
+    g2 = _lower(by_hand, {})
+    assert g1.input_paths == g2.input_paths
+    payload = base64.b64decode(g1.input_paths[1].split(",", 1)[1]).decode()
+    assert payload.count("[CHAPTER]") == 2
+    assert "title=Intro" in payload and "title=Credits" in payload
+
+
 def test_a_chapters_column_groups_with_the_stream_columns() -> None:
     """The chapter list is a GROUP-level value, so the rows it aggregates do
     not each become a file of their own."""
@@ -8008,6 +8056,54 @@ def test_a_bare_written_column_tags_the_container_like_any_other_value() -> None
 def test_a_values_row_is_not_an_output_stream() -> None:
     err = _reject("COPY (" + _MARKS + "SELECT m FROM input('f.mkv') f, marks m) TO 'o.mkv'")
     assert err.code is ErrorCode.UNSUPPORTED_SQL
+
+
+# ---------------------------------------------------------------------------
+# struct row tables: unnest(ARRAY[STRUCT(...), ...]) alias
+# ---------------------------------------------------------------------------
+
+_RUNGS = (
+    "unnest(ARRAY[STRUCT(1920 AS w, '1080p' AS name), "
+    "STRUCT(1280 AS w, '720p' AS name)]) r"
+)
+
+
+def test_struct_row_table_prints_its_written_rows() -> None:
+    sinks = lower_table(
+        resolve(parse(f"SELECT r.name, r.w FROM input('f.mkv') f, {_RUNGS}")),
+        {"f": ProbeResult(streams=[_track("video", 0)])},
+    )
+    assert sinks[0].result.columns == ["name", "w"]
+    assert sinks[0].result.rows == [["1080p", 1920], ["720p", 1280]]
+
+
+def test_struct_row_table_compiles_the_same_argv_as_a_values_cte() -> None:
+    """The STRUCT spelling of ``(VALUES (...)) AS t(c)`` -- same rows, same
+    argv, byte for byte, key fan-out and all."""
+    struct_q = (
+        "COPY (SELECT f.* REPLACE(scale(f.video[1], r.w, -2) AS video) "
+        f"FROM input('x.mp4') f, {_RUNGS}) TO (r.name || '.mp4')"
+    )
+    values_q = (
+        "COPY (WITH r(w, name) AS (VALUES (1920, '1080p'), (1280, '720p')) "
+        "SELECT f.* REPLACE(scale(f.video[1], r.w, -2) AS video) "
+        "FROM input('x.mp4') f, r) TO (r.name || '.mp4')"
+    )
+    probes = {"f": _layout_probe("v")}
+    g1 = insert_splits(_lower(struct_q, probes))
+    g2 = insert_splits(_lower(values_q, probes))
+    assert build_ffmpeg_args(emit(g1), None) == build_ffmpeg_args(emit(g2), None)
+
+
+def test_struct_row_table_field_reads_as_a_scale_option() -> None:
+    """A row's own field is a compile-time value wherever one is wanted --
+    here, a non-duration numeric filter option, not just a WHERE/TO bound."""
+    g = _lower(
+        f"COPY (SELECT scale(f.video[1], r.w, -2) FROM input('f.mkv') f, {_RUNGS} "
+        "WHERE r.name = '1080p') TO 'o.mp4'",
+        {"f": _layout_probe("v")},
+    )
+    assert g.nodes["n1"].args["width"] == 1920
 
 
 # ---------------------------------------------------------------------------

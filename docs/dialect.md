@@ -360,6 +360,7 @@ Every FROM item is a compile-time table; the column model per shape is
 | `input('path', name => value, ...) alias` | 1 | alias mandatory; path is a literal, never computed; trailing named options are ffmpeg's per-input flags |
 | `ffmpeg.<source>(name => value, ...) alias` | 1 | generated stream (testsrc2, sine, color, anullsrc, ...), no `-i`; options named-only |
 | `unnest(alias.<array>) alias` | one per element | the four stream arrays, or `chapters` / `cues` / `attachments`, of an input declared earlier in the same FROM |
+| `unnest(ARRAY[STRUCT(v AS c, ...), ...]) alias` | one per array element | a written row table, the STRUCT spelling of `(VALUES (...)) AS t(c)`; columns are the STRUCT field names, every element declaring the same set |
 | `generate_series(start, stop[, step]) alias` | `stop - start` over `step`, inclusive | alias mandatory, names both the row table and its one column (`i.i`); bounds and step are integer literals after substitution |
 | `cte_or_view_name [alias]` | its body's rows | a multi-row body is a multi-row source; a `VALUES` list is one too |
 | `function_name(args) alias` | its body's rows | a table-returning function, expanded at compile time |
@@ -402,6 +403,16 @@ Each column is one of:
 - **`array_agg(<per-row stream expression>)`**: gathers rows in row
   order; must be a whole column, or the sole argument of `VARIADIC`
   ([rows.md](rows.md#combining-rows)).
+- **`ARRAY(<select>)`**: gathers a single-column, countable subquery's
+  rows into an array, in expression position - the converse of
+  `unnest`, and everywhere an `array_agg` result already stands
+  (a whole column, or `VARIADIC`'s argument). `SELECT AS STRUCT
+  <cols>` gathers a multi-column subquery into an array of structs
+  instead, feeding a `chapters` / `attachments` column or a cue array
+  the way `array_agg(STRUCT(...)::<record>)` does by hand. The
+  subquery is self-contained (its own FROM, no reference to a row
+  source outside it) and this branch may have no row source of its
+  own already.
 - **A metadata column** (table queries): any row column prints as
   data.
 - **`*` / `<alias>.*`**: over an input, its array columns - the four
@@ -443,6 +454,13 @@ valid.
 splat modifiers); `EXCEPT` is otherwise a Postgres set operator, but the
 parenthesized form only ever appears after a bare `*`, where set
 subtraction has no meaning.
+
+`SELECT AS STRUCT <cols>` inside `ARRAY(...)` is borrowed too (BigQuery's
+struct-valued SELECT); it names the array-of-structs form of a gathered
+subquery, since a plain multi-column SELECT there is a typed rejection.
+`ARRAY(<select>)` itself is not a borrowing - Postgres has it natively,
+and this dialect's `unnest(ARRAY[STRUCT(...), ...])` row table is its own
+addition, not a borrowed spelling.
 
 
 One compile-time value grammar serves predicates, `tags` fields, value
