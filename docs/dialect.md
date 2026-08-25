@@ -538,15 +538,17 @@ Every one of these is a typed rejection, never a silent reinterpretation:
   descending or empty range; an unaliased call.
 - **Multi-row into one path** (`ROW_COUNT_MISMATCH`): gather or fan
   out, explicitly.
-- **Filters**: variable-pad (`split` - what the compiler's own split
-  pass is for; UNION ALL is `concat` without ever naming it), multi-output
-  (`scale2ref`, `feedback`), sinks, multi-output sources
+- **Filters**: variable-OUTPUT-pad (`split` - what the compiler's own
+  split pass is for; UNION ALL is `concat` without ever naming it),
+  multi-output (`scale2ref`, `feedback`), sinks, multi-output sources
   (`movie`, `avsynctest`); options typed `binary` or `dictionary`;
-  runtime filter commands (`sendcmd`, `zmq`). The N-input escape:
-  `amix`, `hstack`, `vstack`, `amerge`, `ffmpeg.join`, `interleave`,
-  `ainterleave` take any stream count, positional or `VARIADIC`; so
-  does `ffmpeg.concat`/`concat`, but ONLY under `VARIADIC` - called
-  without it, `concat` is still `UNKNOWN_FUNCTION`.
+  runtime filter commands (`sendcmd`, `zmq`). A variable-INPUT-pad
+  filter (`amix`, `hstack`, `xstack`, and every other filter your
+  ffmpeg reports that way) is an ordinary callable filter, taking any
+  stream count positionally or under `VARIADIC`. `ffmpeg.concat`/
+  `concat` takes any stream count too, but ONLY under `VARIADIC` -
+  called without it, `concat` is still `UNKNOWN_FUNCTION` (its own pad
+  count is variable on the OUTPUT side too).
 - **Functions**: `OR REPLACE`, `IF NOT EXISTS`, a schema-qualified
   name, any property but `RETURNS`/`LANGUAGE`, a language other than
   `sql`, parameter defaults or `OUT`/`VARIADIC`, overloading, recursion,

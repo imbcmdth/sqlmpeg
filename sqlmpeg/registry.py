@@ -32,11 +32,16 @@ from a full scan of `ffmpeg version 7.1-full_build-www.gyan.dev` (captured
   - Pad specs seen across ~560 filters: `A->A`, `AA->A`, `V->V`, `VV->V`,
     `VVV->V`, `VVVV->V`, `A->V`. `VV->A` was never observed; mixed in/out
     letters parse verbatim per character regardless. Multi-output (`VV->VV`:
-    `feedback`, `scale2ref`), dynamic pad count `N` (`split`: `V->N`,
-    `concat`: `N->N`) and source/sink `|` (`testsrc`: `|->V`, `anullsink`:
-    `A->|`) are excluded by the pad scope check. Every zero-input filter
-    observed uses `|` as its input character, never an empty string -- the
-    "zero inputs" exclusion is defensive, not something seen in practice.
+    `feedback`, `scale2ref`), a dynamic pad count on the OUTPUT side (`split`:
+    `V->N`, `concat`/`streamselect`/`astreamselect`: `N->N`) and source/sink
+    `|` (`testsrc`: `|->V`, `anullsink`: `A->|`) are excluded by the pad scope
+    check. A dynamic pad count on the INPUT side alone (`N->V`: `hstack`,
+    `N->A`: `amix`, ~31 filters on ffmpeg 9.0.1) is INCLUDED, marked
+    `DynamicFilter.n_input`, with the input pads' stream type read off the
+    single output letter -- every one observed takes pads of that same kind.
+    Every zero-input filter observed uses `|` as its input character, never
+    an empty string -- the "zero inputs" exclusion is defensive, not
+    something seen in practice.
   - The `-help filter=X` AVOptions header does NOT always read
     `"X AVOptions:"`: filters sharing an implementation share a header
     (`split` -> `"(a)split AVOptions:"`, `acompressor` ->
@@ -165,9 +170,14 @@ class FilterOption:
 class DynamicFilter:
     name: str
     inputs: tuple[StreamType, ...]  # from the pad spec, e.g. ("video", "video")
+    # empty when n_input is True: the pad spec's input side is "N" (a dynamic
+    # count), not a fixed list of letters.
     output: StreamType
     doc: str
     timeline: bool  # `-filters` flag column's leading `T`/`.` char
+    n_input: bool = False  # input side is "N" (e.g. "N->V"): a variable number
+    # of pads, all carrying `output`'s stream type -- every N->V/N->A filter
+    # observed has input pads of the same kind as its single output pad.
     # Options are NOT stored here: Registry.options() loads and caches them
     # lazily per filter on first reference, never all ~460 upfront.
 
@@ -248,9 +258,27 @@ def _parse_filters_list(
                 continue
             sources[name] = SourceFilter(name=name, output=stream, doc=doc_text)
             continue
-        # Scope check: exclude dynamic pad count (N), sink (output '|'),
-        # multi-output, and (defensively) zero-input specs.
-        if not inp or "N" in spec or "|" in spec or len(outp) != 1:
+        # Scope check: exclude sink (output '|'), multi-output, and
+        # (defensively) zero-input specs. A dynamic pad count on the OUTPUT
+        # side (`V->N`: split, `N->N`: concat/streamselect) stays excluded --
+        # the compiler inserts splits itself, and a variable OUTPUT count is
+        # not knowable from an option the way a variable input count is. A
+        # dynamic count on the INPUT side alone (`N->V`, `N->A`) is included
+        # below as n-input.
+        if not inp or "|" in spec or len(outp) != 1:
+            continue
+        if inp == "N":
+            output = _PAD_CHARS.get(outp)
+            if output is None:
+                continue  # N->N: dynamic on the output side too, stays excluded
+            filters[name] = DynamicFilter(
+                name=name,
+                inputs=(),
+                output=output,
+                doc=doc_text,
+                timeline=timeline,
+                n_input=True,
+            )
             continue
         try:
             inputs = tuple(_PAD_CHARS[c] for c in inp)
@@ -408,7 +436,10 @@ def _parse_filter_help(ffmpeg: str, name: str) -> dict[str, FilterOption]:
 # Bump on any change to the cached payload shape. A mismatch -- including an
 # absent key, as in older cache files -- is treated exactly like corrupt JSON:
 # silently discarded and rebuilt from a fresh `-filters`/`-help` pass.
-_CACHE_FORMAT_VERSION = 2
+#
+# 3: `DynamicFilter` gained `n_input` (a dynamic INPUT pad count, `N->V`/
+# `N->A`, is now included rather than excluded -- see `_parse_filters_list`).
+_CACHE_FORMAT_VERSION = 3
 
 
 def _cache_dir() -> Path:
@@ -494,8 +525,9 @@ def _decode_filters(raw: object) -> dict[str, DynamicFilter]:
         output = _require_stream_type(entry["output"])
         doc = _require_str(entry["doc"])
         timeline = _require_bool(entry["timeline"])
+        n_input = _require_bool(entry["n_input"])
         result[name] = DynamicFilter(
-            name=name, inputs=inputs, output=output, doc=doc, timeline=timeline
+            name=name, inputs=inputs, output=output, doc=doc, timeline=timeline, n_input=n_input
         )
     return result
 
@@ -576,6 +608,7 @@ def _encode_payload(
                 "output": f.output,
                 "doc": f.doc,
                 "timeline": f.timeline,
+                "n_input": f.n_input,
             }
             for name, f in filters.items()
         },
@@ -725,8 +758,10 @@ class Registry:
     def get(self, name: str) -> DynamicFilter | None:
         """None if `name` is unknown to this ffmpeg OR excluded by the pad scope check.
 
-        Also None for a known SOURCE name: a source is not a column function,
-        use `get_source()`.
+        Includes n-input filters (`DynamicFilter.n_input`, a dynamic INPUT pad
+        count) -- only a dynamic OUTPUT count, multi-output, sink or source
+        spec is excluded. Also None for a known SOURCE name: a source is not a
+        column function, use `get_source()`.
         """
         self._ensure_loaded()
         return self._filters.get(name)

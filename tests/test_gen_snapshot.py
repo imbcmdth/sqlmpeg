@@ -212,13 +212,18 @@ def test_snapshot_preserves_ffmpeg_option_order() -> None:
         assert list(options)[: len(head)] == head, name
 
 
-def test_snapshot_carries_the_excluded_tables_lowering_needs() -> None:
-    """Both re-admission tables are in the payload, or they are uncallable offline."""
+def test_snapshot_carries_the_options_lowering_needs() -> None:
+    """The array-returning trio's options are in the payload, or they are
+    uncallable offline -- they stay excluded from `Registry.names()` (dynamic
+    on the OUTPUT side), so `excluded_options()` is their only door. An
+    N-input filter (amix, hstack, ...) is an ordinary registry member now, so
+    its options are already there via `options()`; `excluded_options()` reads
+    the same cache and answers just as well."""
     ref = load_reference(_SNAPSHOT_PATH)
     for name in ("channelsplit", "acrossover", "extractplanes"):
         assert ref.excluded_options(name), name
     for name in ("amix", "hstack", "vstack"):
-        options = ref.excluded_options(name)
+        options = ref.options(name)
         assert options is not None and "inputs" in options, name
         assert options["inputs"].default == "2", name
 
@@ -230,7 +235,7 @@ def test_snapshot_carries_the_excluded_tables_lowering_needs() -> None:
 
 def test_snapshot_fixture_is_present_and_well_shaped() -> None:
     data = json.loads(_SNAPSHOT_PATH.read_text(encoding="utf-8"))
-    assert data["format_version"] == 2
+    assert data["format_version"] == 3
     assert isinstance(data["filters"], dict) and len(data["filters"]) > 300
     assert isinstance(data["sources"], dict) and len(data["sources"]) > 20
     assert isinstance(data["options"], dict) and len(data["options"]) > 300
@@ -353,7 +358,7 @@ def test_load_reference_wrong_format_version_degrades_permissively(tmp_path: Pat
 def test_load_reference_bad_shape_degrades_permissively(tmp_path: Path) -> None:
     path = tmp_path / "shape.json"
     path.write_text(
-        json.dumps({"format_version": 2, "filters": "not-a-dict", "sources": {}, "options": {}}),
+        json.dumps({"format_version": 3, "filters": "not-a-dict", "sources": {}, "options": {}}),
         encoding="utf-8",
     )
     ref = load_reference(path)

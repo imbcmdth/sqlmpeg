@@ -109,7 +109,7 @@ $ sqlmpeg compile -f query.sql
 ffmpeg -i stereo.mp4 -filter_complex '[0:a:0]channelsplit[n10][n11];[n10]volume=volume=0.5[n2];[n11]volume=volume=2.0[n3];[n2][n3]amix=inputs=2[out0]' -map '[out0]' out.mp4
 ```
 
-The N-input filters take however many streams you pass: `amix`, `hstack`, `vstack`, `amerge`, `ffmpeg.join` (bare `join` is the SQL keyword), `interleave`, `ainterleave`, `ladspa`. Where the filter has an `inputs`/`nb_inputs` option it is set from the stream count, and a written value that disagrees is a typed error; `ladspa` has none - its pad count comes from the loaded plugin.
+An N-input filter takes however many streams you pass: any filter your ffmpeg reports with a dynamic *input* pad count and one output (`amix`, `hstack`, `xstack`, `ffmpeg.join` - bare `join` is the SQL keyword - and dozens more, whatever your build has). Where the filter has an `inputs`/`nb_inputs` option it is set from the stream count, and a written value that disagrees is a typed error; `ladspa` has none - its pad count comes from the loaded plugin. A dynamic *output* pad count (`split`, the array-returning trio's mirror) is a different shape entirely, and stays out of reach: the compiler inserts its own splits.
 
 To choose which tracks to pass in the first place (by language, codec, resolution), use track rows: [rows.md](rows.md).
 

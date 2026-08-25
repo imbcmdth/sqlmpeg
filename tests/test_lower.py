@@ -679,32 +679,36 @@ def test_a_repeated_scalar_is_fanned_out_by_the_split_pass() -> None:
     assert g.nodes["n2"].inputs == ["src:a:a:1", "src_b_a_0_split:1"]
 
 
-def test_an_in_registry_acrossfade_wins_over_the_n_input_table() -> None:
-    """acrossfade is AA->A on the snapshot's ffmpeg (pre-9) and variadic
-    N->A on ffmpeg 9. The N_INPUT entry must NOT shadow a registry that has
-    the filter in-scope: on old builds it is an ordinary two-input call, no
-    `inputs` option written (older acrossfade has no such option)."""
-    g = _lower(
+def test_a_fixed_arity_acrossfade_wins_over_n_input_treatment(_registry: Registry) -> None:
+    """acrossfade is `AA->A` on ffmpeg 7.1 (an ordinary two-input filter, no
+    `inputs` option) and `N->A` on ffmpeg 9 (n-input, `inputs` option). The
+    dispatch order (`_lower_call` checks `DynamicFilter.n_input` before
+    treating a name as a fixed-arity registry call) must not run n-input
+    treatment against a build whose acrossfade is not n-input at all: an
+    ordinary two-input call, no `inputs` option written (it has none)."""
+    g = _dyn(
         "SELECT acrossfade(a.audio[1], b.audio[1], duration => 1) "
         "FROM input('x.mp4') a, input('y.mp4') b",
-        {"a": _probe_result(audios=1), "b": _probe_result(audios=1)},
+        _registry,
     )
     node = next(iter(g.nodes.values()))
     assert node.filter == "acrossfade"
     assert node.args == {"duration": 1}
+    assert "inputs" not in node.args
 
 
 @pytest.mark.exec
 def test_a_variadic_acrossfade_omits_the_defaulted_count_and_writes_a_real_one() -> None:
-    """On a build where acrossfade is variadic (ffmpeg 9+: excluded N->A with
-    an `inputs` option), the N_INPUT rescue kicks in -- and emits `inputs`
-    only beyond the default of 2, so the two-stream command stays valid on
-    every ffmpeg (cookbook recipe 13's pin is version-stable)."""
+    """On a build where acrossfade is n-input (ffmpeg 9+: `N->A`, an `inputs`
+    option), `emit_default=False` -- the override this brief adds -- omits
+    `inputs` only up to the default of 2, so the two-stream command stays
+    valid on every ffmpeg (cookbook recipe 13's pin is version-stable)."""
     live = registry_module.load()
-    if live.get("acrossfade") is not None:
+    dynamic = live.get("acrossfade")
+    if dynamic is not None and not dynamic.n_input:
         pytest.skip(
             "this ffmpeg's acrossfade is a fixed two-input filter; the "
-            "variadic N_INPUT path only exists on builds that exclude it"
+            "n-input path only exists on builds where it is N->A"
         )
     two = compile_sql(
         "SELECT acrossfade(a.audio[1], a.audio[2], duration => 1) "
@@ -2875,6 +2879,7 @@ Filters:
   N = Dynamic number and/or type of input/output
   | = Source or sink filter
  .S. acrossover        A->N       Split audio into per-bands streams.
+ ... acrossfade        AA->A      Cross fade two input audio streams.
  ... aecho             A->A       Add echoing to the audio.
  ... amerge            N->A       Merge two or more audio streams into a single multi-channel stream.
  ... join              N->A       Join multiple audio streams into multi-channel output.
@@ -2918,6 +2923,14 @@ _HELP_FIXTURES: dict[str, str] = {
    eval              <int>        ..F.A...... specify when to evaluate expressions (from 0 to 1) (default once)
      once            0            ..F.A...... eval volume expression once
      frame           1            ..F.A...... eval volume expression per-frame
+
+""",
+    # ffmpeg 7.1's acrossfade: a plain two-input `AA->A` filter, no `inputs`
+    # option -- that arrives only with the `N->A` shape ffmpeg 9 gave it.
+    "acrossfade": """acrossfade AVOptions:
+   nb_samples        <int>        ..F.A...... set number of samples for cross fade duration (from 1 to 2147483647) (default 44100)
+   duration          <duration>   ..F.A...... set cross fade duration (default 0)
+   overlap           <boolean>    ..F.A...... overlap 1st stream end with 2nd stream start (default true)
 
 """,
     "amix": """amix AVOptions:
@@ -4145,9 +4158,9 @@ def test_a_namespaced_did_you_mean_stays_in_the_namespace(
 
 def test_the_scope_check_applies_to_the_namespace_too(_registry: Registry) -> None:
     """Three `->N` names are re-admitted through this namespace (array-
-    RETURNING), and a handful of `N->1` names through N_INPUT (amix, amerge,
-    ...); multi-output, source and `split`-shaped (`N` on the OUTPUT side,
-    admitted by neither table) names stay excluded."""
+    RETURNING); every `N->1` name (amix, amerge, ...) is an ordinary
+    registry member, marked n-input; multi-output, source and
+    `split`-shaped (`N` on the OUTPUT side) names stay excluded."""
     for sql in (
         "SELECT ffmpeg.feedback(a.video[1], a.video[1]) FROM input('x.mp4') a",
         "SELECT ffmpeg.testsrc(a.video[1]) FROM input('x.mp4') a",
@@ -4824,15 +4837,24 @@ def test_an_n_input_filter_nests(_registry: Registry) -> None:
     assert g.nodes["n2"].inputs == ["n1"]
 
 
-def test_an_n_input_filter_this_ffmpeg_lacks_is_unknown(
+def test_an_n_input_filter_with_no_help_output_is_still_callable(
     _registry: Registry, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The table says what SHAPE the call has, never that the filter exists."""
+    """An N-input filter is an ordinary registry member now (`-filters` alone
+    says its shape is real), so a build whose `-help filter=amix` fails still
+    admits the call -- it just has no options to bind against, exactly like
+    any other filter `-help` fails for."""
     monkeypatch.delitem(_HELP_FIXTURES, "amix")
+    g = _dyn("SELECT amix(a.audio[1], a.audio[2]) FROM input('x.mp4') a", _registry)
+    node = g.nodes["n1"]
+    assert node.filter == "amix"
+    assert node.args == {}
     err = _reject_dyn(
-        "SELECT amix(a.audio[1], a.audio[2]) FROM input('x.mp4') a", _registry
+        "SELECT amix(a.audio[1], a.audio[2], duration => 'shortest') "
+        "FROM input('x.mp4') a",
+        _registry,
     )
-    assert err.code is ErrorCode.UNKNOWN_FUNCTION
+    assert err.code is ErrorCode.UNKNOWN_FILTER_OPTION
 
 
 def test_an_n_input_filter_has_no_timeline_support(_registry: Registry) -> None:
@@ -4857,14 +4879,14 @@ def test_an_n_input_node_is_split_like_any_other(_registry: Registry) -> None:
 
 
 # ---------------------------------------------------------------------------
-# amerge / join / interleave / ainterleave join the N_INPUT table (plan 078)
+# amerge / join / interleave / ainterleave: N-input filters, `nb_inputs`
 # ---------------------------------------------------------------------------
 #
-# Same rescue mechanism as amix/hstack/vstack, added second wave. amerge and
-# join count via `inputs`; interleave/ainterleave count via `nb_inputs` --
-# VERIFIED against a real ffmpeg 9.0.1 (`Registry.excluded_options`): `n` is
-# `nb_inputs`'s adjacent alias, so the registry's dedup rule keeps the longer
-# name, and `nb_inputs` is what a positional binds too.
+# Same derivation as amix/hstack/vstack. amerge and join count via `inputs`;
+# interleave/ainterleave count via `nb_inputs` -- VERIFIED against a real
+# ffmpeg 9.0.1 (`Registry.options`): `n` is `nb_inputs`'s adjacent alias, so
+# the registry's dedup rule keeps the longer name, and `nb_inputs` is what a
+# positional binds too.
 
 
 def test_amerge_is_callable_bare_and_counts_via_inputs(_registry: Registry) -> None:
@@ -5025,6 +5047,100 @@ def test_ladspa_reachable_through_the_namespace(_registry: Registry) -> None:
         _registry,
     )
     assert g.nodes["n1"].filter == "ladspa"
+
+
+# ---------------------------------------------------------------------------
+# N-input filters are derived from the registry, not hand-listed
+# ---------------------------------------------------------------------------
+#
+# registry.py includes every `N->A`/`N->V` filter as an ordinary member of
+# `Registry.names()`, marked `DynamicFilter.n_input`; lower.py's
+# `_n_input_spec` reads its call shape (stream/output/option/fallback) off
+# that filter's own option table instead of a hand-listed table. `xstack`
+# (`N->V`, `inputs`/`layout`/`grid`/`shortest`/`fill`) is a newly admitted
+# filter -- it was excluded before this and reachable through no table.
+
+# The original hand-listed table's exact values for the nine filters it
+# carried, as (stream, output, option, fallback, emit_default).
+_ORIGINAL_N_INPUT_TABLE: dict[str, tuple[str, str, str | None, int, bool]] = {
+    "amix": ("audio", "audio", "inputs", 2, True),
+    "hstack": ("video", "video", "inputs", 2, True),
+    "vstack": ("video", "video", "inputs", 2, True),
+    "acrossfade": ("audio", "audio", "inputs", 2, False),
+    "amerge": ("audio", "audio", "inputs", 2, True),
+    "join": ("audio", "audio", "inputs", 2, True),
+    "interleave": ("video", "video", "nb_inputs", 2, True),
+    "ainterleave": ("audio", "audio", "nb_inputs", 2, True),
+    "ladspa": ("audio", "audio", None, 0, False),
+}
+
+
+def test_derived_n_input_spec_reproduces_the_original_table_exactly() -> None:
+    """Derivation from the registry must land on exactly the values the
+    hand-listed table carried for its nine filters -- not merely compile the
+    same commands, the same `_NInputFilter` fields, so a later refactor of
+    the derivation can diff against this."""
+    registry = _snapshot_registry()
+    for name, (stream, output, option, fallback, emit_default) in _ORIGINAL_N_INPUT_TABLE.items():
+        dynamic = registry.get(name)
+        assert dynamic is not None and dynamic.n_input, name
+        options = registry.options(name)
+        assert options is not None, name
+        spec = lower_module._n_input_spec(name, dynamic, options)
+        assert spec == lower_module._NInputFilter(
+            name=name,
+            stream=stream,  # type: ignore[arg-type]
+            output=output,  # type: ignore[arg-type]
+            option=option,
+            fallback=fallback,
+            emit_default=emit_default,
+        ), name
+
+
+def test_xstack_is_callable_bare_and_positionally() -> None:
+    g = _lower(
+        "SELECT xstack(a.video[1], b.video[1], grid => '2x2') "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+    )
+    node = next(iter(g.nodes.values()))
+    assert node.filter == "xstack"
+    assert node.outputs == ["video"]
+    assert node.args == {"inputs": 2, "grid": "2x2"}
+
+
+def test_xstack_is_callable_variadic() -> None:
+    g = _lower(
+        "SELECT ffmpeg.xstack(VARIADIC a.video, grid => '2x2') FROM input('x.mp4') a",
+        {"a": _probe_result(videos=4)},
+    )
+    node = next(iter(g.nodes.values()))
+    assert node.filter == "xstack"
+    assert node.args == {"inputs": 4, "grid": "2x2"}
+    assert len(node.inputs) == 4
+
+
+def test_xstack_count_disagreement_is_udf_arg_type() -> None:
+    """The same disagreement rejection an original N_INPUT filter gets
+    (`test_a_count_that_disagrees_with_the_streams_is_udf_arg_type`), now
+    exercised on a filter the registry admits rather than a curated table."""
+    err = _reject_lower(
+        "SELECT xstack(a.video[1], b.video[1], inputs => 3) "
+        "FROM input('x.mp4') a, input('y.mp4') b",
+        {},
+    )
+    assert err.code is ErrorCode.UDF_ARG_TYPE
+    assert "was given 2 streams" in err.message
+    assert "'inputs' option says 3" in err.message
+
+
+def test_streamselect_and_astreamselect_stay_excluded() -> None:
+    """Both are `N->N` -- dynamic on the OUTPUT side too, same as `concat` --
+    so they stay excluded from the registry, unlike an ordinary `N->1`
+    n-input filter."""
+    registry = _snapshot_registry()
+    for name in ("streamselect", "astreamselect"):
+        assert registry.get(name) is None, name
+        assert name not in registry.names(), name
 
 
 # ---------------------------------------------------------------------------
@@ -5758,8 +5874,8 @@ def test_a_positionally_compiled_call_runs(_av_fixture: str, tmp_path: Path) -> 
 
 @pytest.mark.exec
 def test_an_n_input_call_runs(_av_fixture: str, tmp_path: Path) -> None:
-    """amix is excluded from the registry's tables; N_INPUT is what makes it
-    callable, and the command it builds is one ffmpeg accepts."""
+    """amix is an N-input filter, and the command it builds is one ffmpeg
+    accepts."""
     out = tmp_path / "amix.mp4"
     query = (
         f"SELECT amix(a.audio[1], a.audio[1]) FROM input('{_av_fixture}') a"

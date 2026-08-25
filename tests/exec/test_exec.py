@@ -1837,9 +1837,9 @@ def test_in_selects_both_language_tracks_and_not_in_selects_one(tmp_path: Path) 
 
 
 def test_amerge_runs_and_produces_one_multichannel_stream(tmp_path: Path) -> None:
-    """`amerge` is excluded from the registry's tables; N_INPUT is what makes
-    it callable at all (mirrors the amix exec test), and running it for real
-    proves the two mono tracks actually landed in one merged stream."""
+    """`amerge` is an N-input filter (mirrors the amix exec test), and
+    running it for real proves the two mono tracks actually landed in one
+    merged stream."""
     _require_fixture(_AV2)
     _require_fixture(_AV3)
     out_path = tmp_path / "merged.mka"
@@ -1881,7 +1881,7 @@ def _find_ladspa_plugin() -> Path | None:
 
 
 def test_ladspa_runs_and_produces_one_audio_stream(tmp_path: Path) -> None:
-    """`ladspa` joins the N_INPUT table with no count option -- ffmpeg derives
+    """`ladspa` is an N-input filter with no count option -- ffmpeg derives
     its pad count from the plugin's own ports. Running it for real needs an
     actual LADSPA plugin FILE on this machine (`LADSPA_PATH`, or ffmpeg's
     compiled-in default); gyan's Windows ffmpeg builds carry no bundled

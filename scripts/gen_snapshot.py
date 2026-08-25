@@ -20,10 +20,10 @@ options up front:
     filters/sources tables by the v1 pad scope check, so ``options()`` cannot
     reach them; ``excluded_options()`` is the only door, see
     ``sqlmpeg/lower.py``'s ``ARRAY_RETURNING``)
-  - the fixed-count N-input trio's options, for exactly the same reason:
-    ``amix``/``hstack``/``vstack`` are ``N->1`` and equally excluded, and
-    their ``inputs`` option is what makes them callable at all (see
-    ``sqlmpeg/lower.py``'s ``N_INPUT``)
+  - every N-input filter's (``amix``/``hstack``/``xstack``/...,
+    ``DynamicFilter.n_input``) options too, for free: registry.py includes
+    them in ``Registry.names()`` now (a dynamic INPUT pad count is no longer
+    excluded), so the ``options()`` pass above already force-loads them
   - the eleven "collision census" names (``Registry.excluded_options()`` too
     -- they are ordinary in-scope filters already covered by the
     ``options()`` pass above, so this adds no new data, but it exercises
@@ -64,7 +64,7 @@ import argparse
 import json
 from pathlib import Path
 
-from sqlmpeg.lower import ARRAY_RETURNING, N_INPUT
+from sqlmpeg.lower import ARRAY_RETURNING
 from sqlmpeg.registry import Registry
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -114,8 +114,6 @@ def build_registry() -> Registry:
     for name in registry.source_names():
         registry.options(name)
     for name in ARRAY_RETURNING:
-        registry.excluded_options(name)
-    for name in N_INPUT:
         registry.excluded_options(name)
     for name in _CENSUS_NAMES:
         registry.excluded_options(name)

@@ -713,18 +713,19 @@ ffmpeg flags with timeline support take it; asking on one that does not is
 `UNKNOWN_FILTER_OPTION`. It is never valid on a generated source or on a
 `sqlmpeg.*` macro (see above).
 
-A handful of names are exceptions to "one stream in, one filter, one call":
-- `amix`, `hstack`, `vstack`, `amerge`, `join` take ANY NUMBER of same-type
-  stream arguments (two or more), all positional, no named options before
-  them: `amix(a, b, c)` mixes three audio streams. The count sqlmpeg passes
-  to ffmpeg is however many streams you wrote; give `inputs => <n>`
-  explicitly only if you need to override that. `interleave`/`ainterleave`
-  are the same shape, but their count option is `nb_inputs`, not `inputs`.
-  `ladspa(audio, ..., file => '<library>', plugin => '<label>')` is the
-  same shape with no count option at all - the loaded plugin's ports
-  decide. Every one of these also takes `VARIADIC` instead of a written-out
-  list (`amix(VARIADIC f.audio)`), and `concat` joins them under `VARIADIC`
-  ONLY (see the `array_agg`/`VARIADIC` entry above).
+A filter with a dynamic INPUT pad count is an exception to "one stream in,
+one filter, one call": `amix`, `hstack`, `vstack`, `xstack`, and every other
+such filter your ffmpeg reports take ANY NUMBER of same-type stream
+arguments (two or more), all positional, no named options before them:
+`amix(a, b, c)` mixes three audio streams. The count sqlmpeg passes to
+ffmpeg is however many streams you wrote; give `inputs => <n>` explicitly
+only if you need to override that. `interleave`/`ainterleave` are the same
+shape, but their count option is `nb_inputs`, not `inputs`.
+`ladspa(audio, ..., file => '<library>', plugin => '<label>')` is the
+same shape with no count option at all - the loaded plugin's ports
+decide. Every one of these also takes `VARIADIC` instead of a written-out
+list (`amix(VARIADIC f.audio)`), and `concat` joins them under `VARIADIC`
+ONLY (see the `array_agg`/`VARIADIC` entry above).
 - Plugin filters compile like any other call when the build ships them:
   `frei0r(video, filter_name => '<plugin>', filter_params => 'a|b')` and
   the source `ffmpeg.frei0r_src(...)` (found via the `FREI0R_PATH`
@@ -737,10 +738,11 @@ A handful of names are exceptions to "one stream in, one filter, one call":
   Splat it into the SELECT list, subscript one element through a CTE column
   (`s.ch[2]`), or broadcast a call over every element. These three resolve
   ONLY through the namespace -- the bare name reaches nowhere.
-- A filter with a variable pad count is not callable under either filter
-  spelling UNLESS it is one of the N-input set or `concat`, and `concat`
-  only under `VARIADIC` (above) -- `split` stays uncallable regardless,
-  since the compiler inserts its own. Neither is a filter with more than one
+- A filter with a variable OUTPUT pad count is not callable under either
+  filter spelling -- `split` stays uncallable regardless, since the
+  compiler inserts its own -- but a variable INPUT pad count is (the
+  N-input set above), and so is `concat`, only under `VARIADIC` (above).
+  Neither is a filter with more than one
   output, or a zero-input one: `ffmpeg.testsrc(...)` is a generated SOURCE,
   and it belongs in `FROM` (see Dialect > Sources), never in the SELECT list.
 

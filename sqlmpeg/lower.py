@@ -174,19 +174,22 @@ compiles therefore depends on what that ffmpeg reports, and an empty registry
   elementwise like any other array. The table is
   consulted before the registry's verdict, since the registry has no entry to
   give; every other excluded name keeps its ``UNKNOWN_FUNCTION``.
-* Several ``N->1`` filters are re-admitted the mirror way (:data:`N_INPUT`):
-  ``amix``, ``hstack``, ``vstack``, ``amerge``, ``join``, ``interleave`` and
-  ``ainterleave`` take a variable number of INPUT pads fixed by one option
-  (``inputs`` for most, ``nb_inputs`` for interleave/ainterleave), so the pad
-  scope check excludes them too, yet the count is statically knowable the moment
-  that option is read. Their leading stream arguments ARE the input pads and
-  the count option must agree with how many were supplied (``UDF_ARG_TYPE``
-  naming both numbers when it does not). Unlike the array trio these are
-  reachable BARE as well as namespaced — no Postgres grammar claims their
-  names. ``ladspa`` (``N->A``) joins the same table but with no count option
-  at all — its pad count is whatever the loaded LADSPA plugin's own ports
-  say, so the streams supplied ARE the count, nothing to cross-check and
-  nothing to write back.
+* The mirror shape, ``N->1``, is an ORDINARY registry filter
+  (``DynamicFilter.n_input``, e.g. ``amix``, ``hstack``, ``xstack`` — ~31 on
+  ffmpeg 9.0.1): a variable number of INPUT pads, all of the filter's own
+  output stream type, fixed by one OPTION. :data:`_NInputFilter` and its
+  per-call derivation (:func:`_n_input_spec`) read that option off the
+  filter's own table — ``inputs`` for most, ``nb_inputs`` where that is the
+  longer name ``interleave``/``ainterleave`` dedup to. Their leading stream
+  arguments ARE the input pads and the count option must agree with how many
+  were supplied (``UDF_ARG_TYPE`` naming both numbers when it does not).
+  Reachable BARE as well as namespaced — no Postgres grammar claims their
+  names. ``ladspa`` (``N->A``) has no count option at all — its pad count is
+  whatever the loaded LADSPA plugin's own ports say, so the streams supplied
+  ARE the count, nothing to cross-check and nothing to write back.
+  ``emit_default``/an absent count option's ``fallback`` are the two things no
+  single ffmpeg build can answer about itself; a small override table
+  (:data:`_N_INPUT_OVERRIDES`) covers those.
 * ``sqlmpeg.<name>(...)`` is a THIRD namespace, resolved against
   :data:`sqlmpeg.macros.MACROS` and NEVER the registry -- macros work offline,
   with no ffmpeg on PATH at all. A macro owns its own fixed
@@ -785,29 +788,23 @@ _ARRAY_INPUT_HINT = (
 )
 
 
-# fixed-count N-INPUT filters, the mirror image of ARRAY_RETURNING.
+# N-input filters: registry.py now includes every `N->A`/`N->V` filter as an
+# ordinary member of `Registry.names()`/`Registry.get()`, marked
+# `DynamicFilter.n_input`. `_NInputFilter` is the per-call shape lowering
+# needs on top of that -- which option (if any) carries the count, and what
+# to do when it is unwritten -- derived per name by `_n_input_spec` rather
+# than hand-listed.
 #
-# Several ffmpeg filters take a number of INPUT pads fixed statically by one
-# of their options and produce exactly one output pad. Their `-filters` spec
-# is `N->A` / `N->V`, so the pad scope check excludes them all -- yet the count is
-# knowable the moment the option is read, the same argument that re-admits the
-# array-returning trio.
-#
-# Re-admitted under BOTH spellings, bare and namespaced: none of these names
-# collides with a Postgres special form.
-#
-# The mechanism generalizes to any `N->1` filter whose input count is one
-# option, and does now that VARIADIC gives an array-consuming call somewhere
-# to bind: every entry below takes VARIADIC too (`_lower_variadic_n_input_call`),
-# and `concat` (`N->N`, its own `n` option) joins them under VARIADIC only --
-# see `_lower_concat_call`. Still scoped to what is curated here; the ffmpeg
-# filter set has other `N->1` shapes (`mix`, `xstack`, ...) this table does
-# not carry.
+# Reachable under BOTH spellings, bare and namespaced: none of these names
+# collides with a Postgres special form. Every entry also takes VARIADIC
+# (`_lower_variadic_n_input_call`), and `concat` (`N->N`, its own `n` option,
+# still excluded from the registry on the OUTPUT side) joins them under
+# VARIADIC only -- see `_lower_concat_call`.
 
 
 @dataclass(frozen=True)
 class _NInputFilter:
-    """One fixed-count N-input filter: its pads, and the option fixing the count."""
+    """One N-input filter's call shape: its pads, and the option fixing the count."""
 
     name: str
     stream: StreamType  # what every one of its INPUT pads carries
@@ -826,51 +823,77 @@ class _NInputFilter:
     emit_default: bool = True
 
 
-N_INPUT: dict[str, _NInputFilter] = {
-    "amix": _NInputFilter(name="amix", stream="audio", output="audio", option="inputs", fallback=2),
-    "hstack": _NInputFilter(
-        name="hstack", stream="video", output="video", option="inputs", fallback=2
-    ),
-    "vstack": _NInputFilter(
-        name="vstack", stream="video", output="video", option="inputs", fallback=2
-    ),
-    "acrossfade": _NInputFilter(
-        name="acrossfade",
-        stream="audio",
-        output="audio",
-        option="inputs",
-        fallback=2,
-        emit_default=False,
-    ),
-    "amerge": _NInputFilter(
-        name="amerge", stream="audio", output="audio", option="inputs", fallback=2
-    ),
-    "join": _NInputFilter(
-        name="join", stream="audio", output="audio", option="inputs", fallback=2
-    ),
-    # interleave/ainterleave's count option is `nb_inputs`, not the shorter
-    # `n` alias: VERIFIED via `Registry.excluded_options` (ffmpeg 9.0.1) -- `n`
-    # is `nb_inputs`'s adjacent alias, and the dedup rule keeps the longer
-    # name (see registry.py's docstring).
-    "interleave": _NInputFilter(
-        name="interleave", stream="video", output="video", option="nb_inputs", fallback=2
-    ),
-    "ainterleave": _NInputFilter(
-        name="ainterleave", stream="audio", output="audio", option="nb_inputs", fallback=2
-    ),
-    "ladspa": _NInputFilter(
-        name="ladspa", stream="audio", output="audio", option=None, fallback=0, emit_default=False
-    ),
+# What no single ffmpeg build's introspection can answer about itself:
+# whether writing the DEFAULTED count is safe on an older build that lacks
+# the option entirely (acrossfade, N->A only since ffmpeg 9), and ladspa's
+# fallback/emit_default, whose "count" is never a real ffmpeg option value.
+# Everything else is derived from the registry -- see `_n_input_spec`.
+@dataclass(frozen=True)
+class _NInputOverride:
+    fallback: int | None = None
+    emit_default: bool | None = None
+
+
+_N_INPUT_OVERRIDES: dict[str, _NInputOverride] = {
+    "acrossfade": _NInputOverride(emit_default=False),
+    "ladspa": _NInputOverride(fallback=0, emit_default=False),
 }
+
+# The count option's name, in the order to look for it: `inputs` for most
+# N-input filters, `nb_inputs` where that is the longer name the registry's
+# adjacent-alias dedup keeps (interleave/ainterleave -- `n` is the alias it
+# drops). A filter with neither has no count option (`option=None`).
+_N_INPUT_OPTION_NAMES = ("inputs", "nb_inputs")
+
+
+def _n_input_spec(
+    name: str, dynamic: DynamicFilter, options: dict[str, FilterOption]
+) -> _NInputFilter:
+    """One N-input filter's call shape, derived from what this registry reports.
+
+    `stream`/`output` both come from `dynamic.output`: ffmpeg's pad notation
+    for an N-input filter is just `N->V`/`N->A`, one letter, and every filter
+    observed takes input pads of that same kind. `option`/`fallback` come from
+    the filter's own option table; `_N_INPUT_OVERRIDES` covers the two things
+    no single build can answer about itself.
+    """
+    option_name = next((n for n in _N_INPUT_OPTION_NAMES if n in options), None)
+    fallback = 2
+    emit_default = True
+    if option_name is not None:
+        default = options[option_name].default
+        if default is not None:
+            try:
+                fallback = int(float(default))
+            except ValueError:
+                pass
+    else:
+        fallback = 0
+        emit_default = False
+    override = _N_INPUT_OVERRIDES.get(name)
+    if override is not None:
+        if override.fallback is not None:
+            fallback = override.fallback
+        if override.emit_default is not None:
+            emit_default = override.emit_default
+    return _NInputFilter(
+        name=name,
+        stream=dynamic.output,
+        output=dynamic.output,
+        option=option_name,
+        fallback=fallback,
+        emit_default=emit_default,
+    )
+
 
 _N_INPUT_HINT = (
     "the number of streams you pass IS the filter's input count; either pass "
     "that many streams, or set the count explicitly, e.g. amix(a, b, c, inputs => 3)"
 )
 
-# `concat` is excluded from the registry by the same pad-scope check as every
-# other `N->N` filter (see registry.py), but VARIADIC gives its count a
-# source, so it is callable on those terms alone -- never without VARIADIC.
+# `concat` stays excluded from the registry (dynamic on the OUTPUT side too,
+# `N->N` -- see registry.py), but VARIADIC gives its count a source, so it is
+# callable on those terms alone -- never without VARIADIC.
 _CONCAT_NAME = "concat"
 
 _CONCAT_VARIADIC_HINT = (
@@ -878,15 +901,10 @@ _CONCAT_VARIADIC_HINT = (
     "concat(VARIADIC array_agg(v))"
 )
 
-
-def _variadic_capable_names() -> list[str]:
-    return sorted({*N_INPUT, _CONCAT_NAME})
-
-
 _VARIADIC_HINT = (
     "VARIADIC spreads an array as the call's argument list, and only a filter "
-    "whose pad count follows its argument count takes it -- "
-    + ", ".join(_variadic_capable_names())
+    "whose pad count follows its argument count takes it -- an N-input filter "
+    "(amix, hstack, xstack, ...) or concat"
 )
 
 
@@ -7022,11 +7040,14 @@ class _Lowerer:
         One convention, three shapes of filter, tried in the order that makes
         each reachable at all:
 
-        * :data:`ARRAY_RETURNING` (namespaced spelling ONLY) and
-          :data:`N_INPUT` (either spelling) come first, because both tables
-          exist precisely for names the v1 pad scope check keeps OUT of the registry
-          — asking ``get`` about them first would answer "unknown" and the
-          tables would never be reached;
+        * :data:`ARRAY_RETURNING` (namespaced spelling ONLY) comes first: the
+          v1 pad scope check keeps its names OUT of the registry entirely, so
+          asking ``get`` about one first would answer "unknown".
+        * an N-input filter (``DynamicFilter.n_input``) comes next, even
+          though it IS an ordinary registry member now: its pad count is not
+          the fixed arity ``dynamic.inputs`` gives the registry's own path,
+          so it needs :func:`_n_input_spec`'s derived shape instead of
+          reaching the registry proper.
         * then the registry proper, whose pad signature is the call's stream
           signature.
 
@@ -7058,9 +7079,10 @@ class _Lowerer:
                 return self._lower_array_call(
                     node, ARRAY_RETURNING[name], options, call, env, select
                 )
-        n_input = self._n_input_options(name)
+        n_input = self._n_input_call(name)
         if n_input is not None:
-            return self._lower_n_input_call(node, N_INPUT[name], n_input, call, env, select)
+            spec, options = n_input
+            return self._lower_n_input_call(node, spec, options, call, env, select)
         dynamic = self.registry.get(name) if self.registry is not None else None
         if dynamic is None:
             raise _error(
@@ -7079,16 +7101,16 @@ class _Lowerer:
     ) -> _Value:
         """Dispatch a call carrying ``VARIADIC``: the pad count follows the array.
 
-        Only :data:`N_INPUT` and ``concat`` have a pad count that can follow
-        anything -- every other filter's arity is fixed by its pad signature,
-        so ``VARIADIC`` on one of those is a rejection naming that, and an
-        unknown name is the ordinary ``UNKNOWN_FUNCTION`` either way.
+        Only an N-input filter (``DynamicFilter.n_input``) and ``concat`` have
+        a pad count that can follow anything -- every other filter's arity is
+        fixed by its pad signature, so ``VARIADIC`` on one of those is a
+        rejection naming that, and an unknown name is the ordinary
+        ``UNKNOWN_FUNCTION`` either way.
         """
-        n_input = self._n_input_options(name)
+        n_input = self._n_input_call(name)
         if n_input is not None:
-            return self._lower_variadic_n_input_call(
-                node, N_INPUT[name], n_input, call, env, select
-            )
+            spec, options = n_input
+            return self._lower_variadic_n_input_call(node, spec, options, call, env, select)
         concat = self._concat_options(name)
         if concat is not None:
             return self._lower_concat_call(node, concat, call, env, select)
@@ -7349,26 +7371,31 @@ class _Lowerer:
             build=build,
         )
 
-    # -- fixed-count N-input filters ----------------------------
+    # -- N-input filters ----------------------------
 
-    def _n_input_options(self, name: str) -> dict[str, FilterOption] | None:
-        """`name`'s option table if it is a callable fixed-count N-input filter.
+    def _n_input_call(self, name: str) -> tuple[_NInputFilter, dict[str, FilterOption]] | None:
+        """`name`'s derived call shape and option table, if THIS registry has
+        it as a callable N-input filter (``DynamicFilter.n_input``).
 
-        Mirrors :meth:`_array_options` exactly: in the table, a registry to ask,
-        and an ffmpeg that actually HAS the filter. The last one is why options
-        are fetched even for a call that passes none — an excluded name is in no
-        registry table, so its option block is the only evidence this build has
-        it (see ``Registry.excluded_options``).
+        An n-input filter is an ordinary registry member now (see
+        registry.py), so this is a membership check plus the same option
+        fetch every other callable filter goes through -- options are
+        fetched even for a call that passes none, since the spec's
+        `option`/`fallback` are derived from the table's own content
+        (:func:`_n_input_spec`). ``acrossfade`` is the case this matters for:
+        on a build where it is still an ordinary ``AA->A`` filter,
+        ``dynamic.n_input`` is False and this returns None, so the registry's
+        own pad signature wins over any N-input treatment.
         """
-        if name not in N_INPUT or self.registry is None:
+        if self.registry is None:
             return None
-        if self.registry.get(name) is not None:
-            # THIS ffmpeg has the filter in-scope (acrossfade was an ordinary
-            # AA->A filter before ffmpeg 9 made it variadic): the registry's
-            # own pad signature is the truth here, and the N_INPUT rescue is
-            # only for builds whose pad scope check excluded the name.
+        dynamic = self.registry.get(name)
+        if dynamic is None or not dynamic.n_input:
             return None
-        return self.registry.excluded_options(name)
+        options = self.registry.options(name)
+        if options is None:
+            return None
+        return _n_input_spec(name, dynamic, options), options
 
     def _lower_n_input_call(
         self,
@@ -7381,9 +7408,10 @@ class _Lowerer:
     ) -> _Value:
         """One node with N input pads, N being what the count option says.
 
-        The stream/option split cannot come from a pad signature here (there
-        is none — the registry excluded the filter for exactly that reason),
-        so it comes from the arguments themselves: the LEADING RUN of
+        The stream/option split cannot come from a fixed pad signature here
+        (there is none — the pad count is dynamic, which is exactly what
+        marks this filter n-input), so it comes from the arguments
+        themselves: the LEADING RUN of
         stream-valued arguments are the input pads, and everything after them
         is an option. That is unambiguous because an option value is always a
         literal and a pad is never one.
@@ -8336,10 +8364,10 @@ class _Lowerer:
                     f"{name} is a generated source, not a function: put it in FROM, "
                     f"e.g. FROM {FILTER_NAMESPACE}.{name}(duration => 2) s"
                 )
-            # `name` itself can be in the candidate set -- N_INPUT lists three
-            # names unconditionally, and this ffmpeg may simply not have one --
-            # and "did you mean amix()?" for `amix()` helps nobody.
-            candidates = sorted((set(registry.names()) | set(N_INPUT) | {_CONCAT_NAME}) - {name})
+            # An n-input filter (amix, hstack, xstack, ...) is already in
+            # `registry.names()` -- an ordinary registry member now -- so
+            # only `concat` (excluded on the OUTPUT side) needs adding by hand.
+            candidates = sorted((set(registry.names()) | {_CONCAT_NAME}) - {name})
             matches = difflib.get_close_matches(name, candidates, n=1, cutoff=0.6)
             if matches:
                 return f"did you mean {matches[0]}()?"
@@ -8369,8 +8397,7 @@ class _Lowerer:
                     f"{name}(duration => 2) s"
                 )
             candidates = sorted(
-                (set(registry.names()) | set(ARRAY_RETURNING) | set(N_INPUT) | {_CONCAT_NAME})
-                - {name}
+                (set(registry.names()) | set(ARRAY_RETURNING) | {_CONCAT_NAME}) - {name}
             )
             matches = difflib.get_close_matches(name, candidates, n=1, cutoff=0.6)
             if matches:
@@ -8469,8 +8496,9 @@ class _Lowerer:
             # a.audio[1]), 0.5)` broadcasts over the channels.
             if call.namespaced and self._array_options(name) is not None:
                 return ARRAY_RETURNING[name].element
-            if self._n_input_options(name) is not None:
-                return N_INPUT[name].output
+            n_input = self._n_input_call(name)
+            if n_input is not None:
+                return n_input[0].output
             dynamic = self.registry.get(name) if self.registry is not None else None
             if dynamic is None:
                 raise _error(

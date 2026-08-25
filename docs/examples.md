@@ -1824,3 +1824,28 @@ ffmpeg -i tests/fixtures/testsrc.mp4 -filter_complex \
 ```
 
 Two `setpts` nodes, `n1_pts` and `n2_pts` - one per trim, neither written by the query - each rebasing its own clip to start at zero before `concat` joins them end to end. Writing your own `setpts`/`asetpts` right after a trim (or calling `sqlmpeg.speed`, which expands to one) takes over timing for that stream, and the compiler leaves it alone rather than stacking a second reset on top.
+
+## 78. Lay four windows into a grid
+
+`ffmpeg.xstack` takes however many video streams you give it and lays them into a `grid` you name - each row mints its own window the same way recipe 74's clips do, and `VARIADIC array_agg` gathers them the same way recipe 75's `concat` does. Four one-second windows of one file become a 2x2 contact sheet:
+
+```pgsql
+COPY (
+  WITH windows AS (
+    SELECT f.video AS frame
+    FROM input('tests/fixtures/av.mp4') f, generate_series(1, 4) i
+    WHERE f.t >= i.i - 1 AND f.t <= i.i
+  )
+  SELECT ffmpeg.xstack(VARIADIC array_agg(windows.frame), grid => '2x2')
+  FROM windows
+) TO 'grid.mp4'
+```
+
+```
+$ sqlmpeg compile -f query.sql
+ffmpeg -ss 0 -to 1 -i tests/fixtures/av.mp4 -ss 1 -to 2 -i tests/fixtures/av.mp4 -ss 2 \
+  -to 3 -i tests/fixtures/av.mp4 -ss 3 -to 4 -i tests/fixtures/av.mp4 -filter_complex \
+  '[0:v:0][1:v:0][2:v:0][3:v:0]xstack=grid=2x2:inputs=4[out0]' -map '[out0]' grid.mp4
+```
+
+`inputs` is written for you, same as `hstack`/`vstack`/`amix` - it is `xstack`'s own first option, so a positional argument right after the streams binds to it, not to `grid`; `grid` needs `=>` to reach past it.
